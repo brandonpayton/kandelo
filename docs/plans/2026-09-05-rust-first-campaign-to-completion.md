@@ -36,6 +36,27 @@ convenient illusion.
    the forcing function; V8 hosts stay production. Not gating native on Tier-1.
 2. **Reference-completeness bar = ALL kinds, no `EOPNOTSUPP`** (externref incl.
    GC-derived, struct, array, i31, static-root) via the ONE shared module.
+   **RECONCILED 2026-09-05 with `docs/fork-reference-support.md`:** that doc
+   gates externref/struct/array/i31/static-root to `EOPNOTSUPP` at CAPTURE today
+   (census: 0/113 packages carry them across a fork). That gate is the TEMPORARY
+   truthful boundary, NOT a permanent exclusion — the bar STANDS. Key facts that
+   make it achievable: the RECONSTRUCTION/replay half is ALREADY built + shared
+   in the co-resident module for every kind (exercised in `fork-codec` tests);
+   only the CAPTURE side + production-site PROVENANCE is missing, and
+   re-instrumentation (the doc's "E1 floors") supplies it SOUNDLY (replacing the
+   deleted unsound host reverse-lookup). So each kind un-gates by: re-instrument
+   to record capture provenance → lift its gate → validate the already-built
+   replay, on ALL three hosts. This IS the port-to-Rust of the remaining fork
+   CAPTURE logic; nothing is excluded. Path: **I5b** (native capture PARITY —
+   funcref/exnref capture in Rust + a real module-state arena; externref/GC/
+   static-root cleanly `EOPNOTSUPP` matching Node/browser + fix the test) →
+   **F5 = FLOOR-1** (re-instrument funcref/externref provenance → lift externref
+   gate, all hosts) → **F6 = FLOOR-2** (GC struct=appended-field /
+   array=wrapper-struct provenance → lift struct/array/i31/static-root gates).
+   FLOOR-1 tractable; FLOOR-2 = hard whole-program transform (field reindexing
+   under subtyping). Both are ABI epochs (rebuild fork packages).
+   Capability-ahead-of-demand is intentional (completeness over YAGNI). This
+   REPLACES the old B2/B3/M2/M3 framing below (references) with I5b→F5→F6.
 3. **Batch validation runs once, at campaign completion**, when all three hosts
    test the finished result on the same `kernel.wasm` (Node Vitest + browser
    Playwright + libc/posix/sortix). No interleaved cross-host validation.
