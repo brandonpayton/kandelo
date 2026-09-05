@@ -9,6 +9,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const examplesDir = resolve(__dirname, "../../../examples");
 
 interface MachineCheckpointThreadsSummary {
+  mounts: string[];
+  unreadableMounts: string[];
   pids: number[];
   threads: { pid: number; tids: number[]; activeCount: number }[];
 }
@@ -78,6 +80,22 @@ test("restores a checkpointed process that keeps running", async ({
 
   expect(result.signaled, result.output).toBe(true);
   expect(result.recaptured!.pids).toEqual(result.captured.pids);
+  // The browser backs every mount with a MemoryFileSystem, so a browser
+  // machine moves whole. Node backs all but `/` with a host directory and
+  // records the seven it left behind. Same code, different mount topology.
+  expect(result.captured.mounts).toEqual([
+    "/",
+    "/tmp",
+    "/var/tmp",
+    "/var/log",
+    "/var/run",
+    "/home/maker",
+    "/root",
+    "/srv",
+  ]);
+  expect(result.captured.unreadableMounts).toEqual([]);
+  expect(result.hostDiagnostics.filter((d) => d.startsWith("checkpoint restore")))
+    .toEqual([]);
 });
 
 test("restores a checkpointed process whose pthread keeps running", async ({

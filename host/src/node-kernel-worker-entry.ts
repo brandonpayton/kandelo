@@ -46,8 +46,17 @@ import {
   MemoryFileSystem,
   readPreparedPlatformFile,
 } from "./vfs";
+import {
+  ReplicationLogReader,
+  ReplicationLogRecorder,
+  type ReplicationLogEntry,
+} from "./replication/log";
+import {
+  RecordingTimeProvider,
+  ReplayingTimeProvider,
+} from "./replication/clock";
 import { resolveForNodeKernelSession } from "./vfs/default-mounts-node";
-import type { MountConfig } from "./vfs/types";
+import type { FileSystemBackend, MountConfig } from "./vfs/types";
 import type { MountSpec } from "./vfs/default-mounts";
 import {
   createClosedLazyAssetFetcherFromOwnedAssets,
@@ -107,14 +116,19 @@ import {
 import { CheckpointFreezeGateCoordinator } from "./checkpoint-freeze-gate";
 import { ProcessExecutionGenerationAllocator } from "./process-execution-generation";
 import {
+  askMountsForCheckpointBytes,
   captureMachineCheckpoint,
   captureMachineCheckpointSummary,
   machineCheckpointTransferList,
   type CheckpointMachine,
   type CheckpointProcessBucket,
   type CheckpointProcessThread,
+  type MachineCheckpoint,
 } from "./migration/checkpoint";
-import { validateMachineCheckpoint } from "./migration/restore";
+import {
+  describeCheckpointMountGaps,
+  validateMachineCheckpoint,
+} from "./migration/restore";
 import { readForkContinuationAnchor } from "./fork-continuation";
 import { ForkExternrefProcessOwner } from "./fork-externref-process-owner";
 import type { ForkExternrefGeneration } from "./fork-reference-broker";
@@ -213,6 +227,22 @@ let execPrograms: Record<string, string> = {};
 let execProgramBytes: Record<string, ArrayBuffer> = {};
 let vfsExecIO: PlatformIO | null = null;
 let rootfsMemfs: MemoryFileSystem | null = null;
+/**
+ * This machine's own clock, and the IO that reads it.
+ *
+ * Replication swaps the clock rather than replacing the IO, so a recording or
+ * a replay can start and stop on a running machine. The base provider is kept
+ * so stopping restores it: a fresh `NodeTimeProvider` would carry a monotonic
+ * origin behind readings the guest has already seen.
+ */
+let baseTimeProvider: NodeTimeProvider | null = null;
+let replicationIO: VirtualPlatformIO | null = null;
+let replicationRecorder: ReplicationLogRecorder | null = null;
+let replicationReplay:
+  | { reader: ReplicationLogReader; entries: readonly ReplicationLogEntry[] }
+  | null = null;
+/** Every mount a checkpoint asks, in mount-spec order with `/` first. */
+let checkpointMounts: { mountPoint: string; backend: FileSystemBackend }[] = [];
 let initReady = false;
 let kernelFatalReported = false;
 let injectedExecWorkerConstructionFailure = false;
@@ -299,11 +329,11 @@ const checkpointMachine: CheckpointMachine = {
   armUnwindRequests: () => kernelWorker.armCheckpointUnwind(),
   disarmUnwindRequests: () => kernelWorker.disarmCheckpointUnwind(),
   copyKernelMemory: () => kernelWorker.copyKernelMemoryForCheckpoint(),
-  filesystemBuffer: () => {
-    if (!rootfsMemfs) {
+  filesystemBuffers: () => {
+    if (!rootfsMemfs || checkpointMounts.length === 0) {
       throw new Error("this machine has no MemoryFileSystem rootfs to checkpoint");
     }
-    return rootfsMemfs.sharedBuffer;
+    return askMountsForCheckpointBytes(checkpointMounts);
   },
   monotonicNowNs: () => {
     if (!vfsExecIO) {
@@ -776,6 +806,41 @@ function post(msg: KernelToMainMessage, transfer?: ArrayBuffer[]) {
   port.postMessage(msg, transfer ?? []);
 }
 
+/**
+ * Swap the guest clock for replication, and name the boundary when there is
+ * no clock to swap.
+ *
+ * A machine booted without a rootfs image runs on `NodePlatformIO`, which owns
+ * no swappable clock. Refusing here is what keeps a caller from holding a log
+ * that is silently empty, or a replay that silently read this host's time.
+ */
+function respondToReplication(
+  requestId: number,
+  swap: (io: VirtualPlatformIO, clock: NodeTimeProvider) => void,
+): void {
+  if (!replicationIO || !baseTimeProvider) {
+    post({
+      type: "response",
+      requestId,
+      result: undefined,
+      error: "replication needs a machine booted from a rootfs image: this one "
+        + "has no swappable guest clock",
+    });
+    return;
+  }
+  try {
+    swap(replicationIO, baseTimeProvider);
+    post({ type: "response", requestId, result: undefined });
+  } catch (err) {
+    post({
+      type: "response",
+      requestId,
+      result: undefined,
+      error: (err as Error)?.message ?? String(err),
+    });
+  }
+}
+
 function reportHostDiagnostic(
   diagnostic: HostDiagnostic,
   level: "error" | "warn" = "error",
@@ -1044,7 +1109,7 @@ async function buildVirtualPlatformIO(
   rootfsLazyUrlBase?: InitMessage["rootfsLazyUrlBase"],
   rootfsLazyAssets?: InitMessage["rootfsLazyAssets"],
   rootfsLazyAssetSources?: InitMessage["rootfsLazyAssetSources"],
-  restoredRootfs?: Uint8Array,
+  restoredCheckpoint?: MachineCheckpoint,
 ): Promise<VirtualPlatformIO> {
   const bootSessionDir = mkdtempSync(join(tmpdir(), "wasm-posix-session-"));
   sessionDir = bootSessionDir;
@@ -1082,10 +1147,14 @@ async function buildVirtualPlatformIO(
     ...specMounts,
     ...extras,
   ];
-  if (restoredRootfs !== undefined) {
-    // The image built the mount layout; the checkpoint supplies the state.
-    // The restored bytes are a live SharedFS, not a serialized image, so the
-    // root backend attaches to them rather than deserializing.
+  if (restoredCheckpoint !== undefined) {
+    // The image built the mount layout; the checkpoint supplies the state, one
+    // buffer per mount. `/` carries the image, but a machine's files live just
+    // as much under `/home/maker`, `/root`, `/tmp`, `/var/*` and `/srv`, each
+    // its own filesystem — restoring `/` alone would resume every process over
+    // empty working directories. The restored bytes are a live SharedFS, not a
+    // serialized image, so a backend attaches to them rather than
+    // deserializing.
     const rootIndex = mounts.findIndex((m) => m.mountPoint === "/");
     if (
       rootIndex < 0
@@ -1095,17 +1164,44 @@ async function buildVirtualPlatformIO(
         "a checkpoint restore needs a MemoryFileSystem rootfs at /",
       );
     }
-    const sab = new SharedArrayBuffer(restoredRootfs.byteLength);
-    new Uint8Array(sab).set(restoredRootfs);
-    mounts[rootIndex] = {
-      ...mounts[rootIndex]!,
-      backend: MemoryFileSystem.fromExisting(sab),
-    };
+    const dropped: string[] = [];
+    for (const restored of restoredCheckpoint.filesystems) {
+      const index = mounts.findIndex(
+        (m) => m.mountPoint === restored.mountPoint,
+      );
+      if (index < 0 || !(mounts[index]!.backend instanceof MemoryFileSystem)) {
+        dropped.push(restored.mountPoint);
+        continue;
+      }
+      const sab = new SharedArrayBuffer(restored.bytes.byteLength);
+      new Uint8Array(sab).set(restored.bytes);
+      mounts[index] = {
+        ...mounts[index]!,
+        backend: (mounts[index]!.backend as MemoryFileSystem)
+          .mountCapturedBytes(sab),
+      };
+    }
+    const gaps = describeCheckpointMountGaps(restoredCheckpoint, dropped);
+    if (gaps !== null) {
+      reportHostDiagnostic(
+        { pid: 0, source: "checkpoint restore", message: gaps },
+        "warn",
+      );
+    }
   }
   const rootMount = mounts.find((m) => m.mountPoint === "/");
   rootfsMemfs = rootMount?.backend instanceof MemoryFileSystem
     ? rootMount.backend
     : null;
+  // Every mount the freeze must ask, `/` first. Drawn from `specMounts`, so
+  // the device surfaces this computer provides — `/dev` and `/dev/shm`, which
+  // a restore rebuilds — are never mistaken for machine state to hand away.
+  checkpointMounts = specMounts.flatMap((spec) => {
+    const live = mounts.find((m) => m.mountPoint === spec.mountPoint);
+    return live === undefined
+      ? []
+      : [{ mountPoint: spec.mountPoint, backend: live.backend }];
+  });
   if (rootfsMemfs) {
     ensureMountParentDirectories(rootfsMemfs, extras.map((m) => m.mountPoint));
     if (rootfsLazyUrlBase !== undefined) {
@@ -1133,7 +1229,8 @@ async function buildVirtualPlatformIO(
       };
     rootfsMemfs.setLazyFetcher(lazyFetcher);
   }
-  return new VirtualPlatformIO(mounts, new NodeTimeProvider());
+  baseTimeProvider = new NodeTimeProvider();
+  return new VirtualPlatformIO(mounts, baseTimeProvider);
 }
 
 function cleanupSessionDir(): void {
@@ -1197,10 +1294,11 @@ async function handleInit(msg: InitMessage) {
       msg.rootfsLazyUrlBase,
       msg.rootfsLazyAssets,
       msg.rootfsLazyAssetSources,
-      msg.restoreCheckpoint?.filesystem,
+      msg.restoreCheckpoint,
     )
     : new NodePlatformIO();
   vfsExecIO = msg.rootfsImage ? io : null;
+  replicationIO = io instanceof VirtualPlatformIO ? io : null;
   if (msg.enableTcpNetwork) {
     io.network = new TcpNetworkBackend();
   }
@@ -4565,6 +4663,50 @@ port.on("message", (msg: MainToKernelMessage) => {
     case "set_syscall_trace": {
       if (msg.enabled) kernelWorker.enableSyscallTrace();
       else kernelWorker.disableSyscallTrace();
+      break;
+    }
+    case "replication_record_start": {
+      respondToReplication(msg.requestId, (io, clock) => {
+        replicationRecorder = new ReplicationLogRecorder();
+        io.setTimeProvider(new RecordingTimeProvider(clock, replicationRecorder));
+      });
+      break;
+    }
+    case "replication_record_stop": {
+      const recorder = replicationRecorder;
+      replicationRecorder = null;
+      if (replicationIO && baseTimeProvider) {
+        replicationIO.setTimeProvider(baseTimeProvider);
+      }
+      post({
+        type: "response",
+        requestId: msg.requestId,
+        result: recorder?.entries ?? [],
+      });
+      break;
+    }
+    case "replication_replay_start": {
+      respondToReplication(msg.requestId, (io, clock) => {
+        const reader = new ReplicationLogReader(msg.entries);
+        replicationReplay = { reader, entries: msg.entries };
+        io.setTimeProvider(new ReplayingTimeProvider(clock, reader));
+      });
+      break;
+    }
+    case "replication_replay_stop": {
+      const replay = replicationReplay;
+      replicationReplay = null;
+      if (replicationIO && baseTimeProvider) {
+        replicationIO.setTimeProvider(baseTimeProvider);
+      }
+      post({
+        type: "response",
+        requestId: msg.requestId,
+        result: {
+          consumed: replay?.reader.consumed ?? 0,
+          total: replay?.entries.length ?? 0,
+        },
+      });
       break;
     }
     case "drain_syscall_trace": {

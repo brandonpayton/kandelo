@@ -5,6 +5,7 @@ import type {
   StatResult,
   StatfsResult,
 } from "../types";
+import type { CheckpointBytes } from "../migration/checkpoint";
 import { STATFS_FLAGS } from "../generated/abi";
 
 /** POSIX statfs(2) flag for filesystems that ignore set-ID mode bits. */
@@ -27,6 +28,15 @@ export interface DirEntry {
 export interface FileSystemBackend {
   /** Materialize deferred path backing before synchronous file I/O. */
   preparePath?(path: string): Promise<boolean>;
+  /** Stamp file times from the machine's clock rather than the host's. */
+  setTimeProvider?(time: TimeProvider): void;
+  /**
+   * The bytes a machine checkpoint carries for this mount, or why there are none.
+   *
+   * A backend that leaves this out is recorded as unreadable, so a checkpoint
+   * never omits a mount it could not read.
+   */
+  checkpointBytes?(): CheckpointBytes;
   // File handle operations
   open(path: string, flags: number, mode: number): number;
   close(handle: number): number;

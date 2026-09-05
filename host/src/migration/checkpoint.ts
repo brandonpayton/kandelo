@@ -147,11 +147,30 @@ export interface CheckpointMachine {
   readonly settleActiveVforkBorrows: () => Promise<void>;
   /** Leg 1: the stopped-process dispatch gate. */
   readonly holdProcessDispatch: () => number[];
-  readonly releaseProcessDispatch: () => number[];
+  /**
+   * Give the held processes back, which the kernel entry may have to queue.
+   *
+   * The read leaves work waiting to enter the kernel, so the release takes its
+   * place in that queue rather than demanding the kernel be free at once.
+   */
+  readonly releaseProcessDispatch: () => Promise<number[]>;
   readonly armUnwindRequests: () => number[];
   readonly disarmUnwindRequests: () => void;
   readonly copyKernelMemory: () => Uint8Array;
-  readonly filesystemBuffer: () => SharedArrayBuffer;
+  /**
+   * Every mount this machine writes to, `/` first, whether or not it answers.
+   *
+   * A machine's files are spread across mounts, not held in one: `/` carries
+   * the image while `/home/maker`, `/root`, `/tmp`, `/var/*` and `/srv` are
+   * separate scratch filesystems with buffers of their own. Reading only `/`
+   * would move a machine whose processes survive but whose working files do
+   * not.
+   *
+   * A mount whose backend holds no shared buffer stays in this list and says
+   * why. Dropping it here would leave the checkpoint unable to tell a restore
+   * that the machine it rebuilds is short a filesystem.
+   */
+  readonly filesystemBuffers: () => readonly CheckpointMountSource[];
   /** Read under the freeze: bindings and write-based pixels are quiescent. */
   readonly framebuffers: () => readonly CheckpointFramebuffer[];
   /** Read under the freeze: the display is quiescent. */
@@ -167,6 +186,63 @@ export interface CheckpointMachine {
   readonly monotonicNowNs: () => number;
   readonly kernelAbiVersion: () => number;
   readonly liveProcesses: () => readonly CheckpointProcessSource[];
+}
+
+/**
+ * What a mount answers when a checkpoint asks for its bytes.
+ *
+ * A backend that keeps its files in a SharedArrayBuffer answers `bytes`. One
+ * that keeps them anywhere else answers `none` with the reason a restore
+ * reports.
+ */
+export type CheckpointBytes =
+  | { readonly kind: "bytes"; readonly buffer: SharedArrayBuffer }
+  | { readonly kind: "none"; readonly reason: string };
+
+/** One mount, as the freeze finds it. */
+export interface CheckpointMountSource {
+  /** Absolute mount point, exactly as the mount layout names it. */
+  readonly mountPoint: string;
+  readonly bytes: CheckpointBytes;
+}
+
+/**
+ * Ask every mount for its bytes, in the order the mount layout names them.
+ *
+ * Both host entries build `filesystemBuffers` from this rather than reading
+ * buffers themselves, so a backend that cannot answer produces the same
+ * recorded refusal on Node and in the browser.
+ */
+export function askMountsForCheckpointBytes(
+  mounts: readonly {
+    readonly mountPoint: string;
+    readonly backend: { checkpointBytes?(): CheckpointBytes };
+  }[],
+): readonly CheckpointMountSource[] {
+  return mounts.map((mount) => ({
+    mountPoint: mount.mountPoint,
+    bytes: mount.backend.checkpointBytes?.() ?? {
+      kind: "none",
+      reason: "this mount's backend reports no checkpoint bytes",
+    },
+  }));
+}
+
+/** One memory-backed mount, as a checkpoint carries it. */
+export interface CheckpointMount {
+  readonly mountPoint: string;
+  readonly bytes: Uint8Array;
+}
+
+/**
+ * One mount a checkpoint could not carry, and what its backend said.
+ *
+ * Carrying nothing for a host directory is defensible; saying nothing about it
+ * is not, so the refusal travels with the checkpoint.
+ */
+export interface CheckpointMountGap {
+  readonly mountPoint: string;
+  readonly reason: string;
 }
 
 export interface CheckpointProcessBucket {
@@ -191,14 +267,39 @@ export interface CheckpointProcessBucket {
  * refuses a checkpoint whose format it does not know rather than guessing at
  * the missing or extra fields.
  */
-export const MACHINE_CHECKPOINT_FORMAT = 2;
+export const MACHINE_CHECKPOINT_FORMAT = 4;
 
 export interface MachineCheckpoint {
   readonly format: typeof MACHINE_CHECKPOINT_FORMAT;
   /** The ABI the captured kernel ran; a restore refuses any other. */
   readonly kernelAbiVersion: number;
   readonly kernelMemory: Uint8Array;
-  readonly filesystem: Uint8Array;
+  /**
+   * Every memory-backed mount, `/` first.
+   *
+   * A restore rebuilds each mount from its own bytes. Carrying only `/` would
+   * hand over a machine whose processes continue but whose `/home/maker`,
+   * `/root`, `/tmp`, `/var/*` and `/srv` came up empty underneath them.
+   *
+   * How much of that a host reaches follows from how it resolves
+   * `DEFAULT_MOUNT_SPEC`. `resolveForBrowser` backs every scratch mount with a
+   * `MemoryFileSystem`; `resolveForNodeKernelSession` backs each one with a
+   * `HostFileSystem` under the per-boot session directory, which owns no
+   * SharedArrayBuffer for the freeze to read. Only memory-backed mounts reach
+   * this field, so a Node checkpoint carries `/` alone and a Node machine
+   * moves without its working directories. Every mount that stayed behind is
+   * named in {@link unreadableFilesystems}.
+   */
+  readonly filesystems: readonly CheckpointMount[];
+  /**
+   * Every mount the freeze asked for bytes and did not get, with the reason.
+   *
+   * A machine short a filesystem is still a machine worth moving, so a gap
+   * here does not refuse the checkpoint. It does mean a restore must say what
+   * it did not get: presenting a machine missing `/tmp` as if it were whole is
+   * the convenient illusion the platform values contract forbids.
+   */
+  readonly unreadableFilesystems: readonly CheckpointMountGap[];
   readonly framebuffers: readonly CheckpointFramebuffer[];
   /** The modeset display, empty for a machine that never drove `/dev/dri`. */
   readonly kms: CheckpointKmsState;
@@ -223,7 +324,14 @@ export interface MachineCheckpoint {
  */
 export interface MachineCheckpointSummary {
   readonly kernelMemoryBytes: number;
+  /** Every mount's bytes added together. */
   readonly filesystemBytes: number;
+  readonly filesystems: readonly {
+    readonly mountPoint: string;
+    readonly bytes: number;
+  }[];
+  /** The mounts the freeze could not read, so a caller holding no bytes sees them. */
+  readonly unreadableFilesystems: readonly CheckpointMountGap[];
   readonly framebuffers: readonly {
     readonly pid: number;
     readonly w: number;
@@ -263,7 +371,15 @@ function summarizeMachineCheckpoint(
 ): MachineCheckpointSummary {
   return {
     kernelMemoryBytes: checkpoint.kernelMemory.byteLength,
-    filesystemBytes: checkpoint.filesystem.byteLength,
+    filesystemBytes: checkpoint.filesystems.reduce(
+      (total, mount) => total + mount.bytes.byteLength,
+      0,
+    ),
+    filesystems: checkpoint.filesystems.map((mount) => ({
+      mountPoint: mount.mountPoint,
+      bytes: mount.bytes.byteLength,
+    })),
+    unreadableFilesystems: checkpoint.unreadableFilesystems,
     framebuffers: checkpoint.framebuffers.map((framebuffer) => ({
       pid: framebuffer.pid,
       w: framebuffer.w,
@@ -313,7 +429,7 @@ export function machineCheckpointTransferList(
 ): ArrayBuffer[] {
   return [
     checkpoint.kernelMemory.buffer as ArrayBuffer,
-    checkpoint.filesystem.buffer as ArrayBuffer,
+    ...checkpoint.filesystems.map((mount) => mount.bytes.buffer as ArrayBuffer),
     ...checkpoint.framebuffers.flatMap((framebuffer) =>
       framebuffer.hostBuffer === null
         ? []
@@ -348,14 +464,27 @@ export interface CheckpointFreezeOptions {
 
 class CheckpointTimeout extends Error {}
 
+/**
+ * `message` may be a function so a timeout can describe the state it found.
+ * A reason built when the race was set up would name what was true before the
+ * wait, which is the opposite of what the caller needs.
+ */
 function withTimeout(
   operation: Promise<unknown>,
   ms: number,
-  message: string,
+  message: string | (() => string),
 ): Promise<void> {
   let handle: ReturnType<typeof setTimeout>;
   const expiry = new Promise<never>((_resolve, reject) => {
-    handle = setTimeout(() => reject(new CheckpointTimeout(message)), ms);
+    handle = setTimeout(
+      () =>
+        reject(
+          new CheckpointTimeout(
+            typeof message === "string" ? message : message(),
+          ),
+        ),
+      ms,
+    );
   });
   return Promise.race([operation, expiry])
     .then(() => undefined)
@@ -364,6 +493,32 @@ function withTimeout(
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Name the processes that had not reached UNWINDING, and what each was doing.
+ *
+ * A freeze fails because of particular processes, and a caller cannot find
+ * them from a count. A real machine runs an init, a shell, and the program
+ * the user came for at the same time, so `argv[0]` says which program is
+ * holding the machine and the phase says how far its freeze reached.
+ */
+function describeUnwindStragglers(
+  sources: readonly CheckpointProcessSource[],
+): string {
+  const stuck = sources
+    .filter((source) => source.checkpointFreeze.currentPhase !== "unwound")
+    .map(
+      (source) =>
+        `pid ${source.pid} (${source.argv[0] ?? "unknown"}) is `
+        + source.checkpointFreeze.currentPhase,
+    );
+  const reason = "a process did not reach UNWINDING before the checkpoint "
+    + "freeze timed out";
+  // Every process can report unwound between the expiry and this line. Say so
+  // rather than print an empty list that reads like a missing diagnostic.
+  if (stuck.length === 0) return `${reason}, then every process unwound`;
+  return `${reason}: ${stuck.join(", ")}`;
 }
 
 /**
@@ -446,7 +601,7 @@ async function freezeAndRead(
     await withTimeout(
       Promise.all(armed.map((source) => source.checkpointFreeze.waitUntilUnwound())),
       options.unwindTimeoutMs,
-      "a process did not reach UNWINDING before the checkpoint freeze timed out",
+      () => describeUnwindStragglers(armed),
     );
     unwound = true;
 
@@ -458,7 +613,7 @@ async function freezeAndRead(
     checkpoint = readMachine(machine, armed);
   } finally {
     machine.disarmUnwindRequests();
-    if (held) unreleased = machine.releaseProcessDispatch();
+    if (held) unreleased = await machine.releaseProcessDispatch();
     for (const source of armed) {
       const freeze = source.checkpointFreeze;
       // A process can die between its unwind report and this line, which
@@ -506,11 +661,24 @@ function readMachine(
   machine: CheckpointMachine,
   sources: readonly CheckpointProcessSource[],
 ): MachineCheckpoint {
+  const mounts = machine.filesystemBuffers();
   return {
     format: MACHINE_CHECKPOINT_FORMAT,
     kernelAbiVersion: machine.kernelAbiVersion(),
     kernelMemory: machine.copyKernelMemory(),
-    filesystem: new Uint8Array(machine.filesystemBuffer()).slice(),
+    filesystems: mounts.flatMap((mount) =>
+      mount.bytes.kind === "bytes"
+        ? [{
+          mountPoint: mount.mountPoint,
+          bytes: new Uint8Array(mount.bytes.buffer).slice(),
+        }]
+        : []
+    ),
+    unreadableFilesystems: mounts.flatMap((mount) =>
+      mount.bytes.kind === "none"
+        ? [{ mountPoint: mount.mountPoint, reason: mount.bytes.reason }]
+        : []
+    ),
     monotonicNs: machine.monotonicNowNs(),
     framebuffers: machine.framebuffers().map((framebuffer) => ({
       ...framebuffer,

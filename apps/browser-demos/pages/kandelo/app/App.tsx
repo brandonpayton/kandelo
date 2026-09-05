@@ -9,12 +9,14 @@ import { descriptorFromGalleryItem } from "../gallery-descriptor";
 import { Gallery } from "../views/Gallery";
 import { EmptyState } from "../views/EmptyState";
 import { createShellTerminal, type ShellTerminal } from "../panes/Shell";
-import { SharedTerminal } from "../panes/SharedTerminal";
+import { SharedMachine } from "../panes/SharedMachine";
 import { NetworkPopup } from "./NetworkPopup";
+import { useMachineHandover } from "./machine-handover";
 import { usePeerSession } from "./peer-session";
+import { useFramebufferPublisher } from "./shared-framebuffer";
 import { useTerminalPublisher } from "./shared-terminal";
 import { Inspector, INSPECTOR_TABS } from "../panes/Inspector";
-import { navigateToGalleryItemUrl } from "../url-state";
+import { navigateToGalleryItemUrl, replaceGalleryItemUrl } from "../url-state";
 import type {
   BootDescriptor,
   GalleryItem,
@@ -85,11 +87,23 @@ export const App: React.FC = () => {
   const nextTerminalIndex = React.useRef(2);
   const autoOpenedDemoGuideKey = React.useRef<string | null>(null);
 
-  const sharingTerminal = useTerminalPublisher(
+  // One machine sends one surface: the one the person holding it is looking
+  // at. A machine that published everything it drives would leave the watching
+  // computer with a screen and a shell stacked in one column, with nothing
+  // saying which of them the other person is using.
+  const presenting = surface.status === "running" ? surface.activePrimary : null;
+  const terminalSharing = useTerminalPublisher(
     host,
     peer.link,
     terminals.find((terminal) => terminal.id === activeTerminalId)?.path,
+    presenting === "terminal",
   );
+  const sharingScreen = useFramebufferPublisher(
+    host,
+    peer.link,
+    presenting === "framebuffer",
+  );
+  const handover = useMachineHandover(host, peer.link);
 
   const desc = host.getBootDescriptor();
   const resolvedThemeMode = theme.mode === "auto" ? systemThemeMode : theme.mode;
@@ -159,6 +173,13 @@ export const App: React.FC = () => {
     setNetworkOpen(false);
     setThemeOpen(false);
   }, [desc.id]);
+
+  // The popup exists to buy a connection. Once there is one it is covering the
+  // machine it was opened to share, so it gets out of the way; the Network
+  // button stays lit and reopens it for the controls that outlive the codes.
+  React.useEffect(() => {
+    if (peer.link) setNetworkOpen(false);
+  }, [peer.link]);
 
   const closeDockPane = React.useCallback(() => {
     setDockPane(null);
@@ -232,18 +253,23 @@ export const App: React.FC = () => {
           console.warn("resolveVfsImageUrl failed:", err);
         }
       }
-      if (vfsImageUrl) {
-        navigateToGalleryItemUrl({ ...item, vfsImageUrl });
+      const launched = vfsImageUrl ? { ...item, vfsImageUrl } : item;
+      // A connected computer boots in place. Navigating would close the peer
+      // connection this document holds, and the two people would have to
+      // exchange invite codes again to get it back.
+      if (vfsImageUrl && peer.link === null) {
+        navigateToGalleryItemUrl(launched);
         return;
       }
 
-      const next = descriptorFromGalleryItem(item, host.getBootDescriptor());
+      const next = descriptorFromGalleryItem(launched, host.getBootDescriptor());
       await host.applyBootDescriptor(next);
+      if (vfsImageUrl) replaceGalleryItemUrl(launched);
       closeDockPane();
     })().catch((err) => {
       console.warn("applyBootDescriptor failed:", err);
     });
-  }, [host, closeDockPane]);
+  }, [host, closeDockPane, peer.link]);
 
   const onAddTerminal = React.useCallback(() => {
     const terminal = createShellTerminal(nextTerminalIndex.current++);
@@ -311,18 +337,54 @@ export const App: React.FC = () => {
         : layout
     ));
   }, []);
+  // Taken at the moment a machine leaves or starts on its way here, and held
+  // until one is drawing again. Reading it on every render would re-join the
+  // screen bytes each time; reading it once, when the move begins, is the only
+  // moment its value can change.
+  //
+  // Both directions need it. The computer giving a machine up keeps the screen
+  // it was showing. The computer taking one keeps the screen it was watching,
+  // because a taker has to boot the image before the checkpoint can restore
+  // into it, and the boot log is not what the person asked to see.
+  const lastSharedScreen = terminalSharing.lastScreen;
+  const moving = handover.handedOver || handover.taking;
+  const held = React.useMemo(
+    () => moving ? lastSharedScreen() : null,
+    [moving, lastSharedScreen],
+  );
+
+  // One landing page, used both on its own and as what a connected computer
+  // shows while the other one is sharing nothing.
+  const emptyState = (
+    <EmptyState
+      onLaunchItem={onLaunchGalleryItem}
+      onBrowseAll={() => setDockPane("gallery")}
+      onApplyDescriptor={applyDescriptor}
+      peerNote={peer.link
+        ? handover.handedOver
+          ? "You handed this machine over. It is starting on the other computer."
+          : "Connected. Waiting for the other computer to share a screen."
+        : null}
+      watching={peer.link !== null}
+    />
+  );
 
   return (
     <div className={appClassName} style={appStyle} data-audio-state={audioState}>
       <main className={`kmain kdocked-main${isEmpty ? " kmain-flush" : ""}`}>
-        {isEmpty && peer.link ? (
-          <SharedTerminal link={peer.link} />
-        ) : isEmpty ? (
-          <EmptyState
-            onLaunchItem={onLaunchGalleryItem}
-            onBrowseAll={() => setDockPane("gallery")}
-            onApplyDescriptor={applyDescriptor}
+        {(isEmpty || handover.taking) && peer.link ? (
+          // While a machine is arriving, this pane stays up over the boot that
+          // is running behind it. `taking` ends when `adoptMachine` resolves,
+          // which is after the checkpoint has restored, so the swap happens
+          // when there is a live screen to swap to.
+          <SharedMachine
+            link={peer.link}
+            moving={moving}
+            held={held}
+            idle={emptyState}
           />
+        ) : isEmpty ? (
+          emptyState
         ) : (
           <MachineView
             surface={surface}
@@ -378,7 +440,15 @@ export const App: React.FC = () => {
         guidePopup={demoGuidePopup}
         internalsPopup={internalsPopup}
         networkPopup={
-          <NetworkPopup session={peer} sharing={sharingTerminal} />
+          <NetworkPopup
+            session={peer}
+            sharingTerminal={terminalSharing.sharing}
+            sharingScreen={sharingScreen}
+            handover={handover}
+            canTakeMachine={isEmpty && handover.peerHasMachine}
+            hasMachine={!isEmpty}
+            presenting={presenting}
+          />
         }
         themePopup={<ThemePopup theme={theme} resolvedMode={resolvedThemeMode} onThemeChange={setTheme} />}
         guideAvailable={!isEmpty && demoGuide !== null}
@@ -387,6 +457,9 @@ export const App: React.FC = () => {
         internalsOpen={!isEmpty && surface.canUseInternals && internalsOpen}
         networkOpen={networkOpen}
         networkConnected={peer.link !== null}
+        // Only in a pair. A computer on its own is neither, and one machine
+        // with one person at it needs no word for that.
+        role={peer.link === null ? null : isEmpty ? "viewer" : "user"}
         themeOpen={themeOpen}
         status={surface.status}
         machineTitle={isEmpty ? "Kandelo" : desc.title}

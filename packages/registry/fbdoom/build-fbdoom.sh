@@ -37,7 +37,7 @@ CDOOM_GIT_SOURCE_COMMIT="${WASM_POSIX_BUILD_GIT_CHOCOLATE_DOOM_COMMIT:-}"
 # reviewed checkout read-only and suppress the developer-only local mirror.
 if [ -n "${WASM_POSIX_DEP_WORK_DIR:-}" ] && [ -n "${WASM_POSIX_DEP_OUT_DIR:-}" ]; then
     export WASM_POSIX_INSTALL_LOCAL_MIRROR=0
-    export WASM_POSIX_INSTALL_FORK_INSTRUMENTATION=disabled
+    export WASM_POSIX_INSTALL_FORK_INSTRUMENTATION=auto
 fi
 
 # SourceOnly never substitutes the primary package source for this independent
@@ -181,7 +181,6 @@ make CC=wasm32posix-cc \
 
 cp fbdoom "$OUT_BIN"
 
-# fbDOOM does not fork, so it must remain free of fork instrumentation.
 ls -la "$OUT_BIN"
 echo "==> fbdoom.wasm built."
 

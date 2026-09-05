@@ -121,6 +121,73 @@ describe("Lazy VFS files", () => {
     expect(st.size).toBe(5000);
   });
 
+  it("mountCapturedBytes carries the deferred content its image knows", async () => {
+    const originalFetch = globalThis.fetch;
+    const image = createMemfs();
+    image.registerLazyFile("/usr/bin/tool", "http://example.com/tool.wasm", 5, 0o755);
+
+    // What a machine checkpoint carries is the filesystem buffer and nothing
+    // else. Which files are still deferred, and where their bytes come from,
+    // lives in the image beside that buffer rather than inside it.
+    const capturedBytes = new SharedArrayBuffer(image.sharedBuffer.byteLength);
+    new Uint8Array(capturedBytes).set(new Uint8Array(image.sharedBuffer));
+
+    // Attached to those bytes alone, the program is a file that exists and can
+    // never be read, so every process that execs it dies on an empty program.
+    expect(
+      MemoryFileSystem.fromExisting(capturedBytes).isPathDeferred("/usr/bin/tool"),
+    ).toBe(false);
+
+    const restored = image.mountCapturedBytes(capturedBytes);
+    expect(restored.isPathDeferred("/usr/bin/tool")).toBe(true);
+
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      headers: new Headers({ "content-length": "5" }),
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array([1, 2, 3, 4, 5]));
+          controller.close();
+        },
+      }),
+    } as unknown as Response);
+    try {
+      await expect(restored.ensureMaterialized("/usr/bin/tool")).resolves.toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    const fd = restored.open("/usr/bin/tool", O_RDONLY, 0);
+    const buf = new Uint8Array(8);
+    expect(restored.read(fd, buf, null, 8)).toBe(5);
+    expect(buf[4]).toBe(5);
+    restored.close(fd);
+  });
+
+  it("mountCapturedBytes keeps a file the captured machine already read", () => {
+    const image = createMemfs();
+    image.registerLazyFile("/usr/bin/tool", "http://example.com/tool.wasm", 5, 0o755);
+
+    const capturedBytes = new SharedArrayBuffer(image.sharedBuffer.byteLength);
+    new Uint8Array(capturedBytes).set(new Uint8Array(image.sharedBuffer));
+    const capturedMachine = MemoryFileSystem.fromExisting(capturedBytes);
+    const data = new Uint8Array([1, 2, 3, 4, 5, 6]);
+    const writeFd = capturedMachine.open("/usr/bin/tool", O_WRONLY | O_TRUNC, 0);
+    capturedMachine.write(writeFd, data, null, data.length);
+    capturedMachine.close(writeFd);
+
+    // The image still calls this path deferred, and the entry it offers no
+    // longer describes the inode in the capture. Adopting it would replace six
+    // captured bytes with a download.
+    const restored = image.mountCapturedBytes(capturedBytes);
+    expect(restored.isPathDeferred("/usr/bin/tool")).toBe(false);
+
+    const fd = restored.open("/usr/bin/tool", O_RDONLY, 0);
+    const buf = new Uint8Array(8);
+    expect(restored.read(fd, buf, null, 8)).toBe(6);
+    restored.close(fd);
+  });
+
   it("materialized file shows real size instead of declared size", () => {
     const mfs = createMemfs();
     mfs.registerLazyFile("/bin/test", "http://example.com/test.wasm", 99999);

@@ -43,8 +43,18 @@ import { createBrowserLazyFetcher } from "./vfs/browser-lazy-fetcher";
 import { resolveLazyUrl } from "./vfs/lazy-url";
 import { DeviceFileSystem } from "./vfs/device-fs";
 import { BrowserTimeProvider } from "./vfs/time";
+import {
+  ReplicationLogReader,
+  ReplicationLogRecorder,
+  type ReplicationLogEntry,
+  type ReplicationPushedDecision,
+} from "./replication/log";
+import {
+  RecordingTimeProvider,
+  ReplayingTimeProvider,
+} from "./replication/clock";
 import { restoreBrowserKernelInitMounts } from "./browser-kernel-vfs-init";
-import type { MountConfig } from "./vfs/types";
+import type { FileSystemBackend, MountConfig } from "./vfs/types";
 import { TlsNetworkBackend } from "./networking/tls-network-backend";
 import { withBrowserMitmCaEnv } from "./networking/browser-mitm-ca-env";
 import { patchWasmForThread } from "./worker-main";
@@ -81,6 +91,7 @@ import {
 import { CheckpointFreezeGateCoordinator } from "./checkpoint-freeze-gate";
 import { ProcessExecutionGenerationAllocator } from "./process-execution-generation";
 import {
+  askMountsForCheckpointBytes,
   captureMachineCheckpoint,
   captureMachineCheckpointSummary,
   machineCheckpointTransferList,
@@ -88,7 +99,10 @@ import {
   type CheckpointProcessBucket,
   type CheckpointProcessThread,
 } from "./migration/checkpoint";
-import { validateMachineCheckpoint } from "./migration/restore";
+import {
+  describeCheckpointMountGaps,
+  validateMachineCheckpoint,
+} from "./migration/restore";
 import { readForkContinuationAnchor } from "./fork-continuation";
 import { ForkExternrefProcessOwner } from "./fork-externref-process-owner";
 import type { ForkExternrefGeneration } from "./fork-reference-broker";
@@ -154,7 +168,23 @@ const O_WRONLY_CREAT_TRUNC =
 let kernelWorker: CentralizedKernelWorker;
 let workerAdapter: BrowserWorkerAdapter;
 let memfs: MemoryFileSystem;
+/** Every mount a checkpoint asks, in mount-spec order with `/` first. */
+let checkpointMounts: { mountPoint: string; backend: FileSystemBackend }[] = [];
 let io: VirtualPlatformIO;
+/**
+ * This machine's own clock, kept so recording can be turned off again.
+ *
+ * A `RecordingTimeProvider` wraps it while a log is being taken; stopping
+ * restores this one rather than building a fresh provider, whose monotonic
+ * origin would sit behind the readings the guest has already seen.
+ */
+let baseTimeProvider: BrowserTimeProvider | null = null;
+/** The decision log this machine is taking, or null when it is taking none. */
+let replicationRecorder: ReplicationLogRecorder | null = null;
+/** The decision log this machine is following, or null when it leads. */
+let replicationReplay:
+  | { reader: ReplicationLogReader; entries: readonly ReplicationLogEntry[] }
+  | null = null;
 let maxPages: number = DEFAULT_MAX_PAGES;
 let defaultThreadSlots: number = DEFAULT_PROCESS_THREAD_SLOTS;
 let processMemoryAllocator: ProcessMemoryAllocator;
@@ -190,11 +220,11 @@ const checkpointMachine: CheckpointMachine = {
   armUnwindRequests: () => kernelWorker.armCheckpointUnwind(),
   disarmUnwindRequests: () => kernelWorker.disarmCheckpointUnwind(),
   copyKernelMemory: () => kernelWorker.copyKernelMemoryForCheckpoint(),
-  filesystemBuffer: () => {
-    if (!memfs) {
+  filesystemBuffers: () => {
+    if (!memfs || checkpointMounts.length === 0) {
       throw new Error("this machine has no MemoryFileSystem rootfs to checkpoint");
     }
-    return memfs.sharedBuffer;
+    return askMountsForCheckpointBytes(checkpointMounts);
   },
   monotonicNowNs: () => {
     const now = io.clockGettime(1);
@@ -836,6 +866,54 @@ function respond(requestId: number, result: unknown) {
   post({ type: "response", requestId, result });
 }
 
+/**
+ * Swap the guest clock for replication, and name the boundary when there is
+ * no clock to swap.
+ *
+ * The clock is built with the machine's platform IO, so a request that arrives
+ * before `init` has nothing to wrap. Refusing is what keeps a caller from
+ * holding a log that is silently empty, or a replay that silently read this
+ * host's time.
+ */
+function respondToReplication(
+  requestId: number,
+  swap: (io: VirtualPlatformIO, clock: BrowserTimeProvider) => void,
+): void {
+  if (!io || !baseTimeProvider) {
+    respondError(
+      requestId,
+      "replication needs an initialized machine: this one has no swappable "
+        + "guest clock yet",
+    );
+    return;
+  }
+  try {
+    swap(io, baseTimeProvider);
+    respond(requestId, undefined);
+  } catch (err) {
+    respondError(requestId, (err as Error)?.message ?? String(err));
+  }
+}
+
+/**
+ * Deliver a decision the primary made without the guest asking for it.
+ *
+ * A pointer movement replays as the delta the host handed the kernel, so the
+ * kernel builds the same PS/2 frame it built on the primary. Nothing records
+ * a device write yet, so one appearing here is a log this build cannot apply,
+ * and saying so is better than dropping it.
+ */
+function applyPushedDecision(decision: ReplicationPushedDecision): void {
+  if (decision.kind === "pointer") {
+    kernelWorker.injectMouseEvent(decision.dx, decision.dy, decision.buttons);
+    return;
+  }
+  throw new Error(
+    `the log carries input for ${decision.device}, which this host cannot `
+      + `replay`,
+  );
+}
+
 function respondTransferredBytes(requestId: number, result: Uint8Array) {
   post(
     { type: "response", requestId, result },
@@ -1155,15 +1233,39 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
   const rootMount = specMounts.find((m) => m.mountPoint === "/");
   if (!rootMount) throw new Error("rootfs mount spec missing / mount");
   if (msg.restoreCheckpoint) {
-    // The image built the mount layout; the checkpoint supplies the state.
-    // The restored bytes are a live SharedFS, not a serialized image, so the
-    // root backend attaches to them rather than deserializing.
-    const restored = msg.restoreCheckpoint.filesystem;
-    const sab = new SharedArrayBuffer(restored.byteLength);
-    new Uint8Array(sab).set(restored);
-    rootMount.backend = MemoryFileSystem.fromExisting(sab);
+    // The image built the mount layout; the checkpoint supplies the state, one
+    // buffer per mount. `/` carries the image, but a machine's files live just
+    // as much under `/home/maker`, `/root`, `/tmp`, `/var/*` and `/srv`, each
+    // its own filesystem — restoring `/` alone would resume every process over
+    // empty working directories. The restored bytes are a live SharedFS, not a
+    // serialized image, so a backend attaches to them rather than
+    // deserializing.
+    const dropped: string[] = [];
+    for (const mount of msg.restoreCheckpoint.filesystems) {
+      const target = specMounts.find((m) => m.mountPoint === mount.mountPoint);
+      if (!target || !(target.backend instanceof MemoryFileSystem)) {
+        dropped.push(mount.mountPoint);
+        continue;
+      }
+      const sab = new SharedArrayBuffer(mount.bytes.byteLength);
+      new Uint8Array(sab).set(mount.bytes);
+      target.backend = target.backend.mountCapturedBytes(sab);
+    }
+    const gaps = describeCheckpointMountGaps(msg.restoreCheckpoint, dropped);
+    if (gaps !== null) {
+      reportHostDiagnostic(
+        { pid: 0, source: "checkpoint restore", message: gaps },
+        "warn",
+      );
+    }
   }
   memfs = rootMount.backend as MemoryFileSystem;
+  // Every mount the freeze must ask. `/` first, so a checkpoint always names
+  // the root before the scratch filesystems layered over it.
+  checkpointMounts = specMounts.map((mount) => ({
+    mountPoint: mount.mountPoint,
+    backend: mount.backend,
+  }));
   if (msg.lazyUrlBase) {
     memfs.rewriteLazyFileUrls((url) => resolveLazyUrl(msg.lazyUrlBase!, url));
     memfs.rewriteLazyArchiveUrls((url) => resolveLazyUrl(msg.lazyUrlBase!, url));
@@ -1184,7 +1286,8 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
   memfs.subscribeLazyDownloads((event) => {
     post({ type: "lazy_download", event });
   });
-  io = new VirtualPlatformIO(mounts, new BrowserTimeProvider());
+  baseTimeProvider = new BrowserTimeProvider();
+  io = new VirtualPlatformIO(mounts, baseTimeProvider);
   if (msg.restoreCheckpoint) {
     // The adopted kernel memory carries monotonic deadlines measured on the
     // captured machine's clock, and a guest's monotonic clock must never run
@@ -1238,6 +1341,9 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
         processMemoryAllocator.observeTarget(memory, target);
       },
       onKernelFatal: terminatePoisonedKernelWorker,
+      onPointerInjected: (dx, dy, buttons) => {
+        replicationRecorder?.record({ kind: "pointer", dx, dy, buttons });
+      },
       onFork: ({
         parentPid,
         childPid,
@@ -1404,7 +1510,16 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
       await restoreProcessFromBucket(bucket, programModule);
       const restoredPtyIdx = kernelWorker.ptyIndexFor(bucket.pid);
       if (restoredPtyIdx !== undefined) {
-        ptyByPid.set(bucket.pid, restoredPtyIdx);
+        // A restored process was never spawned on this kernel, so the spawn
+        // path's `register_pty_output` never runs for it. Without this the
+        // terminal takes input and prints nothing: the writes reach the master
+        // and no one drains what the program answers. Node does the same at
+        // node-kernel-worker-entry.ts.
+        const restoredPid = bucket.pid;
+        ptyByPid.set(restoredPid, restoredPtyIdx);
+        kernelWorker.onPtyOutput(restoredPtyIdx, (data: Uint8Array) => {
+          post({ type: "pty_output", pid: restoredPid, data });
+        });
       }
     }
   }
@@ -5116,6 +5231,43 @@ sw.onmessage = (e: MessageEvent) => {
       } catch (err) {
         respondError(msg.requestId, (err as Error)?.message ?? String(err));
       }
+      break;
+    }
+    case "replication_record_start": {
+      respondToReplication(msg.requestId, (target, clock) => {
+        replicationRecorder = new ReplicationLogRecorder();
+        target.setTimeProvider(
+          new RecordingTimeProvider(clock, replicationRecorder),
+        );
+      });
+      break;
+    }
+    case "replication_record_stop": {
+      const recorder = replicationRecorder;
+      replicationRecorder = null;
+      if (io && baseTimeProvider) io.setTimeProvider(baseTimeProvider);
+      respond(msg.requestId, recorder?.entries ?? []);
+      break;
+    }
+    case "replication_replay_start": {
+      respondToReplication(msg.requestId, (target, clock) => {
+        const reader = new ReplicationLogReader(
+          msg.entries,
+          applyPushedDecision,
+        );
+        replicationReplay = { reader, entries: msg.entries };
+        target.setTimeProvider(new ReplayingTimeProvider(clock, reader));
+      });
+      break;
+    }
+    case "replication_replay_stop": {
+      const replay = replicationReplay;
+      replicationReplay = null;
+      if (io && baseTimeProvider) io.setTimeProvider(baseTimeProvider);
+      respond(msg.requestId, {
+        consumed: replay?.reader.consumed ?? 0,
+        total: replay?.entries.length ?? 0,
+      });
       break;
     }
     case "kms_attach_canvas":

@@ -147,6 +147,30 @@ after editing `libc/musl-overlay/` or `libc/glue/channel_syscall.c`, run
 `scripts/build-musl.sh` first. (`bash build.sh` still works as a deprecated
 delegator to `./run.sh setup`.)
 
+After editing anything under `host/src`, regenerate the program index before
+running a suite that resolves a program binary:
+
+```bash
+./target/<host-triple>/release/xtask build-deps program-index \
+  --source-repo-root "$PWD" "$PWD/packages/registry" \
+  "$PWD/packages/registry/program-packages.json"
+```
+
+`host/src` is a build input of the VFS-image packages, so editing a file there
+re-keys them and `resolveBinary` fails closed with "Program package source
+projection is not current". The suites that hit this are the ones that boot a
+machine from a VFS image — `host/test/migration/`, `tests/package-system/` and
+the package tests. `packages/registry/lamp/build.toml`,
+`nginx-php-vfs/build.toml` and `wordpress/build.toml` declare the whole
+`host/src` directory, so any file under it re-keys those three;
+`packages/registry/shell/build.toml` and its siblings name individual files,
+including `host/src/vfs/memory-fs.ts` and `host/src/vfs/sharedfs-vendor.ts`.
+
+The digest is over content, not mtime. `touch` on a `host/src` file does not
+re-key anything, and restoring an edited file byte-for-byte makes the index
+current again without regenerating it — so "I touched a host file and the index
+stayed current" is not evidence that host edits are safe.
+
 The table names primary evidence, not a universal checklist. Choose the suites
 that support the claim you will make, broaden coverage when a change crosses
 contract boundaries, and report anything relevant that was not run.

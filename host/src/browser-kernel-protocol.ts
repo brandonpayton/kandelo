@@ -14,6 +14,7 @@ import type { ClosedLazyAsset } from "./vfs/closed-lazy-assets";
 import type { PcmTransportDescriptor } from "./audio/pcm-transport";
 import type { MountSpec } from "./vfs/default-mounts";
 import type { MachineCheckpoint } from "./migration/checkpoint";
+import type { ReplicationLogEntry } from "./replication/log";
 import {
   type BrowserCorsProxyConfig,
   validateBrowserCorsProxyConfig,
@@ -406,6 +407,56 @@ export interface DrainSyscallTraceMessage {
   requestId: number;
 }
 
+/**
+ * Start recording the machine's decision log.
+ *
+ * The guest clock and pointer movement are recorded today. Randomness and
+ * external bytes are not routed through the log yet, so a machine that reads
+ * either produces a log that is complete for what it holds and silent about
+ * the rest. See `host/src/replication/log.ts`.
+ */
+export interface ReplicationRecordStartMessage {
+  type: "replication_record_start";
+  requestId: number;
+}
+
+/** Stop recording and take the log. Response carries ReplicationLogEntry[]. */
+export interface ReplicationRecordStopMessage {
+  type: "replication_record_stop";
+  requestId: number;
+}
+
+/**
+ * Serve the machine's decisions from `entries` instead of from this host.
+ *
+ * Sent after `init` and before the replayed guest runs. A restore has already
+ * happened by then, so one message covers both a fresh machine and a replica
+ * that adopted a checkpoint.
+ */
+export interface ReplicationReplayStartMessage {
+  type: "replication_replay_start";
+  requestId: number;
+  entries: readonly ReplicationLogEntry[];
+}
+
+/**
+ * Stop replaying and report how far the replica got.
+ *
+ * The response is a {@link ReplicationReplayProgress}. Two replicas that
+ * consumed different amounts of one log ran different machines, which is the
+ * divergence this measures.
+ */
+export interface ReplicationReplayStopMessage {
+  type: "replication_replay_stop";
+  requestId: number;
+}
+
+/** What a replica took from the log it was replaying. */
+export interface ReplicationReplayProgress {
+  readonly consumed: number;
+  readonly total: number;
+}
+
 /** Send an HTTP request to a server running in the kernel and wait for the
  *  response. Reply arrives as a `response` message whose `result` is an
  *  {@link HttpResponse}. */
@@ -490,6 +541,10 @@ export type MainToKernelMessage =
   | CaptureCheckpointRequestMessage
   | SetSyscallTraceMessage
   | DrainSyscallTraceMessage
+  | ReplicationRecordStartMessage
+  | ReplicationRecordStopMessage
+  | ReplicationReplayStartMessage
+  | ReplicationReplayStopMessage
   | HttpRequestMessage
   | KmsAttachCanvasMessage
   | KmsAttachStatsMessage

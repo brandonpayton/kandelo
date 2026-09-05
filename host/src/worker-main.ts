@@ -3835,7 +3835,13 @@ export async function centralizedWorkerMain(
           } finally {
             releaseProcessForkArchiveReader();
           }
-          if (initData.isForkChild) {
+          // The commit handshake belongs to a child rebuilding the stack it was
+          // given, not to a parent rebuilding its own. `isForkChild` says how
+          // this worker started and stays true for its whole life, so a process
+          // that started as a fork child — or was reconstructed as one by a
+          // checkpoint restore — would demand a gate on every later fork it
+          // performs, where no child is waiting to be committed.
+          if (initData.isForkChild && phase === "child-replay") {
             const gate = initData.forkReplayGate;
             if (!gate) {
               throw new Error(

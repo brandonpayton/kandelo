@@ -4,9 +4,10 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { ABI_VERSION } from "../src/generated/abi";
 import { runCentralizedProgram } from "./centralized-test-helper";
 import {
-  RAW_GC_REFERENCE_STATE_FRESH_WORKER_HEX,
+  rawGcReferenceStateFreshWorkerBytes,
 } from "./fixtures/gc-reference-state-fresh-worker-bytes";
 
 const testDir = dirname(fileURLToPath(import.meta.url));
@@ -30,10 +31,7 @@ describe("Wasm GC reference state in a fresh process Worker", () => {
     // Keep the source path live in the test contract even though the checked
     // byte fixture is required for WABT compatibility.
     expect(fixtureSource).toMatch(/gc-reference-state-fresh-worker\.wat$/);
-    writeFileSync(
-      rawPath,
-      Buffer.from(RAW_GC_REFERENCE_STATE_FRESH_WORKER_HEX, "hex"),
-    );
+    writeFileSync(rawPath, rawGcReferenceStateFreshWorkerBytes(ABI_VERSION));
     execFileSync(instrumenter, [rawPath, "-o", programPath]);
   });
 

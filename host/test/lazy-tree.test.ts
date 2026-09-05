@@ -229,6 +229,38 @@ describe("format-neutral deferred trees", () => {
     expect(afterTarget.nlink).toBe(2);
   });
 
+  it("carries a deferred tree onto captured bytes, and onto the next capture", async () => {
+    const first = tarTreeFixture("first-use", "captured-a");
+    const second = tarTreeFixture("first-use", "captured-b");
+    const image = createFs();
+    await registerAtomicTrees(image, "atomic:captured", [first, second]);
+    const payloads = new Map([
+      ["https://example.invalid/captured-a.tar.gz", first.payload],
+      ["https://example.invalid/captured-b.tar.gz", second.payload],
+    ]);
+
+    // A machine checkpoint carries the filesystem buffer alone, and a tree's
+    // registration is not in it. Mounted on those bytes by themselves,
+    // `/captured-a/tool` is a file that exists and can never be read.
+    const captured = new SharedArrayBuffer(image.sharedBuffer.byteLength);
+    new Uint8Array(captured).set(new Uint8Array(image.sharedBuffer));
+    expect(MemoryFileSystem.fromExisting(captured).isPathDeferred("/captured-a/tool"))
+      .toBe(false);
+
+    const restored = image.mountCapturedBytes(captured);
+    expect(restored.isPathDeferred("/captured-a/tool")).toBe(true);
+
+    // The computer that took the machine can hand it on again, so what it
+    // mounted has to be exportable in turn. A sealed group re-admitted as
+    // unverified would refuse to serialize and strand the machine there.
+    const handedOn = new SharedArrayBuffer(restored.sharedBuffer.byteLength);
+    new Uint8Array(handedOn).set(new Uint8Array(restored.sharedBuffer));
+    const restoredAgain = restored.mountCapturedBytes(handedOn);
+    restoredAgain.setLazyFetcher(async (url) => new Response(payloads.get(url)!));
+    await expect(restoredAgain.preparePath("/captured-a/tool")).resolves.toBe(true);
+    expect(readText(restoredAgain, "/captured-a/tool")).toBe("payload");
+  });
+
   it("validates and applies the exact generic byte-transform contract", () => {
     const plan = exactGenericMaterializationPlan();
     const inventory: LazyTreeMaterializationSourceInventory = {

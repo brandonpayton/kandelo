@@ -93,6 +93,7 @@ import {
   CH_ARGS,
   CH_ARGS_COUNT,
   CH_CHECKPOINT_REQUEST,
+  CH_CHECKPOINT_REQUEST_RESTART,
   CH_CHECKPOINT_REQUEST_UNWIND,
   CH_DATA,
   CH_DATA_SIZE,
@@ -2313,6 +2314,16 @@ export interface CentralizedKernelCallbacks {
   onKernelFatal?: (error: Error) => void;
 
   /**
+   * Called as a pointer movement reaches the kernel, not as one is requested.
+   *
+   * `injectMouseEvent` defers while a kernel entry is in flight, so a caller
+   * that recorded at its own call site would place the movement earlier in a
+   * replication log than the kernel applied it. This fires inside the
+   * deferred entry, where the position is the real one.
+   */
+  onPointerInjected?: (dx: number, dy: number, buttons: number) => void;
+
+  /**
    * Called when a process forks. The kernel has already cloned the Process
    * in its ProcessTable. The callback should spawn a child Worker with
    * a copy of the parent's Memory and register it with the kernel.
@@ -2888,6 +2899,15 @@ export class CentralizedKernelWorker {
    * down the dedicated Worker.
    */
   #kernelFatalError: Error | null = null;
+  /**
+   * Rejectors for checkpoint dispatch releases still waiting in the gate FIFO.
+   *
+   * A fatal latch clears queued ingress, so a queued release would otherwise
+   * never settle and the freeze would wait forever on a machine that is
+   * already gone.
+   */
+  readonly #pendingCheckpointDispatchReleases =
+    new Set<(error: Error) => void>();
   #initialized = false;
   /**
    * Maps a pthread syscall mailbox to its kernel/libc thread id.
@@ -3089,6 +3109,14 @@ export class CentralizedKernelWorker {
    * request. A checkpoint freeze arms this; it is empty at every other time.
    */
   private checkpointUnwindPids = new Set<number>();
+  /**
+   * Channels whose parked syscall a checkpoint freeze completed with EINTR.
+   *
+   * No signal was caught, so each one is owed the call it was making. The
+   * request word carries `CH_CHECKPOINT_REQUEST_RESTART` for exactly these,
+   * and the guest resubmits once the rewind returns.
+   */
+  #checkpointRestartChannels = new Set<ChannelInfo>();
   /** Pids held out of dispatch by a checkpoint freeze rather than by SIGSTOP. */
   private checkpointHeldPids = new Set<number>();
   /**
@@ -3324,8 +3352,20 @@ export class CentralizedKernelWorker {
    *  never touches the canvas — `host_gl_create_context` later flips
    *  it to `"webgl2"` via `markKmsCanvasGlOwned` once the GL session
    *  claims the canvas. Once set, the value is sticky: an OffscreenCanvas
-   *  can only ever hold one context type for its lifetime. */
+   *  can only ever hold one context type for its lifetime.
+   *
+   *  This says what may paint the canvas, not what has. `kmsGlOwned` says
+   *  what has. */
   private kmsContextMode = new Map<number, "2d" | "webgl2">();
+  /** CRTCs a live WebGL2 context paints. Written only by
+   *  `markKmsCanvasGlOwned`, which `host_gl_create_context` calls once the
+   *  context exists.
+   *
+   *  Declaring `mode: "webgl2"` is a request, not a fact: it stops the pump
+   *  from claiming 2D, but until the guest calls `eglCreateContext` its
+   *  pixels still reach the GBM buffer object a checkpoint reads. Keeping the
+   *  two apart is what lets a CPU-painting modeset guest be captured. */
+  private kmsGlOwned = new Set<number>();
   /** KMS stats SAB per CRTC. Slots [0..4] populated by the pump (frame
    *  count, timestamp, width, height, blit µs); slots [5,6] populated
    *  from kernel-side `kernel_kms_commit_count` / `kernel_kms_last_frame_us`. */
@@ -3389,7 +3429,7 @@ export class CentralizedKernelWorker {
       // is the single source of truth for `crtc_id → OffscreenCanvas`.
       getKmsCanvas: (crtcId: number) => this.kmsCanvases.get(crtcId),
       markKmsCanvasGlOwned: (crtcId: number) => {
-        this.kmsContextMode.set(crtcId, "webgl2");
+        this.markKmsCanvasGlOwned(crtcId);
       },
       onStdin: (maxLen: number): Uint8Array | null => {
         const pid = this.currentHandlePid;
@@ -5037,6 +5077,12 @@ export class CentralizedKernelWorker {
     this.blockingRetrySnapshots.clear();
     this.blockingRetryWakeTargets.clear();
     this.activeChannelRequests.clear();
+    // A queued checkpoint release was just discarded with the rest of the
+    // FIFO. Tell its freeze so the machine reports a poisoned generation
+    // instead of waiting for an entry that can never run.
+    const pendingReleases = [...this.#pendingCheckpointDispatchReleases];
+    this.#pendingCheckpointDispatchReleases.clear();
+    for (const rejectRelease of pendingReleases) rejectRelease(error);
     if (this.vblankTimer !== null) {
       this.#cancelRegisteredInterval(this.vblankTimer);
       this.vblankTimer = null;
@@ -7931,16 +7977,56 @@ export class CentralizedKernelWorker {
   }
 
   /**
-   * Ask every registered process to unwind at its next syscall boundary.
+   * Ask every registered process to unwind at its next syscall boundary, and
+   * give a process parked in a blocking syscall a boundary to reach.
    *
-   * Returns the pids that were armed. Arming publishes nothing on its own: the
-   * request word reaches a thread only when that thread's own syscall
-   * completes, which is the point at which the guest reads it.
+   * Returns the pids that were armed. The request word reaches a thread only
+   * when that thread's own syscall completes, which is the point at which the
+   * guest reads it. A process parked in a syscall the kernel has not completed
+   * reaches no such point on its own, and every realistic machine has one: a
+   * login shell in `wait4`, an idle daemon in `poll` or `accept`, a reader on
+   * a quiet pipe. Each parked wait is therefore retired here and completed
+   * with EINTR, which is a boundary rather than an interruption — the guest is
+   * told to resubmit the call once its rewind returns.
    */
   armCheckpointUnwind(): number[] {
     const pids = [...this.processes.keys()];
     this.checkpointUnwindPids = new Set(pids);
+    this.#runImmediateKernelEntry("checkpoint unwind arm", (entry) => {
+      for (const registration of this.processes.values()) {
+        for (const channel of registration.channels) {
+          this.#interruptParkedChannelForCheckpoint(channel, entry);
+        }
+      }
+      return undefined;
+    });
     return pids;
+  }
+
+  /**
+   * Free one parked channel to reach the post-syscall hook.
+   *
+   * An idle mailbox is left alone: it carries no in-flight request, so its
+   * process is already running and will reach the hook by itself.
+   *
+   * Any Rust wait state the task retained is retired first, through the same
+   * exact-task cleanup `pthread_cancel` uses. Publishing EINTR over live
+   * kernel wait state would leave the checkpoint reading a machine whose
+   * kernel still believes the task is waiting. When that cleanup declines, the
+   * channel stays parked and the freeze reports it as a straggler, which is
+   * the truthful outcome: nothing here may fake a boundary it did not reach.
+   */
+  #interruptParkedChannelForCheckpoint(
+    channel: ChannelInfo,
+    entry: KernelWorkerEntryContext,
+  ): void {
+    if (!this.isRegisteredChannel(channel)) return;
+    if (!this.activeChannelRequests.has(channel)) return;
+    if (!this.#cancelLiveTaskKernelWait(channel, entry)) return;
+    this.#checkpointRestartChannels.add(channel);
+    if (!this.#interruptParkedWait(channel, entry, false)) {
+      this.#checkpointRestartChannels.delete(channel);
+    }
   }
 
   /**
@@ -7952,6 +8038,12 @@ export class CentralizedKernelWorker {
    * post-resume syscall begin a second capture with no freeze to resume it,
    * and the guest parks forever. Every participant is parked or abandoned by
    * the time the freeze disarms, so the recall cannot race the guest's read.
+   *
+   * The restart bit is the one thing the recall keeps, and only on a word the
+   * guest has not read yet. A freeze that times out has still completed that
+   * channel's parked syscall with EINTR, and the caller is owed its call back
+   * whether or not the capture succeeded. Recalling the unwind alone leaves
+   * the guest a request it can satisfy without a freeze to resume it.
    */
   disarmCheckpointUnwind(): void {
     for (const pid of this.checkpointUnwindPids) {
@@ -7963,14 +8055,24 @@ export class CentralizedKernelWorker {
           buffer,
           channel.channelOffset,
         );
+        const published = kernelEntryIntrinsicApply(
+          kernelEntryIntrinsicDataViewGetUint32,
+          processView,
+          [CH_CHECKPOINT_REQUEST, true],
+        ) as number;
         kernelEntryIntrinsicApply(
           kernelEntryIntrinsicDataViewSetUint32,
           processView,
-          [CH_CHECKPOINT_REQUEST, 0, true],
+          [
+            CH_CHECKPOINT_REQUEST,
+            published & CH_CHECKPOINT_REQUEST_RESTART,
+            true,
+          ],
         );
       }
     }
     this.checkpointUnwindPids.clear();
+    this.#checkpointRestartChannels.clear();
   }
 
   /**
@@ -7997,25 +8099,55 @@ export class CentralizedKernelWorker {
   /**
    * Release every process this freeze held, and only those.
    *
-   * Returns the pids whose resume barrier did not complete. A pid that exited
-   * or was stopped for real while the freeze ran is reported rather than
-   * retried here, because its owner decides what happens next.
+   * The release joins the ingress FIFO rather than demanding an idle gate.
+   * A freeze always leaves queued work behind it: the arm sweep completes
+   * every parked syscall, and a machine driving a display keeps its 60 Hz
+   * vblank tick, which `startVblankPump` does not suspend. An immediate entry
+   * refuses while anything is queued, so it refused on exactly the machines
+   * worth handing over. Queueing keeps the release in request order behind
+   * that work, which is the order the gate already guarantees, and the gate
+   * always drains what it queued.
+   *
+   * Every held pid is resumed inside one entry. A single ingress may release
+   * more than one stopped process, so a reentrant listener sees the whole
+   * release or none of it.
+   *
+   * Resolves with the pids whose resume barrier did not complete. A pid that
+   * exited or was stopped for real while the freeze ran is reported rather
+   * than retried here, because its owner decides what happens next.
    */
-  releaseProcessDispatchForCheckpoint(): number[] {
-    const unreleased: number[] = [];
+  releaseProcessDispatchForCheckpoint(): Promise<number[]> {
     const held = [...this.checkpointHeldPids];
     this.checkpointHeldPids.clear();
+    return new Promise<number[]>((resolve, reject) => {
+      if (this.#kernelFatalError !== null) {
+        reject(this.#kernelFatalError);
+        return;
+      }
+      // A fatal latch discards queued ingress without running it. Register the
+      // rejector first: the release must report a poisoned generation rather
+      // than leave the freeze waiting for a callback that can never run.
+      this.#pendingCheckpointDispatchReleases.add(reject);
+      const settle = (unreleased: number[]): undefined => {
+        this.#pendingCheckpointDispatchReleases.delete(reject);
+        resolve(unreleased);
+        return undefined;
+      };
+      this.#runOrDeferKernelEntry(
+        "checkpoint freeze dispatch release",
+        (entry) => settle(this.#resumeHeldDispatch(held, entry)),
+      );
+    });
+  }
+
+  #resumeHeldDispatch(
+    held: readonly number[],
+    entry: KernelWorkerEntryContext,
+  ): number[] {
+    const unreleased: number[] = [];
     for (const pid of held) {
       if (!this.stoppedPids.has(pid)) continue;
-      let resumed = false;
-      this.#runImmediateKernelEntry(
-        "checkpoint freeze dispatch release",
-        (entry) => {
-          resumed = this.resumeStoppedProcess(pid, entry);
-          return undefined;
-        },
-      );
-      if (!resumed) unreleased.push(pid);
+      if (!this.resumeStoppedProcess(pid, entry)) unreleased.push(pid);
     }
     return unreleased;
   }
@@ -14554,6 +14686,13 @@ export class CentralizedKernelWorker {
    * `#dequeueSignalForDelivery` declines to write the signal area, and the two
    * decisions are deliberately made from the same flag. The request stays armed
    * and the enclosing ppoll publishes it instead.
+   *
+   * A channel the freeze itself interrupted also carries the restart bit. The
+   * EINTR about to be published was the host's way of reaching this hook, not
+   * a caught signal, so the guest is told to make the call again once its
+   * rewind returns. The mark outlives this publication on purpose: a deferred
+   * completion declines above, and the enclosing ppoll — the call that is
+   * actually owed a restart — must still receive the bit.
    */
   #publishCheckpointUnwindRequest(
     channel: ChannelInfo,
@@ -14566,10 +14705,13 @@ export class CentralizedKernelWorker {
       [CH_REQUEST_FLAGS, true],
     ) as number;
     if ((requestFlags & CH_REQUEST_FLAG_DEFER_SIGNAL_DELIVERY) !== 0) return;
+    const request = this.#checkpointRestartChannels.has(channel)
+      ? CH_CHECKPOINT_REQUEST_UNWIND | CH_CHECKPOINT_REQUEST_RESTART
+      : CH_CHECKPOINT_REQUEST_UNWIND;
     kernelEntryIntrinsicApply(
       kernelEntryIntrinsicDataViewSetUint32,
       processView,
-      [CH_CHECKPOINT_REQUEST, CH_CHECKPOINT_REQUEST_UNWIND, true],
+      [CH_CHECKPOINT_REQUEST, request, true],
     );
   }
 
@@ -16641,11 +16783,50 @@ export class CentralizedKernelWorker {
     // the wait uses (Atomics.notify on the futex addr, cancelling the
     // retry timer, etc.) avoids racing against the handler's own
     // completion path — we never write the channel directly here.
+    if (this.#interruptParkedWait(target, entry, true)) return;
+
+    // No tracked blocking state — the target either hasn't reached the
+    // blocking entry yet, or its handler is synchronous and will pick
+    // up pendingCancels the next time it enters a blocking operation.
+    // Do NOT write the channel here: the in-flight handleSyscall owns
+    // it and would race with our completeChannelRaw.
+  }
+
+  /**
+   * Retire whichever tracked blocking wait a channel is parked in, and
+   * complete it with EINTR.
+   *
+   * `onlyCancellationPoints` narrows which parked waits a caller may take.
+   * `pthread_cancel` may take only a frozen cancellation point, because a
+   * plain syscall that happens to use the same number must stay parked with
+   * its state unchanged. A checkpoint freeze takes every parked wait instead:
+   * a machine whose login shell sits in `wait4` reaches no syscall boundary at
+   * all, and the freeze needs one to publish its unwind request on.
+   *
+   * Clearing `pendingCancels` before each publication is what the cancellation
+   * caller needs, because the relisten that follows may re-dispatch the
+   * mailbox at once. The checkpoint caller never arms that guard, so the
+   * delete is a no-op for it.
+   *
+   * Returns true when a wait was retired. The futex case may wake the engine
+   * wait rather than publish, which still reaches the completion both callers
+   * are after.
+   */
+  #interruptParkedWait(
+    target: ChannelInfo,
+    entry: KernelWorkerEntryContext | undefined,
+    onlyCancellationPoints: boolean,
+  ): boolean {
+    const takes = <T extends FrozenCancellationPointIdentity>(
+      identity: T | undefined,
+    ): identity is T =>
+      identity !== undefined
+      && (!onlyCancellationPoints || isWakeableCancellationPoint(identity));
 
     // 1) Futex wait — Atomics.notify wakes the in-flight waitAsync, which
     //    calls complete() and completeChannelRaw naturally.
     const futexEntry = this.pendingFutexWaits.get(target);
-    if (isWakeableCancellationPoint(futexEntry)) {
+    if (takes(futexEntry)) {
       this.pendingCancels.delete(target);
       if (futexEntry.interrupt) {
         futexEntry.interrupt(-EINTR_ERRNO, EINTR_ERRNO);
@@ -16653,14 +16834,14 @@ export class CentralizedKernelWorker {
         const tgtMemView = new Int32Array(target.memory.buffer);
         Atomics.notify(tgtMemView, futexEntry.futexIndex, 1);
       }
-      return;
+      return true;
     }
 
     // 2) Host-deferred sleep — discard its staged timeout output and cancel
     //    the exact timer before publishing EINTR. A stale callback must never
     //    complete a later request that reuses this mailbox.
     const sleepEntry = this.pendingSleeps.get(target);
-    if (isWakeableCancellationPoint(sleepEntry)) {
+    if (takes(sleepEntry)) {
       this.pendingCancels.delete(target);
       this.#cancelRegisteredTimeout(sleepEntry.timer);
       this.pendingSleeps.delete(target);
@@ -16670,7 +16851,7 @@ export class CentralizedKernelWorker {
         EINTR_ERRNO,
         entry,
       );
-      return;
+      return true;
     }
 
     // 3) rt_sigtimedwait — retire both the current timer and its persistent
@@ -16678,10 +16859,7 @@ export class CentralizedKernelWorker {
     //    channel generation before deleting either record.
     const signalWaitKey = `${target.pid}:${target.channelOffset}`;
     const signalWaitEntry = this.pendingSignalWaits.get(signalWaitKey);
-    if (
-      signalWaitEntry?.channel === target
-      && isWakeableCancellationPoint(signalWaitEntry)
-    ) {
+    if (signalWaitEntry?.channel === target && takes(signalWaitEntry)) {
       this.pendingCancels.delete(target);
       this.#cancelRegisteredTimeout(signalWaitEntry.timer);
       this.pendingSignalWaits.delete(signalWaitKey);
@@ -16692,13 +16870,13 @@ export class CentralizedKernelWorker {
         EINTR_ERRNO,
         entry,
       );
-      return;
+      return true;
     }
 
     // 4) Poll/ppoll retry timer — retire the tracked retry and complete the
     //    exact cancellation point with EINTR.
     const pollEntry = this.pendingPollRetries.get(target);
-    if (isWakeableCancellationPoint(pollEntry)) {
+    if (takes(pollEntry)) {
       this.pendingCancels.delete(target);
       if (pollEntry.timer !== null) this.#cancelRegisteredTimeout(pollEntry.timer);
       this.pendingPollRetries.delete(target);
@@ -16708,12 +16886,12 @@ export class CentralizedKernelWorker {
         EINTR_ERRNO,
         entry,
       );
-      return;
+      return true;
     }
 
     // 5) Advisory-lock retry timer.
     const advisoryLockEntry = this.pendingAdvisoryLockRetries?.get(target);
-    if (isWakeableCancellationPoint(advisoryLockEntry)) {
+    if (takes(advisoryLockEntry)) {
       this.pendingCancels.delete(target);
       this.#cancelRegisteredTimeout(advisoryLockEntry.timer);
       this.pendingAdvisoryLockRetries.delete(target);
@@ -16723,12 +16901,12 @@ export class CentralizedKernelWorker {
         EINTR_ERRNO,
         entry,
       );
-      return;
+      return true;
     }
 
     // 6) Select/pselect retry timer.
     const selEntry = this.pendingSelectRetries.get(target);
-    if (isWakeableCancellationPoint(selEntry)) {
+    if (takes(selEntry)) {
       this.pendingCancels.delete(target);
       this.#cancelRegisteredTimeout(selEntry.timer);
       this.#cancelRegisteredImmediate(selEntry.timer);
@@ -16739,16 +16917,14 @@ export class CentralizedKernelWorker {
         EINTR_ERRNO,
         entry,
       );
-      return;
+      return true;
     }
 
     // 7) Pipe/socket reader/writer registration — unregister and wake.
     let wokePipe = false;
     for (const [pipeIdx, readers] of this.pendingPipeReaders) {
       const filtered = readers.filter(
-        (reader) =>
-          reader.channel !== target
-          || !isWakeableCancellationPoint(reader),
+        (reader) => reader.channel !== target || !takes(reader),
       );
       if (filtered.length !== readers.length) {
         if (filtered.length === 0) this.pendingPipeReaders.delete(pipeIdx);
@@ -16758,9 +16934,7 @@ export class CentralizedKernelWorker {
     }
     for (const [pipeIdx, writers] of this.pendingPipeWriters) {
       const filtered = writers.filter(
-        (writer) =>
-          writer.channel !== target
-          || !isWakeableCancellationPoint(writer),
+        (writer) => writer.channel !== target || !takes(writer),
       );
       if (filtered.length !== writers.length) {
         if (filtered.length === 0) this.pendingPipeWriters.delete(pipeIdx);
@@ -16777,16 +16951,14 @@ export class CentralizedKernelWorker {
         EINTR_ERRNO,
         entry,
       );
-      return;
+      return true;
     }
 
     // 8) wait()/waitpid()/wait4()/waitid() are cancellation points in musl.
     // Remove the exact host-owned waiter before waking its channel so a later
     // child transition cannot complete a canceled thread's reused mailbox.
     const waitIndex = this.waitingForChild.findIndex(
-      (waiter) =>
-        waiter.channel === target
-        && isWakeableCancellationPoint(waiter),
+      (waiter) => waiter.channel === target && takes(waiter),
     );
     if (waitIndex >= 0) {
       this.pendingCancels.delete(target);
@@ -16797,14 +16969,10 @@ export class CentralizedKernelWorker {
         EINTR_ERRNO,
         entry,
       );
-      return;
+      return true;
     }
 
-    // 9) No tracked blocking state — the target either hasn't reached the
-    //    blocking entry yet, or its handler is synchronous and will pick
-    //    up pendingCancels the next time it enters a blocking operation.
-    //    Do NOT write the channel here: the in-flight handleSyscall owns
-    //    it and would race with our completeChannelRaw.
+    return false;
   }
 
   /**
@@ -30841,6 +31009,9 @@ export class CentralizedKernelWorker {
           | undefined;
         if (!inject) return;
         inject(dx, dy, buttons);
+        // Reported after the kernel took it, so a movement the kernel could
+        // not accept never appears in a log as one it did.
+        this.callbacks.onPointerInjected?.(dx, dy, buttons);
         this.scheduleWakeBlockedRetries(entry);
       },
     );
@@ -34083,13 +34254,28 @@ export class CentralizedKernelWorker {
 
   /** CRTCs whose canvas a GL context owns.
    *
-   *  The vblank pump blits only a `"2d"` CRTC, so these are exactly the CRTCs
-   *  whose frames never pass through a host buffer. A caller that must read
-   *  the screen — a checkpoint, a mirror — has nothing to read for them. */
+   *  These are exactly the CRTCs whose frames never pass through a host
+   *  buffer: a GL guest paints the canvas directly and writes nothing back.
+   *  A caller that must read the screen — a checkpoint, a mirror — has
+   *  nothing to read for them.
+   *
+   *  A CRTC the embedder declared `"webgl2"` is absent until GL claims it.
+   *  Until then the guest paints its GBM buffer object by CPU and the
+   *  checkpoint carries those pixels, so refusing it would name a boundary
+   *  the machine has not reached. */
   glOwnedCrtcs(): number[] {
-    return [...this.kmsContextMode]
-      .filter(([, mode]) => mode === "webgl2")
-      .map(([crtcId]) => crtcId);
+    return [...this.kmsGlOwned];
+  }
+
+  /** Record that a live WebGL2 context now paints the CRTC's canvas.
+   *
+   *  Called by `host_gl_create_context` through the kernel's callbacks once
+   *  the context exists. Idempotent, and one-way: an OffscreenCanvas holds
+   *  one context type for its lifetime, so a destroyed GL context does not
+   *  give the pixels back. */
+  markKmsCanvasGlOwned(crtcId: number): void {
+    this.kmsContextMode.set(crtcId, "webgl2");
+    this.kmsGlOwned.add(crtcId);
   }
 
   /** Register an `OffscreenCanvas` (and optional stats SAB) as the
@@ -34105,9 +34291,11 @@ export class CentralizedKernelWorker {
    *  - `"2d"`: legacy CPU-blit path. The pump eagerly grabs 2D here
    *    and copies the kernel's scanout BO into the canvas each frame.
    *    Used by demos that render into the FB via memcpy rather than GL.
-   *  - `"webgl2"`: marks the canvas as GL-owned up front. Pump never
-   *    blits. Same effect as auto + a later `markKmsCanvasGlOwned`,
-   *    but spares the GL bridge from racing the pump's 2D acquisition. */
+   *  - `"webgl2"`: reserves the canvas for GL up front. Pump never
+   *    blits, so the GL bridge cannot lose a race to the pump's 2D
+   *    acquisition. This reserves the canvas; it does not claim it.
+   *    `glOwnedCrtcs` reports the CRTC only once the guest's
+   *    `eglCreateContext` has built the context. */
   attachKmsCanvas(
     crtc_id: number,
     canvas: OffscreenCanvas,

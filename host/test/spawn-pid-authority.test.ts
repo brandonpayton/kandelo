@@ -754,7 +754,7 @@ function createTaskAuthorityHarness(
     callbacks: options.callbacks,
   });
   Reflect.set(worker, "kernelAbiVersion", ABI_VERSION);
-  const scratchPointer = installKernelWorkerTestScratch(
+  const { pointer: scratchPointer } = installKernelWorkerTestScratch(
     worker,
     kernelMemory,
     128,

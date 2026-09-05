@@ -31,7 +31,7 @@ function createHarness(
   const worker = Object.assign(createCentralizedKernelWorkerTestDouble({}), {
     usePolling,
   });
-  installKernelWorkerTestScratch(
+  const { gate } = installKernelWorkerTestScratch(
     worker,
     kernelMemory,
     1024,
@@ -59,7 +59,7 @@ function createHarness(
   if (channel === undefined) {
     throw new Error("checkpoint harness did not create its main channel");
   }
-  return { worker, memory, kernelMemory, channel };
+  return { worker, memory, kernelMemory, channel, gate };
 }
 
 /**
@@ -128,22 +128,71 @@ describe("checkpoint unwind request", () => {
 });
 
 describe("checkpoint dispatch hold", () => {
-  it("holds every registered process and releases exactly those", () => {
+  it("holds every registered process and releases exactly those", async () => {
     const harness = createHarness(() => PROCESS_STATE_RUNNING);
     expect(harness.worker.holdProcessDispatchForCheckpoint()).toEqual([PID]);
     // A second hold adds nothing: the pid is already off dispatch.
     expect(harness.worker.holdProcessDispatchForCheckpoint()).toEqual([]);
-    expect(harness.worker.releaseProcessDispatchForCheckpoint()).toEqual([]);
+    await expect(harness.worker.releaseProcessDispatchForCheckpoint())
+      .resolves.toEqual([]);
     // The release consumed the hold, so there is nothing left to give back.
-    expect(harness.worker.releaseProcessDispatchForCheckpoint()).toEqual([]);
+    await expect(harness.worker.releaseProcessDispatchForCheckpoint())
+      .resolves.toEqual([]);
   });
 
-  it("reports a process whose resume barrier did not complete", () => {
+  it("reports a process whose resume barrier did not complete", async () => {
     let state = PROCESS_STATE_RUNNING;
     const harness = createHarness(() => state);
     harness.worker.holdProcessDispatchForCheckpoint();
     state = PROCESS_STATE_EXITED;
-    expect(harness.worker.releaseProcessDispatchForCheckpoint()).toEqual([PID]);
+    await expect(harness.worker.releaseProcessDispatchForCheckpoint())
+      .resolves.toEqual([PID]);
+  });
+
+  it("releases after work the read left queued in the kernel entry gate", async () => {
+    const harness = createHarness(() => PROCESS_STATE_RUNNING);
+    harness.worker.holdProcessDispatchForCheckpoint();
+
+    // Reproduce what a machine with a display leaves behind. A vblank tick
+    // reached during the read queues behind the entry that is running, so the
+    // gate still has work waiting when the freeze reaches its release. The
+    // release used to demand an idle gate and refused here, which failed the
+    // whole capture.
+    const order: string[] = [];
+    let released: Promise<number[]> | undefined;
+    harness.gate.runOrDeferVoidIngress("the read", () => {
+      harness.gate.runOrDeferVoidIngress("a tick the read left queued", () => {
+        order.push("queued");
+        return undefined;
+      });
+      released = harness.worker.releaseProcessDispatchForCheckpoint();
+      return undefined;
+    });
+
+    await expect(released).resolves.toEqual([]);
+    order.push("released");
+    expect(order).toEqual(["queued", "released"]);
+  });
+
+  it("reports a poisoned generation instead of waiting for a discarded release", async () => {
+    const harness = createHarness(() => PROCESS_STATE_RUNNING);
+    harness.worker.holdProcessDispatchForCheckpoint();
+
+    // A queued entry that poisons the generation discards the rest of the
+    // FIFO, the release included. The freeze must be told, or it waits for a
+    // machine that no longer exists.
+    let released: Promise<number[]> | undefined;
+    harness.gate.runOrDeferVoidIngress("the read", () => {
+      harness.gate.runOrDeferVoidIngress("a tick that fails", () => {
+        throw new Error("kernel_vblank trapped");
+      });
+      released = harness.worker.releaseProcessDispatchForCheckpoint();
+      return undefined;
+    });
+
+    await expect(released).rejects.toThrow(
+      "void kernel ingress a tick that fails failed",
+    );
   });
 });
 

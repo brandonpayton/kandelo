@@ -20,10 +20,26 @@ export interface EmptyStateProps {
   onBrowseAll: () => void;
   /** Called once the user pastes a Kandelo URL and confirms boot. */
   onApplyDescriptor: (desc: BootDescriptor) => void;
+  /**
+   * One line about a connected computer, shown under the tagline.
+   *
+   * A page with a peer but nothing to watch is still this page, so the state
+   * of the link belongs here rather than in a surface that has nothing to
+   * show. Null when no computer is connected.
+   */
+  peerNote?: string | null;
+  /**
+   * Whether this computer is watching the other computer's machine.
+   *
+   * A watcher holds no machine of its own and is not meant to start one: the
+   * machine reaches it by handover, not by boot. False on a page with no peer.
+   */
+  watching?: boolean;
 }
 
 export const EmptyState: React.FC<EmptyStateProps> = ({
-  onLaunchItem, onBrowseAll, onApplyDescriptor,
+  onLaunchItem, onBrowseAll, onApplyDescriptor, peerNote = null,
+  watching = false,
 }) => {
   const [door, setDoor] = React.useState<Door>(null);
   const [pasteUrl, setPasteUrl] = React.useState("");
@@ -53,14 +69,33 @@ export const EmptyState: React.FC<EmptyStateProps> = ({
     }
   };
 
+  const hero = (
+    <div className="kempty-hero">
+      <img className="kempty-logo" src={markUrl} alt="" />
+      <h1 className="kempty-wordmark">Kandelo</h1>
+      <div className="kempty-tag">Boot a VFS image in your browser.</div>
+      {peerNote && (
+        <div className="kempty-peer-note" role="status">{peerNote}</div>
+      )}
+    </div>
+  );
+
+  // A watcher gets a waiting room, not a launcher. Booting here would start a
+  // second machine unrelated to the one being watched, and stop the watching
+  // to show it. The machine crosses by Take over this machine, in the Network
+  // popup, so the ways to start one are not offered while a peer holds one.
+  if (watching) {
+    return (
+      <div className="kempty">
+        <div className="kempty-inner">{hero}</div>
+      </div>
+    );
+  }
+
   return (
     <div className="kempty">
       <div className="kempty-inner">
-        <div className="kempty-hero">
-          <img className="kempty-logo" src={markUrl} alt="" />
-          <h1 className="kempty-wordmark">Kandelo</h1>
-          <div className="kempty-tag">Boot a VFS image in your browser.</div>
-        </div>
+        {hero}
 
         <div className="kempty-doors">
           <button

@@ -57,6 +57,8 @@ interface MigrationRestoreOptions {
 interface MachineCheckpointThreadsSummary {
   pids: number[];
   threads: { pid: number; tids: number[]; activeCount: number }[];
+  mounts: string[];
+  unreadableMounts: string[];
 }
 
 interface MigrationFramebufferEvidence {
@@ -603,6 +605,10 @@ async function init() {
         tids: bucket.threads.map((thread) => thread.tid),
         activeCount: bucket.threadAllocator.activeCount,
       })),
+      mounts: checkpoint.filesystems.map((mount) => mount.mountPoint),
+      unreadableMounts: checkpoint.unreadableFilesystems.map(
+        (gap) => gap.mountPoint,
+      ),
     });
 
     let checkpoint: MachineCheckpoint | null = null;

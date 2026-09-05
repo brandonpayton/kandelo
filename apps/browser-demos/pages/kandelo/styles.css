@@ -595,6 +595,7 @@
   text-align: left;
   flex: 0 1 240px;
   user-select: none;
+  position: relative;
 }
 
 .kdock-status img {
@@ -631,6 +632,9 @@
 }
 
 .kdock-status-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -639,6 +643,31 @@
   font-weight: 760;
   letter-spacing: 0;
   line-height: 1.15;
+}
+
+/* The title runs under a corner the badge takes out of the flow. */
+.kdock-status[data-role] .kdock-status-title {
+  padding-right: 44px;
+}
+
+.kdock-role {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  padding: 1px 5px;
+  border: 1px solid var(--kdock-border);
+  border-radius: 5px;
+  color: var(--kdock-muted);
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+  line-height: 1.4;
+  text-transform: uppercase;
+}
+
+.kdock-status[data-role="user"] .kdock-role {
+  border-color: var(--kdock-text);
+  color: var(--kdock-text);
 }
 
 .kdock-toggle-pill {
@@ -4337,6 +4366,14 @@
   color: var(--k-text-muted);
   font-weight: 500;
 }
+.kempty-peer-note {
+  margin-top: 4px;
+  padding: 6px 12px;
+  border: 1px solid var(--k-border);
+  border-radius: 999px;
+  font-size: 13px;
+  color: var(--k-text-muted);
+}
 .kempty-doors {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -4755,8 +4792,15 @@
   border-color: var(--k-accent, var(--k-border));
 }
 
-.knetwork-disconnect {
-  align-self: flex-start;
+.knetwork-link-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.knetwork-take:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 
 .knetwork-code {
@@ -4773,7 +4817,8 @@
   word-break: break-all;
 }
 
-.knetwork-status {
+.knetwork-status,
+.knetwork-take-note {
   color: var(--k-text-muted);
   font-size: 12px;
   line-height: 1.4;
@@ -4783,6 +4828,46 @@
   color: var(--k-ok, var(--k-accent, currentColor));
 }
 
+.kshared-machine {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+/* One machine sends one surface — the one its holder is looking at — so the
+   surface that is live takes the whole column. Splitting it between the two
+   would leave a divider under a screen with nothing beneath it. */
+.kshared-machine > .kshared-framebuffer,
+.kshared-machine > .kshared-terminal {
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+/* A surface the other computer is not using shows nothing and takes no room
+   in the column. Both panes stay mounted, because a mirror only learns that
+   its surface has started by already watching for it.
+
+   `visibility` rather than `display: none`: xterm measures its character cell
+   from the live box, and a terminal opened into a box with no layout renders
+   nothing once it is shown again. Taking the pane out of flow keeps that box
+   without letting an unused surface take a share of the column. */
+.kshared-machine > [hidden] {
+  display: flex;
+  position: absolute;
+  inset: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.kshared-framebuffer {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .kshared-terminal {
   height: 100%;
   min-height: 0;
@@ -4790,15 +4875,17 @@
   flex-direction: column;
 }
 
-.kshared-terminal-head {
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--k-border);
-  color: var(--k-text-muted);
-  font-size: 12px;
-}
-
 .kshared-terminal-host {
   flex: 1;
   min-height: 0;
   padding: 8px;
+}
+
+/* The surface a machine left behind when it was handed over. Dimmed for as
+   long as it is the last thing this computer saw rather than the machine's
+   current one, so it never reads as a machine still running here. */
+.kshared-terminal.is-held .kshared-terminal-host,
+.kshared-framebuffer.is-held .kframebuffer-surface {
+  opacity: 0.45;
+  transition: opacity 200ms ease-out;
 }

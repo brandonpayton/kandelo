@@ -1,6 +1,7 @@
 // Builds a LiveKernelHost over a real BrowserKernel for the Kandelo page.
 
 import { BrowserKernel } from "@host/browser-kernel-host";
+import type { MachineCheckpoint } from "@host/migration/checkpoint";
 import { ensureServiceWorkerReady } from "../../../lib/init/service-worker-bridge";
 import { setupServiceWorkerFetchBridge } from "../../../lib/init/sw-bridge-fetch";
 import {
@@ -638,13 +639,28 @@ export async function createLiveHost(
     status: machineRequested ? "booting" : "idle",
     descriptor: initialDescriptor,
     galleryItems: localGalleryItems,
-    applyBootDescriptor: async (desc, h) => {
+    applyBootDescriptor: async (desc, h, restore) => {
       if (protectedProfile !== undefined) {
         assertProtectedCandidateDescriptor(desc, protectedProfile.descriptor);
         await activateProtectedProfile();
         return;
       }
-      await startBoot(h, profileForDescriptor(desc, "none"), desc);
+      // The session layer carries a checkpoint it never reads, so it names one
+      // by the minimal `MachineCheckpointLike`. This is the layer that knows
+      // the value is the host runtime's own `MachineCheckpoint`, because it is
+      // the layer that hands it back to a kernel of the kind that produced it.
+      await startBoot(
+        h,
+        profileForDescriptor(desc, "none"),
+        desc,
+        restore as MachineCheckpoint | undefined,
+      );
+    },
+    prewarmBootDescriptor: async (desc) => {
+      // A protected page boots the one image that was placed with it. Nothing
+      // another computer names should send this one off to load something.
+      if (protectedProfile !== undefined) return;
+      await prewarmProfileImage(profileForDescriptor(desc, "none"));
     },
   });
 
@@ -720,6 +736,7 @@ export async function createLiveHost(
     h: LiveKernelHost,
     profile: LiveProfile,
     descriptor: BootDescriptor,
+    restoreCheckpoint?: MachineCheckpoint,
   ): Promise<void> {
     const seq = ++bootSeq;
     const previousKernel = currentKernel;
@@ -742,6 +759,7 @@ export async function createLiveHost(
         bootStartedAt,
         () => seq === bootSeq,
         requireServiceWorker,
+        restoreCheckpoint,
       );
       if (seq !== bootSeq) {
         await kernel.destroy().catch(() => {});
@@ -1076,6 +1094,7 @@ async function bootProfile(
   requireServiceWorker: (
     tick?: (msg: string) => void,
   ) => Promise<ServiceWorker>,
+  restoreCheckpoint?: MachineCheckpoint,
 ): Promise<BrowserKernel> {
   const assertCurrent = () => {
     if (!isCurrent()) throw new BootSuperseded();
@@ -1344,7 +1363,10 @@ async function bootProfile(
         kernelBytes,
         vfsImageBytes,
       );
-    await kernel.initFromImage(kernelInitOptions);
+    await kernel.initFromImage({
+      ...kernelInitOptions,
+      ...(restoreCheckpoint === undefined ? {} : { restoreCheckpoint }),
+    });
     assertCurrent();
     host.attachKernel(kernel);
     host.setTerminalSessionPolicy(
@@ -1396,7 +1418,12 @@ async function bootProfile(
       }
     }
 
-    if (profile.init) {
+    // A restored machine arrives with its processes already running, so this
+    // boot starts none of the programs the profile would normally start.
+    // Spawning init or the demo's command again would put a second copy of
+    // each beside the restored one, and the two would fight over the same
+    // console, the same ports, and the same /dev/fb0.
+    if (profile.init && restoreCheckpoint === undefined) {
       const initArgv =
         effectiveBoot.argv.length > 0 ? effectiveBoot.argv : profile.init.argv;
       tick(`spawning ${initArgv[0]}...`);
@@ -1444,7 +1471,12 @@ async function bootProfile(
 
     maybeUpdateWebReadiness();
 
-    if (profile.framebufferTest) {
+    if (restoreCheckpoint !== undefined) {
+      tick(
+        `restored ${restoreCheckpoint.processes.length} process(es) handed `
+        + `over by the other computer`,
+      );
+    } else if (profile.framebufferTest) {
       const fbtestWasmUrl = await optionalBinaryUrl(
         [
           "../../../../../local-binaries/programs/wasm32/fbtest.wasm",
@@ -1711,6 +1743,66 @@ interface LoadedVfsImage {
   lazyAssets?: ImageOwnedRuntimeLazyAssets;
 }
 
+/**
+ * Images fetched before anything asked to boot them, keyed by their URL.
+ *
+ * Only the plain-URL images need this. A canonical Pages product is already
+ * cached by its loader, which is the cache a boot reads too, so prewarming one
+ * is a call and not a copy. An image named by a bare URL has no such cache,
+ * and `loadVfsImage` would fetch it again.
+ *
+ * One entry at a time: a viewer prewarms the one image its peer is running,
+ * and holding others would spend a machine's worth of memory on machines
+ * nobody is offering.
+ */
+const prewarmedVfsImages = new Map<string, Promise<ArrayBuffer>>();
+
+/**
+ * Fetch what booting `profile` would need, so that booting it does not have to.
+ *
+ * Warms exactly the paths `loadVfsImage` and the boot read from, so a prewarm
+ * that succeeded is time the boot no longer spends. Rejects if the image
+ * cannot be loaded; a speculative caller is expected to ignore that, because
+ * nothing has been asked for yet.
+ */
+async function prewarmProfileImage(profile: LiveProfile): Promise<void> {
+  // The kernel is the same Wasm whatever machine arrives, and a computer that
+  // has only ever watched one has never fetched it. Warmed through the HTTP
+  // cache rather than held here: the boot fetches the same URL, and a second
+  // copy of the kernel in memory buys nothing the cache does not.
+  const kernel = fetch(kernelWasmUrl)
+    .then(failOn("kernel.wasm"))
+    .then((r) => r.arrayBuffer())
+    .then(() => undefined);
+
+  if (profile.vfsSource !== undefined && CANONICAL_PAGES_VFS_LOADER !== undefined) {
+    await Promise.all([
+      kernel,
+      CANONICAL_PAGES_VFS_LOADER.activate(profile.vfsSource.productId),
+    ]);
+    return;
+  }
+
+  const vfsUrl = await resolveProfileVfsUrl(profile);
+  if (!prewarmedVfsImages.has(vfsUrl)) {
+    prewarmedVfsImages.clear();
+    prewarmedVfsImages.set(
+      vfsUrl,
+      fetch(vfsUrl)
+        .then(failOn(`${profile.id}.vfs.zst`))
+        .then((r) => r.arrayBuffer()),
+    );
+  }
+  // A failed prewarm must not be remembered as one that worked, or the boot
+  // would wait on a rejected promise instead of fetching for itself.
+  try {
+    await Promise.all([kernel, prewarmedVfsImages.get(vfsUrl)]);
+  } catch (error) {
+    prewarmedVfsImages.delete(vfsUrl);
+    throw error;
+  }
+}
+
 async function loadVfsImage(profile: LiveProfile): Promise<LoadedVfsImage> {
   if (profile.candidateEvidence !== undefined) {
     if (profile.candidateVfsPlacement === undefined) {
@@ -1731,6 +1823,17 @@ async function loadVfsImage(profile: LiveProfile): Promise<LoadedVfsImage> {
     };
   }
   const vfsUrl = await resolveProfileVfsUrl(profile);
+  const prewarmed = prewarmedVfsImages.get(vfsUrl);
+  if (prewarmed !== undefined) {
+    // Taken, not read: this image is being booted, so nothing is waiting for
+    // it any more, and a viewer that keeps a copy of the machine it just
+    // adopted holds that memory for nothing.
+    prewarmedVfsImages.delete(vfsUrl);
+    // Copied for the same reason the canonical loader copies: the caller
+    // assembles the machine out of these bytes, and a buffer handed straight
+    // from a cache would be one a second boot could no longer trust.
+    return { imageBytes: (await prewarmed).slice(0) };
+  }
   return {
     imageBytes: await fetch(vfsUrl)
       .then(failOn(`${profile.id}.vfs.zst`))

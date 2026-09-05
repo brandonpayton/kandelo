@@ -107,6 +107,16 @@ export const Dock: React.FC<{
   networkConnected: boolean;
   themeOpen: boolean;
   status: MachineStatus;
+  /**
+   * Which side of a shared pair this computer is on, or null when it is not in
+   * one.
+   *
+   * A shared terminal is read-only and gives no sign of it, because a caption
+   * over the screen covers the thing the person came to watch. The dock is
+   * always visible and never over the machine, so the answer to "why does my
+   * keyboard do nothing" lives here instead.
+   */
+  role: "user" | "viewer" | null;
   machineTitle?: string;
   viewDisabled?: Partial<Record<DockViewId, boolean>>;
   onSelectPane: (pane: DockPaneId | null) => void;
@@ -135,6 +145,7 @@ export const Dock: React.FC<{
   internalsOpen,
   networkOpen,
   networkConnected,
+  role,
   themeOpen,
   status,
   machineTitle,
@@ -471,9 +482,10 @@ export const Dock: React.FC<{
             <button
               type="button"
               className="kdock-status"
+              data-role={role ?? undefined}
               onClick={() => onSelectPane(null)}
               title={`${title}: ${statusLabel}`}
-              aria-label={`Current machine: ${title}, ${statusLabel}`}
+              aria-label={`Current machine: ${title}, ${statusLabel}${role === null ? "" : role === "user" ? ", User" : ", Viewer"}`}
             >
               <img src={markUrl} alt="" />
               <span className="kdock-status-copy">
@@ -483,6 +495,11 @@ export const Dock: React.FC<{
                   {statusLabel}
                 </span>
               </span>
+              {role !== null && (
+                <span className="kdock-role">
+                  {role === "user" ? "User" : "Viewer"}
+                </span>
+              )}
             </button>
             <div className="kdock">
               <div className="kdock-section" aria-label="Machine tools">

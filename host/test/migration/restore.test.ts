@@ -10,7 +10,10 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { NodeKernelHost } from "../../src/node-kernel-host";
-import type { MountSpec } from "../../src/vfs/default-mounts";
+import {
+  DEFAULT_MOUNT_SPEC,
+  type MountSpec,
+} from "../../src/vfs/default-mounts";
 import { findRepoRoot, resolveBinary } from "../../src/binary-resolver";
 import { doomSharewareWad } from "../support/doom-shareware";
 import { ABI_VERSION } from "../../src/generated/abi";
@@ -18,6 +21,7 @@ import { FORK_SAVE_BUFFER_SIZE } from "../../src/process-memory";
 import type { MachineCheckpoint } from "../../src/migration/checkpoint";
 import {
   CheckpointRefusedError,
+  describeCheckpointMountGaps,
   validateMachineCheckpoint,
 } from "../../src/migration/restore";
 
@@ -115,9 +119,60 @@ describe("checkpoint validation", () => {
       }, "not a whole number of pages");
 
       await refusal((checkpoint) => {
-        (checkpoint as { filesystem: Uint8Array }).filesystem =
-          new Uint8Array(0);
-      }, "the filesystem buffer is empty");
+        (checkpoint as { filesystems: unknown }).filesystems = [
+          { mountPoint: "/", bytes: new Uint8Array(0) },
+        ];
+      }, "the / mount is empty");
+
+      await refusal((checkpoint) => {
+        (checkpoint as { filesystems: unknown }).filesystems = [
+          { mountPoint: "/home/maker", bytes: new Uint8Array([1]) },
+        ];
+      }, "no / mount was captured");
+
+      // Two buckets for one mount leave the restore choosing which bytes win.
+      await refusal((checkpoint) => {
+        (checkpoint as { filesystems: unknown }).filesystems = [
+          { mountPoint: "/", bytes: new Uint8Array([1]) },
+          { mountPoint: "/home/maker", bytes: new Uint8Array([1]) },
+          { mountPoint: "/home/maker", bytes: new Uint8Array([2]) },
+        ];
+      }, "appears twice");
+
+      await refusal((checkpoint) => {
+        (checkpoint as { filesystems: unknown }).filesystems = [
+          { mountPoint: "/", bytes: new Uint8Array([1]) },
+          { mountPoint: "home/maker", bytes: new Uint8Array([1]) },
+        ];
+      }, "is not absolute");
+
+      // A mount cannot be both carried and left behind: a restore reading the
+      // two lists would report a gap it just filled.
+      await refusal((checkpoint) => {
+        (checkpoint as { unreadableFilesystems: unknown }).unreadableFilesystems =
+          [{ mountPoint: "/", reason: "no" }];
+      }, "is both carried and unreadable");
+
+      await refusal((checkpoint) => {
+        (checkpoint as { unreadableFilesystems: unknown }).unreadableFilesystems =
+          [{ mountPoint: "tmp", reason: "no" }];
+      }, "is not absolute");
+
+      // The reason is printed unaltered, and a peer wrote it.
+      await refusal((checkpoint) => {
+        (checkpoint as { unreadableFilesystems: unknown }).unreadableFilesystems =
+          [{ mountPoint: "/tmp", reason: "x".repeat(201) }];
+      }, "is 201 characters");
+
+      await refusal((checkpoint) => {
+        (checkpoint as { unreadableFilesystems: unknown }).unreadableFilesystems =
+          [{ mountPoint: "/tmp", reason: "" }];
+      }, "is 0 characters");
+
+      await refusal((checkpoint) => {
+        (checkpoint as { unreadableFilesystems: unknown }).unreadableFilesystems =
+          undefined;
+      }, "carries no unreadable-mount list");
 
       await refusal((checkpoint) => {
         (checkpoint as { processes: unknown[] }).processes = [
@@ -405,6 +460,40 @@ describe("checkpoint validation", () => {
         await refused.destroy().catch(() => undefined);
       }
 
+    },
+  );
+
+  it(
+    "says which filesystems a restored Node machine did not get",
+    { timeout: 120_000 },
+    async () => {
+      const checkpoint = await captureRealCheckpoint();
+      // Every scratch mount on Node is a HostFileSystem, so the capture read
+      // `/` alone. A restore that reported nothing would present this machine
+      // as whole when seven of its eight filesystems stayed behind.
+      const diagnostics: string[] = [];
+      const receiver = new NodeKernelHost({
+        rootfsImage: "default",
+        restoreCheckpoint: checkpoint,
+        onHostDiagnostic: (diagnostic) => {
+          if (diagnostic.source === "checkpoint restore") {
+            diagnostics.push(diagnostic.message);
+          }
+        },
+      });
+      await receiver.init();
+      try {
+        expect(diagnostics).toHaveLength(1);
+        for (const mountPoint of DEFAULT_MOUNT_SPEC.map((m) => m.path)) {
+          if (mountPoint === "/") continue;
+          expect(diagnostics[0]).toContain(mountPoint);
+        }
+        expect(diagnostics[0]).toContain(
+          "a host directory backs this mount and owns no shared buffer",
+        );
+      } finally {
+        await receiver.destroy();
+      }
     },
   );
 
@@ -788,4 +877,40 @@ describe("checkpoint validation", () => {
       }
     },
   );
+});
+
+describe("what a restore says about the mounts it did not get", () => {
+  const carried = (gaps: MachineCheckpoint["unreadableFilesystems"]) =>
+    ({ unreadableFilesystems: gaps }) as MachineCheckpoint;
+
+  it("says nothing when every mount arrived", () => {
+    expect(describeCheckpointMountGaps(carried([]))).toBeNull();
+  });
+
+  it("names each mount the sender could not read, with its reason", () => {
+    expect(
+      describeCheckpointMountGaps(
+        carried([{ mountPoint: "/tmp", reason: "a host directory" }]),
+      ),
+    ).toBe("this machine was restored without /tmp (a host directory)");
+  });
+
+  it("names a carried mount this host had nowhere to put", () => {
+    expect(describeCheckpointMountGaps(carried([]), ["/srv"])).toBe(
+      "this machine was restored without /srv "
+      + "(this host has no memory-backed mount there)",
+    );
+  });
+
+  it("reports both directions in one line", () => {
+    expect(
+      describeCheckpointMountGaps(
+        carried([{ mountPoint: "/tmp", reason: "a host directory" }]),
+        ["/srv"],
+      ),
+    ).toBe(
+      "this machine was restored without /tmp (a host directory), "
+      + "/srv (this host has no memory-backed mount there)",
+    );
+  });
 });

@@ -13,27 +13,19 @@ const PTY = "/dev/pts/0";
 function fakeTerminal(size: TerminalSize = { cols: 80, rows: 24 }): {
   source: TerminalSource;
   emit: (text: string) => void;
-  typed: () => string;
 } {
   const listeners = new Set<(bytes: Uint8Array) => void>();
-  const chunks: Uint8Array[] = [];
   return {
     source: {
       onOutput(listener) {
         listeners.add(listener);
         return () => listeners.delete(listener);
       },
-      write(bytes) {
-        chunks.push(bytes.slice());
-      },
       size: () => size,
     },
     emit(text) {
       const bytes = new TextEncoder().encode(text);
       for (const listener of [...listeners]) listener(bytes);
-    },
-    typed() {
-      return chunks.map((each) => new TextDecoder().decode(each)).join("");
     },
   };
 }
@@ -43,9 +35,11 @@ function fakeSink(): {
   text: (id: string) => string | undefined;
   size: (id: string) => TerminalSize | undefined;
   resets: () => number;
+  ended: () => string[];
 } {
   const screens = new Map<string, string>();
   const sizes = new Map<string, TerminalSize>();
+  const ended: string[] = [];
   let resets = 0;
   return {
     sink: {
@@ -57,10 +51,14 @@ function fakeSink(): {
       output(id, bytes) {
         screens.set(id, (screens.get(id) ?? "") + new TextDecoder().decode(bytes));
       },
+      ended(id) {
+        ended.push(id);
+      },
     },
     text: (id) => screens.get(id),
     size: (id) => sizes.get(id),
     resets: () => resets,
+    ended: () => ended,
   };
 }
 
@@ -100,6 +98,30 @@ describe("local terminal mirror", () => {
       await vi.waitFor(() => expect(sink.text(PTY)).toBe("hello world"));
     } finally {
       stopPublish();
+      stopWatch();
+      publisher.close();
+      watcher.close();
+    }
+  });
+
+  it("tells a watcher the terminal ended when the publisher stops", async () => {
+    const channel = `terminal-test-${crypto.randomUUID()}`;
+    const publisher = new LocalTerminalMirror(channel);
+    const watcher = new LocalTerminalMirror(channel);
+    const terminal = fakeTerminal();
+    const stopPublish = publisher.publish(PTY, terminal.source);
+    const sink = fakeSink();
+    const stopWatch = watcher.watch(sink.sink);
+    try {
+      await vi.waitFor(() => expect(sink.text(PTY)).toBe(""));
+      expect(sink.ended()).toEqual([]);
+      // The person holding the machine turned to its screen. Output simply
+      // stopping cannot say that — a terminal nobody is typing into is silent
+      // too — so a watcher told nothing keeps a dead screen up beside the
+      // surface that replaced it.
+      stopPublish();
+      await vi.waitFor(() => expect(sink.ended()).toEqual([PTY]));
+    } finally {
       stopWatch();
       publisher.close();
       watcher.close();
@@ -153,35 +175,9 @@ describe("local terminal mirror", () => {
     }
   });
 
-  it("writes a watcher's keystrokes into the terminal", async () => {
-    const channel = `terminal-test-${crypto.randomUUID()}`;
-    const publisher = new LocalTerminalMirror(channel);
-    const watcher = new LocalTerminalMirror(channel);
-    const terminal = fakeTerminal();
-    const stopPublish = publisher.publish(PTY, terminal.source);
-    const sink = fakeSink();
-    const stopWatch = watcher.watch(sink.sink);
-    try {
-      watcher.send(PTY, new TextEncoder().encode("ls\n"));
-      await vi.waitFor(() => expect(terminal.typed()).toBe("ls\n"));
-
-      // A watcher must not be able to type into a terminal nobody published
-      // under that name.
-      watcher.send("/dev/pts/9", new TextEncoder().encode("rm\n"));
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(terminal.typed()).toBe("ls\n");
-    } finally {
-      stopPublish();
-      stopWatch();
-      publisher.close();
-      watcher.close();
-    }
-  });
-
   it("keeps two published terminals apart", async () => {
     // A machine offers every terminal it has, so one channel carries several.
-    // Output must reach the screen it came from, and a keystroke must reach
-    // the shell it was aimed at.
+    // Output must reach the screen it came from.
     const channel = `terminal-test-${crypto.randomUUID()}`;
     const publisher = new LocalTerminalMirror(channel);
     const watcher = new LocalTerminalMirror(channel);
@@ -198,10 +194,6 @@ describe("local terminal mirror", () => {
         expect(sink.text("/dev/pts/0")).toBe("one");
         expect(sink.text("/dev/pts/1")).toBe("two");
       });
-
-      watcher.send("/dev/pts/1", new TextEncoder().encode("ls\n"));
-      await vi.waitFor(() => expect(second.typed()).toBe("ls\n"));
-      expect(first.typed()).toBe("");
     } finally {
       stopFirst();
       stopSecond();
@@ -210,6 +202,7 @@ describe("local terminal mirror", () => {
       watcher.close();
     }
   });
+
 
   it("replays the tail of a long stream, not all of it", async () => {
     const channel = `terminal-test-${crypto.randomUUID()}`;

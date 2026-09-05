@@ -2087,6 +2087,7 @@ export class WasmPosixKernel {
             b.forward.onCreateContext();
             return;
           }
+          const crtc = this.kms.masterCrtcForPid(pid);
           if (!b.canvas) {
             // Auto-attach the KMS scanout canvas if this pid holds DRM
             // master on a CRTC the embedder has registered with
@@ -2095,7 +2096,6 @@ export class WasmPosixKernel {
             // is about to call eglCreateContext would silently no-op
             // every shader compile/link/draw because `b.canvas` stays
             // null and `b.gl` is never built.
-            const crtc = this.kms.masterCrtcForPid(pid);
             if (crtc != null) {
               const canvas = this.callbacks.getKmsCanvas?.(crtc);
               if (canvas) {
@@ -2113,7 +2113,6 @@ export class WasmPosixKernel {
                 }
                 this.gl.attachCanvas(pid, canvas);
                 b.canvas = canvas;
-                this.callbacks.markKmsCanvasGlOwned?.(crtc);
               }
             }
             if (!b.canvas) return;
@@ -2132,6 +2131,15 @@ export class WasmPosixKernel {
             ctx.getExtension("EXT_color_buffer_float");
             ctx.getExtension("OES_texture_float_linear");
             ctx.getExtension("EXT_float_blend");
+            // GL owns the CRTC's canvas from here, and not before. Until this
+            // context exists the guest's pixels still reach its GBM buffer
+            // object, which a checkpoint reads and carries. Marking ownership
+            // earlier — when a canvas was merely found, or when the embedder
+            // declared `mode: "webgl2"` — refuses a capture the platform can
+            // take, for a reason that is not true of that machine yet.
+            if (crtc != null && this.callbacks.getKmsCanvas?.(crtc) === b.canvas) {
+              this.callbacks.markKmsCanvasGlOwned?.(crtc);
+            }
           }
           b.gl = ctx;
         },

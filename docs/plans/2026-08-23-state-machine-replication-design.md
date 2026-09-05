@@ -186,11 +186,33 @@ recover from divergence even before it is good at avoiding it.
 |---|---|---|
 | State transfer | `migration/checkpoint.ts`, `restore.ts` | Unchanged; becomes replica join and resync |
 | Wire | `migration/channel-chunked.ts` | Unchanged; carries the log |
+| Log transport | `replication/log-local.ts` | Publishes and receives the log |
 | Link | `apps/browser-demos/lib/peer-link.ts` | Moves to `web-libs/kandelo-session` |
 | Screen | `migration/mirror-local.ts` | Fallback mode only |
 | Ownership | `migration/transport-local.ts` | Becomes primary election |
 | Dispatch order | host scheduling | Logical clock in the kernel worker |
 | Clock, random, host I/O | host adapters | Log-sourced |
+
+The log has a wire. `LocalReplicationLog` (`host/src/replication/log-local.ts`)
+publishes a running `ReplicationLogRecorder` and delivers its entries to a
+peer's sink, in order and without a hole, over the same
+`MessageChannelLike` contract the migration transports speak. A peer that
+joins after the recording started is sent the backlog, which is what the
+boot-and-replay join needs. The peer link opens a fourth data channel,
+`kandelo-replication-log`, and gives it the handover's deep-queue defaults
+rather than the mirror's shallow ones: a mirror frame may be skipped, a
+decision may not.
+
+No app code drives either end yet. `apps/browser-demos` opens the channel and
+reads nothing from it, so a connection today carries an idle data channel. The
+consumer is the replica-join flow, which the GL decision above unblocks; until
+that lands, the wire is exercised only by `host/test/replication/log-local.test.ts`.
+
+Nothing drains the recorder, and that is now deliberate rather than deferred.
+A replica joins at boot, so the entries from sequence 0 are the ones it needs
+most. The recorder growing without bound at the roughly 184 entries per second
+measured in the browser is therefore a real cost to budget, not a leak to
+close by forgetting the early log.
 
 `ShareMode` in `web-libs/kandelo-session/src/kernel-host.ts` already
 declares `"live"`, and `docs/plans/2026-05-11-shareable-computer-url-design.md`
@@ -229,24 +251,82 @@ checkpoint can see it:
 - The only path that does assemble one is `mode: "2d"`, which a GL
   guest cannot use: a 2d context cannot be painted by GL.
 - `MachineCheckpoint` carries `/dev/fb0` bindings and their pixels. It
-  carries no KMS or GBM state at all, so handing over a modeset machine
-  would restore one whose display state is missing.
+  now also carries KMS state, as `CheckpointKmsState`
+  (`host/src/migration/checkpoint.ts:107`), populated at
+  `checkpoint.ts:560`. GBM buffer contents travel too:
+  `GbmBoRegistry.snapshot` (`host/src/dri/registry.ts:334`) flushes each
+  buffer object out of process memory and copies its pixels, and both
+  worker entries wire that into `kmsState`.
 
-Making modeset shareable therefore needs one of two pieces of platform
-work, and both are real:
+Making modeset shareable therefore needs three pieces of platform work.
+The first was decided against; the other two are done:
 
 1. **A KMS scanout stream.** Read the frame back where the guest
    finishes it — at the EGL swap in the kernel worker — and publish
    those bytes the way a write-based `/dev/fb0` binding publishes its
    writes. A 1920x1080 BGRA frame is 8.3 MB, so the readback must be
    throttled and it will cost GPU time. This makes modeset mirrorable.
+   **Decided against on 2026-08-25.** It is pixel streaming, which mho
+   rejected for the reason recorded in Goals: two distant computers
+   make it flicker. Under replication a viewer runs modeset in its own
+   replica and paints its own canvas, so no frame crosses the network.
 2. **KMS state in the checkpoint.** Add the CRTC, the framebuffer
    objects and the GBM buffer contents to `MachineCheckpoint` and to
    the restore path. This makes modeset handoverable, and it is also
-   what a replica needs to join.
+   what a replica needs to join. All three are done.
+3. **Refuse on real GL ownership, not on a declared mode.** Done.
+   `captureMachineCheckpoint` refuses whenever `glOwnedCrtcs()` names a
+   CRTC, and `glOwnedCrtcs` used to report every CRTC whose
+   `kmsContextMode` was `"webgl2"`. `attachKmsCanvas` sets that mode the
+   moment a caller asks for it, before the guest has run any GL, and
+   `KernelHost.attachKmsDisplay` defaults to `{ mode: "webgl2" }`, which
+   the Modeset pane takes. So a modeset guest that paints by CPU into a
+   GBM buffer object — whose pixels the checkpoint does carry — was
+   refused for a reason that was not true of it.
 
-Neither is a shim over the other: mirroring shows a modeset machine to
-someone, handover moves it to them, and replication needs the second.
+   The two facts are now separate. `kmsContextMode` says what may paint
+   a CRTC's canvas and still stops the vblank pump from claiming 2D.
+   `kmsGlOwned` says what has painted it, and only
+   `markKmsCanvasGlOwned` writes it. `host_gl_create_context` calls that
+   once `getContext("webgl2")` has returned a context, rather than when
+   it merely found a canvas to attach. `glOwnedCrtcs` reads the second
+   set, so a checkpoint is refused exactly when the pixels are somewhere
+   it cannot read. Covered by `host/test/dri-kms-gl-ownership.test.ts`.
+
+None is a shim over the others: mirroring shows a modeset machine to
+someone, handover moves it to them, and replication needs the second and
+the third.
+
+### How a replica joins a GL machine
+
+**Decided on 2026-08-27: a replica joins at boot and replays from
+sequence 0.** Both peers run their own modeset from the start, so each
+builds its own GPU state by executing the same commands. No texture
+crosses the network and no frame is read back.
+
+The alternative was to carry GPU state in the checkpoint, which needs a
+readback of every texture. That is the pixel readback rejected on
+2026-08-25 and it stays rejected.
+
+The choice rests on an assumption that is now measured on the CPU side:
+replaying the same commands produces the same machine. Two replicas of a
+shell guest that replay one log reach byte-identical kernel memory and
+identical filesystems — see "What the instrument says today".
+
+The GPU side stays unproven and is a known boundary, not a claim. Two
+peers on different GPUs run different drivers and can round shader
+arithmetic differently, so their screens can drift. mho has accepted a
+viewer's screen differing by a few pixels. What this does not yet have
+is a divergence signal for the GPU: the state hash covers kernel,
+filesystems and process memory, and nothing it hashes can see a drifted
+texture.
+
+Two consequences for the rest of the path. A viewer cannot join a
+modeset machine that is already running — joining means booting the same
+machine, so the log must start at sequence 0 and be retained from there.
+And `ReplicationLogRecorder` retaining every entry stops being only a
+leak and becomes a requirement for the GL case, which changes what
+"drain the log when streaming lands" can mean.
 
 ## Implementation Path
 
@@ -267,24 +347,171 @@ expensive determinism work is entered last and with evidence.
 5. Reduce the framebuffer mirror to changed regions instead of whole
    frames. Still a stream, far smaller, and it makes the fallback mode
    respectable.
-6. Give `/dev/dri/card0` a scanout stream read back at the EGL swap, so
-   the modeset surface can be mirrored at all, and put KMS state in the
-   checkpoint so it can be handed over.
+6. Put KMS state in the checkpoint so a modeset machine can be handed
+   over. The scanout-stream half of this step was dropped on
+   2026-08-25: see the decision recorded above.
 7. Make the guest clock log-sourced. Deterministic time is the single
    largest source of divergence and is useful alone: it makes replay
-   debugging possible.
+   debugging possible. Done, at the one interface every guest clock
+   read already crosses (`TimeProvider`). A machine records with
+   `RecordingTimeProvider` and replays with `ReplayingTimeProvider`
+   (`host/src/replication/clock.ts`); both hosts drive them from their
+   kernel-worker entry, and `NodeKernelHost` exposes the four calls
+   `startReplicationRecording`, `stopReplicationRecording`,
+   `startReplicationReplay` and `stopReplicationReplay`. Measured: a
+   replica restored from a checkpoint and fed the log prints the
+   recorded timestamps, not its own.
+
+   The clock is the machine's, not the guest's. SharedFS stamped inode
+   atime, mtime and ctime from `Date.now()`, which is why the first
+   measurement still showed `filesystem:/` diverging under replay.
+   Those stamps now cross the same provider: `SharedFS.setClock`
+   replaces the wall clock a filesystem writes from,
+   `MemoryFileSystem.setTimeProvider` converts a provider reading to
+   the milliseconds the inode fields hold, and `VirtualPlatformIO`
+   hands its clock to every mount that keeps its own file times.
+   Measured: two replicas replaying one log now agree on
+   `filesystem:/`, and two replicas on their own clocks still do not.
 8. Make randomness log-sourced.
 9. Add state hashing at fixed log positions, and a divergence report.
    Build this before the machine is deterministic — it is the
-   instrument that tells you how far from deterministic it is.
+   instrument that tells you how far from deterministic it is. Done,
+   and it has produced its first measurement. See "What the instrument
+   says today" below.
 10. Give the kernel worker a logical dispatch clock, and make
     single-process single-threaded guests deterministic. Prove it with
-    a record-and-replay conformance suite.
+    a record-and-replay conformance suite. The dispatch clock is not
+    yet justified: byte-diffing two replicas showed the kernel already
+    reproduces for a single-process single-threaded guest, and located
+    the only remaining difference in dead call-stack scratch. Build the
+    conformance suite first and let it say whether a logical clock is
+    needed. See "What the instrument says today".
 11. Route external I/O through the log, primary-authoritative.
 12. Replicate a live machine end to end for a single-process guest,
     with resync-on-divergence.
 13. Extend to multi-process and pthread guests, or document the
     boundary if the cost is not worth paying.
+
+## What the instrument says today
+
+Measured on 2026-08-27 with `host/test/replication/replay-determinism.test.ts`.
+The machine is a Node Kandelo booted from the default rootfs image. The guest
+is `sh -c` running `date +%s` five times: five guest clock reads, no
+randomness, no external bytes. Every replica adopts one checkpoint of the same
+idle machine.
+
+| Comparison | Regions that differ |
+|---|---|
+| Two replicas that run nothing | none |
+| Two replicas replaying one log | none, or `kernel` by a few dead stack bytes |
+| Two replicas reading their own clocks | `kernel`, `filesystem:/` |
+
+Five things follow.
+
+**The log-sourced clock works.** A replica prints the recorded seconds, not the
+seconds its own host would have read. The test waits two seconds before the
+replay so a match cannot be two runs landing in the same second.
+
+**The log removes the `filesystem:/` divergence.** Inode atime, mtime and
+ctime now cross the machine's `TimeProvider` rather than `Date.now()`, so two
+replicas replaying one log write identical file metadata. Two replicas reading
+their own clocks still diverge there, which is what says the log is why the
+first pair agrees rather than luck.
+
+**The kernel reproduces too, and dispatch order is not the cause.** This was
+step 10's suspicion and the measurement does not support it. Byte-diffing the
+two 14 MB `kernelMemory` regions over thirteen replayed pairs: twelve were
+identical byte for byte, and the one that was not differed by three bytes at
+`0xffffc`.
+
+That address names the cause. The kernel Wasm is linked stack-first with
+`global[0]`, its `__stack_pointer`, starting at `0x100000`; `__data_end` is
+`0x116acc`. So `[0, 0x100000)` is call-stack scratch and the data segment and
+heap sit above it. `0xffffc` is four bytes below the stack top — residue from a
+call that had already returned, not state a replica must reproduce. The region
+hash reports it because it covers the whole linear memory. Every divergence
+measured under replay, and every one measured on live clocks, was below that
+line; none was in the data segment or the heap.
+
+The same byte-diff locates the live-clock divergence exactly: two replicas on
+their own clocks differ at `0xefcb8`, which holds a `timespec` whose seconds
+field reads as the wall-clock second of the run. Replicas fed the log hold the
+same bytes there.
+
+**The log is the whole machine's clock, not the guest's.** Recording the
+five-`date` guest yields nine entries: the guest's five reads plus the
+filesystem's four inode stamps. A replica asks for exactly nine, which is
+itself a determinism check — a shortfall or an overrun would mean the two runs
+took different paths. A guest transcript is therefore a subsequence of the
+logged readings, not the whole of it.
+
+**A region hash over raw linear memory is coarser than the machine.** It calls
+dead stack scratch a divergence. Deciding a byte is dead needs the stack
+pointer, which the checkpoint does not carry today, so the test bounds the
+difference by the stack line rather than asserting a byte count. This is the
+next thing to settle about the instrument, and it is a question about the hash,
+not about the machine.
+
+This measurement is for one guest: a single-process, single-threaded shell that
+reads the clock and nothing else. It says dispatch order does not diverge that
+workload. It does not say the kernel is deterministic, which is what step 10's
+conformance suite is for.
+
+## What a checkpoint carries across its mounts
+
+**Decided on 2026-08-27, built on 2026-08-27.** A checkpoint asks every
+mount for its bytes and carries every mount that can answer. A mount
+that cannot — a Node `HostFileSystem` backed by a real directory —
+refuses, and the refusal is recorded in the checkpoint so a restore
+reports what it did not get.
+
+Before this, both worker entries built `checkpointMounts` by filtering
+`specMounts` to `MemoryFileSystem`. The two hosts then disagreed about
+what a machine is, because their mount topologies differ rather than
+their code: in the browser every mount is a `MemoryFileSystem`, while on
+Node every mount except `/` is a `HostFileSystem` under the per-boot
+session directory (`host/src/vfs/default-mounts-node.ts:96`). So a Node
+checkpoint carried `/` alone and said nothing about the rest.
+
+Carrying nothing is defensible for a host directory. Saying nothing
+about it is not: a restore presents a machine missing `/tmp` as if it
+were whole, which is the convenient illusion the platform values
+contract forbids.
+
+### How it is built
+
+`FileSystemBackend.checkpointBytes()` is the question, and it is
+optional: a backend that does not implement it is recorded as unreadable
+rather than dropped. `MemoryFileSystem` answers with its
+SharedArrayBuffer. `HostFileSystem` refuses, naming the backing kind and
+not the sandbox path — a checkpoint travels to another computer, and the
+path is this computer's business.
+
+`askMountsForCheckpointBytes` (`host/src/migration/checkpoint.ts`) asks
+the list, and both worker entries build `filesystemBuffers` from it, so
+one code path decides what a machine is on both hosts. The mounts asked
+are `specMounts` alone. `/dev` and `/dev/shm` are device surfaces the
+host provides and a restore rebuilds, so they are not machine state to
+hand away and never appear as gaps.
+
+`MachineCheckpoint.unreadableFilesystems` carries the refusals, and
+`MachineCheckpointSummary` repeats them so a caller holding no bytes
+still sees them. The layout version `MACHINE_CHECKPOINT_FORMAT` went
+from 3 to 4; a restore refuses format 3 outright rather than guessing at
+the missing field. The checkpoint is not part of the kernel ABI, so
+`ABI_VERSION` did not move.
+
+A restore reports the gap through `describeCheckpointMountGaps`
+(`host/src/migration/restore.ts`), which both entries send to
+`reportHostDiagnostic` at `warn`. It reports two directions: mounts the
+sender could not read, and mounts the sender carried that this receiver
+has nowhere memory-backed to put. A gap never refuses the checkpoint — a
+machine short `/tmp` is still worth moving — but it is never silent.
+
+Today a Node checkpoint records seven gaps (`/tmp`, `/var/tmp`,
+`/var/log`, `/var/run`, `/home/maker`, `/root`, `/srv`) and a browser
+checkpoint records none. The asymmetry is now visible in the artifact
+rather than implied by the host it came from.
 
 ## Open Questions
 

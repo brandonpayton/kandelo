@@ -14,6 +14,8 @@ import type { ProcessMemoryLayout } from "../../src/process-memory";
 
 const KERNEL_MEMORY_BYTES = 64;
 const FILESYSTEM_BYTES = 128;
+const SCRATCH_BYTES = 64;
+const REFUSAL = "a host directory backs this mount and owns no shared buffer";
 const PROCESS_MEMORY_BYTES = 256;
 const PROGRAM_BYTES = 32;
 const KERNEL_ABI = 977;
@@ -103,7 +105,7 @@ function testMachine(sources: CheckpointProcessSource[]): TestMachine {
       },
       releaseProcessDispatch: () => {
         released.push(sources.map((source) => source.pid));
-        return state.unreleasable;
+        return Promise.resolve(state.unreleasable);
       },
       armUnwindRequests: () => {
         const pids = sources.map((source) => source.pid);
@@ -114,7 +116,23 @@ function testMachine(sources: CheckpointProcessSource[]): TestMachine {
         disarmed.count += 1;
       },
       copyKernelMemory: () => new Uint8Array(KERNEL_MEMORY_BYTES).fill(7),
-      filesystemBuffer: () => new SharedArrayBuffer(FILESYSTEM_BYTES),
+      filesystemBuffers: () => [
+        {
+          mountPoint: "/",
+          bytes: {
+            kind: "bytes",
+            buffer: new SharedArrayBuffer(FILESYSTEM_BYTES),
+          },
+        },
+        {
+          mountPoint: "/home/maker",
+          bytes: {
+            kind: "bytes",
+            buffer: new SharedArrayBuffer(SCRATCH_BYTES),
+          },
+        },
+        { mountPoint: "/var/log", bytes: { kind: "none", reason: REFUSAL } },
+      ],
       framebuffers: () => [],
       kmsState: () => state.kms,
       glOwnedCrtcs: () => state.glOwnedCrtcs,
@@ -168,7 +186,19 @@ describe("machine checkpoint freeze", () => {
     expect(result.status).toBe("captured");
     if (result.status !== "captured") return;
     expect(result.checkpoint.kernelMemory.byteLength).toBe(KERNEL_MEMORY_BYTES);
-    expect(result.checkpoint.filesystem.byteLength).toBe(FILESYSTEM_BYTES);
+    // Every mount travels, not just the root: a machine whose processes resume
+    // over an empty /home/maker has not been moved, only restarted.
+    expect(
+      result.checkpoint.filesystems.map((mount) => [
+        mount.mountPoint,
+        mount.bytes.byteLength,
+      ]),
+    ).toEqual([["/", FILESYSTEM_BYTES], ["/home/maker", SCRATCH_BYTES]]);
+    // A mount that refused leaves the checkpoint able to say so. Dropping it
+    // from both lists would present this machine as whole.
+    expect(result.checkpoint.unreadableFilesystems).toEqual([
+      { mountPoint: "/var/log", reason: REFUSAL },
+    ]);
     expect(result.checkpoint.processes.map((bucket) => bucket.pid)).toEqual([4, 9]);
     expect(
       result.checkpoint.processes.map((bucket) => bucket.executionGeneration),
@@ -176,7 +206,7 @@ describe("machine checkpoint freeze", () => {
     expect(result.checkpoint.processes[0]!.memory.byteLength)
       .toBe(PROCESS_MEMORY_BYTES);
     expect(result.checkpoint.processes[0]!.argv).toEqual(["/bin/program-4"]);
-    expect(result.checkpoint.format).toBe(2);
+    expect(result.checkpoint.format).toBe(4);
     expect(result.checkpoint.kernelAbiVersion).toBe(KERNEL_ABI);
     expect(
       new Uint8Array(result.checkpoint.processes[0]!.programBytes),
@@ -251,10 +281,14 @@ describe("machine checkpoint freeze", () => {
     state.sources[0]!.checkpointFreeze.unwound();
 
     const result = await capture;
+    // Name the straggler and leave out the process that did unwind: on a real
+    // machine running an init, a shell, and a game at once, a count says
+    // nothing about which program is holding the freeze.
     expect(result).toEqual({
       status: "timed-out",
       reason:
-        "a process did not reach UNWINDING before the checkpoint freeze timed out",
+        "a process did not reach UNWINDING before the checkpoint freeze "
+        + "timed out: pid 9 (/bin/program-9) is armed",
     });
     // Nothing was read, so dispatch was never held, and the process that did
     // unwind is rewound rather than left parked.

@@ -22,8 +22,10 @@ import type {
   HostDiagnostic,
   MainToKernelMessage,
   KernelToMainMessage,
+  ReplicationReplayProgress,
   VfsFileSnapshot,
 } from "./browser-kernel-protocol";
+import type { ReplicationLogEntry } from "./replication/log";
 import type { HttpRequest, HttpResponse } from "./networking/in-kernel-http";
 import {
   type BrowserCorsProxyConfig,
@@ -340,6 +342,7 @@ export class BrowserKernel {
     lazyUrlBase?: string;
     closedLazyAssets?: readonly ClosedLazyAsset[];
     rootfsMountSpec?: readonly MountSpec[];
+    restoreCheckpoint?: MachineCheckpoint;
   }): Promise<void> {
     const [wasmBytes, vfsImage] = await Promise.all([
       options.kernelWasm
@@ -357,6 +360,7 @@ export class BrowserKernel {
       lazyUrlBase: options.lazyUrlBase ?? import.meta.env.BASE_URL,
       closedLazyAssets: options.closedLazyAssets,
       rootfsMountSpec: options.rootfsMountSpec,
+      restoreCheckpoint: options.restoreCheckpoint,
       takeVfsImageOwnership: false,
     });
   }
@@ -837,6 +841,66 @@ export class BrowserKernel {
       includeBytes: true,
     });
     return result as CheckpointFreezeResult;
+  }
+
+  /**
+   * Record every decision this machine's host makes for its guest, from now.
+   *
+   * A checkpoint carries the machine's state; this carries the values the
+   * machine could not derive from that state. A replica that adopts the same
+   * checkpoint and replays this log runs the same machine, and renders it
+   * itself rather than being sent pixels.
+   *
+   * The guest clock and pointer movement are recorded today. Randomness and
+   * external bytes are not routed through the log yet, so a machine that reads
+   * either produces a log that is complete for what it holds and silent about
+   * the rest.
+   */
+  async startReplicationRecording(): Promise<void> {
+    const requestId = this.nextRequestId++;
+    await this.request(requestId, {
+      type: "replication_record_start",
+      requestId,
+    });
+  }
+
+  /** Stop recording and take the log. */
+  async stopReplicationRecording(): Promise<ReplicationLogEntry[]> {
+    const requestId = this.nextRequestId++;
+    const result = await this.request(requestId, {
+      type: "replication_record_stop",
+      requestId,
+    });
+    return (result as ReplicationLogEntry[]) ?? [];
+  }
+
+  /**
+   * Serve this machine's decisions from `entries` instead of from this host.
+   *
+   * Call it after `init` and before the replayed guest runs. A replay that
+   * reaches past the end of the log, or reads a clock the recording does not
+   * hold there, throws `ReplicationDivergence` at the guest's clock read
+   * rather than inventing a value.
+   */
+  async startReplicationReplay(
+    entries: readonly ReplicationLogEntry[],
+  ): Promise<void> {
+    const requestId = this.nextRequestId++;
+    await this.request(requestId, {
+      type: "replication_replay_start",
+      requestId,
+      entries,
+    });
+  }
+
+  /** Stop replaying, and report how much of the log this machine took. */
+  async stopReplicationReplay(): Promise<ReplicationReplayProgress> {
+    const requestId = this.nextRequestId++;
+    const result = await this.request(requestId, {
+      type: "replication_replay_stop",
+      requestId,
+    });
+    return result as ReplicationReplayProgress;
   }
 
   /**

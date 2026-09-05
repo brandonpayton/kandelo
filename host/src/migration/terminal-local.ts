@@ -6,11 +6,12 @@
  * watcher that joins late is sent the recent output as one reset, so it
  * starts from the current screen rather than from the next keystroke.
  *
- * Unlike `LocalFramebufferMirror`, this transport carries input as well.
- * A terminal a second person cannot type into is not a shared terminal, so
- * a watcher's keystrokes travel back and the publisher writes them to the
- * PTY. Both people drive one shell, exactly as two people at one keyboard
- * would; the PTY's own echo is what puts the result on every screen.
+ * Output only, in one direction. Two people typing into one shell interleave
+ * their keystrokes inside a single line of input, and neither can tell which
+ * characters are theirs, so a watcher watches and the computer holding the
+ * machine keeps the keyboard. Typing moves the way the machine does: the
+ * watcher takes the machine over, and then it is the one holding the keyboard.
+ * See `LocalCheckpointHandover` in `transport-local.ts`.
  *
  * What crosses here is text, not pixels: bytes are proportional to what the
  * machine printed rather than to screen area and frame rate, and the far
@@ -43,12 +44,10 @@ export interface TerminalSize {
   readonly rows: number;
 }
 
-/** One live PTY a publisher can read, write and measure. */
+/** One live PTY a publisher can read and measure. */
 export interface TerminalSource {
   /** Subscribe to output bytes in order. Returns an unsubscribe. */
   onOutput(listener: (bytes: Uint8Array) => void): () => void;
-  /** Deliver a watcher's keystrokes to the terminal. */
-  write(bytes: Uint8Array): void;
   size(): TerminalSize;
 }
 
@@ -58,6 +57,17 @@ export interface TerminalSink {
   reset(id: string, size: TerminalSize, bytes: Uint8Array): void;
   /** Append output to what is already on screen. */
   output(id: string, bytes: Uint8Array): void;
+  /**
+   * The publisher stopped sending this terminal.
+   *
+   * A machine publishes the one surface its holder is presenting, so a
+   * publisher that stops is the holder turning to the machine's other surface,
+   * or giving the machine away. Silence alone cannot say that: a terminal
+   * nobody is typing into is silent too, and a watcher that could not tell the
+   * two apart would keep a dead screen up beside the live surface that
+   * replaced it.
+   */
+  ended(id: string): void;
 }
 
 type LocalTerminalMessage =
@@ -70,15 +80,19 @@ type LocalTerminalMessage =
       readonly bytes: Uint8Array;
     }
   | { readonly kind: "output"; readonly id: string; readonly bytes: Uint8Array }
-  | { readonly kind: "input"; readonly id: string; readonly bytes: Uint8Array };
+  | { readonly kind: "ended"; readonly id: string };
 
 /**
  * The tail of a terminal's output, capped.
  *
  * Held as the chunks that arrived, trimmed from the front, so appending
  * costs nothing and only a reset pays to join them.
+ *
+ * Exported because a publisher is not the only thing that needs the recent
+ * screen: a computer handing its machine away keeps one so it can go on
+ * showing what it had while the machine starts elsewhere.
  */
-class ReplayTail {
+export class ReplayTail {
   readonly #chunks: Uint8Array[] = [];
   #byteLength = 0;
 
@@ -119,11 +133,11 @@ export class LocalTerminalMirror {
   }
 
   /**
-   * Publish one PTY under `id`, and write back what watchers type.
+   * Publish one PTY under `id`.
    *
    * Sends a reset immediately, again for every watcher that says hello, and
    * again on drain after a congested wire made it skip output. Returns a
-   * stop function.
+   * stop function, which tells watchers the terminal ended.
    */
   publish(id: string, source: TerminalSource): () => void {
     const tail = new ReplayTail();
@@ -158,13 +172,7 @@ export class LocalTerminalMirror {
     });
     const listener = (event: MessageEvent) => {
       const message = event.data as LocalTerminalMessage;
-      if (message.kind === "hello") {
-        reset();
-        return;
-      }
-      if (message.kind === "input" && message.id === id) {
-        source.write(message.bytes);
-      }
+      if (message.kind === "hello") reset();
     };
     this.#channel.addEventListener("message", listener);
     reset();
@@ -172,6 +180,7 @@ export class LocalTerminalMirror {
       stopOutput();
       stopDrain?.();
       this.#channel.removeEventListener("message", listener);
+      this.#post({ kind: "ended", id });
     };
   }
 
@@ -194,16 +203,15 @@ export class LocalTerminalMirror {
       }
       if (message.kind === "output") {
         sink.output(message.id, message.bytes);
+        return;
+      }
+      if (message.kind === "ended") {
+        sink.ended(message.id);
       }
     };
     this.#channel.addEventListener("message", listener);
     this.#post({ kind: "hello" });
     return () => this.#channel.removeEventListener("message", listener);
-  }
-
-  /** Type into a published terminal from a watching side. */
-  send(id: string, bytes: Uint8Array): void {
-    this.#post({ kind: "input", id, bytes: bytes.slice() });
   }
 
   close(): void {

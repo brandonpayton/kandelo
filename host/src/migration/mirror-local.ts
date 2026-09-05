@@ -30,6 +30,24 @@ import type { FramebufferRegistry } from "../framebuffer/registry.js";
 
 const LOCAL_MIRROR_CHANNEL = "kandelo-framebuffer-mirror";
 
+/**
+ * The read side of a `/dev/fb0` registry a publisher needs.
+ *
+ * `FramebufferRegistry` satisfies it, and so does a host that re-exposes the
+ * live registry for sharing. Naming the read side keeps a publisher from
+ * holding a handle that could rebind the machine's framebuffer.
+ */
+export interface MirrorSource {
+  get(pid: number): {
+    readonly w: number;
+    readonly h: number;
+    readonly stride: number;
+    readonly hostBuffer: Uint8ClampedArray | null;
+  } | undefined;
+  onChange(fn: (pid: number, ev: "bind" | "unbind") => void): () => void;
+  onWrite(fn: (pid: number, offset: number, bytes: Uint8Array) => void): () => void;
+}
+
 type LocalMirrorMessage =
   | { readonly kind: "hello" }
   | {
@@ -45,7 +63,16 @@ type LocalMirrorMessage =
       readonly pid: number;
       readonly offset: number;
       readonly pixels: Uint8Array;
-    };
+    }
+  /**
+   * The publisher stopped sending this screen.
+   *
+   * Either the process gave `/dev/fb0` up, or the person holding the machine
+   * turned to its other surface or gave the machine away. A machine publishes
+   * the one surface its holder is presenting, and a watcher cannot read that
+   * from the pixels stopping: a still screen sends no writes either.
+   */
+  | { readonly kind: "unbind"; readonly pid: number };
 
 export class LocalFramebufferMirror {
   readonly #channel: MessageChannelLike;
@@ -62,7 +89,7 @@ export class LocalFramebufferMirror {
    * the binding (re)appears, and again for every watcher that says hello;
    * forwards each pixel write as it lands. Returns a stop function.
    */
-  publish(registry: FramebufferRegistry, pid: number): () => void {
+  publish(registry: MirrorSource, pid: number): () => void {
     const announce = () => {
       const binding = registry.get(pid);
       if (!binding) return;
@@ -84,7 +111,9 @@ export class LocalFramebufferMirror {
       });
     };
     const stopChange = registry.onChange((boundPid, event) => {
-      if (boundPid === pid && event === "bind") announce();
+      if (boundPid !== pid) return;
+      if (event === "bind") announce();
+      else this.#post({ kind: "unbind", pid });
     });
     const congestion = channelCongestion(this.#channel);
     let starved = false;
@@ -115,6 +144,7 @@ export class LocalFramebufferMirror {
       stopWrite();
       stopDrain?.();
       this.#channel.removeEventListener("message", listener);
+      this.#post({ kind: "unbind", pid });
     };
   }
 
@@ -158,6 +188,10 @@ export class LocalFramebufferMirror {
       }
       if (message.kind === "write") {
         registry.fbWrite(message.pid, message.offset, message.pixels);
+        return;
+      }
+      if (message.kind === "unbind") {
+        registry.unbind(message.pid);
       }
     };
     this.#channel.addEventListener("message", listener);

@@ -1,10 +1,11 @@
-import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { ABI_VERSION } from "../src/generated/abi";
 import { runCentralizedProgram } from "./centralized-test-helper";
+import { buildAbiStampedFixture } from "./fixtures/abi-stamped-wat";
 
 const testDir = dirname(fileURLToPath(import.meta.url));
 const fixtureSource = resolve(
@@ -15,10 +16,6 @@ const referencePayloadFixtureSource = resolve(
   testDir,
   "fixtures/reference-catch-payload-fresh-worker.wat",
 );
-const instrumenter = resolve(
-  testDir,
-  "../../tools/bin/wasm-fork-instrument",
-);
 
 describe("CatchRef fresh process worker replay", () => {
   let workDir = "";
@@ -27,37 +24,18 @@ describe("CatchRef fresh process worker replay", () => {
 
   beforeAll(() => {
     workDir = mkdtempSync(join(tmpdir(), "kandelo-catch-ref-worker-"));
-    const rawPath = join(workDir, "catch-ref-fresh-worker.raw.wasm");
-    programPath = join(workDir, "catch-ref-fresh-worker.wasm");
-    execFileSync("wat2wasm", [
-      "--enable-exceptions",
-      "--enable-threads",
+    programPath = buildAbiStampedFixture(
       fixtureSource,
-      "-o",
-      rawPath,
-    ]);
-    execFileSync(instrumenter, [rawPath, "-o", programPath]);
-
-    const referencePayloadRawPath = join(
       workDir,
-      "reference-catch-payload-fresh-worker.raw.wasm",
+      "catch-ref-fresh-worker",
+      ABI_VERSION,
     );
-    referencePayloadProgramPath = join(
-      workDir,
-      "reference-catch-payload-fresh-worker.wasm",
-    );
-    execFileSync("wat2wasm", [
-      "--enable-exceptions",
-      "--enable-threads",
+    referencePayloadProgramPath = buildAbiStampedFixture(
       referencePayloadFixtureSource,
-      "-o",
-      referencePayloadRawPath,
-    ]);
-    execFileSync(instrumenter, [
-      referencePayloadRawPath,
-      "-o",
-      referencePayloadProgramPath,
-    ]);
+      workDir,
+      "reference-catch-payload-fresh-worker",
+      ABI_VERSION,
+    );
   });
 
   afterAll(() => {

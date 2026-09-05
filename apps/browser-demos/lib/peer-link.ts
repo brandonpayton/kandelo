@@ -12,12 +12,12 @@
  * with an automatic exchange of the same two strings; nothing else here
  * changes.
  *
- * The link opens three labeled, ordered, reliable data channels — one for
- * the checkpoint handover protocol, one for the framebuffer mirror, one for
- * the terminal mirror — and wraps each in a `ChunkedMessageChannel`, so the
- * transports speak to a remote computer exactly as they speak to a
- * same-origin tab. Each label equals the BroadcastChannel name its transport
- * uses on one origin.
+ * The link opens four labeled, ordered, reliable data channels — one for the
+ * checkpoint handover protocol, one for the framebuffer mirror, one for the
+ * terminal mirror, one for the replication decision log — and wraps each in a
+ * `ChunkedMessageChannel`, so the transports speak to a remote computer
+ * exactly as they speak to a same-origin tab. Each label equals the
+ * BroadcastChannel name its transport uses on one origin.
  *
  * STUN only: with no TURN relay configured, two peers whose NATs refuse a
  * direct route cannot connect, and the failure is reported as that boundary
@@ -28,6 +28,7 @@ import { ChunkedMessageChannel } from "@host/migration/channel-chunked";
 const HANDOVER_LABEL = "kandelo-checkpoint-handover";
 const MIRROR_LABEL = "kandelo-framebuffer-mirror";
 const TERMINAL_LABEL = "kandelo-terminal-mirror";
+const REPLICATION_LABEL = "kandelo-replication-log";
 const CODE_PREFIX = "kandelo1:";
 const ICE_SERVERS = [
   { urls: "stun:stun.l.google.com:19302" },
@@ -40,7 +41,9 @@ const GATHERING_WAIT_MS = 3000;
  * Every queued byte is delay the watching computer sees, and a mirror frame
  * is droppable: the publisher would rather skip to the current frame than
  * deliver an old one. The handover keeps the deep default instead, because a
- * checkpoint is one message that wants the wire kept busy end to end.
+ * checkpoint is one message that wants the wire kept busy end to end. So does
+ * the replication log: a skipped decision is a replica that stopped being the
+ * same machine, so that traffic may be delayed but never dropped.
  */
 const MIRROR_HIGH_WATER_BYTES = 128 * 1024;
 const MIRROR_LOW_WATER_BYTES = 32 * 1024;
@@ -49,6 +52,7 @@ export interface PeerLink {
   readonly handover: ChunkedMessageChannel;
   readonly mirror: ChunkedMessageChannel;
   readonly terminal: ChunkedMessageChannel;
+  readonly replication: ChunkedMessageChannel;
   onClose(listener: () => void): () => void;
   close(): void;
 }
@@ -126,6 +130,7 @@ function buildLink(
   handoverChannel: RTCDataChannel,
   mirrorChannel: RTCDataChannel,
   terminalChannel: RTCDataChannel,
+  replicationChannel: RTCDataChannel,
 ): PeerLink {
   const closeListeners = new Set<() => void>();
   let closed = false;
@@ -149,10 +154,12 @@ function buildLink(
     lowWaterBytes: MIRROR_LOW_WATER_BYTES,
   });
   const terminal = new ChunkedMessageChannel(terminalChannel);
+  const replication = new ChunkedMessageChannel(replicationChannel);
   return {
     handover,
     mirror,
     terminal,
+    replication,
     onClose: (listener) => {
       closeListeners.add(listener);
       return () => closeListeners.delete(listener);
@@ -161,6 +168,7 @@ function buildLink(
       handover.close();
       mirror.close();
       terminal.close();
+      replication.close();
       connection.close();
       fireClose();
     },
@@ -172,6 +180,7 @@ export async function createPeerInvite(): Promise<PeerInvite> {
   const handoverChannel = connection.createDataChannel(HANDOVER_LABEL);
   const mirrorChannel = connection.createDataChannel(MIRROR_LABEL);
   const terminalChannel = connection.createDataChannel(TERMINAL_LABEL);
+  const replicationChannel = connection.createDataChannel(REPLICATION_LABEL);
   await connection.setLocalDescription(await connection.createOffer());
   await gatheringSettled(connection);
   return {
@@ -182,12 +191,14 @@ export async function createPeerInvite(): Promise<PeerInvite> {
         channelOpen(connection, handoverChannel),
         channelOpen(connection, mirrorChannel),
         channelOpen(connection, terminalChannel),
+        channelOpen(connection, replicationChannel),
       ]);
       return buildLink(
         connection,
         handoverChannel,
         mirrorChannel,
         terminalChannel,
+        replicationChannel,
       );
     },
     cancel: () => connection.close(),
@@ -213,21 +224,25 @@ export async function answerPeerInvite(
   await connection.setLocalDescription(await connection.createAnswer());
   await gatheringSettled(connection);
   const connected = (async () => {
-    const [handoverChannel, mirrorChannel, terminalChannel] = await Promise.all([
-      arrived(HANDOVER_LABEL),
-      arrived(MIRROR_LABEL),
-      arrived(TERMINAL_LABEL),
-    ]);
+    const [handoverChannel, mirrorChannel, terminalChannel, replicationChannel] =
+      await Promise.all([
+        arrived(HANDOVER_LABEL),
+        arrived(MIRROR_LABEL),
+        arrived(TERMINAL_LABEL),
+        arrived(REPLICATION_LABEL),
+      ]);
     await Promise.all([
       channelOpen(connection, handoverChannel),
       channelOpen(connection, mirrorChannel),
       channelOpen(connection, terminalChannel),
+      channelOpen(connection, replicationChannel),
     ]);
     return buildLink(
       connection,
       handoverChannel,
       mirrorChannel,
       terminalChannel,
+      replicationChannel,
     );
   })();
   return { answer: encodeSignal(connection.localDescription!), connected };

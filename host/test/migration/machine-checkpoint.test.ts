@@ -125,6 +125,19 @@ describe("machine checkpoint of a running guest", () => {
         const { summary } = response;
         expect(summary.kernelMemoryBytes).toBeGreaterThan(0);
         expect(summary.filesystemBytes).toBeGreaterThan(0);
+        // A caller that asks for the summary holds no bytes, so the mounts the
+        // freeze could not read have to reach it here or not at all.
+        expect(summary.filesystems.map((m) => m.mountPoint)).toEqual(["/"]);
+        expect(summary.unreadableFilesystems.map((g) => g.mountPoint))
+          .toEqual([
+            "/tmp",
+            "/var/tmp",
+            "/var/log",
+            "/var/run",
+            "/home/maker",
+            "/root",
+            "/srv",
+          ]);
         const captured = summary.processes.find((p) => p.pid === pid);
         expect(captured).toBeDefined();
         expect(captured!.memoryBytes).toBeGreaterThan(0);
@@ -179,10 +192,38 @@ describe("machine checkpoint of a running guest", () => {
         expect(response.status).toBe("captured");
         if (response.status !== "captured") return;
         const { checkpoint } = response;
-        expect(checkpoint.format).toBe(2);
+        expect(checkpoint.format).toBe(4);
         expect(checkpoint.kernelAbiVersion).toBe(ABI_VERSION);
         expect(checkpoint.kernelMemory.byteLength).toBeGreaterThan(0);
-        expect(checkpoint.filesystem.byteLength).toBeGreaterThan(0);
+        // `/` alone, because `resolveForNodeKernelSession` gives every scratch
+        // mount in DEFAULT_MOUNT_SPEC a HostFileSystem with no
+        // SharedArrayBuffer for the freeze to read. A Node machine moves
+        // without its working directories. The set is asserted exactly so that
+        // giving Node memory-backed scratch mounts fails here rather than
+        // silently changing what a handover moves.
+        const mountPoints = checkpoint.filesystems.map((m) => m.mountPoint);
+        expect(mountPoints).toEqual(["/"]);
+        for (const mount of checkpoint.filesystems) {
+          expect(mount.bytes.byteLength).toBeGreaterThan(0);
+        }
+        // Every mount that stayed behind is named. A checkpoint that dropped
+        // them from both lists would let a restore present this machine as
+        // whole when seven of its eight filesystems did not travel.
+        expect(checkpoint.unreadableFilesystems.map((g) => g.mountPoint))
+          .toEqual([
+            "/tmp",
+            "/var/tmp",
+            "/var/log",
+            "/var/run",
+            "/home/maker",
+            "/root",
+            "/srv",
+          ]);
+        for (const gap of checkpoint.unreadableFilesystems) {
+          expect(gap.reason).toBe(
+            "a host directory backs this mount and owns no shared buffer",
+          );
+        }
         const bucket = checkpoint.processes.find((p) => p.pid === pid);
         expect(bucket).toBeDefined();
         expect(bucket!.memory.byteLength).toBeGreaterThan(0);
@@ -312,7 +353,7 @@ describe("machine checkpoint of a running guest", () => {
   );
 
   it(
-    "fails rather than hangs when a thread cannot adopt a newer archive",
+    "adopts a newer archive on a thread whose replica is behind",
     { timeout: 60_000 },
     async () => {
       const sideModule = buildSideModule();
@@ -327,17 +368,27 @@ describe("machine checkpoint of a running guest", () => {
         const elapsed = Date.now() - started;
 
         // The pthread's replica is one generation behind, so it must take the
-        // archive writer, which the parked main thread's reader holds shut.
-        expect(response.status).toBe("failed");
-        if (response.status !== "failed") return;
-        expect(response.reason).toContain(
-          "the dynamic-loader archive writer stayed held",
-        );
-        // The refusal is what ended the freeze, not the 10 s unwind deadline.
+        // archive writer. That writer used to be held shut by the main
+        // thread's reader: the main thread reached the freeze first and parked
+        // in `nanosleep` still holding it, so the pthread ran out its bounded
+        // wait and the capture refused itself with "the dynamic-loader archive
+        // writer stayed held".
+        //
+        // Arming the freeze now interrupts a parked wait rather than waiting
+        // for the parked thread to reach a syscall completion, so the reader
+        // is given back and the deadlock never forms.
+        expect(response.status).toBe("captured");
+        // Ending promptly is the point: the capture resolves the contention
+        // rather than sitting on it until the 10 s unwind deadline.
         expect(elapsed).toBeLessThan(TIMEOUTS.unwindTimeoutMs);
 
         // The machine is whole: the freeze reversed and the guest still runs.
         expect(await host.signalProcess(pid, 0)).toBe(true);
+        // The archive the pthread adopted is stable, not a one-shot that left
+        // the loader state torn: the machine can be read a second time.
+        expect((await host.captureCheckpoint(TIMEOUTS)).status).toBe(
+          "captured",
+        );
       } finally {
         await host.destroy();
       }
@@ -345,13 +396,14 @@ describe("machine checkpoint of a running guest", () => {
   );
 
   it(
-    "fails rather than hangs when the main thread cannot adopt a newer archive",
+    "adopts a newer archive on the main thread when its replica is behind",
     { timeout: 60_000 },
     async () => {
       // The fixture's "thread" mode makes the pthread load the side module,
       // so the thread whose replica is behind — and whose bounded writer wait
-      // refuses the capture — is the main thread. This drives the process
-      // kernel_checkpoint site the way the test above drives the pthread one.
+      // used to refuse the capture — is the main thread. This drives the
+      // process kernel_checkpoint site the way the test above drives the
+      // pthread one.
       const sideModule = buildSideModule();
       const { host, pid } = await startReadyGuest("checkpoint-dlopen.wasm", {
         args: [SIDE_MODULE_GUEST_PATH, "thread"],
@@ -363,16 +415,18 @@ describe("machine checkpoint of a running guest", () => {
         const response = await host.captureCheckpoint(TIMEOUTS);
         const elapsed = Date.now() - started;
 
-        expect(response.status).toBe("failed");
-        if (response.status !== "failed") return;
-        expect(response.reason).toContain(
-          "the dynamic-loader archive writer stayed held",
-        );
-        // The refusal is what ended the freeze, not the 10 s unwind deadline.
+        expect(response.status).toBe("captured");
+        // Ending promptly is the point: the capture resolves the contention
+        // rather than sitting on it until the 10 s unwind deadline.
         expect(elapsed).toBeLessThan(TIMEOUTS.unwindTimeoutMs);
 
         // The machine is whole: the freeze reversed and the guest still runs.
         expect(await host.signalProcess(pid, 0)).toBe(true);
+        // The archive the main thread adopted is stable, not a one-shot that
+        // left the loader state torn: the machine can be read a second time.
+        expect((await host.captureCheckpoint(TIMEOUTS)).status).toBe(
+          "captured",
+        );
       } finally {
         await host.destroy();
       }
@@ -421,7 +475,7 @@ describe("machine checkpoint of a running guest", () => {
   );
 
   it(
-    "times out on a process parked in a syscall the kernel has not completed",
+    "captures a process parked in a syscall the kernel has not completed",
     { timeout: 60_000 },
     async () => {
       const exited = new Set<number>();
@@ -447,8 +501,15 @@ describe("machine checkpoint of a running guest", () => {
           vforkTimeoutMs: 5_000,
         });
 
-        expect(response.status).toBe("timed-out");
-        // A timeout reverses the freeze rather than poisoning the machine.
+        // `block-forever` parks in a syscall the kernel never completes, so it
+        // reaches no completion of its own to read an unwind request on.
+        // Arming the freeze interrupts that parked wait with EINTR and asks
+        // the glue to resubmit it, which is what lets the capture finish
+        // instead of running out the unwind deadline. Every realistic machine
+        // has such a process — the login shell in `wait4` is one.
+        expect(response.status).toBe("captured");
+        // The interruption is a freeze mechanism, not a kill: the process is
+        // resumed into the same wait it was taken out of.
         expect(exited.has(pid)).toBe(false);
         expect(await host.signalProcess(pid, 0)).toBe(true);
       } finally {
@@ -458,7 +519,7 @@ describe("machine checkpoint of a running guest", () => {
   );
 
   it(
-    "keeps forking, exec and pthreads working after a checkpoint times out",
+    "keeps forking, exec and pthreads working after a parked process is read",
     { timeout: 60_000 },
     async () => {
       const host = new NodeKernelHost({ rootfsImage: "default" });
@@ -477,7 +538,7 @@ describe("machine checkpoint of a running guest", () => {
             unwindTimeoutMs: 1_000,
             vforkTimeoutMs: 5_000,
           })).status,
-        ).toBe("timed-out");
+        ).toBe("captured");
 
         // Every leg of the freeze has to have been given back. Worker creation
         // is the one whose original close had no reopen path, and a pthread

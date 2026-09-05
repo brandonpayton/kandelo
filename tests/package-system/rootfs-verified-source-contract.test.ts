@@ -18,7 +18,7 @@ const verifiedArchivePackages = [
   ["gawk", "GAWK_VERSION", "auto"],
   ["grep", "GREP_VERSION", "auto"],
   ["sed", "SED_VERSION", "auto"],
-  ["bc", "BC_VERSION", "disabled"],
+  ["bc", "BC_VERSION", "auto"],
   ["file", "FILE_VERSION", "auto"],
   ["m4", "M4_VERSION", "auto"],
   ["make", "MAKE_VERSION", "auto"],

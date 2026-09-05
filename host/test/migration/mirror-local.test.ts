@@ -59,6 +59,26 @@ describe("local framebuffer mirror", () => {
     }
   });
 
+  it("unbinds a watcher when the process gives /dev/fb0 up", async () => {
+    const channel = `mirror-test-${crypto.randomUUID()}`;
+    const publisher = new LocalFramebufferMirror(channel);
+    const watcher = new LocalFramebufferMirror(channel);
+    const source = publishedRegistry([1, 2, 3, 4, 5, 6, 7, 8]);
+    const stopPublish = publisher.publish(source, 7);
+    const sink = new FramebufferRegistry();
+    const stopWatch = watcher.watch(sink);
+    try {
+      await vi.waitFor(() => expect(sink.get(7)).toBeDefined());
+      source.unbind(7);
+      await vi.waitFor(() => expect(sink.get(7)).toBeUndefined());
+    } finally {
+      stopPublish();
+      stopWatch();
+      publisher.close();
+      watcher.close();
+    }
+  });
+
   it("re-announces onto a watcher without rebinding it", async () => {
     // A congested publisher re-announces on every drain. Rebinding on each
     // one installs a fresh zeroed buffer and makes renderers re-attach onto
@@ -119,7 +139,7 @@ describe("local framebuffer mirror", () => {
     }
   });
 
-  it("stops forwarding once the publisher stops", async () => {
+  it("ends the screen it was showing once the publisher stops", async () => {
     const channel = `mirror-test-${crypto.randomUUID()}`;
     const publisher = new LocalFramebufferMirror(channel);
     const watcher = new LocalFramebufferMirror(channel);
@@ -139,7 +159,12 @@ describe("local framebuffer mirror", () => {
         // a second watcher joining now proves the silence isn't a race.
         await new Promise((resolve) => setTimeout(resolve, 100));
         expect(sinkB.get(7)).toBeUndefined();
-        expect([...sink.get(7)!.hostBuffer!]).toEqual([1, 1, 1, 1, 1, 1, 1, 1]);
+        // And the watcher that was already there is told the screen ended,
+        // rather than left holding the last frame as if it were live. The
+        // publisher stops when the person holding the machine turns to its
+        // terminal or gives the machine away, and pixels stopping cannot say
+        // that on their own: a still screen sends no writes either.
+        expect(sink.get(7)).toBeUndefined();
       } finally {
         stopWatchB();
         watcherB.close();

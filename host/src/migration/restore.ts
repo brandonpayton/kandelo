@@ -26,8 +26,36 @@ import {
  */
 export class CheckpointRefusedError extends Error {}
 
+/** Cap on a mount refusal's text, which a restore prints unaltered. */
+const MAX_GAP_REASON_LENGTH = 200;
+
 function refuse(reason: string): never {
   throw new CheckpointRefusedError(`checkpoint refused: ${reason}`);
+}
+
+/**
+ * What a restore must say about the filesystems it did not get.
+ *
+ * A gap does not refuse the checkpoint: a machine short `/tmp` is still worth
+ * moving. It does have to be said out loud, because a restore that reports
+ * nothing presents the machine as whole. `null` means every mount arrived.
+ *
+ * `dropped` names mounts the checkpoint carried that this host cannot accept,
+ * which is the same gap seen from the other side: the sender read the bytes
+ * and this receiver has nowhere memory-backed to put them.
+ */
+export function describeCheckpointMountGaps(
+  checkpoint: MachineCheckpoint,
+  dropped: readonly string[] = [],
+): string | null {
+  const parts = checkpoint.unreadableFilesystems.map(
+    (gap) => `${gap.mountPoint} (${gap.reason})`,
+  );
+  for (const mountPoint of dropped) {
+    parts.push(`${mountPoint} (this host has no memory-backed mount there)`);
+  }
+  if (parts.length === 0) return null;
+  return `this machine was restored without ${parts.join(", ")}`;
 }
 
 /**
@@ -63,8 +91,51 @@ export async function validateMachineCheckpoint(
       + `not a whole number of pages`,
     );
   }
-  if (checkpoint.filesystem.byteLength === 0) {
-    refuse("the filesystem buffer is empty");
+  // A machine always has a root. Every other mount is optional, but a repeated
+  // or relative mount point would leave the restore choosing which bytes win.
+  const rootMount = checkpoint.filesystems.find(
+    (mount) => mount.mountPoint === "/",
+  );
+  if (rootMount === undefined) {
+    refuse("no / mount was captured");
+  } else if (rootMount.bytes.byteLength === 0) {
+    refuse("the / mount is empty");
+  }
+  const seenMountPoints = new Set<string>();
+  for (const mount of checkpoint.filesystems) {
+    if (!mount.mountPoint.startsWith("/")) {
+      refuse(`mount point ${JSON.stringify(mount.mountPoint)} is not absolute`);
+    }
+    if (seenMountPoints.has(mount.mountPoint)) {
+      refuse(`mount point ${JSON.stringify(mount.mountPoint)} appears twice`);
+    }
+    seenMountPoints.add(mount.mountPoint);
+  }
+  if (!Array.isArray(checkpoint.unreadableFilesystems)) {
+    refuse("the checkpoint carries no unreadable-mount list");
+  }
+  for (const gap of checkpoint.unreadableFilesystems) {
+    if (!gap.mountPoint.startsWith("/")) {
+      refuse(
+        `unreadable mount point ${JSON.stringify(gap.mountPoint)} `
+        + "is not absolute",
+      );
+    }
+    if (seenMountPoints.has(gap.mountPoint)) {
+      refuse(
+        `mount point ${JSON.stringify(gap.mountPoint)} is both carried and `
+        + "unreadable",
+      );
+    }
+    seenMountPoints.add(gap.mountPoint);
+    // The reason is text a restore prints. A checkpoint arrives from a peer,
+    // so cap it rather than relay an unbounded string into a diagnostic.
+    if (gap.reason.length === 0 || gap.reason.length > MAX_GAP_REASON_LENGTH) {
+      refuse(
+        `the reason for unreadable mount ${JSON.stringify(gap.mountPoint)} `
+        + `is ${gap.reason.length} characters`,
+      );
+    }
   }
   if (
     !Number.isSafeInteger(checkpoint.monotonicNs)

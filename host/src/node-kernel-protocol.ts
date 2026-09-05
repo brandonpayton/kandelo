@@ -21,6 +21,7 @@ import type {
 import type { MountSpec } from "./vfs/default-mounts";
 import type { NodeSessionSeedTree } from "./vfs/default-mounts-node";
 import type { MachineCheckpoint } from "./migration/checkpoint";
+import type { ReplicationLogEntry } from "./replication/log";
 
 export type { HttpRequest, HttpResponse };
 export type { HostDiagnostic } from "./host-diagnostic";
@@ -332,6 +333,57 @@ export interface DrainSyscallTraceMessage {
   requestId: number;
 }
 
+/**
+ * Start recording the machine's decision log.
+ *
+ * Only the guest clock is recorded today, because it is the only pulled
+ * decision routed through the log. A machine that also reads randomness or
+ * external bytes produces a log that is complete for its clock and silent
+ * about the rest, so a replay of such a machine will diverge rather than
+ * mislead. See `host/src/replication/log.ts`.
+ */
+export interface ReplicationRecordStartMessage {
+  type: "replication_record_start";
+  requestId: number;
+}
+
+/** Stop recording and take the log. Response carries ReplicationLogEntry[]. */
+export interface ReplicationRecordStopMessage {
+  type: "replication_record_stop";
+  requestId: number;
+}
+
+/**
+ * Serve the guest clock from `entries` instead of from this host's clock.
+ *
+ * Sent after `init` and before the replayed guest runs. A restore has already
+ * happened by then, so one message covers both a fresh machine and a replica
+ * that adopted a checkpoint.
+ */
+export interface ReplicationReplayStartMessage {
+  type: "replication_replay_start";
+  requestId: number;
+  entries: readonly ReplicationLogEntry[];
+}
+
+/**
+ * Stop replaying and report how far the replica got.
+ *
+ * The response is `{ consumed, total }`. Two replicas that consumed different
+ * amounts of one log ran different machines, which is the divergence this
+ * measures.
+ */
+export interface ReplicationReplayStopMessage {
+  type: "replication_replay_stop";
+  requestId: number;
+}
+
+/** What a replica took from the log it was replaying. */
+export interface ReplicationReplayProgress {
+  readonly consumed: number;
+  readonly total: number;
+}
+
 /** Send an HTTP request to a server running in the kernel and wait for the
  *  response. Reply arrives as a `response` message whose `result` is an
  *  {@link HttpResponse}, or with `error` set if no listener was found. */
@@ -397,6 +449,10 @@ export type MainToKernelMessage =
   | CaptureCheckpointRequestMessage
   | SetSyscallTraceMessage
   | DrainSyscallTraceMessage
+  | ReplicationRecordStartMessage
+  | ReplicationRecordStopMessage
+  | ReplicationReplayStartMessage
+  | ReplicationReplayStopMessage
   | HttpRequestMessage
   | KmsAttachCanvasMessage
   | KmsAttachStatsMessage;

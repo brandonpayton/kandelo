@@ -69,6 +69,19 @@ export interface KernelProcessSnapshot {
 export interface FramebufferRegistryLike {
   list(): Array<{ pid: number }>;
   onChange(fn: (pid: number, ev: "bind" | "unbind") => void): () => void;
+  /**
+   * The binding for `pid`, or undefined when nothing is bound. `hostBuffer`
+   * holds the pixels of a write-based binding and is null for an mmap-based
+   * one, whose pixels live in the process's own memory instead.
+   */
+  get(pid: number): {
+    readonly w: number;
+    readonly h: number;
+    readonly stride: number;
+    readonly hostBuffer: Uint8ClampedArray | null;
+  } | undefined;
+  /** Subscribe to the pixel writes of every write-based binding. */
+  onWrite(fn: (pid: number, offset: number, bytes: Uint8Array) => void): () => void;
 }
 
 /**
@@ -148,6 +161,19 @@ export interface KernelLike {
    * round-trip (unlike the deprecated synchronous {@link fs}).
    */
   writeFileToVfs?(path: string, bytes: Uint8Array, mode?: number): Promise<void>;
+  /**
+   * Freeze this machine, read it whole, and resume it. The machine keeps
+   * running: every buffer in the result is a copy the freeze took, which is
+   * what a restore on another computer consumes. Mirrors
+   * `host/src/migration/checkpoint.ts: CheckpointFreezeResult`.
+   */
+  captureCheckpointBytes?(options: {
+    unwindTimeoutMs: number;
+    vforkTimeoutMs: number;
+  }): Promise<
+    | { readonly status: "captured"; readonly checkpoint: MachineCheckpointLike }
+    | { readonly status: "timed-out" | "failed"; readonly reason: string }
+  >;
   /**
    * Append bytes to a process's stdin buffer. Used by the framebuffer
    * input path so DOM key events on the canvas reach the fb-bound
@@ -322,6 +348,59 @@ export interface Capabilities {
   signedSources?: string[];         // required signature roots
 }
 
+// ── Machine handover ───────────────────────────────────────────────────────
+
+/**
+ * A frozen machine, as the wrapped kernel produced it.
+ *
+ * The session layer never reads inside one. It carries the value from the
+ * capture that made it to the restore that consumes it, and the host runtime
+ * owns its schema (`host/src/migration/checkpoint.ts: MachineCheckpoint`).
+ * Only the pid list is named here, because the UI reports which processes
+ * moved and nothing else.
+ */
+export interface MachineCheckpointLike {
+  readonly processes: ReadonlyArray<{ readonly pid: number }>;
+}
+
+/**
+ * One terminal, as it moves with the machine that draws it.
+ *
+ * A terminal is machine state, not a view of one. The checkpoint restores the
+ * process on the far end of the PTY, but which process that is, how large its
+ * window was, and what it had already printed are all held by the computer
+ * that was showing it. A handover carrying only the checkpoint lands on a
+ * computer that knows a shell exists somewhere but not where, so it starts a
+ * second one on the same PTY — two processes reading one keyboard, each
+ * taking characters the other was meant to get — and draws that new shell's
+ * banner over a screen the person was in the middle of reading.
+ */
+export interface CapturedTerminal {
+  /** The key the session was attached under, such as `/dev/pts/0`. */
+  readonly path: string;
+  /** The process on the far end. A restore preserves pids, so this finds it. */
+  readonly pid: number;
+  readonly cols: number;
+  readonly rows: number;
+  /** What the terminal had printed, capped to a screen's worth and more. */
+  readonly screen: Uint8Array;
+}
+
+/**
+ * One machine, ready to move to another computer: the frozen processes, the
+ * descriptor naming the image they run on, and the terminals they are talking
+ * to.
+ *
+ * All three travel because a taker may hold nothing at all. A computer that
+ * received only the checkpoint would have no image to restore it into, and no
+ * way to reach the restored processes through a terminal.
+ */
+export interface CapturedMachine {
+  readonly checkpoint: MachineCheckpointLike;
+  readonly boot: BootDescriptor;
+  readonly terminals: readonly CapturedTerminal[];
+}
+
 // ── Streaming primitives ───────────────────────────────────────────────────
 
 export type DmesgLevel = "info" | "warn" | "err" | "ok" | "debug";
@@ -334,14 +413,15 @@ export interface DmesgLine {
 }
 
 /**
- * A second reader and writer for a terminal somebody else is driving.
+ * A second reader for a terminal somebody else is driving.
  *
- * It carries no geometry authority: the emulator that attached the session
- * owns `cols`/`rows`, and a sharer reads them to size its own view. Anything
- * that could change the session belongs on {@link PtyHandle}.
+ * It carries no authority over the session at all. The emulator that attached
+ * it owns `cols`/`rows`, and a sharer reads them to size its own view. Nor can
+ * a sharer type: the computer holding the machine keeps the keyboard, so
+ * everything that could change the session — `write` included — belongs on
+ * {@link PtyHandle}.
  */
 export interface SharedPtyHandle {
-  write(bytes: string | Uint8Array): void;
   onData(cb: (bytes: Uint8Array) => void): () => void;
   size(): { cols: number; rows: number };
   /** Detach this handle and its listeners without removing the logical PTY. */
@@ -349,6 +429,7 @@ export interface SharedPtyHandle {
 }
 
 export interface PtyHandle extends SharedPtyHandle {
+  write(bytes: string | Uint8Array): void;
   resize(cols: number, rows: number): void;
 }
 
@@ -400,6 +481,25 @@ export interface FramebufferHandle {
   /** Subscribe to bound-pid changes. Fires with the new pid or null on unbind. */
   onBoundPidChange(cb: (pid: number | null) => void): () => void;
   /** Detach the canvas and stop forwarding events. */
+  close(): void;
+}
+
+/**
+ * A second reader for the framebuffer somebody else is driving.
+ *
+ * It paints nothing and claims no input: the pane that attached the canvas
+ * keeps both, and a sharer only reads which process owns `/dev/fb0` and the
+ * pixels that process produces. Watching a machine therefore cannot move it.
+ * Anything that could change the binding belongs on {@link FramebufferHandle}.
+ */
+export interface SharedFramebufferHandle {
+  /** The live binding registry a framebuffer mirror publishes from. */
+  readonly registry: FramebufferRegistryLike;
+  /** Pid currently bound to /dev/fb0, or null if no binding is live. */
+  getBoundPid(): number | null;
+  /** Subscribe to bound-pid changes. Fires with the new pid or null on unbind. */
+  onBoundPidChange(cb: (pid: number | null) => void): () => void;
+  /** Detach this handle and its listeners without disturbing the binding. */
   close(): void;
 }
 
@@ -636,6 +736,54 @@ export interface KernelHost {
   halt(): Promise<void>;
   reboot(): Promise<void>;
 
+  // machine handover — one machine moves between computers, whole and running.
+  // A mirror only shows a machine; these three methods move one.
+  /**
+   * Freeze this machine and read it whole, for another computer to restore.
+   * Null when there is no machine here, or when the wrapped kernel cannot
+   * capture one. Rejects when a capture was attempted and failed.
+   *
+   * The machine keeps running: a capture that is never delivered must leave it
+   * exactly where it was.
+   */
+  captureMachine(): Promise<CapturedMachine | null>;
+  /**
+   * Give this machine up because it now runs on another computer. Ends at
+   * `idle`, not `halted`: nothing was shut down.
+   */
+  releaseMachine(): Promise<void>;
+  /**
+   * Boot `desc` and restore `checkpoint` into it, so a machine another
+   * computer froze carries on running here.
+   *
+   * `terminals` are the sessions that machine had open. The first emulator to
+   * attach to one adopts the restored process instead of starting a second on
+   * the same PTY, and redraws the screen the other computer was showing.
+   * Everything here is another computer's input and is checked before use.
+   */
+  adoptMachine(
+    desc: BootDescriptor,
+    checkpoint: MachineCheckpointLike,
+    terminals?: readonly CapturedTerminal[],
+  ): Promise<void>;
+  /**
+   * Load what booting `desc` would need, without booting it.
+   *
+   * Moving a machine is the cheap half of a handover. The expensive half is
+   * that a viewer holds no image of its own, so the keeper's has to be fetched
+   * and assembled before the checkpoint has anywhere to go — and the person
+   * who gave the machine away watches a page with nothing on it for exactly
+   * that long. A viewer told early which image its peer runs can have it ready
+   * before anyone presses anything.
+   *
+   * Starts no machine and changes no status: a computer that prewarms an image
+   * is still a computer holding no machine, and must not look like one that
+   * does. Resolves when there is nothing more to prepare, and rejects if the
+   * image cannot be loaded — a caller prewarming speculatively should ignore
+   * that rather than report it, because nothing has been asked for yet.
+   */
+  prewarmBootDescriptor(desc: BootDescriptor): Promise<void>;
+
   // dmesg ring
   subscribeDmesg(cb: (line: DmesgLine) => void): () => void;
   dmesgHistory(): DmesgLine[];
@@ -706,6 +854,11 @@ export interface KernelHost {
   // process. PCM output is machine-level; startAudio remains as a deprecated
   // compatibility adapter.
   attachFramebuffer(canvas: HTMLCanvasElement): FramebufferHandle;
+  /**
+   * Join the framebuffer a pane is already painting, to share it with a peer.
+   * Null when the wrapped kernel exposes no binding registry.
+   */
+  shareFramebuffer(): SharedFramebufferHandle | null;
 
   // KMS display — registers a canvas as the scanout target for a
   // DRM CRTC. `opts.mode` (default "webgl2") selects how the canvas
@@ -921,10 +1074,120 @@ export interface LiveKernelHostOptions {
   descriptor?: BootDescriptor;
   /** Initial presentation intent surfaced to the UI. */
   presentation?: DemoPresentation;
-  /** Live-mode reboot hook supplied by the browser page. */
-  applyBootDescriptor?: (desc: BootDescriptor, host: LiveKernelHost) => Promise<void>;
+  /**
+   * Live-mode reboot hook supplied by the browser page.
+   *
+   * `restore` is present only when the descriptor is being booted to adopt a
+   * machine another computer froze. A page that receives one must skip the
+   * programs it would otherwise start: the checkpoint already carries them,
+   * and a second copy would fight the restored one over the same devices.
+   */
+  applyBootDescriptor?: (
+    desc: BootDescriptor,
+    host: LiveKernelHost,
+    restore?: MachineCheckpointLike,
+  ) => Promise<void>;
+  /**
+   * Load what booting a descriptor would need, without booting it.
+   *
+   * Supplied by the browser page, because the page is the layer that knows how
+   * a descriptor becomes an image. A host without one prewarms nothing, which
+   * is slower but never wrong.
+   */
+  prewarmBootDescriptor?: (desc: BootDescriptor) => Promise<void>;
   /** Preset list for galleryQuery("presets"). */
   galleryItems?: GalleryItem[];
+}
+
+/**
+ * How long a freeze waits for the machine to reach a readable state.
+ *
+ * `unwindTimeoutMs` bounds unwinding every process out of its syscall;
+ * `vforkTimeoutMs` bounds waiting for a vfork child to exec or exit, because
+ * a parent suspended inside vfork holds a stack no checkpoint can read.
+ */
+const HANDOVER_CAPTURE_TIMEOUTS = {
+  unwindTimeoutMs: 10_000,
+  vforkTimeoutMs: 5_000,
+};
+
+/**
+ * How much of a terminal's output moves with the machine.
+ *
+ * A screen is a suffix of everything a terminal printed, so a bounded tail
+ * always redraws what the person was looking at; what it drops is scrollback
+ * older than that. The number matches the replay budget the terminal mirror
+ * keeps in `host/src/migration/terminal-local.ts`, because both carry the same
+ * thing for the same reason.
+ */
+const HANDOVER_TERMINAL_BYTES = 128 * 1024;
+
+/** The last `limit` bytes of `chunks`, joined. */
+function tailBytes(chunks: readonly Uint8Array[], limit: number): Uint8Array {
+  let taken = 0;
+  let first = chunks.length;
+  while (first > 0 && taken < limit) {
+    taken += chunks[first - 1]!.byteLength;
+    first--;
+  }
+  const joined = new Uint8Array(Math.min(taken, limit));
+  let offset = 0;
+  for (let index = first; index < chunks.length; index++) {
+    const chunk = chunks[index]!;
+    // Only the first chunk can overhang the limit; the rest were counted whole.
+    const usable = chunk.subarray(Math.max(0, chunk.byteLength - (joined.byteLength - offset)));
+    joined.set(usable, offset);
+    offset += usable.byteLength;
+  }
+  return joined;
+}
+
+/**
+ * Read a peer's terminal set, or refuse it.
+ *
+ * These arrive over a link from another computer and are acted on directly:
+ * the pid decides which process a keyboard reaches, and the screen is written
+ * into an emulator unread. Anything malformed fails the take rather than
+ * becoming a terminal that misbehaves later.
+ */
+function checkedTerminals(
+  terminals: readonly CapturedTerminal[],
+): readonly CapturedTerminal[] {
+  if (!Array.isArray(terminals)) {
+    throw new Error("the peer's terminal list is not a list");
+  }
+  return terminals.map((terminal, index) => {
+    const where = `the peer's terminal ${index}`;
+    if (typeof terminal?.path !== "string" || terminal.path.length === 0) {
+      throw new Error(`${where} has no path`);
+    }
+    if (!isPositiveInteger(terminal.pid)) {
+      throw new Error(`${where} names no process`);
+    }
+    if (!isPositiveInteger(terminal.cols) || !isPositiveInteger(terminal.rows)) {
+      throw new Error(`${where} has no size`);
+    }
+    if (!(terminal.screen instanceof Uint8Array)) {
+      throw new Error(`${where} carries no screen`);
+    }
+    if (terminal.screen.byteLength > HANDOVER_TERMINAL_BYTES) {
+      throw new Error(
+        `${where} carries ${terminal.screen.byteLength} bytes of screen, `
+        + `over the ${HANDOVER_TERMINAL_BYTES} allowed`,
+      );
+    }
+    return {
+      path: terminal.path,
+      pid: terminal.pid,
+      cols: terminal.cols,
+      rows: terminal.rows,
+      screen: terminal.screen,
+    };
+  });
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
 const DEFAULT_DESCRIPTOR: BootDescriptor = {
@@ -990,6 +1253,7 @@ export class LiveKernelHost implements KernelHost {
   private presentationListeners = new ListenerSet<DemoPresentation>();
   private surfaceListeners = new ListenerSet<SurfaceAvailability>();
   private terminalSessionListeners = new ListenerSet<string[]>();
+  private ptyOwnerListeners = new ListenerSet<void>();
   private galleryListeners = new ListenerSet<void>();
   private demoGuideListeners = new ListenerSet<DemoGuideConfig | null>();
   private demoIngestListeners = new ListenerSet<DemoIngestConfig | null>();
@@ -998,6 +1262,7 @@ export class LiveKernelHost implements KernelHost {
   private _descriptor: BootDescriptor;
   private presentation: DemoPresentation;
   private applyBootDescriptorImpl?: NonNullable<LiveKernelHostOptions["applyBootDescriptor"]>;
+  private prewarmBootDescriptorImpl?: NonNullable<LiveKernelHostOptions["prewarmBootDescriptor"]>;
   private galleryItems: GalleryItem[];
   private webPreview: WebPreviewState | null = null;
   private demoGuide: DemoGuideConfig | null = null;
@@ -1021,6 +1286,21 @@ export class LiveKernelHost implements KernelHost {
    */
   private shellPids = new Map<number, string>();
   /**
+   * Terminals handed over with a machine that is arriving, before its kernel
+   * is attached.
+   *
+   * Two slots rather than one, because `attachKernel` clears every session the
+   * previous kernel owned and would clear these with them. A machine on its
+   * way in parks here; `attachKernel` moves it to {@link restoredTerminals}
+   * once that clearing is done.
+   */
+  private arrivingTerminals: readonly CapturedTerminal[] = [];
+  /**
+   * Terminals of the restored machine, keyed by path, each waiting for the
+   * first emulator to attach to it. Consumed once, by `ensurePtySession`.
+   */
+  private restoredTerminals = new Map<string, CapturedTerminal>();
+  /**
    * KMS display handles keyed by their canvas DOM node. React 18 StrictMode
    * double-invokes effects, and `transferControlToOffscreen()` may only run
    * once per canvas, so attachKmsDisplay memoizes the handle here. A WeakMap
@@ -1035,6 +1315,7 @@ export class LiveKernelHost implements KernelHost {
     this.kernel = undefined;
     this.shell = opts.shell;
     this.applyBootDescriptorImpl = opts.applyBootDescriptor;
+    this.prewarmBootDescriptorImpl = opts.prewarmBootDescriptor;
     this.galleryItems = opts.galleryItems ?? [];
     if (opts.kernel) {
       this.attachKernel(opts.kernel);
@@ -1060,6 +1341,12 @@ export class LiveKernelHost implements KernelHost {
     this.offAudioState?.();
     this.offAudioState = null;
     this.invalidatePtySessions(previousKernel);
+    // After the clearing, never before: a machine arriving with terminals is
+    // replacing the kernel whose sessions were just discarded.
+    this.restoredTerminals = new Map(
+      this.arrivingTerminals.map((terminal) => [terminal.path, terminal]),
+    );
+    this.arrivingTerminals = [];
     this.kernel = kernel;
     if (kernel.framebuffers) {
       this.offFramebufferAvailability = kernel.framebuffers.onChange(() => {
@@ -1388,8 +1675,115 @@ export class LiveKernelHost implements KernelHost {
   }
 
   async halt(): Promise<void> {
-    this.setStatus("halted");
-    this.cancelLazyDownloads("kernel halted");
+    await this.dropMachine("halted", "kernel halted");
+  }
+
+  async reboot(): Promise<void> {
+    this.invalidatePtySessions(this.kernel);
+    await this.applyBootDescriptor(this.getBootDescriptor());
+  }
+
+  // ── KernelHost: machine handover ─────────────────────────────────────────
+
+  async captureMachine(): Promise<CapturedMachine | null> {
+    const kernel = this.kernel;
+    if (!kernel?.captureCheckpointBytes) return null;
+    const result = await kernel.captureCheckpointBytes(HANDOVER_CAPTURE_TIMEOUTS);
+    if (result.status !== "captured") {
+      throw new Error(`freezing this machine ${result.status}: ${result.reason}`);
+    }
+    return {
+      checkpoint: result.checkpoint,
+      boot: this.getBootDescriptor(),
+      terminals: this.captureTerminals(),
+    };
+  }
+
+  /**
+   * Every terminal this machine is talking to, as the taker will need it.
+   *
+   * A session whose process has gone carries nothing: there is no pid on the
+   * far end to adopt, and the taker starts one of its own exactly as this
+   * computer would have.
+   */
+  private captureTerminals(): CapturedTerminal[] {
+    const captured: CapturedTerminal[] = [];
+    for (const [path, session] of this.ptySessions) {
+      if (session.closed || session.pid <= 0) continue;
+      captured.push({
+        path,
+        pid: session.pid,
+        cols: session.cols,
+        rows: session.rows,
+        screen: tailBytes(session.history, HANDOVER_TERMINAL_BYTES),
+      });
+    }
+    // A terminal that arrived with this machine and never had an emulator
+    // attached is running exactly like the rest of it: `ptySessions` lists the
+    // emulators, not the terminals. On a machine showing a screen nobody opens
+    // a terminal pane, so leaving these out drops the shell that owns the PTY
+    // on the next handover, and the computer after that has no keyboard.
+    const attached = new Set(captured.map((terminal) => terminal.path));
+    for (const [path, terminal] of this.restoredTerminals) {
+      if (attached.has(path) || terminal.pid <= 0) continue;
+      captured.push(terminal);
+    }
+    return captured;
+  }
+
+  /**
+   * Give this machine up because it now runs on another computer.
+   *
+   * Unlike {@link halt} this ends at `idle`, not `halted`: no process was shut
+   * down, they moved. A page holding no machine of its own is also the page
+   * that can watch the peer which now holds this one.
+   */
+  async releaseMachine(): Promise<void> {
+    await this.dropMachine("idle", "machine handed over");
+  }
+
+  /**
+   * Load what booting `desc` would need, without booting it.
+   *
+   * A no-op on a host the page gave no way to do it: prewarming is an
+   * optimisation, and a machine that has to load its image when it arrives is
+   * slower to arrive, never wrong when it does.
+   */
+  async prewarmBootDescriptor(desc: BootDescriptor): Promise<void> {
+    await this.prewarmBootDescriptorImpl?.(desc);
+  }
+
+  async adoptMachine(
+    desc: BootDescriptor,
+    checkpoint: MachineCheckpointLike,
+    terminals: readonly CapturedTerminal[] = [],
+  ): Promise<void> {
+    if (!this.applyBootDescriptorImpl) {
+      throw new Error(
+        "this host cannot boot a descriptor, so it cannot adopt a machine",
+      );
+    }
+    // Checked before it is parked, not when it is read: these name processes
+    // to route a keyboard to and carry bytes to write into an emulator, and
+    // they came from another computer. A malformed set must fail the take,
+    // where someone is waiting for an answer, rather than surface later as a
+    // terminal that misbehaves.
+    this.arrivingTerminals = checkedTerminals(terminals);
+    try {
+      await this.applyBootDescriptorImpl(desc, this, checkpoint);
+    } finally {
+      // `attachKernel` takes them. Anything still parked belongs to a boot
+      // that never reached one, and must not be adopted by a later machine.
+      this.arrivingTerminals = [];
+    }
+  }
+
+  private async dropMachine(
+    status: "halted" | "idle",
+    reason: string,
+  ): Promise<void> {
+    this.setStatus(status);
+    this.cancelLazyDownloads(reason);
     this.offFramebufferAvailability?.();
     this.offFramebufferAvailability = null;
     this.offLazyDownloads?.();
@@ -1403,11 +1797,6 @@ export class LiveKernelHost implements KernelHost {
     this.invalidatePtySessions(kernel);
     this.kernel = undefined;
     await kernel?.destroy?.();
-  }
-
-  async reboot(): Promise<void> {
-    this.invalidatePtySessions(this.kernel);
-    await this.applyBootDescriptor(this.getBootDescriptor());
   }
 
   // ── KernelHost: dmesg ────────────────────────────────────────────────────
@@ -1528,6 +1917,44 @@ export class LiveKernelHost implements KernelHost {
     return this.terminalSessionListeners.add(cb);
   }
 
+  /**
+   * Every pid that owns a terminal's PTY.
+   *
+   * The shells this host started or adopted, and the terminals a machine
+   * arrived with that no emulator has attached to yet. Both are running: a
+   * restored terminal's shell is alive from the moment the checkpoint is
+   * restored, and only its emulator is missing.
+   *
+   * Counting the second kind is what gives a taken-over machine a keyboard. A
+   * framebuffer program launched from a shell reads its keystrokes from that
+   * shell's PTY, and on a machine showing a screen nobody opens a terminal
+   * pane: left out, the shell that owns the PTY would stay unknown for as long
+   * as the person stayed on the screen, and every key they pressed would go to
+   * a stdin buffer the program never reads.
+   */
+  private ptyOwnerPids(): Set<number> {
+    const pids = new Set(this.shellPids.keys());
+    for (const terminal of this.restoredTerminals.values()) pids.add(terminal.pid);
+    return pids;
+  }
+
+  /**
+   * Record a shell as the owner of its terminal's PTY, and say so.
+   *
+   * Anything that routes input by PTY answers from {@link ptyOwnerPids}, and a
+   * shell does not always exist by the time that question is first asked: a
+   * program can bind `/dev/fb0` before the shell that will launch the next one
+   * has started. Announcing lets those answers be taken again.
+   *
+   * Only growth is announced. A pid that leaves takes a route away rather than
+   * creating one, and the binding it belonged to is torn down by its own
+   * unbind and exit paths.
+   */
+  private registerShellPid(pid: number, sessionKey: string): void {
+    this.shellPids.set(pid, sessionKey);
+    this.ptyOwnerListeners.emit(undefined);
+  }
+
   private emitTerminalSessions(): void {
     this.terminalSessionListeners.emit(this.getTerminalSessions());
   }
@@ -1535,10 +1962,11 @@ export class LiveKernelHost implements KernelHost {
   /**
    * Join a terminal that is already attached, to share it with a peer.
    *
-   * Unlike {@link attachPty} it starts nothing and resizes nothing: the
-   * emulator that attached the session keeps geometry authority, and a
-   * sharer adopts what is already there. Returns null when no session holds
-   * that path, because a terminal nobody opened is not one to share.
+   * Unlike {@link attachPty} it starts nothing, resizes nothing and writes
+   * nothing: the emulator that attached the session keeps geometry authority
+   * and the keyboard, and a sharer adopts what is already there. Returns null
+   * when no session holds that path, because a terminal nobody opened is not
+   * one to share.
    */
   sharePty(path: string): SharedPtyHandle | null {
     const sessionKey = path || "/dev/pts/0";
@@ -1546,17 +1974,10 @@ export class LiveKernelHost implements KernelHost {
     const kernel = this.kernel;
     if (!session || !kernel) return null;
 
-    const encoder = new TextEncoder();
     let closed = false;
     const dataSubscriptions = new Set<() => void>();
 
     return {
-      write: (bytes) => {
-        if (closed) return;
-        const buf = typeof bytes === "string" ? encoder.encode(bytes) : bytes;
-        if (!this.isCurrentPtySession(sessionKey, session) || session.closed) return;
-        kernel.ptyWrite(session.pid, buf);
-      },
       onData: (cb) => {
         if (closed) return () => {};
         const off = session.dataListeners.add(cb);
@@ -1613,6 +2034,16 @@ export class LiveKernelHost implements KernelHost {
     policy: TerminalSessionPolicy | undefined,
     opts: { cols: number; rows: number },
   ): Promise<LivePtySession> {
+    // A machine that arrived from another computer brought this terminal with
+    // it. Adopting the process it named is what keeps a second one from being
+    // started on the same PTY below.
+    const arrived = this.restoredTerminals.get(sessionKey);
+    if (arrived !== undefined && !this.ptySessions.has(sessionKey)) {
+      this.restoredTerminals.delete(sessionKey);
+      const adopted = await this.adoptRestoredTerminal(sessionKey, arrived, kernel, policy);
+      if (adopted) return adopted;
+    }
+
     let session = this.ptySessions.get(sessionKey);
     if (session && !session.closed && !(await this.isPtySessionAlive(session.pid))) {
       if (session.supervised) {
@@ -1672,6 +2103,59 @@ export class LiveKernelHost implements KernelHost {
     } else if (shell) {
       await this.startPtyProgram(sessionKey, session, kernel, shell);
     }
+    return session;
+  }
+
+  /**
+   * Take over a terminal that arrived with a restored machine.
+   *
+   * Starts nothing: the process is already running, because the checkpoint
+   * restored it. This records where it is, how large its window was and what
+   * it had printed, so the emulator attaching now continues that session
+   * rather than opening a new one beside it. Returns null when the pid is not
+   * there after all, which leaves the ordinary path to start a program — a
+   * restore that lost the process should give the person a working terminal,
+   * not an empty one wired to nothing.
+   *
+   * One thing does not survive the move. `startPtyProgram` follows a process
+   * through the exit promise it got back when it spawned it, and a restored
+   * process hands out no such promise, so a terminal adopted here is not
+   * relaunched by the policy's `afterExit` when its program ends.
+   */
+  private async adoptRestoredTerminal(
+    sessionKey: string,
+    arrived: CapturedTerminal,
+    kernel: KernelLike,
+    policy: TerminalSessionPolicy | undefined,
+  ): Promise<LivePtySession | null> {
+    if (!(await this.isPtySessionAlive(arrived.pid))) return null;
+
+    const session: LivePtySession = {
+      path: sessionKey,
+      pid: arrived.pid,
+      logicalGeneration: 1,
+      processGeneration: 1,
+      // The arriving process is this session's login. Saying so is what stops
+      // `ensurePtySession` starting the policy's initial program beside it.
+      autologinConsumed: true,
+      startedAt: nowMs(),
+      restartDelayMs: policy?.initialRestartDelayMs ?? 0,
+      restartTimer: null,
+      removed: false,
+      dataListeners: new ListenerSet<Uint8Array>(),
+      history: arrived.screen.byteLength > 0 ? [arrived.screen] : [],
+      closed: false,
+      cols: arrived.cols,
+      rows: arrived.rows,
+      supervised: policy !== undefined,
+    };
+    this.ptySessions.set(sessionKey, session);
+    this.registerShellPid(arrived.pid, sessionKey);
+    kernel.onPtyOutput(arrived.pid, (data) => {
+      if (this.ptySessions.get(sessionKey) !== session) return;
+      this.emitPtyData(session, data);
+    });
+    this.emitTerminalSessions();
     return session;
   }
 
@@ -1737,7 +2221,7 @@ export class LiveKernelHost implements KernelHost {
     session.pid = pid;
     session.closed = false;
     session.startedAt = nowMs();
-    this.shellPids.set(pid, sessionKey);
+    this.registerShellPid(pid, sessionKey);
     kernel.onPtyOutput(pid, (data) => {
       if (!this.isCurrentPtyProcess(
         sessionKey,
@@ -1922,6 +2406,9 @@ export class LiveKernelHost implements KernelHost {
     this.ptyAttachPromises.clear();
     this.ptyCommandQueues.clear();
     this.shellPids.clear();
+    // A terminal nobody attached to belongs to the machine being discarded. It
+    // must not be adopted by whatever runs here next.
+    this.restoredTerminals.clear();
     this.emitTerminalSessions();
   }
 
@@ -2224,8 +2711,9 @@ export class LiveKernelHost implements KernelHost {
    * the shell, or enumProcs can't reach the kernel.
    */
   private async findPtyRoutingPid(pid: number): Promise<number | null> {
-    if (this.shellPids.size === 0) return null;
-    if (this.shellPids.has(pid)) return null;
+    const owners = this.ptyOwnerPids();
+    if (owners.size === 0) return null;
+    if (owners.has(pid)) return null;
     try {
       const procs = await this.enumProcs();
       const byPid = new Map(procs.map((p) => [p.pid, p.ppid]));
@@ -2234,7 +2722,7 @@ export class LiveKernelHost implements KernelHost {
       let cur: number | undefined = byPid.get(pid);
       const seen = new Set<number>();
       while (cur !== undefined && cur !== 0 && !seen.has(cur)) {
-        if (this.shellPids.has(cur)) return cur;
+        if (owners.has(cur)) return cur;
         seen.add(cur);
         cur = byPid.get(cur);
       }
@@ -2283,16 +2771,28 @@ export class LiveKernelHost implements KernelHost {
       boundPidListeners.emit(pid);
     };
 
-    const tryAttach = (pid: number) => {
-      if (attachedPid !== null) return; // already attached
-      setBoundPid(pid);
-      // Decide which stdin path to use: if this pid descends from the
-      // shell's PTY, route input through the PTY master; otherwise feed
-      // the process's own host-side stdin buffer. We query enumProcs
-      // and check ppid — if it descends from a shell, use that PTY.
+    // Decide which stdin path the bound process reads from: a pid that
+    // descends from a shell's PTY is fed through the PTY master, and a
+    // standalone one through its own host-side stdin buffer.
+    //
+    // Re-answered whenever a PTY-owning pid appears, because the binding does
+    // not always come last. A machine restored from a checkpoint has its
+    // framebuffer bound by the restore itself, before the terminals it arrived
+    // with are registered: answered once at bind time, every keystroke on a
+    // machine that arrived by handover goes to a stdin buffer nothing reads.
+    const resolveRouting = (pid: number) => {
       void this.findPtyRoutingPid(pid).then((ptyPid) => {
         if (attachedPid === pid) attachedPtyPid = ptyPid;
       });
+    };
+    const offPtyOwners = this.ptyOwnerListeners.add(() => {
+      if (attachedPid !== null) resolveRouting(attachedPid);
+    });
+
+    const tryAttach = (pid: number) => {
+      if (attachedPid !== null) return; // already attached
+      setBoundPid(pid);
+      resolveRouting(pid);
       // Lazy-import the host renderer so it is not pulled into Kandelo
       // bundles that do not render framebuffers.
       void import("../../../host/src/framebuffer/canvas-renderer.js").then(({ attachCanvas }) => {
@@ -2392,9 +2892,52 @@ export class LiveKernelHost implements KernelHost {
       close: () => {
         offChange();
         offProcessExit();
+        offPtyOwners();
         stop?.();
         stop = null;
         setBoundPid(null);
+      },
+    };
+  }
+
+  /**
+   * Join the framebuffer a pane is already painting, to share it with a peer.
+   *
+   * Unlike {@link attachFramebuffer} it starts no renderer and forwards no
+   * input: it reports which process owns `/dev/fb0` and hands back the
+   * registry a mirror publishes from. A machine can therefore be watched by
+   * a peer while the pane that attached the canvas keeps input authority.
+   */
+  shareFramebuffer(): SharedFramebufferHandle | null {
+    const registry = this.kernel?.framebuffers;
+    if (!registry) return null;
+
+    const boundPidListeners = new ListenerSet<number | null>();
+    let boundPid: number | null = registry.list()[0]?.pid ?? null;
+    const setBoundPid = (pid: number | null) => {
+      if (pid === boundPid) return;
+      boundPid = pid;
+      boundPidListeners.emit(pid);
+    };
+
+    const offChange = registry.onChange((pid, ev) => {
+      if (ev === "bind") setBoundPid(pid);
+      else if (pid === boundPid) setBoundPid(null);
+    });
+    // A process can die without the kernel emitting an unbind, and a mirror
+    // that kept publishing a dead pid would show its last frame as live.
+    const offProcessExit = this.processListeners.add((event) => {
+      if (event.kind !== "exit" || event.pid !== boundPid) return;
+      setBoundPid(null);
+    });
+
+    return {
+      registry,
+      getBoundPid: () => boundPid,
+      onBoundPidChange: (cb) => boundPidListeners.add(cb),
+      close: () => {
+        offChange();
+        offProcessExit();
       },
     };
   }
