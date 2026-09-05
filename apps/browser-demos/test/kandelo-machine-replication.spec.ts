@@ -256,9 +256,10 @@ test("follows the user to the demo they launch next", async ({
 /**
  * Stir the fluid with the pointer, so the dye the replica must show exists.
  *
- * Pavel's sim splats dye on pointer motion and the dye fades, so a machine
- * left alone converges to a black screen that says nothing. The motion
- * crosses the wire as pointer decisions, never as pixels.
+ * Pavel's sim splats dye on a drag — a button held during motion
+ * (`modeset.c` guards on `buttons`) — and the dye fades, so a machine left
+ * alone converges to a black screen that says nothing. The motion crosses
+ * the wire as pointer decisions, never as pixels.
  */
 async function stirFluid(page: Page): Promise<void> {
   const box = await page.locator(".kmodeset-stage").first().boundingBox();
@@ -266,8 +267,10 @@ async function stirFluid(page: Page): Promise<void> {
   const centerX = box.x + box.width / 2;
   const centerY = box.y + box.height / 2;
   await page.mouse.move(centerX - 80, centerY - 40, { steps: 5 });
+  await page.mouse.down();
   await page.mouse.move(centerX + 80, centerY + 40, { steps: 10 });
   await page.mouse.move(centerX, centerY - 60, { steps: 10 });
+  await page.mouse.up();
 }
 
 test("replicates a machine whose screen only a GL context painted", async ({
