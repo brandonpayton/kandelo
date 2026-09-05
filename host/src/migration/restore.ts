@@ -98,7 +98,121 @@ export async function validateMachineCheckpoint(
     }
     framebufferPids.add(framebuffer.pid);
   }
+  validateKmsState(checkpoint.kms, checkpoint.processes);
   return modules;
+}
+
+/**
+ * Refuse a modeset display the receiver cannot rebuild faithfully.
+ *
+ * A CRTC binding outlives `rmFb` on its framebuffer, so a CRTC naming an
+ * absent `fb_id` is DRM-correct and accepted. Everything else must close: a
+ * framebuffer names a buffer that travels, a buffer's pixels fill it, and a
+ * mapped range fits the memory of a process the checkpoint carries.
+ */
+function validateKmsState(
+  kms: MachineCheckpoint["kms"],
+  processes: readonly CheckpointProcessBucket[],
+): void {
+  if (kms === null || typeof kms !== "object") {
+    refuse("the checkpoint carries no KMS state");
+  }
+  if (
+    !Array.isArray(kms.fbs)
+    || !Array.isArray(kms.crtcs)
+    || !Array.isArray(kms.buffers)
+  ) {
+    refuse("the KMS state is not a framebuffer, CRTC, and buffer list");
+  }
+
+  const bufferIds = new Set<number>();
+  for (const buffer of kms.buffers) {
+    const geometryUsable = [buffer.bo_id, buffer.size, buffer.w, buffer.h, buffer.stride]
+      .every((value) => Number.isSafeInteger(value) && value >= 0);
+    if (!geometryUsable || buffer.w === 0 || buffer.h === 0 || buffer.stride < buffer.w * 4) {
+      refuse(`buffer object ${String(buffer.bo_id)}'s geometry is unusable`);
+    }
+    if (bufferIds.has(buffer.bo_id)) {
+      refuse(`buffer object ${buffer.bo_id} appears twice`);
+    }
+    bufferIds.add(buffer.bo_id);
+    if (buffer.size < buffer.h * buffer.stride) {
+      refuse(
+        `buffer object ${buffer.bo_id} is ${buffer.size} bytes, `
+        + `too small for a ${buffer.h}-row ${buffer.stride}-byte stride`,
+      );
+    }
+    if (buffer.pixels.byteLength !== buffer.size) {
+      refuse(
+        `buffer object ${buffer.bo_id} carries ${buffer.pixels.byteLength} `
+        + `pixel bytes for a ${buffer.size}-byte buffer`,
+      );
+    }
+    if (buffer.pids.length === 0) {
+      refuse(`buffer object ${buffer.bo_id} is held by no process`);
+    }
+    for (const pid of buffer.pids) {
+      if (!processes.some((bucket) => bucket.pid === pid)) {
+        refuse(
+          `buffer object ${buffer.bo_id} is held by pid ${String(pid)}, `
+          + "which has no process bucket",
+        );
+      }
+    }
+    for (const binding of buffer.bindings) {
+      const bucket = processes.find((candidate) => candidate.pid === binding.pid);
+      if (bucket === undefined) {
+        refuse(
+          `buffer object ${buffer.bo_id} is mapped by pid ${String(binding.pid)}, `
+          + "which has no process bucket",
+        );
+      }
+      const rangeUsable = [binding.addr, binding.len].every(
+        (value) => Number.isSafeInteger(value) && value >= 0,
+      );
+      if (!rangeUsable || binding.len === 0 || binding.addr + binding.len > bucket.memory.byteLength) {
+        refuse(
+          `buffer object ${buffer.bo_id}'s mapping in pid ${binding.pid} does `
+          + `not fit inside its ${bucket.memory.byteLength}-byte memory`,
+        );
+      }
+    }
+  }
+
+  const fbIds = new Set<number>();
+  for (const fb of kms.fbs) {
+    const geometryUsable = [fb.fb_id, fb.bo_id, fb.width, fb.height, fb.pitch]
+      .every((value) => Number.isSafeInteger(value) && value >= 0);
+    if (!geometryUsable || fb.width === 0 || fb.height === 0 || fb.pitch < fb.width * 4) {
+      refuse(`framebuffer ${String(fb.fb_id)}'s geometry is unusable`);
+    }
+    if (fbIds.has(fb.fb_id)) refuse(`framebuffer ${fb.fb_id} appears twice`);
+    fbIds.add(fb.fb_id);
+    if (!bufferIds.has(fb.bo_id)) {
+      refuse(
+        `framebuffer ${fb.fb_id} scans out buffer object ${fb.bo_id}, `
+        + "which the checkpoint does not carry",
+      );
+    }
+  }
+
+  const crtcIds = new Set<number>();
+  for (const crtc of kms.crtcs) {
+    if (!Number.isSafeInteger(crtc.crtc_id) || !Number.isSafeInteger(crtc.fb_id)) {
+      refuse(`a CRTC binding names ${String(crtc.crtc_id)} and ${String(crtc.fb_id)}`);
+    }
+    if (crtcIds.has(crtc.crtc_id)) {
+      refuse(`CRTC ${crtc.crtc_id} is bound twice`);
+    }
+    crtcIds.add(crtc.crtc_id);
+  }
+
+  if (kms.masterPid === null) return;
+  if (!processes.some((bucket) => bucket.pid === kms.masterPid)) {
+    refuse(
+      `DRM master is pid ${String(kms.masterPid)}, which has no process bucket`,
+    );
+  }
 }
 
 /**

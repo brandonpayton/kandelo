@@ -204,9 +204,96 @@ describe("checkpoint validation", () => {
         ];
       }, /framebuffer range does not fit inside/);
 
+      // A modeset display bound to the captured machine's own process, which
+      // every KMS corruption below starts from.
+      const modeset = (checkpoint: MachineCheckpoint) => {
+        const pid = checkpoint.processes[0]!.pid;
+        return {
+          fbs: [{
+            fb_id: 10,
+            bo_id: 100,
+            width: 8,
+            height: 8,
+            pixel_format: 0x34325258,
+            pitch: 32,
+          }],
+          crtcs: [{ crtc_id: 1, fb_id: 10 }],
+          masterPid: pid,
+          buffers: [{
+            bo_id: 100,
+            size: 256,
+            w: 8,
+            h: 8,
+            stride: 32,
+            pids: [pid],
+            bindings: [{ pid, addr: 0, len: 256 }],
+            pixels: new Uint8Array(256),
+          }],
+        };
+      };
+
+      await refusal((checkpoint) => {
+        const kms = modeset(checkpoint);
+        kms.fbs[0]!.bo_id = 424242;
+        checkpoint.kms = kms;
+      }, /buffer object 424242, which the checkpoint does not carry/);
+
+      await refusal((checkpoint) => {
+        const kms = modeset(checkpoint);
+        kms.buffers[0]!.pixels = new Uint8Array(7);
+        checkpoint.kms = kms;
+      }, /carries 7 pixel bytes for a 256-byte buffer/);
+
+      await refusal((checkpoint) => {
+        const kms = modeset(checkpoint);
+        kms.buffers[0]!.pids = [424242];
+        checkpoint.kms = kms;
+      }, /held by pid 424242, which has no process bucket/);
+
+      await refusal((checkpoint) => {
+        const kms = modeset(checkpoint);
+        kms.buffers[0]!.pids = [];
+        checkpoint.kms = kms;
+      }, /buffer object 100 is held by no process/);
+
+      await refusal((checkpoint) => {
+        const kms = modeset(checkpoint);
+        kms.buffers[0]!.bindings[0]!.pid = 424242;
+        checkpoint.kms = kms;
+      }, /mapped by pid 424242, which has no process bucket/);
+
+      await refusal((checkpoint) => {
+        const kms = modeset(checkpoint);
+        kms.buffers[0]!.bindings[0]!.addr =
+          checkpoint.processes[0]!.memory.byteLength;
+        checkpoint.kms = kms;
+      }, /mapping in pid \d+ does not fit inside/);
+
+      await refusal((checkpoint) => {
+        const kms = modeset(checkpoint);
+        kms.crtcs.push({ crtc_id: 1, fb_id: 10 });
+        checkpoint.kms = kms;
+      }, /CRTC 1 is bound twice/);
+
+      await refusal((checkpoint) => {
+        const kms = modeset(checkpoint);
+        kms.masterPid = 424242;
+        checkpoint.kms = kms;
+      }, /DRM master is pid 424242, which has no process bucket/);
+
       // The corruptions above never touched the captured object itself.
       await expect(
         validateMachineCheckpoint(cloneCheckpoint(captured), EXPECTED),
+      ).resolves.toBeDefined();
+
+      // DRM leaves a CRTC modeset when its framebuffer goes, so a CRTC naming
+      // an absent fb_id is a real machine's state, not a broken record.
+      const staleBinding = cloneCheckpoint(captured) as Mutable<MachineCheckpoint>;
+      const kms = modeset(staleBinding);
+      kms.fbs = [];
+      staleBinding.kms = kms;
+      await expect(
+        validateMachineCheckpoint(staleBinding, EXPECTED),
       ).resolves.toBeDefined();
     },
   );

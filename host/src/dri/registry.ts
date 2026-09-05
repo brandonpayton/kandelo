@@ -87,6 +87,19 @@ export type GbmBoEntry = {
   binding: GbmBoBinding | null;
 };
 
+/** One buffer object with its canonical pixels, as a checkpoint carries it. */
+export type GbmBoSnapshot = {
+  readonly bo_id: number;
+  readonly size: number;
+  readonly w: number;
+  readonly h: number;
+  readonly stride: number;
+  /** Every pid holding a handle: the creator plus any PRIME importer. */
+  readonly pids: readonly number[];
+  readonly bindings: readonly (GbmBoBinding & { readonly pid: number })[];
+  readonly pixels: Uint8Array;
+};
+
 export type GbmBoChangeEvent = "create" | "bind" | "unbind" | "destroy";
 export type GbmBoChangeListener = (
   pid: number,
@@ -303,6 +316,67 @@ export class GbmBoRegistry {
     if (!e) return;
     for (const [pid, binding] of e.bindingsByPid) {
       this.flushMemoryToSab(e, pid, binding);
+    }
+  }
+
+  /**
+   * Every buffer object, with each one's pixels flushed out of process memory.
+   *
+   * A bound pid's latest paint sits in its wasm Memory until a bind boundary
+   * moves it, so the flush runs first. The bytes are then copied out, leaving
+   * the SAB serving the machine the checkpoint gives back.
+   *
+   * Every bo's pixels are carried, not only an unbound one's. A bound bo's
+   * bytes do also ride inside the process memory copy, but `scanoutBytes`
+   * reads the SAB rather than process memory, so a restore that rebuilt only
+   * the mapped ranges would scan out a black frame.
+   */
+  snapshot(): GbmBoSnapshot[] {
+    const out: GbmBoSnapshot[] = [];
+    for (const e of this.bos.values()) {
+      this.syncFromMemory(e.bo_id);
+      out.push({
+        bo_id: e.bo_id,
+        size: e.size,
+        w: e.w,
+        h: e.h,
+        stride: e.stride,
+        pids: [...e.pids],
+        bindings: [...e.bindingsByPid].map(([pid, binding]) => ({
+          pid,
+          addr: binding.addr,
+          len: binding.len,
+        })),
+        pixels: new Uint8Array(e.sab).slice(),
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Adopt checkpointed buffer objects, replacing whatever this registry holds.
+   *
+   * The pixels land in fresh SABs. Nothing here writes into process memory: a
+   * restored process adopts a byte copy of its captured memory, so a mapped
+   * range already holds the same pixels this seeds the SAB with.
+   */
+  restore(buffers: readonly GbmBoSnapshot[]): void {
+    this.bos.clear();
+    for (const b of buffers) {
+      const sab = new SharedArrayBuffer(b.size);
+      new Uint8Array(sab).set(b.pixels.subarray(0, b.size));
+      this.bos.set(b.bo_id, {
+        bo_id: b.bo_id,
+        size: b.size,
+        w: b.w,
+        h: b.h,
+        stride: b.stride,
+        sab,
+        pids: new Set(b.pids),
+        bindingsByPid: new Map(
+          b.bindings.map(({ pid, addr, len }) => [pid, { addr, len }]),
+        ),
+      });
     }
   }
 

@@ -34073,6 +34073,17 @@ export class CentralizedKernelWorker {
     return this.#kernel.kms;
   }
 
+  /** CRTCs whose canvas a GL context owns.
+   *
+   *  The vblank pump blits only a `"2d"` CRTC, so these are exactly the CRTCs
+   *  whose frames never pass through a host buffer. A caller that must read
+   *  the screen — a checkpoint, a mirror — has nothing to read for them. */
+  glOwnedCrtcs(): number[] {
+    return [...this.kmsContextMode]
+      .filter(([, mode]) => mode === "webgl2")
+      .map(([crtcId]) => crtcId);
+  }
+
   /** Register an `OffscreenCanvas` (and optional stats SAB) as the
    *  scanout target for a CRTC. Starts the vblank pump on first
    *  attach.

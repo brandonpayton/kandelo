@@ -1,17 +1,21 @@
 import { describe, expect, it } from "vitest";
 import { ChunkedMessageChannel } from "../../src/migration/channel-chunked";
-import type { MachineCheckpoint } from "../../src/migration/checkpoint";
+import {
+  MACHINE_CHECKPOINT_FORMAT,
+  type MachineCheckpoint,
+} from "../../src/migration/checkpoint";
 import { LocalCheckpointHandover } from "../../src/migration/transport-local";
 import { FakeDataChannel } from "../support/data-channel-pair";
 
 function fakeCheckpoint(marker: number): MachineCheckpoint {
   return {
-    format: 1,
+    format: MACHINE_CHECKPOINT_FORMAT,
     kernelAbiVersion: 43,
     kernelMemory: new Uint8Array([marker]),
     filesystem: new Uint8Array([marker, marker]),
     monotonicNs: 5_000_000_000,
     framebuffers: [],
+    kms: { fbs: [], crtcs: [], masterPid: null, buffers: [] },
     processes: [],
   };
 }

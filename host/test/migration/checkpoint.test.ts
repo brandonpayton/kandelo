@@ -5,6 +5,8 @@ import { RootfsSnapshotGate } from "../../src/rootfs-snapshot-gate";
 import { ThreadPageAllocator } from "../../src/thread-allocator";
 import {
   captureMachineCheckpoint,
+  captureMachineCheckpointSummary,
+  type CheckpointKmsState,
   type CheckpointMachine,
   type CheckpointProcessSource,
 } from "../../src/migration/checkpoint";
@@ -66,7 +68,8 @@ interface TestMachine {
   readonly disarmed: { count: number };
   settleVforks: () => Promise<void>;
   unreleasable: number[];
-  modesetCrtcs: number[];
+  kms: CheckpointKmsState;
+  glOwnedCrtcs: number[];
 }
 
 function testMachine(sources: CheckpointProcessSource[]): TestMachine {
@@ -86,7 +89,8 @@ function testMachine(sources: CheckpointProcessSource[]): TestMachine {
     disarmed,
     settleVforks: () => Promise.resolve(),
     unreleasable: [],
-    modesetCrtcs: [],
+    kms: { fbs: [], crtcs: [], masterPid: null, buffers: [] },
+    glOwnedCrtcs: [],
     machine: {
       runWithoutWorkerCreation: (operation, exclusive) =>
         creators.runExclusive(operation, exclusive),
@@ -112,13 +116,40 @@ function testMachine(sources: CheckpointProcessSource[]): TestMachine {
       copyKernelMemory: () => new Uint8Array(KERNEL_MEMORY_BYTES).fill(7),
       filesystemBuffer: () => new SharedArrayBuffer(FILESYSTEM_BYTES),
       framebuffers: () => [],
-      modesetCrtcs: () => state.modesetCrtcs,
+      kmsState: () => state.kms,
+      glOwnedCrtcs: () => state.glOwnedCrtcs,
       monotonicNowNs: () => 7_000_000_000,
       kernelAbiVersion: () => KERNEL_ABI,
       liveProcesses: () => sources,
     },
   };
   return state;
+}
+
+/** A CPU-scanout display: one CRTC, one framebuffer, one painted buffer. */
+function modesetKms(masterPid: number): CheckpointKmsState {
+  return {
+    fbs: [{
+      fb_id: 10,
+      bo_id: 100,
+      width: 32,
+      height: 32,
+      pixel_format: 0x34325258,
+      pitch: 128,
+    }],
+    crtcs: [{ crtc_id: 1, fb_id: 10 }],
+    masterPid,
+    buffers: [{
+      bo_id: 100,
+      size: 4096,
+      w: 32,
+      h: 32,
+      stride: 128,
+      pids: [masterPid],
+      bindings: [{ pid: masterPid, addr: 0, len: 4096 }],
+      pixels: new Uint8Array(4096).fill(0xab),
+    }],
+  };
 }
 
 /** Let every already-resolved promise settle without advancing fake time. */
@@ -145,7 +176,7 @@ describe("machine checkpoint freeze", () => {
     expect(result.checkpoint.processes[0]!.memory.byteLength)
       .toBe(PROCESS_MEMORY_BYTES);
     expect(result.checkpoint.processes[0]!.argv).toEqual(["/bin/program-4"]);
-    expect(result.checkpoint.format).toBe(1);
+    expect(result.checkpoint.format).toBe(2);
     expect(result.checkpoint.kernelAbiVersion).toBe(KERNEL_ABI);
     expect(
       new Uint8Array(result.checkpoint.processes[0]!.programBytes),
@@ -292,19 +323,55 @@ describe("machine checkpoint freeze", () => {
     expect(state.held).toEqual([]);
   });
 
-  it("refuses a modeset machine without freezing it", async () => {
+  it("refuses a GL-owned CRTC without freezing the machine", async () => {
     const state = testMachine([processSource(4, 1)]);
-    state.modesetCrtcs = [31];
+    state.glOwnedCrtcs = [31];
 
     await expect(captureMachineCheckpoint(state.machine, options)).resolves.toEqual({
       status: "failed",
       reason:
-        "checkpoint does not carry KMS state, and CRTC 31 holds a bound framebuffer",
+        "CRTC 31 paints through a GL-owned canvas, whose pixels never reach "
+        + "a host buffer a checkpoint can read",
     });
     expect(state.held).toEqual([]);
     expect(state.armed).toEqual([]);
     expect(Atomics.load(new Int32Array(state.sources[0]!.checkpointFreeze.gate), 0))
       .toBe(0);
+  });
+
+  it("captures a CPU-scanout modeset machine", async () => {
+    const state = testMachine([processSource(4, 1)]);
+    state.kms = modesetKms(4);
+
+    const capture = captureMachineCheckpoint(state.machine, options);
+    await flush();
+    for (const source of state.sources) source.checkpointFreeze.unwound();
+
+    const result = await capture;
+    expect(result.status).toBe("captured");
+    if (result.status !== "captured") return;
+    expect(result.checkpoint.kms.crtcs).toEqual([{ crtc_id: 1, fb_id: 10 }]);
+    expect(result.checkpoint.kms.masterPid).toBe(4);
+    expect(result.checkpoint.kms.fbs[0]!.fb_id).toBe(10);
+    expect(result.checkpoint.kms.buffers[0]!.pixels[0]).toBe(0xab);
+  });
+
+  it("summarises the display it read, without the pixels", async () => {
+    const state = testMachine([processSource(4, 1)]);
+    state.kms = modesetKms(4);
+
+    const capture = captureMachineCheckpointSummary(state.machine, options);
+    await flush();
+    for (const source of state.sources) source.checkpointFreeze.unwound();
+
+    const result = await capture;
+    expect(result.status).toBe("captured");
+    if (result.status !== "captured") return;
+    expect(result.summary.kms).toEqual({
+      crtcs: [1],
+      fbs: [10],
+      buffers: [{ bo_id: 100, w: 32, h: 32, pixelBytes: 4096 }],
+    });
   });
 
   it("fails without freezing when a thread dies before the read", async () => {

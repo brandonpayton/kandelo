@@ -59,6 +59,58 @@ export interface CheckpointFramebuffer {
   readonly hostBuffer: Uint8Array | null;
 }
 
+/**
+ * One GBM buffer object and its pixels.
+ *
+ * A bound buffer's bytes also ride inside the process memory copy, but the KMS
+ * scanout path reads the host buffer rather than process memory, and an
+ * unbound buffer has no mapped range at all. The checkpoint therefore carries
+ * every buffer's pixels rather than deriving them from the mapped ranges.
+ */
+export interface CheckpointGbmBuffer {
+  readonly bo_id: number;
+  readonly size: number;
+  readonly w: number;
+  readonly h: number;
+  readonly stride: number;
+  readonly pids: readonly number[];
+  readonly bindings: readonly {
+    readonly pid: number;
+    readonly addr: number;
+    readonly len: number;
+  }[];
+  readonly pixels: Uint8Array;
+}
+
+/** One framebuffer object the guest created with `drmModeAddFB2`. */
+export interface CheckpointKmsFramebuffer {
+  readonly fb_id: number;
+  readonly bo_id: number;
+  readonly width: number;
+  readonly height: number;
+  readonly pixel_format: number;
+  readonly pitch: number;
+}
+
+/** One CRTC the guest drove `drmModeSetCrtc` on. */
+export interface CheckpointKmsCrtc {
+  readonly crtc_id: number;
+  readonly fb_id: number;
+}
+
+/**
+ * The modeset display state, which a restore rebuilds before the guest runs.
+ *
+ * A CRTC binding outlives `rmFb` on its framebuffer, matching DRM, so `crtcs`
+ * can name an `fb_id` that `fbs` does not list.
+ */
+export interface CheckpointKmsState {
+  readonly fbs: readonly CheckpointKmsFramebuffer[];
+  readonly crtcs: readonly CheckpointKmsCrtc[];
+  readonly masterPid: number | null;
+  readonly buffers: readonly CheckpointGbmBuffer[];
+}
+
 /** One live execution image the freeze can read. */
 export interface CheckpointProcessSource {
   readonly pid: number;
@@ -102,9 +154,15 @@ export interface CheckpointMachine {
   readonly filesystemBuffer: () => SharedArrayBuffer;
   /** Read under the freeze: bindings and write-based pixels are quiescent. */
   readonly framebuffers: () => readonly CheckpointFramebuffer[];
-  /** A checkpoint carries no KMS state, so a machine with any modeset CRTC is
-   *  refused rather than captured as one that never had a display. */
-  readonly modesetCrtcs: () => readonly number[];
+  /** Read under the freeze: the display is quiescent. */
+  readonly kmsState: () => CheckpointKmsState;
+  /** CRTCs whose canvas a GL context owns.
+   *
+   *  A GL guest paints its OffscreenCanvas through the EGL to WebGL2 bridge,
+   *  so no CPU ever assembles a frame and no host buffer holds one. Those
+   *  pixels are outside what a checkpoint can read, and the capture refuses
+   *  rather than restoring a machine whose screen is silently gone. */
+  readonly glOwnedCrtcs: () => readonly number[];
   /** This machine's CLOCK_MONOTONIC in nanoseconds. */
   readonly monotonicNowNs: () => number;
   readonly kernelAbiVersion: () => number;
@@ -133,7 +191,7 @@ export interface CheckpointProcessBucket {
  * refuses a checkpoint whose format it does not know rather than guessing at
  * the missing or extra fields.
  */
-export const MACHINE_CHECKPOINT_FORMAT = 1;
+export const MACHINE_CHECKPOINT_FORMAT = 2;
 
 export interface MachineCheckpoint {
   readonly format: typeof MACHINE_CHECKPOINT_FORMAT;
@@ -142,6 +200,8 @@ export interface MachineCheckpoint {
   readonly kernelMemory: Uint8Array;
   readonly filesystem: Uint8Array;
   readonly framebuffers: readonly CheckpointFramebuffer[];
+  /** The modeset display, empty for a machine that never drove `/dev/dri`. */
+  readonly kms: CheckpointKmsState;
   /**
    * The captured machine's CLOCK_MONOTONIC at the freeze, in nanoseconds.
    *
@@ -170,6 +230,16 @@ export interface MachineCheckpointSummary {
     readonly h: number;
     readonly hostBufferBytes: number;
   }[];
+  readonly kms: {
+    readonly crtcs: readonly number[];
+    readonly fbs: readonly number[];
+    readonly buffers: readonly {
+      readonly bo_id: number;
+      readonly w: number;
+      readonly h: number;
+      readonly pixelBytes: number;
+    }[];
+  };
   readonly processes: readonly {
     readonly pid: number;
     readonly executionGeneration: number;
@@ -200,6 +270,16 @@ function summarizeMachineCheckpoint(
       h: framebuffer.h,
       hostBufferBytes: framebuffer.hostBuffer?.byteLength ?? 0,
     })),
+    kms: {
+      crtcs: checkpoint.kms.crtcs.map((crtc) => crtc.crtc_id),
+      fbs: checkpoint.kms.fbs.map((fb) => fb.fb_id),
+      buffers: checkpoint.kms.buffers.map((buffer) => ({
+        bo_id: buffer.bo_id,
+        w: buffer.w,
+        h: buffer.h,
+        pixelBytes: buffer.pixels.byteLength,
+      })),
+    },
     processes: checkpoint.processes.map((bucket) => ({
       pid: bucket.pid,
       executionGeneration: bucket.executionGeneration,
@@ -238,6 +318,9 @@ export function machineCheckpointTransferList(
       framebuffer.hostBuffer === null
         ? []
         : [framebuffer.hostBuffer.buffer as ArrayBuffer]
+    ),
+    ...checkpoint.kms.buffers.map(
+      (buffer) => buffer.pixels.buffer as ArrayBuffer,
     ),
     ...checkpoint.processes.map(
       (bucket) => bucket.memory.buffer as ArrayBuffer,
@@ -294,13 +377,13 @@ export async function captureMachineCheckpoint(
   machine: CheckpointMachine,
   options: CheckpointFreezeOptions,
 ): Promise<CheckpointFreezeResult> {
-  const modeset = machine.modesetCrtcs();
-  if (modeset.length > 0) {
+  const glOwned = machine.glOwnedCrtcs();
+  if (glOwned.length > 0) {
     return {
       status: "failed",
       reason:
-        `checkpoint does not carry KMS state, and CRTC ` +
-        `${modeset.join(", ")} holds a bound framebuffer`,
+        `CRTC ${glOwned.join(", ")} paints through a GL-owned canvas, whose ` +
+        `pixels never reach a host buffer a checkpoint can read`,
     };
   }
   try {
@@ -435,6 +518,7 @@ function readMachine(
         ? null
         : framebuffer.hostBuffer.slice(),
     })),
+    kms: machine.kmsState(),
     processes: sources.map((source) => ({
       pid: source.pid,
       executionGeneration: source.executionGeneration,

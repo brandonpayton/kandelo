@@ -312,7 +312,11 @@ const checkpointMachine: CheckpointMachine = {
     const now = vfsExecIO.clockGettime(1);
     return now.sec * 1_000_000_000 + now.nsec;
   },
-  modesetCrtcs: () => kernelWorker.kms.boundCrtcs(),
+  kmsState: () => ({
+    ...kernelWorker.kms.snapshot(),
+    buffers: kernelWorker.bos.snapshot(),
+  }),
+  glOwnedCrtcs: () => kernelWorker.glOwnedCrtcs(),
   framebuffers: () =>
     kernelWorker.framebuffers.list().map((binding) => ({
       pid: binding.pid,
@@ -1424,6 +1428,10 @@ async function handleInit(msg: InitMessage) {
         );
       }
     }
+    // Buffer objects first: a restored CRTC scans out through the framebuffer
+    // that names one, so the pixels must be in place before the binding is.
+    kernelWorker.bos.restore(msg.restoreCheckpoint.kms.buffers);
+    kernelWorker.kms.restore(msg.restoreCheckpoint.kms);
   }
 
   const pcmTransport = kernelWorker.claimPcmTransport(false);
