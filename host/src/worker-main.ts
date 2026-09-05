@@ -314,8 +314,29 @@ type KernelImports = Record<string, WebAssembly.ExportValue> & {
 const STARTUP_E2BIG = 7;
 const STARTUP_EAGAIN = 11;
 const STARTUP_EFAULT = 14;
+const STARTUP_EBUSY = 16;
 const STARTUP_EINVAL = 22;
 const STARTUP_ERANGE = 34;
+
+/**
+ * How long a checkpoint may wait for the dynamic-loader archive writer.
+ *
+ * A freeze parks every thread of the process holding an archive reader, and a
+ * reader outstanding is exactly what the writer waits behind. A thread whose
+ * table replica is behind therefore asks for a writer no peer can give back
+ * until the freeze gives up. The bound is long enough for a peer that is
+ * genuinely mid-dlopen to finish and short enough that the capture fails while
+ * the caller is still waiting on it.
+ */
+const CHECKPOINT_ARCHIVE_WRITER_WAIT_MS = 250;
+
+/**
+ * The dynamic-loader archive writer stayed held for a whole bounded wait.
+ *
+ * Only a bounded acquisition raises this. An unbounded one blocks, which is
+ * the POSIX loader serialization every non-checkpoint caller needs.
+ */
+class ArchiveWriterUnavailableError extends Error {}
 
 function processForkMode(value: number): ProcessForkMode | null {
   if (value === PROCESS_FORK_MODE_FORK) return PROCESS_FORK_MODE_FORK;
@@ -646,6 +667,14 @@ export interface DlopenSupport {
   /** Release one reader token acquired by this Worker. */
   releaseArchiveReader(): void;
   withArchiveWriter<T>(operation: () => T): T;
+  /**
+   * Run an operation whose writer acquisitions may not wait past a deadline.
+   *
+   * A wait that runs out raises `ArchiveWriterUnavailableError` and leaves the
+   * archive untouched. The bound applies to nested acquisitions too, which is
+   * how a reconcile reaches it.
+   */
+  withArchiveWriterWaitBound<T>(timeoutMs: number, operation: () => T): T;
   withArchiveReader<T>(operation: () => T): T;
   writerOwned(): boolean;
   /** Run after a fresh writer acquisition and before the protected operation. */
@@ -1234,6 +1263,43 @@ export function buildDlopenImports(
     | null = null;
   let writerAcquireObserver: (() => void) | null = null;
   let operationAbortObserver: (() => void) | null = null;
+  let writerWaitBound: { readonly deadline: number; readonly ms: number } | null =
+    null;
+  const withArchiveWriterWaitBound = <T>(
+    timeoutMs: number,
+    operation: () => T,
+  ): T => {
+    const previous = writerWaitBound;
+    writerWaitBound = { deadline: Date.now() + timeoutMs, ms: timeoutMs };
+    try {
+      return operation();
+    } finally {
+      writerWaitBound = previous;
+    }
+  };
+  /**
+   * Wait for one writer turn, honouring a bound the caller put on this scope.
+   *
+   * Every call site holds no lock word, so raising here leaves the archive
+   * exactly as it was found.
+   */
+  const awaitWriterTurn = (word: Int32Array, expected: number): void => {
+    const bound = writerWaitBound;
+    if (bound === null) {
+      Atomics.wait(word, 0, expected);
+      return;
+    }
+    const remaining = bound.deadline - Date.now();
+    if (
+      remaining > 0
+      && Atomics.wait(word, 0, expected, remaining) !== "timed-out"
+    ) {
+      return;
+    }
+    throw new ArchiveWriterUnavailableError(
+      `the dynamic-loader archive writer stayed held for ${bound.ms} ms`,
+    );
+  };
   const finishFreshWriterAcquisition = (): void => {
     mainDlopenDepth = 1;
     try {
@@ -1328,7 +1394,7 @@ export function buildDlopenImports(
     for (;;) {
       const transactionOwner = foreignLoaderOwner();
       if (transactionOwner !== DLOPEN_OWNER_IDLE) {
-        Atomics.wait(loaderOwner, 0, transactionOwner);
+        awaitWriterTurn(loaderOwner, transactionOwner);
         continue;
       }
       const owner = Atomics.compareExchange(
@@ -1341,10 +1407,10 @@ export function buildDlopenImports(
         const racedTransactionOwner = foreignLoaderOwner();
         if (racedTransactionOwner === DLOPEN_OWNER_IDLE) break;
         releaseRawWriterLock();
-        Atomics.wait(loaderOwner, 0, racedTransactionOwner);
+        awaitWriterTurn(loaderOwner, racedTransactionOwner);
         continue;
       }
-      Atomics.wait(archiveLock, 0, owner);
+      awaitWriterTurn(archiveLock, owner);
     }
     finishFreshWriterAcquisition();
   };
@@ -2300,6 +2366,7 @@ export function buildDlopenImports(
     acquireArchiveReader,
     releaseArchiveReader,
     withArchiveWriter,
+    withArchiveWriterWaitBound,
     withArchiveReader,
     writerOwned: () => mainDlopenDepth > 0,
     setWriterAcquireObserver: (observer) => {
@@ -3717,6 +3784,23 @@ export async function centralizedWorkerMain(
         processForkArchiveReaderHeld = false;
         processDlopenSupport?.releaseArchiveReader();
       };
+      /**
+       * Take the fork reader under a bound, which only a checkpoint wants.
+       *
+       * A peer parked in the same freeze holds an archive reader, so a replica
+       * that is behind asks for a writer nobody can give back until the freeze
+       * ends. Bounding it lets the capture fail instead of stalling the thread
+       * for the whole unwind deadline.
+       */
+      const acquireCheckpointProcessForkArchiveReader = (): void => {
+        if (!processDlopenSupport) {
+          throw new Error(`pid=${pid}: fork archive owner is not initialized`);
+        }
+        processDlopenSupport.withArchiveWriterWaitBound(
+          CHECKPOINT_ARCHIVE_WRITER_WAIT_MS,
+          acquireCurrentProcessForkArchiveReader,
+        );
+      };
       const acquireCurrentProcessForkArchiveReader = (): void => {
         if (!processDlopenSupport || !processTableReplication) {
           throw new Error(`pid=${pid}: fork archive owner is not initialized`);
@@ -3850,7 +3934,18 @@ export async function centralizedWorkerMain(
         }
         captureReason = "checkpoint";
 
-        acquireCurrentProcessForkArchiveReader();
+        try {
+          acquireCheckpointProcessForkArchiveReader();
+        } catch (error) {
+          if (!(error instanceof ArchiveWriterUnavailableError)) throw error;
+          releaseProcessForkArchiveReader();
+          port.postMessage({
+            type: "checkpoint_refused",
+            pid,
+            reason: error.message,
+          } satisfies WorkerToHostMessage);
+          return -STARTUP_EBUSY;
+        }
         const arena = newModuleStateArena();
         try {
           arena.begin();
@@ -5794,20 +5889,36 @@ export async function centralizedThreadWorkerMain(
         threadCaptureReason = "checkpoint";
 
         try {
-          for (;;) {
-            acquirePthreadForkLock();
-            if (
-              !threadTableReplication ||
-              threadTableReplication.isCurrentUnderLock()
-            ) {
-              break;
-            }
-            releasePthreadForkLock();
-            threadTableReplication.reconcileNow();
-          }
+          // A peer parked in this same freeze holds an archive reader, and a
+          // reader outstanding is what the writer waits behind. Bound the wait
+          // so a replica that is behind fails the capture rather than stalling
+          // here for the whole unwind deadline.
+          threadDlopenSupport.withArchiveWriterWaitBound(
+            CHECKPOINT_ARCHIVE_WRITER_WAIT_MS,
+            () => {
+              for (;;) {
+                acquirePthreadForkLock();
+                if (
+                  !threadTableReplication ||
+                  threadTableReplication.isCurrentUnderLock()
+                ) {
+                  break;
+                }
+                releasePthreadForkLock();
+                threadTableReplication.reconcileNow();
+              }
+            },
+          );
         } catch (error) {
           releasePthreadForkLock();
-          throw error;
+          if (!(error instanceof ArchiveWriterUnavailableError)) throw error;
+          port.postMessage({
+            type: "checkpoint_refused",
+            pid,
+            tid,
+            reason: error.message,
+          } satisfies WorkerToHostMessage);
+          return -STARTUP_EBUSY;
         }
 
         // The process image is shared, so the main thread writes the sparse

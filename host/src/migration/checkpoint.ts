@@ -30,6 +30,12 @@ export interface CheckpointProcessSource {
   readonly layout: ProcessMemoryLayout;
   readonly argv: readonly string[];
   readonly memory: WebAssembly.Memory;
+  /**
+   * The exact program image this generation runs. Read under the freeze:
+   * after the machine resumes, an exec can retire the generation and a bucket
+   * keyed to it must not pick up the successor's program.
+   */
+  readonly programBytes: () => ArrayBuffer;
   readonly threadAllocatorState: () => ThreadPageAllocatorState;
   readonly forkReplayContext?: CheckpointForkReplayContext;
   readonly checkpointFreeze: CheckpointFreezeGateCoordinator;
@@ -53,6 +59,7 @@ export interface CheckpointMachine {
   readonly disarmUnwindRequests: () => void;
   readonly copyKernelMemory: () => Uint8Array;
   readonly filesystemBuffer: () => SharedArrayBuffer;
+  readonly kernelAbiVersion: () => number;
   readonly liveProcesses: () => readonly CheckpointProcessSource[];
 }
 
@@ -64,11 +71,25 @@ export interface CheckpointProcessBucket {
   readonly layout: ProcessMemoryLayout;
   readonly argv: readonly string[];
   readonly memory: Uint8Array;
+  /** Live reference, never mutated: exec replaces the buffer, in place. */
+  readonly programBytes: ArrayBuffer;
   readonly threadAllocator: ThreadPageAllocatorState;
   readonly forkReplayContext?: CheckpointForkReplayContext;
 }
 
+/**
+ * The version of this checkpoint layout, carried in every checkpoint.
+ *
+ * A checkpoint is untrusted input on every path that consumes one. A restore
+ * refuses a checkpoint whose format it does not know rather than guessing at
+ * the missing or extra fields.
+ */
+export const MACHINE_CHECKPOINT_FORMAT = 1;
+
 export interface MachineCheckpoint {
+  readonly format: typeof MACHINE_CHECKPOINT_FORMAT;
+  /** The ABI the captured kernel ran; a restore refuses any other. */
+  readonly kernelAbiVersion: number;
   readonly kernelMemory: Uint8Array;
   readonly filesystem: Uint8Array;
   readonly processes: readonly CheckpointProcessBucket[];
@@ -77,10 +98,9 @@ export interface MachineCheckpoint {
 /**
  * What a checkpoint holds, without the bytes.
  *
- * Nothing sends a checkpoint yet, so nothing needs the buckets outside the
- * kernel worker that read them. This is what crosses the worker port: enough
- * to prove the freeze read a whole machine, and cheap enough to be worth
- * sending. `PLAN.md` § T1.5 is where the bytes acquire a consumer.
+ * This is what crosses the worker port when the caller only needs proof the
+ * freeze read a whole machine. A caller that will rebuild a machine asks for
+ * the full {@link MachineCheckpoint} instead.
  */
 export interface MachineCheckpointSummary {
   readonly kernelMemoryBytes: number;
@@ -127,6 +147,25 @@ export type CheckpointFreezeResult =
   | { readonly status: "captured"; readonly checkpoint: MachineCheckpoint }
   | { readonly status: "timed-out"; readonly reason: string }
   | { readonly status: "failed"; readonly reason: string };
+
+/**
+ * The buffers a worker port should transfer rather than clone.
+ *
+ * Every buffer here is a copy the freeze took, so the worker gives it away.
+ * `programBytes` stays out: each is the live program image its generation
+ * still runs, and transferring it would detach the running process's copy.
+ */
+export function machineCheckpointTransferList(
+  checkpoint: MachineCheckpoint,
+): ArrayBuffer[] {
+  return [
+    checkpoint.kernelMemory.buffer as ArrayBuffer,
+    checkpoint.filesystem.buffer as ArrayBuffer,
+    ...checkpoint.processes.map(
+      (bucket) => bucket.memory.buffer as ArrayBuffer,
+    ),
+  ];
+}
 
 export interface CheckpointFreezeOptions {
   /**
@@ -260,6 +299,26 @@ async function freezeAndRead(
     }
   }
 
+  // A participant can be abandoned between its unwind report and the end of the
+  // read — a thread that dies there is the known case. Nothing rejects in that
+  // window, so the torn attempt is only visible as a coordinator that never
+  // reached `resumed`.
+  const torn = armed.filter(
+    (source) => source.checkpointFreeze.currentPhase !== "resumed",
+  );
+  if (torn.length > 0) {
+    return {
+      status: "failed",
+      reason:
+        "checkpoint freeze read a machine that stopped being whole: "
+        + torn
+          .map((source) =>
+            source.checkpointFreeze.abandonReason?.message
+            ?? `pid=${source.pid} was abandoned during the read`)
+          .join("; "),
+    };
+  }
+
   if (unreleased.length > 0) {
     // The bytes are real, but the machine they came from is not whole. Report
     // the boundary rather than hand back a checkpoint and a stuck keeper.
@@ -278,6 +337,8 @@ function readMachine(
   sources: readonly CheckpointProcessSource[],
 ): MachineCheckpoint {
   return {
+    format: MACHINE_CHECKPOINT_FORMAT,
+    kernelAbiVersion: machine.kernelAbiVersion(),
     kernelMemory: machine.copyKernelMemory(),
     filesystem: new Uint8Array(machine.filesystemBuffer()).slice(),
     processes: sources.map((source) => ({
@@ -288,6 +349,7 @@ function readMachine(
       layout: source.layout,
       argv: [...source.argv],
       memory: new Uint8Array(source.memory.buffer).slice(),
+      programBytes: source.programBytes(),
       threadAllocator: source.threadAllocatorState(),
       ...(source.forkReplayContext
         ? { forkReplayContext: source.forkReplayContext }

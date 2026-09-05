@@ -92,6 +92,17 @@ for (const key of browserEnvironmentKeys) {
   }
 }
 
+// Nix dev-shell build/linker paths are for toolchain commands, not
+// downloaded Playwright browser binaries. WebKitGTK reads more host
+// environment than Chromium/Firefox and can crash before navigation.
+const launchOptions = {
+  env: browserLaunchEnv,
+  args:
+    protectedBrowserBaseUrl === undefined
+    ? undefined
+    : ["--proxy-bypass-list=<-loopback>"],
+};
+
 export default defineConfig({
   testDir: join(__dirname, "test"),
   testMatch: "*.spec.ts",
@@ -113,16 +124,7 @@ export default defineConfig({
       assembledSiteRoot === undefined
         ? undefined
         : { "Accept-Encoding": "identity" },
-    // Nix dev-shell build/linker paths are for toolchain commands, not
-    // downloaded Playwright browser binaries. WebKitGTK reads more host
-    // environment than Chromium/Firefox and can crash before navigation.
-    launchOptions: {
-      env: browserLaunchEnv,
-      args:
-        protectedBrowserBaseUrl === undefined
-        ? undefined
-        : ["--proxy-bypass-list=<-loopback>"],
-    },
+    launchOptions,
     proxy:
       protectedBrowserBaseUrl === undefined
       ? undefined
@@ -164,7 +166,16 @@ export default defineConfig({
     },
     {
       name: "firefox",
-      use: { browserName: "firefox" },
+      // Playwright launches Chromium with --mute-audio and gives Firefox no
+      // equivalent, so a demo with sound plays through the host's speakers
+      // during a headless run.
+      use: {
+        browserName: "firefox",
+        launchOptions: {
+          ...launchOptions,
+          firefoxUserPrefs: { "media.volume_scale": "0.0" },
+        },
+      },
     },
     {
       name: "webkit",

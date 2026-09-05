@@ -11,6 +11,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { statSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -125,7 +126,13 @@ const TEST_PROGRAMS = [
   "kernel_allocator_churn_test.c",
   "checkpoint-loop.c",
   "checkpoint-threads.c",
+  "checkpoint-dlopen.c",
 ];
+
+/** Extra compiler flags a test program needs beyond the shared invocation. */
+const TEST_PROGRAM_FLAGS: Record<string, readonly string[]> = {
+  "checkpoint-dlopen.c": ["-ldl"],
+};
 
 /** Memory64 counterparts needed to prove pointer-width-neutral syscall input. */
 const WASM64_TEST_PROGRAMS = ["lseek_invalid_test.c"];
@@ -160,10 +167,14 @@ const FORK_INSTRUMENT_SEEDS = ["--checkpoint-entry", "kernel.kernel_checkpoint"]
  * different artifact from the one the SDK publishes, and a Vitest run that
  * rebuilds it would silently replace the published one on disk.
  */
-function compileCTestProgram(src: string, out: string): void {
+function compileCTestProgram(
+  src: string,
+  out: string,
+  flags: readonly string[] = [],
+): void {
   const linked = `${out}.linked`;
   try {
-    execFileSync("wasm32posix-cc", [src, "-o", linked], {
+    execFileSync("wasm32posix-cc", [...flags, src, "-o", linked], {
       cwd: repoRoot,
       stdio: "pipe",
     });
@@ -232,6 +243,29 @@ function fixtureBuildContract(
     }\n${compilerVersion}`,
     inputs,
   );
+}
+
+/**
+ * Fold a program's extra flags into its freshness fingerprint.
+ *
+ * The flags change what the compiler emits without changing any input file,
+ * exactly like the instrument seeds, so a fixture built under different flags
+ * must not read as current. A program with no extra flags keeps the shared
+ * contract, and no already-stamped fixture rebuilds.
+ */
+function flaggedContract(
+  contract: ProgramFixtureBuildContract,
+  flags: readonly string[],
+): ProgramFixtureBuildContract {
+  if (flags.length === 0) return contract;
+  return {
+    repoRoot: contract.repoRoot,
+    inputFingerprint: createHash("sha256")
+      .update(contract.inputFingerprint)
+      .update("\0flags\0")
+      .update(flags.join("\0"))
+      .digest("hex"),
+  };
 }
 
 export async function setup() {
@@ -309,11 +343,13 @@ export async function setup() {
       console.warn(`[global-setup] Source not found: ${src}, skipping`);
       continue;
     }
-    if (!programFixtureNeedsRebuild(src, out, wasm32Contract)) continue;
+    const flags = TEST_PROGRAM_FLAGS[cFile] ?? [];
+    const contract = flaggedContract(wasm32Contract, flags);
+    if (!programFixtureNeedsRebuild(src, out, contract)) continue;
 
     console.log(`[global-setup] Compiling ${cFile}...`);
-    compileCTestProgram(src, out);
-    stampProgramFixture(src, out, wasm32Contract);
+    compileCTestProgram(src, out, flags);
+    stampProgramFixture(src, out, contract);
   }
 
   for (const cFile of WASM64_TEST_PROGRAMS) {

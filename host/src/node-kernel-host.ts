@@ -29,7 +29,10 @@ import type {
   ResolveExecRequestMessage,
 } from "./node-kernel-protocol";
 import type { ProcessSnapshot, SyscallTraceEvent } from "./kernel-worker";
-import type { CheckpointCaptureResponse } from "./migration/checkpoint";
+import type {
+  CheckpointCaptureResponse,
+  CheckpointFreezeResult,
+} from "./migration/checkpoint";
 import type { HttpRequest, HttpResponse } from "./networking/in-kernel-http";
 import type { LazyDownloadEvent } from "./vfs/memory-fs";
 import { compiledWorkerEntryIsCurrent } from "./compiled-worker-entry";
@@ -802,6 +805,30 @@ export class NodeKernelHost {
       vforkTimeoutMs: options.vforkTimeoutMs,
     });
     return result as CheckpointCaptureResponse;
+  }
+
+  /**
+   * Freeze this machine, read it, resume it, and hand back the whole
+   * checkpoint rather than its summary. Mirrors
+   * `BrowserKernel.captureCheckpointBytes`.
+   *
+   * The machine keeps running: every buffer in the checkpoint is a copy the
+   * freeze took, transferred out of the kernel worker. This is what a restore
+   * consumes.
+   */
+  async captureCheckpointBytes(options: {
+    unwindTimeoutMs: number;
+    vforkTimeoutMs: number;
+  }): Promise<CheckpointFreezeResult> {
+    const requestId = this._nextRequestId++;
+    const result = await this.request(requestId, {
+      type: "capture_checkpoint",
+      requestId,
+      unwindTimeoutMs: options.unwindTimeoutMs,
+      vforkTimeoutMs: options.vforkTimeoutMs,
+      includeBytes: true,
+    });
+    return result as CheckpointFreezeResult;
   }
 
   /**

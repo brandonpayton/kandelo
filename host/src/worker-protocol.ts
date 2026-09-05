@@ -193,7 +193,8 @@ export type WorkerToHostMessage =
   | AlarmSetMessage
   | VmInterruptTimerMessage
   | ForkHostImportWakeMessage
-  | CheckpointUnwoundMessage;
+  | CheckpointUnwoundMessage
+  | CheckpointRefusedMessage;
 
 export interface WorkerReadyMessage {
   type: "ready";
@@ -217,6 +218,21 @@ export interface CheckpointUnwoundMessage {
   pid: number;
   /** Absent for the process's main thread. */
   tid?: number;
+}
+
+/**
+ * The worker read its unwind request and could not reach its capture.
+ *
+ * The freeze fails on this rather than on its own deadline, so the caller is
+ * told why the machine could not be read instead of only that nobody reported
+ * in time. The guest keeps running; a refusal is not a process failure.
+ */
+export interface CheckpointRefusedMessage {
+  type: "checkpoint_refused";
+  pid: number;
+  /** Absent for the process's main thread. */
+  tid?: number;
+  reason: string;
 }
 
 export interface WorkerExitMessage {

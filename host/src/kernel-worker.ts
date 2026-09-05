@@ -7852,11 +7852,32 @@ export class CentralizedKernelWorker {
   }
 
   /**
-   * Stop asking for unwinds. A word already published cannot be recalled, so a
-   * process can still unwind after this returns; its freeze gate is what
-   * releases it.
+   * Stop asking for unwinds, and recall every word already published.
+   *
+   * A completion that lands while a process is already unwinding republishes
+   * the word after the guest cleared it — the capture's own arena mmaps are
+   * the standing case. Left in place, that leftover makes the guest's first
+   * post-resume syscall begin a second capture with no freeze to resume it,
+   * and the guest parks forever. Every participant is parked or abandoned by
+   * the time the freeze disarms, so the recall cannot race the guest's read.
    */
   disarmCheckpointUnwind(): void {
+    for (const pid of this.checkpointUnwindPids) {
+      const registration = this.processes.get(pid);
+      if (!registration) continue;
+      for (const channel of registration.channels) {
+        const buffer = kernelEntryMemoryBuffer(channel.memory);
+        const processView = new KernelEntryIntrinsicDataView(
+          buffer,
+          channel.channelOffset,
+        );
+        kernelEntryIntrinsicApply(
+          kernelEntryIntrinsicDataViewSetUint32,
+          processView,
+          [CH_CHECKPOINT_REQUEST, 0, true],
+        );
+      }
+    }
     this.checkpointUnwindPids.clear();
   }
 

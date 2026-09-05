@@ -7,19 +7,34 @@
  * hook, parks with its frames in linear memory, and is read and resumed.
  */
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NodeKernelHost } from "../../src/node-kernel-host";
-import { findRepoRoot } from "../../src/binary-resolver";
+import { ABI_VERSION } from "../../src/generated/abi";
+import {
+  binaryCacheRoot,
+  findRepoRoot,
+  resolveBinary,
+} from "../../src/binary-resolver";
 
 const TIMEOUTS = { unwindTimeoutMs: 10_000, vforkTimeoutMs: 5_000 };
 
-function programBytes(name: string): ArrayBuffer {
-  const bytes = readFileSync(join(findRepoRoot(), "examples", name));
+/** Where the guest finds the side module the freeze fixture loads. */
+const SIDE_MODULE_GUEST_PATH = "/tmp/checkpoint-dlopen-lib.so";
+
+function fileArrayBuffer(path: string): ArrayBuffer {
+  const bytes = readFileSync(path);
   return bytes.buffer.slice(
     bytes.byteOffset,
     bytes.byteOffset + bytes.byteLength,
   ) as ArrayBuffer;
+}
+
+function programBytes(name: string): ArrayBuffer {
+  return fileArrayBuffer(join(findRepoRoot(), "examples", name));
 }
 
 /**
@@ -31,6 +46,10 @@ function programBytes(name: string): ArrayBuffer {
  */
 async function startReadyGuest(
   program: string,
+  options: {
+    readonly args?: readonly string[];
+    readonly prepare?: (host: NodeKernelHost) => Promise<void>;
+  } = {},
 ): Promise<{ host: NodeKernelHost; pid: number }> {
   let ready = () => {};
   const isReady = new Promise<void>((resolve) => { ready = resolve; });
@@ -43,15 +62,102 @@ async function startReadyGuest(
     },
   });
   await host.init();
+  await options.prepare?.(host);
   let pid = -1;
   const started = new Promise<void>((resolve) => {
-    void host.spawn(programBytes(program), [program], {
+    void host.spawn(programBytes(program), [program, ...(options.args ?? [])], {
       onStarted: (started) => { pid = started; resolve(); },
     });
   });
   await started;
   await isReady;
   return { host, pid };
+}
+
+/**
+ * Build the side module the checkpoint fixture loads.
+ *
+ * It goes through the SDK the same way any other shared library does, so the
+ * archive generation the guest publishes is a real one. It is instrumented
+ * like every loadable Kandelo artifact: a capture saves module state for each
+ * live module, and a module without the instrumentation is absent from the
+ * process module catalogs.
+ */
+function buildSideModule(): Uint8Array {
+  const buildDir = join(tmpdir(), "wasm-checkpoint-dlopen");
+  mkdirSync(buildDir, { recursive: true });
+  const soPath = join(buildDir, "checkpoint-dlopen-lib.so");
+  execFileSync(
+    "wasm32posix-cc",
+    [
+      "-shared",
+      "-fPIC",
+      "-O2",
+      `-I${join(findRepoRoot(), "libc/glue")}`,
+      join(findRepoRoot(), "host/test/fixtures/checkpoint-dlopen-lib.c"),
+      "-o",
+      soPath,
+    ],
+    { stdio: "pipe" },
+  );
+  execFileSync(
+    "bash",
+    [
+      join(findRepoRoot(), "scripts/run-wasm-fork-instrument.sh"),
+      soPath,
+      "-o",
+      soPath,
+    ],
+    { stdio: "pipe" },
+  );
+  // A fresh copy, because writeFileToVfs transfers the backing buffer and a
+  // readFileSync Buffer sits in a pool it does not own.
+  return new Uint8Array(readFileSync(soPath));
+}
+
+/**
+ * The Doom shareware IWAD the fbDOOM checkpoint test runs against.
+ *
+ * Same pinned source as `images/vfs/products/browser-main-shell.toml`: the
+ * browser demo fetches this file at page load, so the test exercises the same
+ * asset the product ships. Fetched once, verified against the pinned sha256,
+ * and cached beside the resolver's package generations.
+ */
+const DOOM_WAD_URL =
+  "https://cdn.jsdelivr.net/gh/gaborbata/vanilla-mocha-doom@15825a07a48806bcfb242a42afd5ee7cb3c9a3a4/wads/doom1.wad";
+const DOOM_WAD_SHA256 =
+  "1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771";
+
+async function doomSharewareWad(): Promise<Uint8Array> {
+  const cachePath = join(
+    binaryCacheRoot(),
+    "archives",
+    `doom-shareware-${DOOM_WAD_SHA256.slice(0, 8)}.wad`,
+  );
+  const sha256 = (bytes: Uint8Array) =>
+    createHash("sha256").update(bytes).digest("hex");
+  try {
+    // A fresh copy, because writeFileToVfs transfers the backing buffer and
+    // a readFileSync Buffer sits in a pool it does not own.
+    const cached = new Uint8Array(readFileSync(cachePath));
+    if (sha256(cached) === DOOM_WAD_SHA256) return cached;
+  } catch {
+    // Not cached yet.
+  }
+  const response = await fetch(DOOM_WAD_URL);
+  if (!response.ok) {
+    throw new Error(`fetching ${DOOM_WAD_URL} failed: ${response.status}`);
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const digest = sha256(bytes);
+  if (digest !== DOOM_WAD_SHA256) {
+    throw new Error(
+      `${DOOM_WAD_URL} hashed to ${digest}, expected ${DOOM_WAD_SHA256}`,
+    );
+  }
+  mkdirSync(join(binaryCacheRoot(), "archives"), { recursive: true });
+  writeFileSync(cachePath, bytes);
+  return bytes;
 }
 
 describe("machine checkpoint of a running guest", () => {
@@ -85,6 +191,139 @@ describe("machine checkpoint of a running guest", () => {
   );
 
   it(
+    "keeps the guest running after the freeze resumes it",
+    { timeout: 60_000 },
+    async () => {
+      const { host } = await startReadyGuest("checkpoint-loop.wasm");
+      try {
+        expect((await host.captureCheckpoint(TIMEOUTS)).status).toBe(
+          "captured",
+        );
+
+        // Well past the resume, not immediately after it. A leftover unwind
+        // request word — republished by the completions of the capture's own
+        // arena mmaps — would make the guest's next syscall begin a second
+        // capture with no freeze active and park it forever. An immediate
+        // second capture cannot see that: it adopts the spurious unwind as
+        // its own.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+
+        const second = await host.captureCheckpoint(TIMEOUTS);
+        expect(second.status).toBe("captured");
+      } finally {
+        await host.destroy();
+      }
+    },
+  );
+
+  it(
+    "hands the whole checkpoint to the caller",
+    { timeout: 60_000 },
+    async () => {
+      const program = programBytes("checkpoint-loop.wasm");
+      const { host, pid } = await startReadyGuest("checkpoint-loop.wasm");
+      try {
+        const response = await host.captureCheckpointBytes(TIMEOUTS);
+
+        expect(response.status).toBe("captured");
+        if (response.status !== "captured") return;
+        const { checkpoint } = response;
+        expect(checkpoint.format).toBe(1);
+        expect(checkpoint.kernelAbiVersion).toBe(ABI_VERSION);
+        expect(checkpoint.kernelMemory.byteLength).toBeGreaterThan(0);
+        expect(checkpoint.filesystem.byteLength).toBeGreaterThan(0);
+        const bucket = checkpoint.processes.find((p) => p.pid === pid);
+        expect(bucket).toBeDefined();
+        expect(bucket!.memory.byteLength).toBeGreaterThan(0);
+        // The exact program image rode along, so a restore can relaunch it.
+        expect(new Uint8Array(bucket!.programBytes)).toEqual(
+          new Uint8Array(program),
+        );
+
+        // The transfer moved copies, not live state: the guest still runs
+        // and the machine can be read again.
+        expect(await host.signalProcess(pid, 0)).toBe(true);
+        expect((await host.captureCheckpoint(TIMEOUTS)).status).toBe(
+          "captured",
+        );
+      } finally {
+        await host.destroy();
+      }
+    },
+  );
+
+  it(
+    "reads a running fbDOOM",
+    { timeout: 120_000 },
+    async () => {
+      // A real application rather than a fixture written for the freeze: it
+      // loads a 4 MB IWAD, renders through /dev/fb0 and crosses a syscall
+      // boundary every game tic.
+      const fbdoom = fileArrayBuffer(resolveBinary("programs/fbdoom.wasm"));
+      const wad = await doomSharewareWad();
+      let ptyOutput = "";
+      const host = new NodeKernelHost({
+        rootfsImage: "default",
+        onPtyOutput: (_pid, data) => {
+          ptyOutput += new TextDecoder().decode(data);
+        },
+      });
+      await host.init();
+      try {
+        await host.writeFileToVfs("/doom1.wad", wad);
+        let pid = -1;
+        const started = new Promise<void>((resolve) => {
+          void host.spawn(fbdoom, ["fbdoom", "-iwad", "/doom1.wad"], {
+            // fbDOOM's keyboard input needs a controlling terminal or it
+            // exits during startup.
+            pty: true,
+            // NodeKernelHost has no audio consumer, so a working /dev/dsp
+            // would fill the kernel's ring and park fbDOOM in a write the
+            // kernel never completes — the timed-out case below, not this
+            // one. An unopenable AUDIODEV disables sound through fbDOOM's
+            // own fallback.
+            env: ["AUDIODEV=/nonexistent-dsp"],
+            onStarted: (p) => {
+              pid = p;
+              resolve();
+            },
+          });
+        });
+        await started;
+
+        // ST_Init is the last startup line before fbDOOM enters its game
+        // loop; the settle lets it reach the demo loop proper so the freeze
+        // meets a game in flight rather than a program still initializing.
+        await expect
+          .poll(() => ptyOutput.includes("ST_Init"), { timeout: 60_000 })
+          .toBe(true);
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+
+        const response = await host.captureCheckpoint(TIMEOUTS);
+
+        expect(response.status).toBe("captured");
+        if (response.status !== "captured") return;
+        const { summary } = response;
+        expect(summary.kernelMemoryBytes).toBeGreaterThan(0);
+        expect(summary.filesystemBytes).toBeGreaterThan(wad.byteLength);
+        const captured = summary.processes.find((p) => p.pid === pid);
+        expect(captured).toBeDefined();
+        // The guest loaded the IWAD, so its image holds more than the wad.
+        expect(captured!.memoryBytes).toBeGreaterThan(wad.byteLength);
+        expect(captured!.argv).toEqual(["fbdoom", "-iwad", "/doom1.wad"]);
+        expect(captured!.executionGeneration).toBeGreaterThan(0);
+
+        // The freeze reversed: the game still runs and can be read again.
+        expect(await host.signalProcess(pid, 0)).toBe(true);
+        const second = await host.captureCheckpoint(TIMEOUTS);
+        expect(second.status).toBe("captured");
+      } finally {
+        await host.destroy();
+      }
+    },
+  );
+
+  it(
     "reads a process whose pthread must unwind too",
     { timeout: 60_000 },
     async () => {
@@ -104,6 +343,74 @@ describe("machine checkpoint of a running guest", () => {
         // parked on a gate the resume did not reach.
         const second = await host.captureCheckpoint(TIMEOUTS);
         expect(second.status).toBe("captured");
+      } finally {
+        await host.destroy();
+      }
+    },
+  );
+
+  it(
+    "fails rather than hangs when a thread cannot adopt a newer archive",
+    { timeout: 60_000 },
+    async () => {
+      const sideModule = buildSideModule();
+      const { host, pid } = await startReadyGuest("checkpoint-dlopen.wasm", {
+        args: [SIDE_MODULE_GUEST_PATH],
+        prepare: (started) =>
+          started.writeFileToVfs(SIDE_MODULE_GUEST_PATH, sideModule),
+      });
+      try {
+        const started = Date.now();
+        const response = await host.captureCheckpoint(TIMEOUTS);
+        const elapsed = Date.now() - started;
+
+        // The pthread's replica is one generation behind, so it must take the
+        // archive writer, which the parked main thread's reader holds shut.
+        expect(response.status).toBe("failed");
+        if (response.status !== "failed") return;
+        expect(response.reason).toContain(
+          "the dynamic-loader archive writer stayed held",
+        );
+        // The refusal is what ended the freeze, not the 10 s unwind deadline.
+        expect(elapsed).toBeLessThan(TIMEOUTS.unwindTimeoutMs);
+
+        // The machine is whole: the freeze reversed and the guest still runs.
+        expect(await host.signalProcess(pid, 0)).toBe(true);
+      } finally {
+        await host.destroy();
+      }
+    },
+  );
+
+  it(
+    "fails rather than hangs when the main thread cannot adopt a newer archive",
+    { timeout: 60_000 },
+    async () => {
+      // The fixture's "thread" mode makes the pthread load the side module,
+      // so the thread whose replica is behind — and whose bounded writer wait
+      // refuses the capture — is the main thread. This drives the process
+      // kernel_checkpoint site the way the test above drives the pthread one.
+      const sideModule = buildSideModule();
+      const { host, pid } = await startReadyGuest("checkpoint-dlopen.wasm", {
+        args: [SIDE_MODULE_GUEST_PATH, "thread"],
+        prepare: (started) =>
+          started.writeFileToVfs(SIDE_MODULE_GUEST_PATH, sideModule),
+      });
+      try {
+        const started = Date.now();
+        const response = await host.captureCheckpoint(TIMEOUTS);
+        const elapsed = Date.now() - started;
+
+        expect(response.status).toBe("failed");
+        if (response.status !== "failed") return;
+        expect(response.reason).toContain(
+          "the dynamic-loader archive writer stayed held",
+        );
+        // The refusal is what ended the freeze, not the 10 s unwind deadline.
+        expect(elapsed).toBeLessThan(TIMEOUTS.unwindTimeoutMs);
+
+        // The machine is whole: the freeze reversed and the guest still runs.
+        expect(await host.signalProcess(pid, 0)).toBe(true);
       } finally {
         await host.destroy();
       }

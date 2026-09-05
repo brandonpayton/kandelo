@@ -296,12 +296,18 @@ export interface ReadProcMapsRequestMessage {
  * freeze completed, or the reason it timed out or failed. A process that makes
  * no syscall never reaches its unwind hook, so a timeout is an ordinary
  * outcome and the machine keeps running.
+ *
+ * With `includeBytes`, a captured response carries the full
+ * `MachineCheckpoint` instead of the summary, its kernel, filesystem, and
+ * process buffers in the transfer list. Every transferred buffer is a copy
+ * the freeze took; the worker keeps only live state.
  */
 export interface CaptureCheckpointRequestMessage {
   type: "capture_checkpoint";
   requestId: number;
   unwindTimeoutMs: number;
   vforkTimeoutMs: number;
+  includeBytes?: true;
 }
 
 /** Enable / disable the syscall trace ring. Mirrors the browser host. */

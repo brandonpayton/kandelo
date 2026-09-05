@@ -13,6 +13,8 @@ import type { ProcessMemoryLayout } from "../../src/process-memory";
 const KERNEL_MEMORY_BYTES = 64;
 const FILESYSTEM_BYTES = 128;
 const PROCESS_MEMORY_BYTES = 256;
+const PROGRAM_BYTES = 32;
+const KERNEL_ABI = 977;
 
 const layout = (channelOffset: number): ProcessMemoryLayout => ({
   initialPages: 1,
@@ -42,6 +44,7 @@ function processSource(pid: number, generation: number): CheckpointProcessSource
     layout: layout(pid * 1024),
     argv: [`/bin/program-${pid}`],
     memory,
+    programBytes: () => new Uint8Array(PROGRAM_BYTES).fill(pid).buffer,
     threadAllocatorState: () =>
       new ThreadPageAllocator({
         firstSlotStartPage: 4,
@@ -105,6 +108,7 @@ function testMachine(sources: CheckpointProcessSource[]): TestMachine {
       },
       copyKernelMemory: () => new Uint8Array(KERNEL_MEMORY_BYTES).fill(7),
       filesystemBuffer: () => new SharedArrayBuffer(FILESYSTEM_BYTES),
+      kernelAbiVersion: () => KERNEL_ABI,
       liveProcesses: () => sources,
     },
   };
@@ -135,6 +139,11 @@ describe("machine checkpoint freeze", () => {
     expect(result.checkpoint.processes[0]!.memory.byteLength)
       .toBe(PROCESS_MEMORY_BYTES);
     expect(result.checkpoint.processes[0]!.argv).toEqual(["/bin/program-4"]);
+    expect(result.checkpoint.format).toBe(1);
+    expect(result.checkpoint.kernelAbiVersion).toBe(KERNEL_ABI);
+    expect(
+      new Uint8Array(result.checkpoint.processes[0]!.programBytes),
+    ).toEqual(new Uint8Array(PROGRAM_BYTES).fill(4));
     expect(result.checkpoint.processes[0]!.threadAllocator).toEqual({
       nextPage: 4,
       freePages: [],
@@ -275,6 +284,49 @@ describe("machine checkpoint freeze", () => {
       reason: "pid=4: the process ended during the checkpoint freeze",
     });
     expect(state.held).toEqual([]);
+  });
+
+  it("fails without freezing when a thread dies before the read", async () => {
+    const state = testMachine([processSource(4, 1)]);
+    const freeze = state.sources[0]!.checkpointFreeze;
+    freeze.registerThread(7);
+    const capture = captureMachineCheckpoint(state.machine, options);
+    await flush();
+    freeze.unwound();
+    freeze.unregisterThread(7);
+
+    await expect(capture).resolves.toEqual({
+      status: "failed",
+      reason: "pid=4: tid=7 ended during the checkpoint freeze",
+    });
+    expect(state.held).toEqual([]);
+  });
+
+  it("fails after reading when a thread dies during the read", async () => {
+    const state = testMachine([processSource(4, 1)]);
+    const freeze = state.sources[0]!.checkpointFreeze;
+    freeze.registerThread(7);
+    const machine: CheckpointMachine = {
+      ...state.machine,
+      copyKernelMemory: () => {
+        freeze.unregisterThread(7);
+        return new Uint8Array(KERNEL_MEMORY_BYTES);
+      },
+    };
+    const capture = captureMachineCheckpoint(machine, options);
+    await flush();
+    freeze.unwound();
+    freeze.unwound(7);
+
+    // Nothing rejects in this window, so the bytes were read. They describe a
+    // machine that lost a thread while they were being copied.
+    await expect(capture).resolves.toEqual({
+      status: "failed",
+      reason:
+        "checkpoint freeze read a machine that stopped being whole: "
+        + "pid=4: tid=7 ended during the checkpoint freeze",
+    });
+    expect(state.held).toEqual([[4]]);
   });
 
   it("checkpoints again after a failed attempt", async () => {

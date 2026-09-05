@@ -183,15 +183,55 @@ describe("checkpoint freeze gate", () => {
     expect(coordinator.currentPhase).toBe("unwound");
   });
 
-  it("releases a freeze waiting on a thread that exits", async () => {
+  it("fails a freeze that is still waiting on a thread that exits", async () => {
     const coordinator = new CheckpointFreezeGateCoordinator("pid=24");
     coordinator.registerThread(2);
     coordinator.arm();
+    const waiter = coordinator.waitUntilUnwound();
     coordinator.unwound();
     coordinator.unregisterThread(2);
 
-    await coordinator.waitUntilUnwound();
+    await expect(waiter).rejects.toThrow(
+      "pid=24: tid=2 ended during the checkpoint freeze",
+    );
+    expect(coordinator.currentPhase).toBe("abandoned");
+  });
+
+  it("fails a freeze when a thread that already parked exits", () => {
+    const coordinator = new CheckpointFreezeGateCoordinator("pid=26");
+    coordinator.registerThread(2);
+    coordinator.arm();
+    coordinator.unwound();
+    coordinator.unwound(2);
     expect(coordinator.currentPhase).toBe("unwound");
+
+    coordinator.unregisterThread(2);
+    expect(coordinator.currentPhase).toBe("abandoned");
+    expect(coordinator.abandonReason?.message).toBe(
+      "pid=26: tid=2 ended during the checkpoint freeze",
+    );
+    // The thread that stayed alive is rewound rather than left parked.
+    expect(stateOf(coordinator.gate)).toBe(1);
+  });
+
+  it("lets a thread exit outside a freeze without spoiling the next one", () => {
+    const coordinator = new CheckpointFreezeGateCoordinator("pid=27");
+    const second = coordinator.registerThread(2);
+    const third = coordinator.registerThread(3);
+    coordinator.arm();
+    coordinator.unwound();
+    coordinator.unwound(2);
+    coordinator.unwound(3);
+    coordinator.resume();
+    for (const gate of [coordinator.gate, second, third]) {
+      waitForCheckpointFreezeResume(gate, "pid=27");
+    }
+
+    coordinator.unregisterThread(3);
+    expect(coordinator.currentPhase).toBe("resumed");
+    coordinator.arm();
+    expect(coordinator.currentPhase).toBe("armed");
+    expect(coordinator.abandonReason).toBeNull();
   });
 
   it("abandoning rewinds every parked thread", () => {

@@ -81,7 +81,9 @@ import {
 import { CheckpointFreezeGateCoordinator } from "./checkpoint-freeze-gate";
 import { ProcessExecutionGenerationAllocator } from "./process-execution-generation";
 import {
+  captureMachineCheckpoint,
   captureMachineCheckpointSummary,
+  machineCheckpointTransferList,
   type CheckpointMachine,
 } from "./migration/checkpoint";
 import { ForkExternrefProcessOwner } from "./fork-externref-process-owner";
@@ -188,6 +190,7 @@ const checkpointMachine: CheckpointMachine = {
     }
     return memfs.sharedBuffer;
   },
+  kernelAbiVersion: () => kernelWorker.getKernelAbiVersion(),
   liveProcesses: () =>
     [...processes.entries()].map(([pid, info]) => ({
       pid,
@@ -197,6 +200,7 @@ const checkpointMachine: CheckpointMachine = {
       layout: info.layout,
       argv: info.argv,
       memory: info.memory,
+      programBytes: () => info.programBytes,
       threadAllocatorState: () => info.threadAllocator.snapshotState(),
       forkReplayContext: info.forkReplayContext,
       checkpointFreeze: info.checkpointFreeze,
@@ -1785,6 +1789,16 @@ function installProcessWorkerListeners(
       // The frames exist only until the gate reopens, so the report and the
       // read that follows it are the whole capture window.
       process.checkpointFreeze.unwound();
+      return;
+    }
+    if (
+      m.type === "checkpoint_refused"
+      && m.pid === pid
+      && m.tid === undefined
+    ) {
+      // This thread read the request and could not reach its capture. Fail the
+      // freeze on the real reason rather than let it expire on its deadline.
+      process.checkpointFreeze.abandon(m.reason);
       return;
     }
     if (intentionallyTerminated.has(worker as object)) return;
@@ -3580,6 +3594,8 @@ async function handleClone(
       // The frames exist only until the gate reopens, so the report and the
       // read that follows it are the whole capture window.
       processInfo.checkpointFreeze.unwound(tid);
+    } else if (m.type === "checkpoint_refused" && m.tid === tid) {
+      processInfo.checkpointFreeze.abandon(m.reason);
     } else if (m.type === "thread_exit") {
       if (!isCurrentThreadGeneration()) {
         void terminateThreadEntry();
@@ -4540,6 +4556,21 @@ sw.onmessage = (e: MessageEvent) => {
     }
     case "capture_checkpoint": {
       const { requestId, unwindTimeoutMs, vforkTimeoutMs } = msg;
+      if (msg.includeBytes) {
+        void captureMachineCheckpoint(checkpointMachine, {
+          unwindTimeoutMs,
+          vforkTimeoutMs,
+        }).then(
+          (result) => post(
+            { type: "response", requestId, result },
+            result.status === "captured"
+              ? machineCheckpointTransferList(result.checkpoint)
+              : [],
+          ),
+          (err) => respondError(requestId, (err as Error)?.message ?? String(err)),
+        );
+        break;
+      }
       void captureMachineCheckpointSummary(checkpointMachine, {
         unwindTimeoutMs,
         vforkTimeoutMs,

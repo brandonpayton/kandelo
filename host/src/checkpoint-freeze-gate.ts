@@ -107,11 +107,22 @@ export class CheckpointFreezeGateCoordinator {
   private unwoundPromise: Promise<void> | null = null;
   private resolveUnwound: (() => void) | null = null;
   private rejectUnwound: ((reason: Error) => void) | null = null;
+  private abandonment: Error | null = null;
 
   constructor(readonly context: string) {}
 
   get currentPhase(): CheckpointFreezePhase {
     return this.phase;
+  }
+
+  /**
+   * Why the attempt was given up, for a caller that has no rejection to read.
+   *
+   * An abandon after the unwind report has no pending promise to reject, so
+   * the keeper only learns the cause by asking.
+   */
+  get abandonReason(): Error | null {
+    return this.abandonment;
   }
 
   /**
@@ -130,14 +141,20 @@ export class CheckpointFreezeGateCoordinator {
   }
 
   /**
-   * Drop an exited thread, releasing a freeze that is still waiting for it.
+   * Drop an exited thread, failing a freeze that was counting on it.
+   *
+   * WHY the attempt fails rather than proceeds without the thread: the thread's
+   * frames are part of the image the keeper reads, and a thread that dies
+   * inside the freeze takes them with it. Releasing the freeze here would
+   * report a whole machine that is already missing one participant. A thread
+   * that exits outside a freeze is an ordinary exit and settles nothing.
    */
   unregisterThread(tid: number): void {
     if (!this.threadGates.delete(tid)) return;
-    this.parked.delete(tid);
-    if (this.awaited.delete(tid) && this.awaited.size === 0) {
-      this.settleUnwound();
-    }
+    const awaiting = this.awaited.delete(tid);
+    const wasParked = this.parked.delete(tid);
+    if (!awaiting && !wasParked) return;
+    this.abandon(`tid=${tid} ended during the checkpoint freeze`);
   }
 
   private gateFor(tid: number): SharedArrayBuffer {
@@ -170,6 +187,7 @@ export class CheckpointFreezeGateCoordinator {
       }
     }
     this.phase = "armed";
+    this.abandonment = null;
     this.awaited = new Set(participants);
     this.parked = new Set();
     this.unwoundPromise = new Promise<void>((resolve, reject) => {
@@ -220,12 +238,13 @@ export class CheckpointFreezeGateCoordinator {
     if (this.phase === "abandoned") return;
     const settled = this.phase === "armed" ? this.rejectUnwound : null;
     this.phase = "abandoned";
+    this.abandonment = abandonedError(this.context, reason);
     for (const tid of this.parked) {
       resumeCheckpointFreezeGate(this.gateFor(tid));
     }
     this.parked.clear();
     this.awaited.clear();
-    settled?.(abandonedError(this.context, reason));
+    settled?.(this.abandonment);
     this.resolveUnwound = null;
     this.rejectUnwound = null;
     this.unwoundPromise = null;
