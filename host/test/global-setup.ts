@@ -125,10 +125,12 @@ const TEST_PROGRAMS = [
   "fifo_lifecycle_test.c",
   "kernel_allocator_churn_test.c",
   "checkpoint-loop.c",
+  "checkpoint-epoll.c",
   "checkpoint-threads.c",
   "checkpoint-dlopen.c",
   "checkpoint-handles.c",
   "checkpoint-pty-echo.c",
+  "checkpoint-blocking-read.c",
 ];
 
 /** Extra compiler flags a test program needs beyond the shared invocation. */

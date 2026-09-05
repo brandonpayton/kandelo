@@ -362,6 +362,29 @@ describe("checkpoint validation", () => {
         checkpoint.kms = kms;
       }, /DRM master is pid 424242, which has no process bucket/);
 
+      await refusal((checkpoint) => {
+        (checkpoint as { epolls: unknown }).epolls = undefined;
+      }, "carries no epoll list");
+
+      await refusal((checkpoint) => {
+        checkpoint.epolls = [{ pid: 424242, epfd: 3, interests: [] }];
+      }, /an epoll mirror names pid 424242, which has no process bucket/);
+
+      await refusal((checkpoint) => {
+        checkpoint.epolls = [{
+          pid: checkpoint.processes[0]!.pid,
+          epfd: 3,
+          interests: [{ fd: 4, events: 1, data: "not a number" }],
+        }];
+      }, /carries unusable data for fd 4/);
+
+      await refusal((checkpoint) => {
+        checkpoint.epolls = [
+          { pid: checkpoint.processes[0]!.pid, epfd: 3, interests: [] },
+          { pid: checkpoint.processes[0]!.pid, epfd: 3, interests: [] },
+        ];
+      }, /carries two mirrors for epoll fd 3/);
+
       // The corruptions above never touched the captured object itself.
       await expect(
         validateMachineCheckpoint(cloneCheckpoint(captured), EXPECTED),
@@ -568,6 +591,47 @@ describe("checkpoint validation", () => {
         );
       } finally {
         await mismatched.destroy().catch(() => undefined);
+      }
+    },
+  );
+
+  it(
+    "serves epoll_wait from a restored machine",
+    { timeout: 120_000 },
+    async () => {
+      // The host answers epoll_pwait from its mirror of the interest list,
+      // built by watching epoll_ctl. The captured guest registered its pipe
+      // before the freeze, so the mirror must arrive with the checkpoint —
+      // a restore without it answers EBADF and the guest's tick dies.
+      const checkpoint = await captureRealCheckpoint("checkpoint-epoll.wasm");
+      const pid = checkpoint.processes[0]!.pid;
+      expect(checkpoint.epolls).toEqual([{
+        pid,
+        epfd: expect.any(Number),
+        interests: [{
+          fd: expect.any(Number),
+          events: expect.any(Number),
+          data: expect.any(String),
+        }],
+      }]);
+
+      let output = "";
+      let sawTick = () => {};
+      const ticked = new Promise<void>((resolve) => { sawTick = resolve; });
+      const receiver = new NodeKernelHost({
+        rootfsImage: "default",
+        restoreCheckpoint: checkpoint,
+        onStdout: (_pid, data) => {
+          output += new TextDecoder().decode(data);
+          if (output.includes("TICK")) sawTick();
+        },
+      });
+      await receiver.init();
+      try {
+        await ticked;
+        expect(output).not.toContain("EPOLL_ERR");
+      } finally {
+        await receiver.destroy();
       }
     },
   );

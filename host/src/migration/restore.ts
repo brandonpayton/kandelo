@@ -196,7 +196,68 @@ export async function validateMachineCheckpoint(
     }
     glPids.add(context.pid);
   }
+  if (!Array.isArray(checkpoint.epolls)) {
+    refuse("the checkpoint carries no epoll list");
+  }
+  const epollKeys = new Set<string>();
+  for (const epoll of checkpoint.epolls) {
+    validateEpoll(
+      epoll,
+      checkpoint.processes.find((bucket) => bucket.pid === epoll.pid),
+    );
+    const key = `${epoll.pid}:${epoll.epfd}`;
+    if (epollKeys.has(key)) {
+      refuse(`pid ${epoll.pid} carries two mirrors for epoll fd ${epoll.epfd}`);
+    }
+    epollKeys.add(key);
+  }
   return modules;
+}
+
+/** Cap on one epoll mirror a peer sent, far above any real interest list. */
+const MAX_EPOLL_INTERESTS = 65_536;
+
+function validateEpoll(
+  epoll: MachineCheckpoint["epolls"][number],
+  bucket: CheckpointProcessBucket | undefined,
+): void {
+  const { pid, epfd, interests } = epoll;
+  if (bucket === undefined) {
+    refuse(`an epoll mirror names pid ${pid}, which has no process bucket`);
+  }
+  if (!Number.isSafeInteger(epfd) || epfd < 0) {
+    refuse(`pid ${pid}'s epoll mirror names fd ${String(epfd)}`);
+  }
+  if (!Array.isArray(interests) || interests.length > MAX_EPOLL_INTERESTS) {
+    refuse(`pid ${pid}'s epoll ${epfd} mirror is unusable`);
+  }
+  for (const interest of interests) {
+    if (!Number.isSafeInteger(interest.fd) || interest.fd < 0) {
+      refuse(
+        `pid ${pid}'s epoll ${epfd} watches fd ${String(interest.fd)}`,
+      );
+    }
+    if (
+      !Number.isSafeInteger(interest.events)
+      || interest.events < 0
+      || interest.events > 0xffff_ffff
+    ) {
+      refuse(
+        `pid ${pid}'s epoll ${epfd} carries unusable events for fd `
+        + `${interest.fd}`,
+      );
+    }
+    if (
+      typeof interest.data !== "string"
+      || !/^\d{1,20}$/.test(interest.data)
+      || BigInt(interest.data) > 0xffff_ffff_ffff_ffffn
+    ) {
+      refuse(
+        `pid ${pid}'s epoll ${epfd} carries unusable data for fd `
+        + `${interest.fd}`,
+      );
+    }
+  }
 }
 
 /** Caps on a GL context a peer sent, far above anything a real guest makes. */

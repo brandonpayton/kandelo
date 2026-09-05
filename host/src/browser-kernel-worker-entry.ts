@@ -246,6 +246,7 @@ const checkpointMachine: CheckpointMachine = {
     buffers: kernelWorker.bos.snapshot(),
   }),
   glContexts: () => kernelWorker.captureGlContextsForCheckpoint(),
+  epollInterests: () => kernelWorker.captureEpollInterestsForCheckpoint(),
   framebuffers: () =>
     kernelWorker.framebuffers.list().map((binding) => ({
       pid: binding.pid,
@@ -1582,6 +1583,9 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
   if (msg.restoreCheckpoint && restoredProgramModules) {
     kernelWorker.rebindRestoredHostHandles(
       msg.restoreCheckpoint.processes.map((bucket) => ({ pid: bucket.pid })),
+    );
+    kernelWorker.restoreEpollInterestsFromCheckpoint(
+      msg.restoreCheckpoint.epolls,
     );
     // Before the first restored process resumes: its next GL submit must
     // find a binding, or a machine that was healthy when captured fails

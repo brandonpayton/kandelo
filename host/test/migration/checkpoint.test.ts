@@ -145,6 +145,7 @@ function testMachine(sources: CheckpointProcessSource[]): TestMachine {
       framebuffers: () => [],
       kmsState: () => state.kms,
       glContexts: () => state.glContexts,
+      epollInterests: () => [],
       monotonicNowNs: () => 7_000_000_000,
       kernelAbiVersion: () => KERNEL_ABI,
       liveProcesses: () => sources,
@@ -215,7 +216,7 @@ describe("machine checkpoint freeze", () => {
     expect(result.checkpoint.processes[0]!.memory.byteLength)
       .toBe(PROCESS_MEMORY_BYTES);
     expect(result.checkpoint.processes[0]!.argv).toEqual(["/bin/program-4"]);
-    expect(result.checkpoint.format).toBe(6);
+    expect(result.checkpoint.format).toBe(7);
     expect(result.checkpoint.kernelAbiVersion).toBe(KERNEL_ABI);
     expect(
       new Uint8Array(result.checkpoint.processes[0]!.programBytes),

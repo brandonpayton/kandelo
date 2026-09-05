@@ -65,6 +65,31 @@ export interface CheckpointFramebuffer {
 }
 
 /**
+ * One epoll instance's interest list, as the host mirrors it.
+ *
+ * The kernel's own epoll state rides inside the kernel memory copy, but
+ * `epoll_pwait` is served from a host-side mirror of the interest list that
+ * the host builds by watching `epoll_ctl` (`kernel_handle_channel` crashes in
+ * Chrome for `epoll_pwait`). A restored machine's host never saw those calls,
+ * so the mirror is machine state the checkpoint must carry: without it, every
+ * restored `epoll_wait` answers EBADF for an fd the guest genuinely holds.
+ *
+ * `data` is the guest's `epoll_data`, a u64 carried as decimal text because
+ * the checkpoint codec is JSON plus binary blobs and JSON has no u64.
+ */
+export interface CheckpointEpollInterest {
+  readonly fd: number;
+  readonly events: number;
+  readonly data: string;
+}
+
+export interface CheckpointEpoll {
+  readonly pid: number;
+  readonly epfd: number;
+  readonly interests: readonly CheckpointEpollInterest[];
+}
+
+/**
  * One GBM buffer object and its pixels.
  *
  * A bound buffer's bytes also ride inside the process memory copy, but the KMS
@@ -194,6 +219,7 @@ export interface CheckpointMachine {
    *  not need them: the guest's context state travels here, a restore
    *  rebuilds it, and the restored guest's own draws repaint the screen. */
   readonly glContexts: () => readonly CheckpointGlContext[];
+  readonly epollInterests: () => readonly CheckpointEpoll[];
   /** This machine's CLOCK_MONOTONIC in nanoseconds. */
   readonly monotonicNowNs: () => number;
   readonly kernelAbiVersion: () => number;
@@ -294,7 +320,7 @@ export interface CheckpointProcessBucket {
  * refuses a checkpoint whose format it does not know rather than guessing at
  * the missing or extra fields.
  */
-export const MACHINE_CHECKPOINT_FORMAT = 6;
+export const MACHINE_CHECKPOINT_FORMAT = 7;
 
 export interface MachineCheckpoint {
   readonly format: typeof MACHINE_CHECKPOINT_FORMAT;
@@ -341,6 +367,8 @@ export interface MachineCheckpoint {
    * take, which a restore reports rather than absorbs.
    */
   readonly gl: readonly CheckpointGlContext[];
+  /** Every epoll interest mirror, empty for a machine that never used epoll. */
+  readonly epolls: readonly CheckpointEpoll[];
   /**
    * The captured machine's CLOCK_MONOTONIC at the freeze, in nanoseconds.
    *
@@ -835,6 +863,7 @@ function readMachine(
     })),
     kms: machine.kmsState(),
     gl: machine.glContexts(),
+    epolls: machine.epollInterests(),
     processes: sources.map((source) => {
       const memory = new Uint8Array(source.memory.buffer).slice();
       const threads = source.threads();

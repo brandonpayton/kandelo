@@ -3,7 +3,7 @@ import {
   MACHINE_STATE_HASH_FORMAT,
   compareMachineStateHashes,
   hashMachineCheckpoint,
-} from "../../src/replication/state-hash";
+} from "../support/state-hash";
 import {
   MACHINE_CHECKPOINT_FORMAT,
   type CheckpointMount,
@@ -41,6 +41,7 @@ function machine(
     unreadableFilesystems: [],
     framebuffers: [],
     kms: { fbs: [], crtcs: [], masterPid: null, buffers: [] },
+    epolls: [],
     monotonicNs: 0,
     processes: [bucket(41, 3)],
     ...overrides,

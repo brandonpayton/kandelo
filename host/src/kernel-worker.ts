@@ -312,6 +312,7 @@ import {
 } from "./audio/pcm-transport";
 
 import type { KernelConfig, NetworkAddress, PlatformIO, TcpConnectionPeer, UdpDatagram } from "./types";
+import type { CheckpointEpoll } from "./migration/checkpoint";
 
 // WHY: kernel exports can synchronously reach hostile host hooks. Capture the
 // mutable intrinsics used by the split scoped/detached entry protocol before
@@ -19843,6 +19844,46 @@ export class CentralizedKernelWorker {
   //   epoll_create1/create → still call kernel (works fine), mirror result
   //   epoll_ctl → still call kernel (works fine), mirror interest list
   //   epoll_pwait → convert to poll entirely on host, no kernel_handle_channel
+
+  /**
+   * The epoll mirror, for a checkpoint.
+   *
+   * `epoll_pwait` is served from this mirror rather than from the kernel, so
+   * the mirror is machine state: a checkpoint without it restores guests
+   * whose `epoll_wait` answers EBADF for fds they genuinely hold. The kernel
+   * memory copy carries the kernel's own epoll state; this carries the
+   * host's.
+   */
+  captureEpollInterestsForCheckpoint(): CheckpointEpoll[] {
+    return [...this.epollInterests.entries()].map(([key, interests]) => {
+      const [pid, epfd] = key.split(":").map(Number);
+      return {
+        pid: pid!,
+        epfd: epfd!,
+        interests: interests.map((interest) => ({
+          fd: interest.fd,
+          events: interest.events,
+          data: interest.data.toString(),
+        })),
+      };
+    });
+  }
+
+  /** Adopt a captured machine's epoll mirror, before any restored guest polls. */
+  restoreEpollInterestsFromCheckpoint(
+    epolls: readonly CheckpointEpoll[],
+  ): void {
+    for (const epoll of epolls) {
+      this.epollInterests.set(
+        `${epoll.pid}:${epoll.epfd}`,
+        epoll.interests.map((interest) => ({
+          fd: interest.fd,
+          events: interest.events,
+          data: BigInt(interest.data),
+        })),
+      );
+    }
+  }
 
   /**
    * Handle epoll_create1 / epoll_create: let the kernel create the fd,
