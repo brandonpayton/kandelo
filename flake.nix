@@ -248,6 +248,13 @@
             # tools instead of ambient host binaries.
             export AR="$LLVM_BIN/llvm-ar"
             export RANLIB="$LLVM_BIN/llvm-ranlib"
+            # Same failure shape as AR/RANLIB. mkShell's generic CC=clang and
+            # CXX=clang++ resolve through llvmTree, which carries
+            # clang-unwrapped. On Darwin that driver has no libc++ or SDK
+            # include path, so a package's native host build step fails on
+            # `#include <new>`. Bind both to the wrapped clang.
+            export CC="${llvmPkg.clang}/bin/clang"
+            export CXX="${llvmPkg.clang}/bin/clang++"
             export WASM_POSIX_LLVM_LIBCXX_SOURCE=${llvmPkg.libcxx.src}
             export WASM_POSIX_LLVM_LIBUNWIND_SOURCE=${llvmPkg.libunwind.src}
             # CA bundle for HTTPS — pure-shell strips the user's
