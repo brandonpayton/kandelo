@@ -110,6 +110,35 @@ const FIXTURES: Record<string, string> = {
   // fail-loud stream (constructs, errors on data — real Brotli deferred).
   "mainzlib.cjs":
     '(async()=>{try{const z=require("zlib");const c=z.constants;const unz=typeof z.createUnzip==="function"&&!!z.createUnzip();let brThrew=false;try{const br=z.createBrotliDecompress();brThrew=await new Promise((res)=>{br.on("error",()=>res(true));setTimeout(()=>res(false),3000);br.write(Buffer.from([1,2,3]));});}catch(e){brThrew=true;}console.log("ZLIB",c.Z_SYNC_FLUSH,c.BROTLI_OPERATION_FLUSH,unz,brThrew);}catch(e){console.log("ZLIBERR",(e&&e.message)||e);}})();',
+  // Cyclic require(esm): two type:module files require() each other. Before the
+  // fix the second (cyclic) require lands on a still-Evaluating module and the
+  // seam re-enters ModuleEvaluate -> "module record has unexpected status:
+  // Evaluating". After the fix it returns the partial live namespace and the
+  // cycle resolves.
+  "cycA.mjs":
+    'export const a="A";const B=import.meta.require("/app/cycB.mjs");export function getB(){return B&&B.b;}',
+  "cycB.mjs":
+    'export const b="B";const A=import.meta.require("/app/cycA.mjs");export function getA(){return A&&A.a;}',
+  "maincyc.cjs":
+    '(()=>{try{const A=require("/app/cycA.mjs");console.log("CYC",A.a,typeof A.getB==="function"?A.getB():"?");}catch(e){console.log("CYCERR",(e&&e.name)||"",(e&&e.message)||e);}})();',
+  // TDZ: the cyclically-required module (tdzB) reads a binding of its requirer
+  // (tdzA.late) that is NOT yet initialized at the cyclic edge -> ReferenceError.
+  // Proves the returned namespace is the real live module namespace.
+  "tdzA.mjs":
+    'export const early="EA";const B=import.meta.require("/app/tdzB.mjs");export const late="LA";export function readB(){return B.readLateEarly;}',
+  "tdzB.mjs":
+    'export const b="B";const A=import.meta.require("/app/tdzA.mjs");export let readLateEarly;try{readLateEarly="V:"+A.late;}catch(e){readLateEarly="TDZ:"+e.name;}',
+  "maintdz.cjs":
+    '(()=>{try{const A=require("/app/tdzA.mjs");console.log("TDZ",A.early,A.readB());}catch(e){console.log("TDZERR",(e&&e.name)||"",(e&&e.message)||e);}})();',
+  // Live binding fills in later: liveB captures liveA's namespace while liveA.late
+  // is still uninitialized, then reads it AFTER the cycle settles and sees the
+  // value -- proving the namespace is a live view, not a point-in-time copy.
+  "liveA.mjs":
+    'const B=import.meta.require("/app/liveB.mjs");export const late="LATE";export function getB(){return B;}',
+  "liveB.mjs":
+    'export const b="B";const A=import.meta.require("/app/liveA.mjs");export function readALate(){return A.late;}',
+  "mainlive.cjs":
+    '(()=>{try{const nsA=require("/app/liveA.mjs");const nsB=nsA.getB();console.log("LIVE",nsB.readALate());}catch(e){console.log("LIVEERR",(e&&e.name)||"",(e&&e.message)||e);}})();',
 };
 
 function stageFixtures(): string {
@@ -138,12 +167,15 @@ function image(): Uint8Array | Promise<Uint8Array> {
 }
 
 describe("spidermonkey-node ESM probe", () => {
+  const envNode = process.env.WASM_POSIX_ESM_PROBE_NODE;
   const nodeWasm =
-    tryResolveBinary("programs/spidermonkey-node.wasm") ??
-    (() => {
-      const pkg = join(__dirname, "../../packages/registry/spidermonkey/bin/node.wasm");
-      return existsSync(pkg) ? pkg : null;
-    })();
+    (envNode && existsSync(envNode))
+      ? envNode
+      : (tryResolveBinary("programs/spidermonkey-node.wasm") ??
+        (() => {
+          const pkg = join(__dirname, "../../packages/registry/spidermonkey/bin/node.wasm");
+          return existsSync(pkg) ? pkg : null;
+        })());
   const ready = nodeWasm != null;
 
   async function runOne(mainPath: string) {
@@ -298,5 +330,29 @@ describe("spidermonkey-node ESM probe", () => {
     console.log("ZLIB OUT:", JSON.stringify(r.stdout.trim()), "ERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
     // Z_SYNC_FLUSH=2, BROTLI_OPERATION_FLUSH=1, createUnzip works, Brotli errors on data.
     expect(r.stdout).toContain("ZLIB 2 1 true true");
+  }, 90_000);
+
+  it.runIf(ready)("cyclic require(esm) returns the partial namespace (no 'unexpected status')", async () => {
+    const r = await runOne("/app/maincyc.cjs");
+    // eslint-disable-next-line no-console
+    console.log("CYC OUT:", JSON.stringify(r.stdout.trim()), "ERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
+    expect(r.stdout).toContain("CYC A B");
+    expect(r.stdout).not.toContain("CYCERR");
+  }, 90_000);
+
+  it.runIf(ready)("cyclic require(esm) exposes an uninitialized binding as TDZ", async () => {
+    const r = await runOne("/app/maintdz.cjs");
+    // eslint-disable-next-line no-console
+    console.log("TDZ OUT:", JSON.stringify(r.stdout.trim()), "ERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
+    // tdzB read tdzA.late before it was initialized -> ReferenceError (TDZ).
+    expect(r.stdout).toContain("TDZ EA TDZ:ReferenceError");
+  }, 90_000);
+
+  it.runIf(ready)("cyclic require(esm) namespace is a live binding (value fills in later)", async () => {
+    const r = await runOne("/app/mainlive.cjs");
+    // eslint-disable-next-line no-console
+    console.log("LIVE OUT:", JSON.stringify(r.stdout.trim()), "ERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
+    // liveB captured liveA's ns while late was TDZ; reads "LATE" after the cycle settles.
+    expect(r.stdout).toContain("LIVE LATE");
   }, 90_000);
 });

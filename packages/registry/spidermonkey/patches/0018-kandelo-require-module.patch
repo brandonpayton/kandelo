@@ -1,6 +1,13 @@
 --- a/js/src/shell/ModuleLoader.cpp
 +++ b/js/src/shell/ModuleLoader.cpp
-@@ -18,6 +18,7 @@
+@@ -12,12 +12,14 @@
+ #include "jsapi.h"
+ #include "NamespaceImports.h"
+ 
++#include "builtin/ModuleObject.h"  // js::ModuleObject, js::ModuleStatus
+ #include "builtin/TestingUtility.h"  // js::CreateScriptPrivate
+ #include "js/CallAndConstruct.h"     // JS_CallFunctionValue, JS::IsCallable
+ #include "js/Conversions.h"
  #include "js/GlobalObject.h"  // JS::CurrentGlobalOrNull
  #include "js/MapAndSet.h"
  #include "js/Modules.h"
@@ -8,8 +15,51 @@
  #include "js/PropertyAndElement.h"  // JS_DefineProperty, JS_GetProperty
  #include "js/SourceText.h"
  #include "js/StableStringChars.h"
-@@ -244,6 +245,78 @@ void ModuleLoader::clearModules(JSContext* cx) {
+@@ -242,8 +244,119 @@
+ void ModuleLoader::clearModules(JSContext* cx) {
+   Handle<GlobalObject*> global = cx->global();
    global->setReservedSlot(GlobalAppSlotModuleRegistry, UndefinedValue());
++}
++
++// Kandelo: return the ES module namespace of |module| in |rval|.
++static bool KandeloReturnModuleNamespace(JSContext* cx, HandleObject module,
++                                         MutableHandleValue rval) {
++  RootedObject ns(cx, JS::GetModuleNamespace(cx, module));
++  if (!ns) {
++    return false;
++  }
++  rval.setObject(*ns);
++  return true;
++}
++
++// Kandelo: throw for require() of an ES module that cannot complete
++// synchronously (pending top-level await), with .code =
++// "ERR_REQUIRE_ASYNC_MODULE". Shared by the fresh-load Pending branch and the
++// cyclic EvaluatingAsync branch.
++static bool KandeloThrowRequireAsync(JSContext* cx, HandleString path) {
++  UniqueChars pathUtf8 = JS_EncodeStringToUTF8(cx, path);
++  if (!pathUtf8) {
++    return false;
++  }
++  JS_ReportErrorUTF8(
++      cx, "require() of ES Module %s with top-level await is not supported",
++      pathUtf8.get());
++  RootedValue exn(cx);
++  if (JS_GetPendingException(cx, &exn) && exn.isObject()) {
++    JS_ClearPendingException(cx);
++    RootedObject exnObj(cx, &exn.toObject());
++    RootedString codeStr(cx,
++                         JS_NewStringCopyZ(cx, "ERR_REQUIRE_ASYNC_MODULE"));
++    if (!codeStr) {
++      return false;
++    }
++    RootedValue codeVal(cx, StringValue(codeStr));
++    if (!JS_DefineProperty(cx, exnObj, "code", codeVal, JSPROP_ENUMERATE)) {
++      return false;
++    }
++    JS_SetPendingException(cx, exn);
++  }
++  return false;
  }
  
 +// Kandelo: synchronous require() of an ES module. Node's require() CJS-wraps
@@ -27,10 +77,31 @@
 +    return false;
 +  }
 +
-+  if (!JS::ModuleLink(cx, module)) {
-+    return false;
++  // `JS::GetModuleStatus` is not public in this ESR; read the status off the
++  // internal ModuleObject (the shell is part of the engine build).
++  js::ModuleStatus status = module.get()->as<js::ModuleObject>().status();
++
++  // Cyclic require(): |module| is an ancestor still on the evaluation stack.
++  // ES Evaluate() requires status linked / evaluating-async / evaluated;
++  // calling JS::ModuleEvaluate on an `evaluating` module throws
++  // "module record has unexpected status: Evaluating". Return the partial live
++  // namespace instead (Node circular require(esm) semantics). Not-yet-run
++  // exports read as TDZ ReferenceError and fill in live as evaluation proceeds.
++  if (status == js::ModuleStatus::Evaluating) {
++    return KandeloReturnModuleNamespace(cx, module, rval);
 +  }
 +
++  // Link only a fresh (unlinked) module. A module already linked by a prior
++  // import, or evaluating-async / evaluated, must not be re-linked.
++  if (status == js::ModuleStatus::Unlinked) {
++    if (!JS::ModuleLink(cx, module)) {
++      return false;
++    }
++  }
++
++  // Evaluate. Idempotent and safe for linked / evaluating-async / evaluated:
++  // it returns the module's top-level-capability promise. Only `evaluating`
++  // (handled above) is illegal.
 +  RootedValue evalResult(cx);
 +  if (!JS::ModuleEvaluate(cx, module, &evalResult)) {
 +    return false;
@@ -42,46 +113,23 @@
 +  }
 +
 +  RootedObject evalPromise(cx, &evalResult.toObject());
-+  JS::PromiseState state = JS::GetPromiseState(evalPromise);
++  JS::PromiseState pstate = JS::GetPromiseState(evalPromise);
 +
-+  if (state == JS::PromiseState::Rejected) {
++  // Rejected: a synchronous evaluation failure, or the stored evaluation error
++  // on an already-evaluated module -> rethrow the rejection value.
++  if (pstate == JS::PromiseState::Rejected) {
 +    RootedValue reason(cx, JS::GetPromiseResult(evalPromise));
 +    JS_SetPendingException(cx, reason);
 +    return false;
 +  }
 +
-+  if (state == JS::PromiseState::Pending) {
-+    UniqueChars pathUtf8 = JS_EncodeStringToUTF8(cx, path);
-+    if (!pathUtf8) {
-+      return false;
-+    }
-+    JS_ReportErrorUTF8(
-+        cx, "require() of ES Module %s with top-level await is not supported",
-+        pathUtf8.get());
-+    RootedValue exn(cx);
-+    if (JS_GetPendingException(cx, &exn) && exn.isObject()) {
-+      JS_ClearPendingException(cx);
-+      RootedObject exnObj(cx, &exn.toObject());
-+      RootedString codeStr(cx,
-+                           JS_NewStringCopyZ(cx, "ERR_REQUIRE_ASYNC_MODULE"));
-+      if (!codeStr) {
-+        return false;
-+      }
-+      RootedValue codeVal(cx, StringValue(codeStr));
-+      if (!JS_DefineProperty(cx, exnObj, "code", codeVal, JSPROP_ENUMERATE)) {
-+        return false;
-+      }
-+      JS_SetPendingException(cx, exn);
-+    }
-+    return false;
++  // Pending: unsettled top-level await (fresh, or evaluating-async reached via
++  // a cycle) cannot complete synchronously.
++  if (pstate == JS::PromiseState::Pending) {
++    return KandeloThrowRequireAsync(cx, path);
 +  }
 +
-+  RootedObject ns(cx, JS::GetModuleNamespace(cx, module));
-+  if (!ns) {
-+    return false;
-+  }
-+  rval.setObject(*ns);
-+  return true;
++  return KandeloReturnModuleNamespace(cx, module, rval);
 +}
 +
  bool ModuleLoader::loadAndExecute(JSContext* cx, HandleString path,
@@ -89,7 +137,7 @@
                                    MutableHandleValue rval) {
 --- a/js/src/shell/ModuleLoader.h
 +++ b/js/src/shell/ModuleLoader.h
-@@ -25,6 +25,15 @@ class ModuleLoader {
+@@ -25,6 +25,15 @@
    // Testing hook to clear all loaded modules.
    void clearModules(JSContext* cx);
  
@@ -107,7 +155,7 @@
                                           HandleValue referencingPrivate,
 --- a/js/src/shell/js.cpp
 +++ b/js/src/shell/js.cpp
-@@ -1426,6 +1426,26 @@ static bool KandeloNativeEvalScriptAsFunction(JSContext* cx, unsigned argc,
+@@ -1426,6 +1426,26 @@
    return true;
  }
  
@@ -134,7 +182,7 @@
  static bool DefineKandeloNodeNative(JSContext* cx) {
    RootedObject native(cx, JS_NewPlainObject(cx));
    if (!native) {
-@@ -1433,6 +1453,7 @@ static bool DefineKandeloNodeNative(JSContext* cx) {
+@@ -1433,6 +1453,7 @@
    }
    const JSFunctionSpec funcs[] = {
        JS_FN("evalScriptAsFunction", KandeloNativeEvalScriptAsFunction, 2, 0),
