@@ -4244,6 +4244,52 @@ describe("remaining pointer-bearing blocking retry snapshots", () => {
   );
 
   it.each(WIDTHS)(
+    "%s publishes EINTR instead of parking a caught signal on nanosleep",
+    (_name, pointerWidth) => {
+      const harness = createRetryHarness(pointerWidth);
+      const requestPointer = 0x1000;
+      const processView = new DataView(harness.processMemory.buffer);
+      processView.setBigInt64(requestPointer, 5n, true);
+      processView.setBigInt64(requestPointer + 8, 0n, true);
+      writeRequest(
+        harness,
+        ABI_SYSCALLS.Nanosleep,
+        [BigInt(requestPointer), 0n],
+      );
+      harness.kernelExports.kernel_handle_channel = vi.fn(
+        (rawPointer: number | bigint) => {
+          publishKernelResult(kernelView(harness, rawPointer), 0, 0);
+          return 0;
+        },
+      );
+      harness.kernelExports.kernel_dequeue_signal = vi.fn(
+        (
+          _pid: number,
+          _tid: number,
+          rawPointer: number | bigint,
+        ) => writeKernelCaughtSignal(harness, rawPointer),
+      );
+
+      harness.worker.handleSyscall(harness.channel);
+
+      // The signal record must survive for the glue: a parked sleep would
+      // publish no completion, and the sleep's own later completion would
+      // find nothing pending and clear the record — losing the signal.
+      expect(requestResult(harness)).toEqual({
+        status: CHANNEL_STATUS_COMPLETE,
+        returnValue: -1,
+        errno: EINTR,
+      });
+      expect(harness.worker.pendingSleeps.has(harness.channel)).toBe(false);
+      const channelView = new DataView(
+        harness.processMemory.buffer,
+        harness.channel.channelOffset,
+      );
+      expect(channelView.getUint32(CH_SIG_SIGNUM, true)).toBe(SIGUSR1);
+    },
+  );
+
+  it.each(WIDTHS)(
     "%s preserves public accept EAGAIN while attaching a caught signal",
     (_name, pointerWidth) => {
       const harness = createRetryHarness(pointerWidth);

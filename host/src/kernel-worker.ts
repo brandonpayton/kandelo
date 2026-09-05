@@ -13709,6 +13709,7 @@ export class CentralizedKernelWorker {
           kernelResult.sleepDelayMs,
           kernelResult.outputWrites,
           entry,
+          deliveredSignal,
         )
       ) {
         return;
@@ -18170,6 +18171,7 @@ export class CentralizedKernelWorker {
     capturedDelayMs?: number,
     outputWrites: ChannelOutputWrite[] = [],
     entry?: KernelWorkerEntryContext,
+    deliveredSignal = 0,
   ): boolean {
     let delayMs = 0;
 
@@ -18180,6 +18182,27 @@ export class CentralizedKernelWorker {
       delayMs = Math.max(1, Math.floor(usec / 1000));
     } else if (syscallNr === SYS_CLOCK_NANOSLEEP && retVal >= 0) {
       delayMs = capturedDelayMs ?? 0;
+    }
+
+    if (delayMs > 0 && deliveredSignal > 0) {
+      // The dispatch dequeue already wrote this completion's caught-signal
+      // record into CH_SIG. Parking the sleep would publish no completion, so
+      // the guest could not read the record, and the sleep's own completion
+      // would find nothing pending and clear it — losing the signal. POSIX
+      // interrupts the sleep at this boundary instead.
+      const EINTR = 4;
+      this.completeChannel(
+        channel,
+        syscallNr,
+        origArgs,
+        SYSCALL_ARGS[syscallNr],
+        -1,
+        EINTR,
+        [],
+        undefined,
+        entry,
+      );
+      return true;
     }
 
     if (delayMs > 0) {
