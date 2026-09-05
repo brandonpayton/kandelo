@@ -744,6 +744,7 @@ function createSpawnHarness(options: {
       kernel_get_process_exit_signal: vi.fn(() => -1),
       kernel_process_secure_exec: vi.fn(() => 0),
       kernel_mark_process_signaled: vi.fn(() => 0),
+      kernel_process_secure_exec: vi.fn(() => 0),
       kernel_set_current_tid: vi.fn(() => 0),
       ...options.kernelExports,
     },

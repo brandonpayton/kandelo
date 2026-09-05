@@ -2145,10 +2145,12 @@ function hydrateTypeProperties(
             ),
       ),
     );
-    const propertyValue = cloneState(
-      stateFor(states, canonicalSymbol(checker, property)),
+    const propertySource = stateFor(
+      states,
+      canonicalSymbol(checker, property),
     );
-    if (!hasCapability(propertyValue)) continue;
+    if (!hasCapability(propertySource)) continue;
+    const propertyValue = cloneState(propertySource);
     // WHY: private/protected TypeScript slots must remain selectable through
     // explicit diagnostic casts, but must not make the whole owning wrapper a
     // raw-memory escape. Object spread promotes these ordinary runtime fields.
@@ -2628,16 +2630,15 @@ function expressionState(
         // getSymbolAtLocation(name) denotes the object-literal property. The
         // shorthand value symbol is the outer binding that actually carries
         // ownership into the new container.
-        const value = cloneState(
-          stateFor(
-            states,
-            canonicalSymbol(
-              checker,
-              checker.getShorthandAssignmentValueSymbol(property),
-            ),
+        const propertySource = stateFor(
+          states,
+          canonicalSymbol(
+            checker,
+            checker.getShorthandAssignmentValueSymbol(property),
           ),
         );
-        if (!hasCapability(value)) continue;
+        if (!hasCapability(propertySource)) continue;
+        const value = cloneState(propertySource);
         const existing = result.properties.get(property.name.text);
         if (existing) unionState(existing, value);
         else result.properties.set(property.name.text, value);
@@ -2671,8 +2672,9 @@ function expressionState(
       ) {
         const name = propertyNameText(property.name);
         if (!name) continue;
-        const value = cloneState(stateFor(states, property));
-        if (!hasCapability(value)) continue;
+        const propertySource = stateFor(states, property);
+        if (!hasCapability(propertySource)) continue;
+        const value = cloneState(propertySource);
         const existing = result.properties.get(name);
         if (existing) unionState(existing, value);
         else result.properties.set(name, value);

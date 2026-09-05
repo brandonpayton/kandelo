@@ -731,6 +731,13 @@ fn render_c_channel_contract() -> String {
          #define WASM_POSIX_CHANNEL_SIGINFO_WORD_2_OFFSET {siginfo_word_2}u\n\
          #define WASM_POSIX_CHANNEL_SIG_ALT_SP_OFFSET {sig_alt_sp}u\n\
          #define WASM_POSIX_CHANNEL_SIG_ALT_SIZE_OFFSET {sig_alt_size}u\n\
+         \n\
+         /* Checkpoint request wire, reserved below the signal-delivery area. */\n\
+         #define WASM_POSIX_CHANNEL_CHECKPOINT_AREA_SIZE {checkpoint_area_size}u\n\
+         #define WASM_POSIX_CHANNEL_CHECKPOINT_WIRE_SIZE {checkpoint_wire_size}u\n\
+         #define WASM_POSIX_CHANNEL_CHECKPOINT_BASE_OFFSET {checkpoint_base}u\n\
+         #define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_OFFSET {checkpoint_request}u\n\
+         #define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_UNWIND {checkpoint_request_unwind}u\n\
          \n",
         status_idle = shared::ChannelStatus::Idle as u32,
         status_pending = shared::ChannelStatus::Pending as u32,
@@ -775,6 +782,11 @@ fn render_c_channel_contract() -> String {
         siginfo_word_2 = channel::SIGINFO_WORD_2,
         sig_alt_sp = channel::SIG_ALT_SP,
         sig_alt_size = channel::SIG_ALT_SIZE,
+        checkpoint_area_size = channel::CHECKPOINT_AREA_SIZE,
+        checkpoint_wire_size = channel::CHECKPOINT_WIRE_SIZE,
+        checkpoint_base = channel::CHECKPOINT_BASE,
+        checkpoint_request = channel::CHECKPOINT_REQUEST,
+        checkpoint_request_unwind = channel::CHECKPOINT_REQUEST_UNWIND,
     )
 }
 
@@ -3039,6 +3051,26 @@ fn render_ts_module() -> String {
     out.push_str(&format!(
         "export const CH_SIG_ALT_SIZE = {} as const;\n\n",
         channel::SIG_ALT_SIZE
+    ));
+    out.push_str(&format!(
+        "export const CH_CHECKPOINT_BASE = {} as const;\n",
+        channel::CHECKPOINT_BASE
+    ));
+    out.push_str(&format!(
+        "export const CH_CHECKPOINT_AREA_SIZE = {} as const;\n",
+        channel::CHECKPOINT_AREA_SIZE
+    ));
+    out.push_str(&format!(
+        "export const CH_CHECKPOINT_WIRE_SIZE = {} as const;\n",
+        channel::CHECKPOINT_WIRE_SIZE
+    ));
+    out.push_str(&format!(
+        "export const CH_CHECKPOINT_REQUEST = {} as const;\n",
+        channel::CHECKPOINT_REQUEST
+    ));
+    out.push_str(&format!(
+        "export const CH_CHECKPOINT_REQUEST_UNWIND = {} as const;\n\n",
+        channel::CHECKPOINT_REQUEST_UNWIND
     ));
     out.push_str(&format!(
         "export const SIGNAL_ACTION_RESTART = {} as const;\n\n",
@@ -7576,6 +7608,11 @@ mod tests {
             "#define WASM_POSIX_CHANNEL_SIGINFO_WORD_2_OFFSET 65588u",
             "#define WASM_POSIX_CHANNEL_SIG_ALT_SP_OFFSET 65592u",
             "#define WASM_POSIX_CHANNEL_SIG_ALT_SIZE_OFFSET 65600u",
+            "#define WASM_POSIX_CHANNEL_CHECKPOINT_AREA_SIZE 8u",
+            "#define WASM_POSIX_CHANNEL_CHECKPOINT_WIRE_SIZE 4u",
+            "#define WASM_POSIX_CHANNEL_CHECKPOINT_BASE_OFFSET 65544u",
+            "#define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_OFFSET 65544u",
+            "#define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_UNWIND 1u",
         ] {
             assert!(header.contains(expected), "missing generated C: {expected}");
         }
@@ -7595,6 +7632,11 @@ mod tests {
             "export const CH_SIGINFO_WORD_2 = 65588 as const;",
             "export const CH_SIG_ALT_SP = 65592 as const;",
             "export const CH_SIG_ALT_SIZE = 65600 as const;",
+            "export const CH_CHECKPOINT_BASE = 65544 as const;",
+            "export const CH_CHECKPOINT_AREA_SIZE = 8 as const;",
+            "export const CH_CHECKPOINT_WIRE_SIZE = 4 as const;",
+            "export const CH_CHECKPOINT_REQUEST = 65544 as const;",
+            "export const CH_CHECKPOINT_REQUEST_UNWIND = 1 as const;",
         ] {
             assert!(
                 typescript.contains(expected),

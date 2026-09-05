@@ -471,6 +471,15 @@ const FIXTURE_NO_FORK: &str = r#"
       (memory 1))
 "#;
 
+const FIXTURE_NO_FORK_NESTED_CALL: &str = r#"
+    (module
+      (func $inner (export "inner") (result i32)
+        i32.const 1)
+      (func $outer (export "outer") (result i32)
+        call $inner)
+      (memory 1))
+"#;
+
 const FIXTURE_MULTIVALUE: &str = r#"
     (module
       (import "kernel" "kernel_fork" (func $fork (result i32)))
@@ -749,6 +758,39 @@ fn module_without_fork_or_dynamic_boundary_is_byte_identical() {
     assert_eq!(
         bytes, input,
         "a standalone non-forking executable must not acquire fork-runtime features",
+    );
+}
+
+#[test]
+fn instrument_all_wraps_a_module_without_fork_or_dynamic_boundary() {
+    // The ceiling mode instruments the same module the test above returns
+    // untouched, so the transform can be measured and applied before a seed
+    // import exists.
+    let input = parse_wat(FIXTURE_NO_FORK_NESTED_CALL);
+    let bytes = instrument(
+        &input,
+        &Options {
+            instrument_all: true,
+            ..Options::default()
+        },
+    )
+    .expect("instrument");
+    validate(&bytes);
+    let module = Module::from_buffer(&bytes).unwrap();
+    // `outer` owns the one resumable call site, so it carries the dispatch
+    // br_table. `inner` is a leaf: it has no call to resume to, so it gets the
+    // replay preamble without a dispatch.
+    let outer = func_by_name(&module, "outer");
+    assert_eq!(
+        count_br_tables(local_func(&module, outer)),
+        1,
+        "the caller should emit its dispatch br_table",
+    );
+    let inner = func_by_name(&module, "inner");
+    assert_ne!(
+        entry_instr_kinds(&module, inner),
+        vec![InstrKind::Const],
+        "the leaf must still be wrapped, not left byte-for-byte unchanged",
     );
 }
 
@@ -4045,4 +4087,41 @@ fn reference_payload_emits_complete_exception_dispatch() {
     validate(&bytes);
     let module = Module::from_buffer(&bytes).unwrap();
     assert_function_uses_exception_recipe(&module, "caller");
+}
+
+#[test]
+fn a_checkpoint_seed_instruments_a_module_that_never_forks() {
+    let wat = r#"
+        (module
+          (import "kernel" "kernel_checkpoint" (func $checkpoint (result i32)))
+          (memory 1)
+          (func (export "_start") (result i32)
+            call $checkpoint))
+    "#;
+    let bytes = parse_wat(wat);
+    assert_eq!(
+        instrument(&bytes, &Options::default()).expect("instrument"),
+        bytes,
+        "no seed import leaves the linker bytes untouched",
+    );
+
+    let opts = Options {
+        checkpoint_import: Some("kernel.kernel_checkpoint".into()),
+        ..Options::default()
+    };
+    let instrumented = instrument(&bytes, &opts).expect("instrument");
+    validate(&instrumented);
+    let module = Module::from_buffer(&instrumented).expect("walrus parse");
+    for export in [
+        runtime_names::EXPORT_UNWIND_BEGIN,
+        runtime_names::EXPORT_UNWIND_END,
+        runtime_names::EXPORT_REWIND_BEGIN,
+        runtime_names::EXPORT_REWIND_END,
+        runtime_names::EXPORT_STATE,
+    ] {
+        assert!(
+            module.exports.iter().any(|e| e.name == export),
+            "`{export}` export missing",
+        );
+    }
 }

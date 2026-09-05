@@ -853,6 +853,12 @@ export const CH_SIGINFO_WORD_2 = 65588 as const;
 export const CH_SIG_ALT_SP = 65592 as const;
 export const CH_SIG_ALT_SIZE = 65600 as const;
 
+export const CH_CHECKPOINT_BASE = 65544 as const;
+export const CH_CHECKPOINT_AREA_SIZE = 8 as const;
+export const CH_CHECKPOINT_WIRE_SIZE = 4 as const;
+export const CH_CHECKPOINT_REQUEST = 65544 as const;
+export const CH_CHECKPOINT_REQUEST_UNWIND = 1 as const;
+
 export const SIGNAL_ACTION_RESTART = 268435456 as const;
 
 export const WAIT_EVENT_EXITED = 1 as const;

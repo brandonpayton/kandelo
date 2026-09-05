@@ -110,6 +110,7 @@ int *__errno_location(void);
 #define CH_SIGINFO_WORD_2 WASM_POSIX_CHANNEL_SIGINFO_WORD_2_OFFSET
 #define CH_SIG_ALT_SP  WASM_POSIX_CHANNEL_SIG_ALT_SP_OFFSET
 #define CH_SIG_ALT_SIZE WASM_POSIX_CHANNEL_SIG_ALT_SIZE_OFFSET
+#define CH_CHECKPOINT_REQUEST WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_OFFSET
 
 _Static_assert(WASM_POSIX_CHANNEL_ARGS_COUNT == 6u,
                "channel syscall glue requires six argument slots");
@@ -135,6 +136,16 @@ _Static_assert(sizeof(uint64_t) == WASM_POSIX_CHANNEL_SIG_ALT_SP_BYTES,
                "signal delivery alt-stack pointer width must match generated ABI");
 _Static_assert(sizeof(uint64_t) == WASM_POSIX_CHANNEL_SIG_ALT_SIZE_BYTES,
                "signal delivery alt-stack size width must match generated ABI");
+_Static_assert(WASM_POSIX_CHANNEL_CHECKPOINT_BASE_OFFSET
+                       + WASM_POSIX_CHANNEL_CHECKPOINT_AREA_SIZE
+                   == WASM_POSIX_CHANNEL_SIG_BASE_OFFSET,
+               "checkpoint request area must sit directly below the signal area");
+_Static_assert(WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_OFFSET
+                       + WASM_POSIX_CHANNEL_CHECKPOINT_WIRE_SIZE
+                   <= WASM_POSIX_CHANNEL_SIG_BASE_OFFSET,
+               "checkpoint request word must not reach into the signal area");
+_Static_assert(sizeof(uint32_t) == WASM_POSIX_CHANNEL_CHECKPOINT_WIRE_SIZE,
+               "checkpoint request word width must match generated ABI");
 
 #define EFAULT 14
 #define EINTR 4
@@ -481,6 +492,19 @@ int32_t kernel_fork(int32_t mode);
 __attribute__((import_module("kernel"), import_name("kernel_exit")))
 _Noreturn void kernel_exit(int32_t status);
 
+/* Checkpoint — the migration unwind boundary, seeded exactly like kernel_fork.
+ *
+ * Unlike kernel_fork this IS reached from the syscall dispatcher, deliberately.
+ * A checkpoint must unwind the whole call stack, so seeding the instrumenter
+ * from here is what gives it every function that can be live at a syscall
+ * return. Programs that never fork, such as fbDOOM, have no other seed.
+ *
+ * The capture pass does not return: the frames unwind into linear memory. The
+ * only return the guest ever observes comes from a rewind, which is why the
+ * value distinguishes a resumed-in-place process from a restored one. */
+__attribute__((import_module("kernel"), import_name("kernel_checkpoint")))
+int32_t kernel_checkpoint(void);
+
 /*
  * Complete one ordinary guest-owned channel request after a host import that
  * performed channel work in JavaScript. Those host-owned completions leave
@@ -749,6 +773,19 @@ static uint32_t __deliver_pending_signal(uintptr_t base, int *delivered)
     return flags;
 }
 
+static void __take_pending_checkpoint(uintptr_t base)
+{
+    uint32_t *request_ptr = (uint32_t *)(uintptr_t)(base + CH_CHECKPOINT_REQUEST);
+
+    if (*request_ptr == 0) return;
+
+    /* Clear before the call, never after. The capture pass unwinds instead of
+     * returning, so a clear placed after it never runs, and the restored
+     * process would read the request again and checkpoint itself forever. */
+    *request_ptr = 0;
+    (void)kernel_checkpoint();
+}
+
 /* ------------------------------------------------------------------ */
 /* Central dispatch — writes to channel and blocks for result          */
 /* ------------------------------------------------------------------ */
@@ -950,6 +987,12 @@ restart_wait_syscall:
         get_channel_base(),
         &delivered_signal
     );
+
+    /* Take a pending checkpoint before the restart block below. A frozen
+     * process must unwind here rather than resubmit a blocking syscall it
+     * would then park on, leaving the keeper waiting for an unwind that
+     * cannot arrive. */
+    __take_pending_checkpoint(get_channel_base());
 
     /* A host-deferred blocking operation or slow PCM drain completes the
      * channel with EINTR so the caught handler runs at the real interruption

@@ -14,6 +14,11 @@ import {
   CH_ARG_SIZE,
   CH_ARGS,
   CH_ARGS_COUNT,
+  CH_CHECKPOINT_AREA_SIZE,
+  CH_CHECKPOINT_BASE,
+  CH_CHECKPOINT_REQUEST,
+  CH_CHECKPOINT_REQUEST_UNWIND,
+  CH_CHECKPOINT_WIRE_SIZE,
   CH_DATA,
   CH_DATA_SIZE,
   CH_ERRNO,
@@ -577,6 +582,15 @@ describe("generated host ABI bindings", () => {
     expect(
       CH_SIG_AREA_SIZE - CH_SIG_DELIVERY_SIZE,
     ).toBe(snapshot.channel_signal_area.reserved_tail_size);
+  });
+
+  it("reserve the checkpoint request below the signal delivery area", () => {
+    expect(CH_CHECKPOINT_BASE + CH_CHECKPOINT_AREA_SIZE).toBe(CH_SIG_BASE);
+    expect(
+      CH_CHECKPOINT_REQUEST + CH_CHECKPOINT_WIRE_SIZE,
+    ).toBeLessThanOrEqual(CH_SIG_BASE);
+    expect(CH_CHECKPOINT_BASE).toBeGreaterThanOrEqual(CH_DATA);
+    expect(CH_CHECKPOINT_REQUEST_UNWIND).not.toBe(0);
   });
 
   it("match Rust-owned syscall and struct metadata", () => {

@@ -1323,6 +1323,32 @@ pub mod channel {
     pub const SIG_ALT_SP: usize = SIG_BASE + kernel_scratch_wire::SIGNAL_ALT_SP_OFFSET;
     /// Alternate signal-stack size.
     pub const SIG_ALT_SIZE: usize = SIG_BASE + kernel_scratch_wire::SIGNAL_ALT_SIZE_OFFSET;
+
+    // Checkpoint request area — reserved immediately below the signal delivery
+    // area, at the end of the data buffer. The host writes the request word
+    // before it completes a process's pending syscall. The glue reads it at the
+    // same post-syscall hook that delivers a signal, and calls
+    // `kernel.kernel_checkpoint` when it is set.
+    //
+    // This is not the libc `__wasm_posix_signal_checkpoint` trampoline, which
+    // re-enters one channel completion so a deferred signal handler can run.
+    /// Bytes the checkpoint request wire occupies.
+    pub const CHECKPOINT_WIRE_SIZE: usize = size_of::<u32>();
+    /// Keep the reserved tail naturally aligned even though the wire is packed.
+    pub const CHECKPOINT_AREA_ALIGNMENT: usize = core::mem::align_of::<u64>();
+    /// Complete reserved checkpoint area, including any trailing alignment pad.
+    pub const CHECKPOINT_AREA_SIZE: usize = (CHECKPOINT_WIRE_SIZE + CHECKPOINT_AREA_ALIGNMENT - 1)
+        / CHECKPOINT_AREA_ALIGNMENT
+        * CHECKPOINT_AREA_ALIGNMENT;
+    /// Base offset of the checkpoint request area.
+    pub const CHECKPOINT_BASE: usize = SIG_BASE - CHECKPOINT_AREA_SIZE;
+    /// The checkpoint request word (u32). 0 = no request.
+    ///
+    /// The host publishes it; the guest clears it once it has taken the
+    /// request, so a later syscall on the same channel does not unwind again.
+    pub const CHECKPOINT_REQUEST: usize = CHECKPOINT_BASE;
+    /// Request value: unwind this process's call stack into its linear memory.
+    pub const CHECKPOINT_REQUEST_UNWIND: u32 = 1;
 }
 
 #[cfg(test)]
@@ -1373,6 +1399,20 @@ mod channel_abi_tests {
         assert!(channel::SIG_DELIVERY_SIZE <= channel::SIG_AREA_SIZE);
         assert_eq!(channel::SIG_AREA_SIZE - channel::SIG_DELIVERY_SIZE, 0);
         assert_eq!(channel::SIG_BASE % channel::SIG_AREA_ALIGNMENT, 0);
+    }
+
+    #[test]
+    fn checkpoint_request_sits_below_the_signal_area_without_moving_it() {
+        assert_eq!(
+            channel::CHECKPOINT_BASE + channel::CHECKPOINT_AREA_SIZE,
+            channel::SIG_BASE,
+        );
+        assert!(
+            channel::CHECKPOINT_REQUEST + channel::CHECKPOINT_WIRE_SIZE <= channel::SIG_BASE,
+        );
+        assert_eq!(channel::CHECKPOINT_BASE % channel::CHECKPOINT_AREA_ALIGNMENT, 0);
+        assert!(channel::CHECKPOINT_BASE >= channel::DATA_OFFSET);
+        assert_ne!(channel::CHECKPOINT_REQUEST_UNWIND, 0);
     }
 }
 

@@ -447,6 +447,7 @@ fn marks_env_fork_side_entry_separately() {
         &input,
         &Options {
             entry_import: "env.fork".into(),
+            ..Options::default()
         },
     )
     .expect("instrument side");

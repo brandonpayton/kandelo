@@ -305,6 +305,7 @@ function continuationMunmap(
  * pointer width before any guest-memory view is created.
  */
 type KernelImports = Record<string, WebAssembly.ExportValue> & {
+  kernel_checkpoint: () => number;
   kernel_exit: (status: number) => void;
   kernel_fork: (mode: number) => number;
 };
@@ -556,6 +557,16 @@ function buildKernelImports(
 
       if (err) return -err;
       return result;
+    },
+
+    // Checkpoint capture is not implemented yet. The glue only calls this when
+    // the channel's checkpoint request word is set, and nothing sets it, so
+    // reaching it means a request was published without a capture path behind
+    // it. Fail loudly rather than let the guest continue as if it had unwound.
+    kernel_checkpoint: (): number => {
+      throw new Error(
+        "kernel_checkpoint reached, but checkpoint capture is not implemented.",
+      );
     },
 
     // Fork dispatches through the mode's dedicated channel syscall.
