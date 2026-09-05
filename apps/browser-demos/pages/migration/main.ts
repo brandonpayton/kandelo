@@ -7,10 +7,21 @@
  * game continues from the captured frame, keyboard included. Audio stays
  * disabled: this page wires no PCM consumer, and a working /dev/dsp would
  * park fbDOOM in a write nobody drains.
+ *
+ * The tab that holds the machine also mirrors its frames on the local
+ * framebuffer channel, and every tab without a machine watches that stream
+ * live — before its first takeover and after handing over alike. Watching
+ * carries no input authority: the keyboard is attached only in the owning
+ * tab, and "Take over" is what moves it.
  */
 import { BrowserKernel } from "@host/browser-kernel-host";
-import { attachCanvas, attachLinuxMediumRawKeyboard } from "@host/framebuffer";
+import {
+  FramebufferRegistry,
+  attachCanvas,
+  attachLinuxMediumRawKeyboard,
+} from "@host/framebuffer";
 import type { MachineCheckpoint } from "@host/migration/checkpoint";
+import { LocalFramebufferMirror } from "@host/migration/mirror-local";
 import { LocalCheckpointHandover } from "@host/migration/transport-local";
 import kernelWasmUrl from "@kernel-wasm?url";
 import fbdoomUrl from "@binaries/programs/wasm32/fbdoom.wasm?url";
@@ -24,11 +35,15 @@ import {
 const DOOM_WAD_URL =
   "https://cdn.jsdelivr.net/gh/gaborbata/vanilla-mocha-doom@15825a07a48806bcfb242a42afd5ee7cb3c9a3a4/wads/doom1.wad";
 const CAPTURE_TIMEOUTS = { unwindTimeoutMs: 10_000, vforkTimeoutMs: 5_000 };
+const WATCHING_STATUS = "Watching the other tab's machine live. Take over to play.";
+const HANDED_OVER_STATUS =
+  "Handed over — watching the machine live in the other tab. Take it back any time.";
 
 declare global {
   interface Window {
     __migrationDemo: {
       state: () => string;
+      hasInput: () => boolean;
       framePixelSum: () => number;
       snapshotFrame: () => number;
       frameDiffCount: () => number;
@@ -46,7 +61,12 @@ let pid = 0;
 let detachCanvas: (() => void) | null = null;
 let detachKeyboard: (() => void) | null = null;
 let stopOffer: (() => void) | null = null;
+let stopPublish: (() => void) | null = null;
+let stopWatch: (() => void) | null = null;
+let watchRegistry: FramebufferRegistry | null = null;
+let watchPid = 0;
 const handover = new LocalCheckpointHandover();
+const mirror = new LocalFramebufferMirror();
 
 function setStatus(text: string): void {
   statusLine.textContent = text;
@@ -75,6 +95,38 @@ function attachScreen(machine: BrowserKernel, screenPid: number): void {
   canvas.focus();
 }
 
+function startWatching(bindStatus: string): void {
+  stopWatching();
+  const registry = new FramebufferRegistry();
+  watchRegistry = registry;
+  const stopChange = registry.onChange((boundPid, event) => {
+    if (event !== "bind" || kernel) return;
+    watchPid = boundPid;
+    detachCanvas?.();
+    detachCanvas = attachCanvas(canvas, registry, boundPid, {
+      getProcessMemory: () => undefined,
+    });
+    setStatus(bindStatus);
+  });
+  const stopMirror = mirror.watch(registry);
+  stopWatch = () => {
+    stopChange();
+    stopMirror();
+  };
+}
+
+function stopWatching(): void {
+  stopWatch?.();
+  stopWatch = null;
+  watchRegistry = null;
+  watchPid = 0;
+}
+
+function startPublishing(machine: BrowserKernel, publishPid: number): void {
+  stopPublish?.();
+  stopPublish = mirror.publish(machine.framebuffers, publishPid);
+}
+
 function offerThisMachine(): void {
   stopOffer?.();
   stopOffer = handover.offer(
@@ -93,11 +145,14 @@ function offerThisMachine(): void {
       kernel = null;
       stopOffer?.();
       stopOffer = null;
+      stopPublish?.();
+      stopPublish = null;
       detachCanvas?.();
       detachCanvas = null;
       detachKeyboard?.();
       detachKeyboard = null;
-      setStatus("Handed over — the machine continues in the other tab. Take it back any time.");
+      startWatching(HANDED_OVER_STATUS);
+      setStatus(HANDED_OVER_STATUS);
       takeButton.disabled = false;
       void handedOver?.destroy().then(() => settleWebKitReclaim());
     },
@@ -107,6 +162,7 @@ function offerThisMachine(): void {
 async function start(): Promise<void> {
   startButton.disabled = true;
   takeButton.disabled = true;
+  stopWatching();
   try {
     setStatus("Fetching fbDOOM and the shareware IWAD...");
     const [kernelWasm, fbdoom, wad] = await Promise.all([
@@ -142,10 +198,12 @@ async function start(): Promise<void> {
     });
     attachScreen(machine, pid);
     offerThisMachine();
+    startPublishing(machine, pid);
     setStatus("Running. Open this page in a second tab and take over there.");
   } catch (error) {
     setStatus(`Start failed: ${error instanceof Error ? error.message : String(error)}`);
     startButton.disabled = false;
+    startWatching(WATCHING_STATUS);
   }
 }
 
@@ -173,8 +231,10 @@ async function take(): Promise<void> {
     });
     kernel = machine;
     pid = checkpoint.processes[0]!.pid;
+    stopWatching();
     attachScreen(machine, pid);
     offerThisMachine();
+    startPublishing(machine, pid);
     setStatus("Running the restored machine — taken over from the other tab.");
   } catch (error) {
     setStatus(`Take over failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -185,10 +245,12 @@ async function take(): Promise<void> {
 
 startButton.addEventListener("click", () => void start());
 takeButton.addEventListener("click", () => void take());
+startWatching(WATCHING_STATUS);
 
 function sampleFrame(): Uint8Array | null {
-  if (!kernel) return null;
-  const binding = kernel.framebuffers.get(pid);
+  const binding = kernel
+    ? kernel.framebuffers.get(pid)
+    : watchRegistry?.get(watchPid);
   if (!binding?.hostBuffer) return null;
   // Sampling every 97th byte keeps the probes cheap while any animation
   // still changes them.
@@ -203,6 +265,7 @@ let frameSnapshot: Uint8Array | null = null;
 
 window.__migrationDemo = {
   state: () => statusLine.textContent ?? "",
+  hasInput: () => detachKeyboard !== null,
   framePixelSum: () => {
     const samples = sampleFrame();
     if (!samples) return -1;

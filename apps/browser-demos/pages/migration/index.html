@@ -14,11 +14,13 @@
 <body>
   <h1>Tab-to-tab machine handover</h1>
   <p>
-    Start fbDOOM in this tab, open this page in a second tab, and press
-    "Take over" there. The running machine freezes, crosses the
-    BroadcastChannel, and continues in the second tab from the same frame,
-    keyboard included. Take it back from the first tab whenever you like —
-    the machine moves between the tabs as often as you ask.
+    Start fbDOOM in this tab, open this page in a second tab, and watch the
+    same game render live there. Press "Take over" in the watching tab and
+    the running machine freezes, crosses the BroadcastChannel, and continues
+    there from the same frame — the keyboard moves with it, and the tab that
+    handed over keeps watching live. Take it back whenever you like — the
+    machine moves between the tabs as often as you ask, and only the tab
+    that holds it can play.
   </p>
   <div>
     <button id="start" type="button">Start fbDOOM</button>

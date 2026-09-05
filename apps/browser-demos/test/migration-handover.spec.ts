@@ -6,6 +6,7 @@ declare global {
   interface Window {
     __migrationDemo: {
       state: () => string;
+      hasInput: () => boolean;
       framePixelSum: () => number;
       snapshotFrame: () => number;
       frameDiffCount: () => number;
@@ -38,9 +39,79 @@ async function expectTurnChangesView(page: Page, who: string): Promise<void> {
 }
 
 /**
+ * Count differing frame samples over one settling window, optionally
+ * holding a key through it.
+ */
+async function measureFrameDiff(
+  page: Page,
+  key: string | null,
+): Promise<number> {
+  await page.evaluate(() => window.__migrationDemo.snapshotFrame());
+  if (key) {
+    await page.keyboard.down(key);
+    await page.waitForTimeout(600);
+    await page.keyboard.up(key);
+    await page.waitForTimeout(1_500);
+  } else {
+    await page.waitForTimeout(2_100);
+  }
+  return page.evaluate(() => window.__migrationDemo.frameDiffCount());
+}
+
+/** The exact permission state: a watching tab has no keyboard attached. */
+async function expectNoKeyboard(page: Page, who: string): Promise<void> {
+  expect(
+    await page.evaluate(() => window.__migrationDemo.hasInput()),
+    `${who}: a watching tab must hold no keyboard`,
+  ).toBe(false);
+}
+
+/**
+ * Prove a keypress did NOT reach the game. Reliable only in a scene whose
+ * own animation is bounded — the freshly started game facing the static
+ * corridor. Once accumulated turns leave a monster in view, its acting
+ * rewrites thousands of samples with no input at all, so later hops assert
+ * the permission state through expectNoKeyboard instead.
+ */
+async function expectSpectatorKeysDoNothing(
+  page: Page,
+  who: string,
+): Promise<void> {
+  await expectNoKeyboard(page, who);
+  const idle = await measureFrameDiff(page, null);
+  const keyed = await measureFrameDiff(page, "ArrowLeft");
+  expect(
+    keyed,
+    `${who}: ArrowLeft must not turn the watched view (idle noise ${idle})`,
+  ).toBeLessThan(Math.max(1_000, idle * 3 + 500));
+}
+
+/**
+ * The tab must be rendering the other tab's machine live: frames present
+ * and still changing (fbDOOM's status-bar animation runs even in a static
+ * scene).
+ */
+async function expectLiveMirror(page: Page, who: string): Promise<void> {
+  await expect
+    .poll(() => pixelSum(page), {
+      timeout: 30_000,
+      message: `${who}: mirror renders`,
+    })
+    .toBeGreaterThan(0);
+  const mirrored = await pixelSum(page);
+  await expect
+    .poll(() => pixelSum(page), {
+      timeout: 30_000,
+      message: `${who}: mirror keeps updating`,
+    })
+    .not.toBe(mirrored);
+}
+
+/**
  * One handover hop: the taking tab asks, the yielding tab freezes and
  * reports it, and the restored machine must render fresh frames and hear
- * the keyboard in its new tab.
+ * the keyboard in its new tab. The yielding tab keeps watching the same
+ * machine live but loses the keyboard with it.
  */
 async function expectTakeover(
   taking: Page,
@@ -65,6 +136,8 @@ async function expectTakeover(
   await expect
     .poll(() => pixelSum(taking), { timeout: 30_000 })
     .not.toBe(restoredFrame);
+  await expectLiveMirror(yielding, `${who}: yielded tab`);
+  await expectNoKeyboard(yielding, `${who}: yielded tab`);
   await expectTurnChangesView(taking, who);
 }
 
@@ -113,6 +186,16 @@ test("hands a running fbDOOM machine from one tab to another", async ({
 
   const taker = await context.newPage();
   await taker.goto(new URL("/pages/migration/", baseURL!).href);
+
+  // A tab that merely opens the page watches the running game live and has
+  // no say in it — only "Take over" grants the keyboard.
+  await taker.waitForFunction(
+    () => window.__migrationDemo?.state().startsWith("Watching"),
+    undefined,
+    { timeout: 30_000 },
+  );
+  await expectLiveMirror(taker, "watcher before takeover");
+  await expectSpectatorKeysDoNothing(taker, "watcher before takeover");
 
   // The machine moves between the tabs as often as asked: over, back, and
   // over again. Every taker re-offers, and a tab that handed over re-arms
