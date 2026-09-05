@@ -120,7 +120,24 @@ own memory:
   The guest clock becomes a value the log carries, not a value the host
   reads. `MachineCheckpoint.monotonicNs` and the monotonic-floor work
   already establish that the guest clock is something the platform
-  owns.
+  owns. Every reading also carries the process it was handed to, and a
+  replica serves each process its own readings. Syscall order is the
+  item above this one and is not in the log yet, so a machine with more
+  than one process reads its clocks in an order the two computers never
+  share; without the reader's identity such a machine diverges on its
+  first reading. Threads of one process share one stream and can still
+  diverge, which needs the current thread id at the syscall the same way
+  this needed the current process.
+- **Accept selection.** Which process took each connection off a shared
+  accept queue. A pre-fork server — nginx, php-fpm — leaves every worker
+  blocked in `accept` on one queue, and the connection goes to whichever
+  worker the host runs first. That choice is nowhere in the machine's
+  memory. It is one narrow, tractable case of the syscall-order item
+  above, and it is the one that decides which worker's heap serves a
+  request, so it is in the log: `kind: "accept"`, keyed by the listener's
+  accept readiness token, carrying the winning pid. The kernel asks the
+  host at the queue in `sys_accept`; a replaying host tells every other
+  worker `EAGAIN` and leaves the connection for the recorded one.
 - **Randomness.** Every `getrandom` result, or a seed the replicas
   share and a deterministic generator on top of it.
 - **External bytes.** Socket reads, lazy file fetches, OPFS reads,
@@ -270,6 +287,62 @@ recorded anything, does not finish, and then completes and prints the primary's
 seconds once the primary runs. `host/test/replication/log-queue.test.ts` holds
 the ring's own claims, with the reader on a real second thread.
 
+### What clock a replica measures a guest's wait against
+
+**Decided and built on 2026-09-05.** The log's, not this computer's. A guest's
+timeout — `poll`, `select`, `epoll_wait`, `nanosleep` — is a duration on the
+machine's clock, and on a replica the machine's clock is the primary's log. A
+replica that measured it against `Date.now()` serves the wait again at its
+original pace, so it never closes the gap it joined with.
+
+This was measured, not reasoned. A viewer following a WordPress machine showed
+the sharer's click 22 seconds late. The trace named the cause exactly: the
+replica consumed **three log entries per second** for thirteen seconds while
+three thousand entries sat unread in its ring. Those three were one
+supervisor's readings of `CLOCK_MONOTONIC`. The process spent each second
+parked in `epoll_wait(fds, 1000)`, on a deadline this host set from its own
+clock, and the injected request the viewer was waiting for sat in the log
+behind those readings. Nothing else was implicated: no wait in
+`ReplicationLogReader` ever ran, `borrowedClockReadings` stayed at zero, and
+the kernel worker never blocked for more than 400 ms.
+
+`ReplicationLogReader.aheadMs(pid)` is the answer, and the shape of it matters.
+It reports how much machine time passed between the reading a process was last
+served and its **own** next recorded one. The primary spent the wait and then
+read the clock on the far side of it, so that gap is the wait the primary
+actually served. A wait no longer than the gap is one the primary already
+spent, and the host completes it at once.
+
+Two coarser rules were built first and both are wrong, so neither should be
+tried again:
+
+- **Gating on the log head** (`entryReady`). The log grows the whole time a
+  machine runs, so the head is ahead of an idle process at every moment,
+  including when that process is at the head of its own stream. Every wait
+  collapses, the process spins, it spends readings the primary has not made,
+  and it borrows. Measured: `borrowedClockReadings` climbed to 41 and the
+  replica stopped serving pages at all.
+- **Gating on "this process has an unserved reading"**. True right up to the
+  last one recorded, so a spinning process runs off the end of its own stream
+  and borrows the same way. It cut the follow lag from 22 s to 7 s and then
+  wedged the machine on the second navigation.
+
+The duration is what makes the rule safe. A wait longer than the gap is one the
+primary had not finished, so the replica keeps waiting; the readiness check
+itself is untouched, and the wait still ends on whatever the kernel reports.
+
+Zero names the machine rather than a process, for a host wait that belongs to
+no guest — the audio backlog discard and the vblank pump — and answers whether
+the log carries anything this replica has not reached.
+
+`getReadinessDeadline` in `kernel-worker.ts` is the one place every timed
+readiness wait passes through, so the rule is stated once and covers `poll`,
+`ppoll`, `select`, `pselect`, `epoll_wait` and `epoll_pwait`; `handleSleepDelay`
+states it again for the sleep family. Measured end to end by
+`apps/browser-demos/test/repro-wp-sharer-click.spec.ts`: the follow lag went
+from 22.0 s to 0.15-2.0 s on the first navigation and under 150 ms after it,
+with `borrowedClockReadings` and `borrowedAcceptSelections` both zero.
+
 ### How a replica joins a machine that is already running
 
 **Decided on 2026-08-29: by checkpoint, not by boot.** A replica adopts the
@@ -343,6 +416,37 @@ page therefore nudges after every batch it queues: `entries` →
 `replication_replay_drain`, which takes what the ring already holds
 (`takeReady`, never blocking) and applies it. A guest that is parked inside a
 clock read needs no nudge; the blocking extender drains as entries arrive.
+
+A live join also softens the clock stream, in two bounded ways, because the
+two computers schedule their workers differently and a worker pool hands the
+same request to different processes on each of them. Both live in
+`ReplicationLogReader.takeClock` (`host/src/replication/log.ts`), both exist
+only while a bounded extender is installed, and a finished recording replayed
+locally keeps the strict order and the hard `ReplicationDivergence`.
+
+**A process whose counterpart stopped reading borrows.** Readings are served
+per process, so a replica process whose primary counterpart never reads the
+clock again has no next reading to wait for — and the wait runs on the kernel
+worker, which holds every process of the machine, silently. `takeClock`
+therefore waits a bounded time (`CLOCK_STREAM_WAIT_MS`, shortened once a
+process has borrowed) and then serves the machine-latest reading of that
+clock. The reading is still one the primary observed — the log stays the
+whole machine's clock — and it cannot step a monotonic clock backward,
+because entries append in recorded order. Every borrow is counted in
+`borrowedClockReadings` and surfaces in replay progress: a visible softening,
+not a silent one.
+
+**A process that interleaves its own clocks differently is served ahead.**
+The same scheduling difference reaches inside one process: a replica's
+process can read `CLOCK_REALTIME` and `CLOCK_MONOTONIC` in a different
+interleaving than its counterpart did, so its next recorded reading is of the
+wrong clock. Instead of diverging, `takeClock` scans ahead
+(`#findClockAhead`) for the process's next unserved reading of the clock it
+asked for, serves it out of order, and leaves the stepped-over reading where
+the process's own later read will find it. Every reading served this way is
+still one the primary recorded for this process, in order per clock. Only
+when no such reading exists does the read fall into the bounded wait and the
+borrow above.
 
 Nothing drains the recorder, and that is now deliberate rather than deferred.
 A replica joins at boot, so the entries from sequence 0 are the ones it needs
@@ -463,6 +567,101 @@ machine, so the log must start at sequence 0 and be retained from there.
 And `ReplicationLogRecorder` retaining every entry stops being only a
 leak and becomes a requirement for the GL case, which changes what
 "drain the log when streaming lands" can mean.
+
+### How a viewer follows the web preview
+
+The web preview is a fourth surface, and it is neither pixels nor a
+PTY: it is HTTP. The primary's page routes every `/app/` request
+through the service worker to the bridge, and the bridge injects it
+into the machine as a synthetic connection. An injection is host
+input — the accept, the randomly drawn peer port, and the request
+bytes are all host-produced — so it enters the log as
+`ReplicationHttpExchange` (`host/src/replication/log.ts`). The
+response does not travel: it is the machine's own output, and a
+replica that runs the same machine computes it again.
+
+A viewer's page asks for the same resources, and its machine must not
+see those asks — a live injection on a replica is an input the
+primary's log does not carry, and it diverges the machine. The
+pairing happens outside the machine instead (`ReplayedHttpExchanges`
+in `host/src/replication/worker.ts`): each replayed exchange deposits
+the response this replica computed, keyed by request line, and the
+viewer's fetch takes the copy. Latest wins per request line, because
+the two browsers cache differently.
+
+That cache difference is also the surface's open hole. What the
+primary's browser never asks for, the primary's machine never serves.
+WordPress marks its static assets cacheable, so a font or script that
+loaded once comes from the primary's HTTP cache afterward; no
+injection happens, nothing enters the log, and the viewer's identical
+request waits out its park and reports "unrecorded" — a 502 whose
+cause is a cache asymmetry between two browsers, not a divergence.
+
+The cache hole has a sibling: the late joiner. A checkpoint joiner
+follows the log from the join instant; an exchange served before that
+instant is in the state it adopted, not in the entries it replays, so
+its response never lands in the viewer's store — and re-injecting it
+on the replica would make that machine serve a request the primary's
+machine never served again. The publisher reloading its preview when
+recording starts (`previewReloadToken`) narrows this to what the
+reload's own cache hits swallow, which is the same hole again.
+
+**Built 2026-09-04: a viewer's miss becomes the primary's request.**
+When a viewer's fetch finds no replay of its
+request line coming, it does not give up and does not inject. It
+forwards the request line over the peer link to the primary's page,
+and that page fetches it through its own service worker with `cache:
+"no-store"` — past its browser cache, into its bridge, into the
+machine. The injection is a primary input like any other: it enters
+the log, every replica replays it, and the replica's own computed
+response resolves the viewer's parked fetch through the
+`expect`/`deliver` pairing that already exists. Both holes close at
+once. No response bytes cross the wire, the checkpoint does not grow,
+and the primary's browser keeps its cache — the blanket
+`Cache-Control: no-store` header considered first is not needed,
+because the one fetch that must skip the cache says so itself.
+
+The boundaries of the mechanism:
+
+- Only GET and HEAD forward. Any other method is a mutation, and the
+  viewer that cannot type cannot POST either; those stay refused.
+- The viewer forwards after a short park, not after the full 30 s
+  deadline `ReplayedHttpExchanges.take` waits today — "unrecorded" is
+  only knowable by waiting, and a viewer that waited the full
+  deadline before asking would read as a broken page. A forward that
+  races a replay already in flight costs one redundant injection, and
+  latest-wins absorbs it.
+- The viewer dedups misses per request line while one is in flight,
+  so a page asking for the same font four ways costs the primary one
+  injection, not four.
+- A forwarded GET still runs guest code — nginx logs it, PHP may
+  touch a session — which is true of every request the primary's own
+  page makes. The viewer sees the machine as the primary's browser,
+  cookie jar included; that is what viewing one session means.
+- A primary that is gone cannot serve, and the miss stays "never
+  served" — which is then true.
+
+The alternative, kept as the fallback: the primary retains the latest
+response per request line and ships that store with the checkpoint,
+pre-seeding the viewer's `ReplayedHttpExchanges`. It answers misses
+with no round trip, but it grows the join payload by a page's worth
+of assets and it puts recomputable machine output on the wire — the
+data the log's whole design keeps off it. It becomes worth building
+only if miss-forwarding's round trip reads as a broken page in
+practice.
+
+Forwarding delivered the request and then exposed what was behind it.
+The viewer's WordPress replica served the same injected request as a
+500 while the primary served it 200, with no divergence raised and a
+clean log replay — uncaptured nondeterminism rather than a log fault.
+Its cause was accept selection. The demo runs php-fpm with
+`pm.max_children = 6`, all six workers blocked on one shared accept
+queue, and the connection went to whichever worker each host ran
+first; the replica handed the request to a worker whose own heap
+fatalled on it. A single-worker ablation rendered byte-identical on
+home, `?p=1` and wp-login, which named the cause. The fix is the
+`kind: "accept"` decision described under "What must enter the log":
+all six workers stay, and each one does what its counterpart did.
 
 ## Implementation Path
 
