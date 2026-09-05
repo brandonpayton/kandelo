@@ -2630,6 +2630,90 @@ pub struct ForkModule {
     pub fm_externrefs_resolved: wasmtime::TypedFunc<(), i64>,
     pub fm_exnrefs_reconstructed: wasmtime::TypedFunc<(), i64>,
     pub fm_gc_nodes_reconstructed: wasmtime::TypedFunc<(), i64>,
+
+    // -- N1-I5 Task 1: the module's reference-replay `fm_*` exports, bound
+    // here for the same reason as the frame-coordinator exports above (one
+    // lookup, checked eagerly). NOTHING calls these yet — Task 1 is wiring
+    // only; Task 3 drives the actual reference-replay sequence
+    // (`fork-process-continuation.ts:1081-1100`'s order). See this struct's
+    // doc comment and `instantiate_fork_module`'s "N1-I5 Task 1" comments.
+    /// Seed the whole-arena reference graph for this fork
+    /// (`module_state_root`, `pid`); `fm_last_errno` reports failure.
+    pub fm_begin_reference_replay: wasmtime::TypedFunc<(u32, u32), ()>,
+    /// Seed activation `activation_id`'s funcref-catalog merge base (only
+    /// needed for >1 activation; unused by Task 1's single-activation path).
+    pub fm_set_activation_catalog_base: wasmtime::TypedFunc<(u32, u32), ()>,
+    /// Seed activation `activation_id`'s static-root-catalog merge base
+    /// (only needed for >1 static-root activation).
+    pub fm_set_activation_static_root_base: wasmtime::TypedFunc<(u32, u32), ()>,
+    /// Seed activation `activation_id`'s raw `kandelo.wpk_fork.gc_codec`
+    /// section bytes (`ptr`, `byte_len`, both guest byte offsets/lengths).
+    pub fm_set_activation_gc_codec: wasmtime::TypedFunc<(u32, u32, u32), ()>,
+    /// Seed the worker's `hostExceptionOwner` (`u32::MAX` == none).
+    pub fm_set_host_exception_owner: wasmtime::TypedFunc<u32, ()>,
+    /// Build the real topological GC drive plan for the fork's whole
+    /// reference graph; returns a guest address for `fm_drive_execute`, or
+    /// `0` + `fm_last_errno` on failure.
+    pub fm_build_gc_plan: wasmtime::TypedFunc<u32, u32>,
+    /// Step count of the last `fm_build_gc_plan` build (the `count` argument
+    /// for `fm_drive_execute`).
+    pub fm_gc_plan_count: wasmtime::TypedFunc<(), i32>,
+    /// The walrus-injected drive loop: `call_indirect`s
+    /// `env.__wpk_fork_drive_table` once per serialized plan step.
+    pub fm_drive_execute: wasmtime::TypedFunc<(u32, u32), ()>,
+    /// The first `env.__wpk_fork_drive_table` slot for `activation` (a pure
+    /// formula — `activation * 3`, safe to call before any seeding).
+    pub fm_drive_table_base: wasmtime::TypedFunc<u32, i32>,
+    /// `__wpk_fork_ref_vector_get(ordinal, index) -> recipe_id`.
+    pub fm_ref_vector_get: wasmtime::TypedFunc<(u32, u32), i32>,
+    /// `__wpk_fork_ref_gc_route(recipe_id, expected_activation) -> layout|0|-1`.
+    pub fm_ref_gc_route: wasmtime::TypedFunc<(u32, u32), i32>,
+    /// `__wpk_fork_ref_gc_payload_len(recipe_id, activation, layout) -> len`.
+    pub fm_ref_gc_payload_len: wasmtime::TypedFunc<(u32, u32, u32), i32>,
+    /// `__wpk_fork_ref_gc_load(recipe_id, activation, type, layout, kind,
+    /// dst, len) -> vector_ordinal|0`; `dst` is an absolute guest byte offset.
+    pub fm_ref_gc_load: wasmtime::TypedFunc<(u32, u32, u32, u32, u32, u32, u32), i32>,
+    /// `__wpk_fork_ref_exn_route(recipe_id, expected_activation) -> layout|-1`.
+    pub fm_ref_exn_route: wasmtime::TypedFunc<(u32, u32), i32>,
+    /// `__wpk_fork_ref_exn_load(recipe_id, activation, tag, layout,
+    /// scalar_dst, scalar_len, ref_ids_dst, ref_count) -> 1`. Both `dst`
+    /// args are absolute guest byte offsets.
+    pub fm_ref_exn_load: wasmtime::TypedFunc<(u32, u32, u32, u32, u32, u32, u32, u32), i32>,
+    /// `__wpk_fork_ref_exn_cache_index(recipe_id) -> index`.
+    pub fm_ref_exn_cache_index: wasmtime::TypedFunc<u32, i32>,
+    /// NOT guest-facing: resolves a funcref recipe to a function-catalog
+    /// ordinal (`-1` == the canonical Null reference); TRAPS on inconsistency.
+    pub fm_funcref_ordinal: wasmtime::TypedFunc<u32, i32>,
+    /// NOT guest-facing: resolves a static-root recipe to a merged
+    /// anyref-catalog index; TRAPS on inconsistency.
+    pub fm_static_root_slot: wasmtime::TypedFunc<u32, i32>,
+    /// NOT guest-facing: resolves an externref recipe to its captured
+    /// broker `handle`; TRAPS on inconsistency.
+    pub fm_externref_handle: wasmtime::TypedFunc<u32, i32>,
+    /// Proof-of-use counter: static roots published into the anyref transit
+    /// since worker start.
+    pub fm_static_roots_published: wasmtime::TypedFunc<(), i64>,
+    /// Proof-of-use counter: drive steps `fm_drive_execute` has executed
+    /// since worker start.
+    pub fm_drive_steps_executed: wasmtime::TypedFunc<(), i64>,
+    /// The module's own module-defined, module-EXPORTED `(ref null any)`
+    /// transit table (STORE #2) a guest's `_gc_allocate` publishes into and
+    /// `_gc_fill` consumes. Bound into a fork-instrumented guest's own
+    /// `env.__wpk_fork_ref_gc_transit` import (N1-I5 Task 1 step 3).
+    pub gc_transit_table: Table,
+    /// The module's OWN imported funcref table (`env.__wpk_fork_function_catalog`)
+    /// — created empty by [`instantiate_fork_module`]; N1-I5 Task 1 populates
+    /// it, after a guest instance exists, with that guest's own exported
+    /// catalog entries (real `Func` values, identity preserved).
+    pub function_catalog_table: Table,
+    /// The module's OWN imported funcref table (`env.__wpk_fork_drive_table`)
+    /// the injected `fm_drive_execute` `call_indirect`s; populated with a
+    /// guest's `_gc_allocate`/`_gc_fill`/`_exception_materialize` exports.
+    pub drive_table: Table,
+    /// The module's OWN imported anyref table
+    /// (`env.__wpk_fork_static_root_catalog`) the static-root binder
+    /// `table.get`s; populated with a guest's harvested static-root values.
+    pub static_root_catalog_table: Table,
 }
 
 /// Instantiate the co-resident fork-module (`crate::fork_module_path()`)
@@ -2769,12 +2853,17 @@ pub(crate) fn instantiate_fork_module(
     // declares this GC-proposal table even though this frames-only path
     // never drives a step that reads it — so its null init is `Ref::Any`,
     // not `Ref::Func`.
-    for (name, init) in [
-        ("__indirect_function_table", Ref::Func(None)),
-        ("__wpk_fork_function_catalog", Ref::Func(None)),
-        ("__wpk_fork_drive_table", Ref::Func(None)),
-        ("__wpk_fork_static_root_catalog", Ref::Any(None)),
-    ] {
+    // N1-I5 Task 1: the three funcref/anyref tables below are kept as named
+    // `Table` handles (not just defined into the linker and dropped) so
+    // `spawn_guest_thread` can populate them, AFTER a guest instance exists,
+    // from that guest's own exported catalog/drive/static-root tables — see
+    // this function's returned [`ForkModule::function_catalog_table`]/
+    // [`ForkModule::drive_table`]/[`ForkModule::static_root_catalog_table`].
+    // `wasmtime::Table` is a cheap `Copy` handle into this `Store`, so
+    // capturing it here and also handing a copy to `linker.define` are the
+    // SAME underlying table — growing/populating the captured handle later
+    // is visible to the module through its import.
+    let mut fork_module_table = |name: &str, init: Ref| -> anyhow::Result<Table> {
         let ty = module
             .imports()
             .find(|i| i.module() == "env" && i.name() == name)
@@ -2785,7 +2874,13 @@ pub(crate) fn instantiate_fork_module(
             })?;
         let table = Table::new(&mut *store, ty, init)?;
         linker.define(&mut *store, "env", name, table)?;
-    }
+        Ok(table)
+    };
+    fork_module_table("__indirect_function_table", Ref::Func(None))?;
+    let function_catalog_table = fork_module_table("__wpk_fork_function_catalog", Ref::Func(None))?;
+    let drive_table = fork_module_table("__wpk_fork_drive_table", Ref::Func(None))?;
+    let static_root_catalog_table =
+        fork_module_table("__wpk_fork_static_root_catalog", Ref::Any(None))?;
 
     let memory_base_global = Global::new(
         &mut *store,
@@ -2829,6 +2924,17 @@ pub(crate) fn instantiate_fork_module(
         };
     }
 
+    // N1-I5 Task 1: the module's own module-defined, module-EXPORTED anyref
+    // transit table (STORE #2 — see `fork-module-inject/src/main.rs`'s
+    // `TRANSIT_TABLE_IMPORT` doc comment for why the module, not the host,
+    // owns this table). Every co-resident fork-module build exports it
+    // unconditionally, so a missing export here is a real module/host ABI
+    // mismatch, not a "guest doesn't use references" case — hence a hard
+    // error, like every other `fm_func!` lookup below.
+    let gc_transit_table = instance
+        .get_table(&mut *store, "__wpk_fork_ref_gc_transit")
+        .ok_or_else(|| anyhow::anyhow!("fork-module missing export __wpk_fork_ref_gc_transit"))?;
+
     Ok(ForkModule {
         instance,
         memory_base,
@@ -2850,6 +2956,31 @@ pub(crate) fn instantiate_fork_module(
         fm_externrefs_resolved: fm_func!("fm_externrefs_resolved": () => i64),
         fm_exnrefs_reconstructed: fm_func!("fm_exnrefs_reconstructed": () => i64),
         fm_gc_nodes_reconstructed: fm_func!("fm_gc_nodes_reconstructed": () => i64),
+        fm_begin_reference_replay: fm_func!("fm_begin_reference_replay": (u32, u32) => ()),
+        fm_set_activation_catalog_base: fm_func!("fm_set_activation_catalog_base": (u32, u32) => ()),
+        fm_set_activation_static_root_base: fm_func!("fm_set_activation_static_root_base": (u32, u32) => ()),
+        fm_set_activation_gc_codec: fm_func!("fm_set_activation_gc_codec": (u32, u32, u32) => ()),
+        fm_set_host_exception_owner: fm_func!("fm_set_host_exception_owner": u32 => ()),
+        fm_build_gc_plan: fm_func!("fm_build_gc_plan": u32 => u32),
+        fm_gc_plan_count: fm_func!("fm_gc_plan_count": () => i32),
+        fm_drive_execute: fm_func!("fm_drive_execute": (u32, u32) => ()),
+        fm_drive_table_base: fm_func!("fm_drive_table_base": u32 => i32),
+        fm_ref_vector_get: fm_func!("fm_ref_vector_get": (u32, u32) => i32),
+        fm_ref_gc_route: fm_func!("fm_ref_gc_route": (u32, u32) => i32),
+        fm_ref_gc_payload_len: fm_func!("fm_ref_gc_payload_len": (u32, u32, u32) => i32),
+        fm_ref_gc_load: fm_func!("fm_ref_gc_load": (u32, u32, u32, u32, u32, u32, u32) => i32),
+        fm_ref_exn_route: fm_func!("fm_ref_exn_route": (u32, u32) => i32),
+        fm_ref_exn_load: fm_func!("fm_ref_exn_load": (u32, u32, u32, u32, u32, u32, u32, u32) => i32),
+        fm_ref_exn_cache_index: fm_func!("fm_ref_exn_cache_index": u32 => i32),
+        fm_funcref_ordinal: fm_func!("fm_funcref_ordinal": u32 => i32),
+        fm_static_root_slot: fm_func!("fm_static_root_slot": u32 => i32),
+        fm_externref_handle: fm_func!("fm_externref_handle": u32 => i32),
+        fm_static_roots_published: fm_func!("fm_static_roots_published": () => i64),
+        fm_drive_steps_executed: fm_func!("fm_drive_steps_executed": () => i64),
+        gc_transit_table,
+        function_catalog_table,
+        drive_table,
+        static_root_catalog_table,
     })
 }
 
@@ -3539,6 +3670,109 @@ fn spawn_guest_thread(
             }
         }
 
+        // N1-I5 Task 1: bind the co-resident module's reference-replay
+        // surface into the GUEST's own reference imports, when the guest is
+        // fork-instrumented (mirrors `host/src/worker-main.ts:4593-4607`'s
+        // guest import-flip block + `:3730-3750`'s `moduleReferenceFeedFlip`
+        // — see `docs/plans/2026-09-05-n1-i5-references-grounding.md` §4).
+        // This is WIRING ONLY: nothing in this task calls `fm_begin_
+        // reference_replay`/`fm_build_gc_plan`/`fm_drive_execute` (Task 3's
+        // job), so a guest that never captures a funcref/externref/GC value
+        // across a fork never actually reaches any of these — the bind is
+        // dormant until Task 3 drives it. Must run BEFORE `linker.instantiate`
+        // (a `Linker` entry has to exist before instantiation resolves
+        // imports against it) and BEFORE the blanket `define_unknown_
+        // imports_as_traps`/`define_unknown_imports_as_default_values` calls
+        // below (those two only fill in imports NOT already resolvable via
+        // `Linker::_get_by_import`, so defining these specific names first
+        // makes the blanket calls skip them — same ordering the unwind-tag
+        // and resume-table wiring above already rely on).
+        //
+        // Every name is looked up against the GUEST's OWN declared imports
+        // first (`module.imports()`), not assumed: a guest module that omits
+        // one (e.g. no exception codec, so no `__wpk_fork_ref_exn_*`
+        // imports) is simply left alone, exactly like the unwind-tag/
+        // resume-table blocks above.
+        if let (Some(_fmt), Some(fm)) = (fork_format.as_ref(), fork_module.as_ref()) {
+            let guest_declares = |name: &str| {
+                module.imports().any(|i| i.module() == "env" && i.name() == name)
+            };
+
+            // Bind env.__wpk_fork_ref_gc_transit -> the module's own
+            // module-owned, module-EXPORTED anyref transit table (STORE #2)
+            // — net-new: no prior native wiring bound this import at all.
+            if guest_declares(wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_TRANSIT) {
+                if let Err(e) = linker.define(
+                    &mut store,
+                    "env",
+                    wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_TRANSIT,
+                    fm.gc_transit_table,
+                ) {
+                    eprintln!(
+                        "wiring env.{} failed: {e:#}",
+                        wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_TRANSIT
+                    );
+                    return;
+                }
+            }
+
+            // The two reference-returning decode shims: raw `Func` lookups
+            // (like the FRAME_IMPORT_NAMES flip above), not `TypedFunc`,
+            // since a funcref-/externref-returning export cannot round-trip
+            // through a `TypedFunc<Params, Results>` binding the way plain
+            // i32/i64 exports do.
+            let decode_funcref = match fm.instance.get_func(&mut store, "__wpk_fork_ref_decode_funcref") {
+                Some(f) => f,
+                None => {
+                    eprintln!("fork-module missing expected export __wpk_fork_ref_decode_funcref");
+                    return;
+                }
+            };
+            let decode_externref = match fm.instance.get_func(&mut store, "__wpk_fork_ref_decode_externref") {
+                Some(f) => f,
+                None => {
+                    eprintln!("fork-module missing expected export __wpk_fork_ref_decode_externref");
+                    return;
+                }
+            };
+
+            // The decode + seven RESTORE data-feed imports, flipped to the
+            // module's matching exports. `TypedFunc::func()` hands back the
+            // same `Func` handle already bound into `ForkModule` above (no
+            // second lookup for the seven `fm_ref_*` exports).
+            let flips: [(&str, wasmtime::Func); 9] = [
+                (
+                    wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_DECODE_FUNCREF,
+                    decode_funcref,
+                ),
+                (
+                    wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_DECODE_EXTERNREF,
+                    decode_externref,
+                ),
+                (wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_VECTOR_GET, *fm.fm_ref_vector_get.func()),
+                (wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_ROUTE, *fm.fm_ref_gc_route.func()),
+                (
+                    wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_PAYLOAD_LEN,
+                    *fm.fm_ref_gc_payload_len.func(),
+                ),
+                (wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_LOAD, *fm.fm_ref_gc_load.func()),
+                (wasm_posix_shared::abi::WPK_FORK_EXCEPTION_IMPORT_ROUTE, *fm.fm_ref_exn_route.func()),
+                (wasm_posix_shared::abi::WPK_FORK_EXCEPTION_IMPORT_LOAD, *fm.fm_ref_exn_load.func()),
+                (
+                    wasm_posix_shared::abi::WPK_FORK_EXCEPTION_IMPORT_CACHE_INDEX,
+                    *fm.fm_ref_exn_cache_index.func(),
+                ),
+            ];
+            for (name, f) in flips {
+                if guest_declares(name) {
+                    if let Err(e) = linker.define(&mut store, "env", name, f) {
+                        eprintln!("wiring env.{name} failed: {e:#}");
+                        return;
+                    }
+                }
+            }
+        }
+
         // The fork-exec import set is imported but never reached on this
         // (non-forking) path; a trap is the truthful boundary.
         linker.define_unknown_imports_as_traps(&module).unwrap();
@@ -3623,6 +3857,160 @@ fn spawn_guest_thread(
                     if let Err(e) = dest.set(&mut store, slot, thunk) {
                         eprintln!("populating __wpk_fork_resume_table[{slot}] failed: {e:#}");
                         return;
+                    }
+                }
+            }
+        }
+
+        // N1-I5 Task 1: populate the co-resident module's three imported
+        // reference-carrying tables from THIS GUEST's own exports, now that
+        // `instance` exists — mirrors `host/src/worker-main.ts:4780-4874,
+        // 4915-4982`. Single-activation only (base 0 default; a >1-
+        // activation program would additionally need `fm_set_activation_
+        // catalog_base`/`fm_set_activation_static_root_base` — deferred, see
+        // this file's "N1-I5 Task 1" section doc comment). Every export is
+        // looked up optionally: a guest that never captures a reference
+        // still unconditionally declares these names (fork-instrumentation
+        // is per-program, not per-fork — see `native_fork.instrumented.wasm`),
+        // but a plain, non-instrumented fixture declares none of them, so
+        // this whole block is a no-op for it. Nothing here is reachable by
+        // guest code yet either way (Task 3 wires the actual drive/decode
+        // call sequence); this only makes the copy MECHANISM live.
+        if let Some(fm) = fork_module.as_ref() {
+            // -- Funcref catalog mirror -------------------------------------
+            if let Some(guest_catalog) = instance.get_table(&mut store, "__wpk_fork_function_catalog") {
+                let len = guest_catalog.size(&mut store);
+                if len > 0 {
+                    if let Err(e) = fm.function_catalog_table.grow(&mut store, len, Ref::Func(None)) {
+                        eprintln!("growing fork-module __wpk_fork_function_catalog failed: {e:#}");
+                        return;
+                    }
+                    for i in 0..len {
+                        match guest_catalog.get(&mut store, i) {
+                            Some(v @ Ref::Func(_)) => {
+                                if let Err(e) = fm.function_catalog_table.set(&mut store, i, v) {
+                                    eprintln!(
+                                        "populating fork-module __wpk_fork_function_catalog[{i}] failed: {e:#}"
+                                    );
+                                    return;
+                                }
+                            }
+                            Some(other) => {
+                                eprintln!(
+                                    "guest __wpk_fork_function_catalog[{i}] is {other:?}, not a funcref"
+                                );
+                                return;
+                            }
+                            None => {
+                                eprintln!("guest __wpk_fork_function_catalog[{i}] is out of bounds");
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // -- Drive-table bind (activation 0 only) ------------------------
+            let gc_allocate =
+                instance.get_func(&mut store, wasm_posix_shared::abi::WPK_FORK_REFERENCE_EXPORT_GC_ALLOCATE);
+            let gc_fill = instance.get_func(&mut store, wasm_posix_shared::abi::WPK_FORK_REFERENCE_EXPORT_GC_FILL);
+            if let (Some(gc_allocate), Some(gc_fill)) = (gc_allocate, gc_fill) {
+                let base = match fm.fm_drive_table_base.call(&mut store, 0) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("fm_drive_table_base(0) failed: {e:#}");
+                        return;
+                    }
+                };
+                let Ok(base) = u64::try_from(base) else {
+                    eprintln!("fm_drive_table_base(0) returned a negative base {base}");
+                    return;
+                };
+                let needed = base + 3; // ALLOC=0, FILL=1, EXN=2.
+                let current = fm.drive_table.size(&mut store);
+                if needed > current {
+                    if let Err(e) = fm.drive_table.grow(&mut store, needed - current, Ref::Func(None)) {
+                        eprintln!("growing fork-module __wpk_fork_drive_table failed: {e:#}");
+                        return;
+                    }
+                }
+                if let Err(e) = fm.drive_table.set(&mut store, base, Ref::Func(Some(gc_allocate))) {
+                    eprintln!("binding __wpk_fork_drive_table[{base}] (ALLOC) failed: {e:#}");
+                    return;
+                }
+                if let Err(e) = fm.drive_table.set(&mut store, base + 1, Ref::Func(Some(gc_fill))) {
+                    eprintln!("binding __wpk_fork_drive_table[{}] (FILL) failed: {e:#}", base + 1);
+                    return;
+                }
+                // The exception-materialize slot is optional: a guest with
+                // no exception codec (no captured exnref) does not export
+                // it, and the slot is simply never driven.
+                if let Some(exception_materialize) = instance
+                    .get_func(&mut store, wasm_posix_shared::abi::WPK_FORK_EXCEPTION_EXPORT_MATERIALIZE)
+                {
+                    if let Err(e) =
+                        fm.drive_table.set(&mut store, base + 2, Ref::Func(Some(exception_materialize)))
+                    {
+                        eprintln!("binding __wpk_fork_drive_table[{}] (EXN) failed: {e:#}", base + 2);
+                        return;
+                    }
+                }
+            }
+
+            // -- Static-root catalog mirror (activation 0 only) --------------
+            // The guest's OWN `__wpk_fork_static_root_catalog` export is a
+            // harvest BUFFER, not permanent storage (see
+            // `crates/fork-instrument/src/static_reference_catalog.rs`'s
+            // module doc comment): the host must call the guest's
+            // `__wpk_fork_static_root_harvest` export exactly once, right
+            // after instantiation and before any other guest code runs, to
+            // fill it — which is exactly where this block sits.
+            if let Some(guest_roots) =
+                instance.get_table(&mut store, wasm_posix_shared::abi::WPK_FORK_STATIC_ROOT_CATALOG_EXPORT)
+            {
+                let len = guest_roots.size(&mut store);
+                if len > 0 {
+                    let Ok(harvest) = instance.get_typed_func::<(), ()>(
+                        &mut store,
+                        wasm_posix_shared::abi::WPK_FORK_STATIC_ROOT_HARVEST_EXPORT,
+                    ) else {
+                        eprintln!(
+                            "guest declares a non-empty {} but is missing/mistyped {}",
+                            wasm_posix_shared::abi::WPK_FORK_STATIC_ROOT_CATALOG_EXPORT,
+                            wasm_posix_shared::abi::WPK_FORK_STATIC_ROOT_HARVEST_EXPORT
+                        );
+                        return;
+                    };
+                    if let Err(e) = harvest.call(&mut store, ()) {
+                        eprintln!(
+                            "{} failed: {e:#}",
+                            wasm_posix_shared::abi::WPK_FORK_STATIC_ROOT_HARVEST_EXPORT
+                        );
+                        return;
+                    }
+                    if let Err(e) = fm.static_root_catalog_table.grow(&mut store, len, Ref::Any(None)) {
+                        eprintln!("growing fork-module __wpk_fork_static_root_catalog failed: {e:#}");
+                        return;
+                    }
+                    for i in 0..len {
+                        match guest_roots.get(&mut store, i) {
+                            Some(v @ Ref::Any(_)) => {
+                                if let Err(e) = fm.static_root_catalog_table.set(&mut store, i, v) {
+                                    eprintln!(
+                                        "populating fork-module static-root catalog[{i}] failed: {e:#}"
+                                    );
+                                    return;
+                                }
+                            }
+                            Some(other) => {
+                                eprintln!("guest static-root catalog[{i}] is {other:?}, not anyref");
+                                return;
+                            }
+                            None => {
+                                eprintln!("guest static-root catalog[{i}] is out of bounds");
+                                return;
+                            }
+                        }
                     }
                 }
             }
