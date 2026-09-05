@@ -617,25 +617,50 @@ fn grow_to_cover(mem: &SharedMemory, end_addr: usize) -> anyhow::Result<()> {
 /// hand-rolled wire format, so a future decoder/encoder wire change cannot
 /// silently drift this out of sync. `fm_begin_reference_replay` fails loudly
 /// (`EINVAL`) on any malformed header, so a mistake here would be a visible
-/// bug, not a silent illusion. A future task that adds real native
-/// module-state capture (out of this task's scope — see the N1-I5 grounding
-/// doc's capture-side gap) replaces this with the guest's own captured
-/// arena.
+/// bug, not a silent illusion.
+///
+/// N1-I5b Task 1: this is now a THIN wrapper around [`write_module_state_
+/// arena`], passing a freshly-`begin()`'d, never-mutated builder — i.e. the
+/// exact canonical null-only graph this function always produced. It is
+/// still called once per guest OS thread, at `instantiate_fork_module` time,
+/// to leave a genuinely-valid floor value at the scratch address before any
+/// fork has happened; `drive_fork_capture_seal_and_launch_child` now
+/// overwrites that SAME address with THIS fork's real, capture-filled graph
+/// (via the same [`write_module_state_arena`]) once its unwind completes —
+/// see that function's doc comment.
 fn write_empty_module_state_arena(guest_mem: &SharedMemory, scratch_addr: u32) -> anyhow::Result<()> {
+    let builder = fork_codec::ReferenceGraphBuilder::begin();
+    write_module_state_arena(guest_mem, scratch_addr, &builder)
+}
+
+/// N1-I5b Task 1: write a genuinely-valid module-state (KFMS) arena at
+/// `scratch_addr` encoding `builder`'s reference graph, via the module's OWN
+/// encoder (`fork_codec::ReferenceSegmentsWriter`) — the general form
+/// [`write_empty_module_state_arena`] specializes to the canonical
+/// null-only floor, and [`drive_fork_capture_seal_and_launch_child`]
+/// specializes to a real, capture-filled [`NativeReferenceCapture::graph`].
+/// See `write_empty_module_state_arena`'s (pre-I5b) doc comment for why a
+/// literally record-less chunk is rejected as malformed by `fm_begin_
+/// reference_replay`'s decoder, not accepted as empty — a `builder` still at
+/// its `begin()` state (no live reference ever captured) already encodes
+/// the correct "empty" answer as one canonical-null node record, so this
+/// function needs no separate empty-case branch.
+fn write_module_state_arena(
+    guest_mem: &SharedMemory,
+    scratch_addr: u32,
+    builder: &fork_codec::ReferenceGraphBuilder,
+) -> anyhow::Result<()> {
     use wasm_posix_shared::abi;
 
     let header_size = abi::wpk_fork_module_state_chunk_header_size(4)
         .ok_or_else(|| anyhow::anyhow!("no KFMS chunk header size for wasm32 pointer width"))?
         as usize;
 
-    // Encode the canonical null-only reference transaction via the module's
-    // own (de)serializer — see this function's doc comment for why a
-    // literally record-less chunk is rejected as malformed, not accepted as
-    // empty.
-    let builder = fork_codec::ReferenceGraphBuilder::begin();
+    // Encode `builder`'s reference transaction via the module's own
+    // (de)serializer.
     let writer = fork_codec::ReferenceSegmentsWriter::new(
         abi::WPK_FORK_REFERENCE_TRANSACTION_OWNER,
-        1 << 16, // one segment per section; the null-only graph is tiny
+        1 << 16, // one segment per section; a single fork's graph is tiny
     )
     .map_err(|e| anyhow::anyhow!("ReferenceSegmentsWriter::new failed: {e:?}"))?;
     let mut kfms_records: Vec<(u16, u32, u32, Vec<u8>)> = Vec::new();
@@ -645,7 +670,7 @@ fn write_empty_module_state_arena(guest_mem: &SharedMemory, scratch_addr: u32) -
             Ok(())
         };
         writer
-            .write(&mut sink, &builder)
+            .write(&mut sink, builder)
             .map_err(|e| anyhow::anyhow!("ReferenceSegmentsWriter::write failed: {e:?}"))?;
     }
 
@@ -2455,6 +2480,27 @@ const FORK_MODULE_RESUME_CATALOG_CAP: usize = 16_384;
 /// code can ever observe or collide with it.
 const FORK_MODULE_CATALOG_SCRATCH_BYTES: usize = FORK_MODULE_RESUME_CATALOG_CAP * 4;
 
+/// N1-I5b Task 1: a small, fixed-size, host-owned scratch region for the
+/// capture-side `__wpk_fork_ref_scratch_reserve`/`_release` imports — see
+/// [`NativeReferenceCapture::scratch_reserve`]'s doc comment for why this is
+/// a SEPARATE page from [`ForkModule::empty_module_state_root`] rather than
+/// reusing it: the two would otherwise be spatially safe to share (scratch
+/// use is always transient, strictly before the KFMS seal write — see
+/// `drive_fork_capture_seal_and_launch_child`), but keeping them apart makes
+/// that non-overlap true BY CONSTRUCTION, not by an ordering argument a
+/// future change could quietly invalidate. Reserved immediately after the
+/// KFMS scratch page, still inside the module's own shadow-stack padding
+/// (which `instantiate_fork_module`'s `grow_to_cover` call already covers).
+/// A generic buffer the guest's reference codec may request during ANY
+/// capture, not kind-gated (see `docs/plans/2026-09-05-n1-i5b-reference-
+/// capture-grounding.md` §5's per-import table) — in practice unreached by a
+/// funcref-only capture (only the typed-GC/exception codec's generated code
+/// calls it, per `crates/fork-instrument/src/module_exception_codec.rs`),
+/// but every capture-side import needs SOME live body before a
+/// fork-instrumented guest's capture walk can run at all (see this file's
+/// "N1-I5b Task 1" section doc comment on `spawn_guest_thread`).
+const FORK_MODULE_CAPTURE_SCRATCH_BYTES: usize = WASM_PAGE_SIZE;
+
 /// Find a custom section named `name` in raw wasm module `bytes`, returning
 /// its payload if present. Generalizes the section-scanning loop
 /// [`read_fork_module_mem_info`] already uses for `dylink.0`, so
@@ -2776,6 +2822,98 @@ impl ForkCoordState {
     }
 }
 
+/// N1-I5b Task 1: per-guest-OS-thread native reference CAPTURE bookkeeping —
+/// the native analogue of `ForkReferenceTransaction`'s capture half
+/// (`host/src/fork-reference-transaction.ts`). Capture has never been
+/// module-owned on any host (`docs/plans/2026-09-05-n1-i5b-reference-
+/// capture-grounding.md` §1/§2): Node/browser bind the ~15 capture-side
+/// guest imports directly to per-fork host JS closures over a
+/// `ForkReferenceTransaction`, not to a co-resident module export, so native
+/// mirrors that shape in Rust instead of trying to "flip" an import to a
+/// module export that does not exist.
+///
+/// Lifecycle, mirroring `worker-main.ts:4154-4176`'s `beginCapture`/
+/// `sealCapture` pair: created ONCE per guest OS thread (`spawn_guest_thread`,
+/// alongside [`ForkCoordState`]), `reset()` at the START of every capture
+/// (`kernel_fork`'s `Idle` arm, mirroring `arena.begin()` + a fresh
+/// `ForkReferenceTransaction`), filled by the guest's own per-frame commits
+/// during the unwind that follows (via the `__wpk_fork_ref_encode_funcref`/
+/// `_vector_begin`/`_append`/`_finish` import bodies bound in
+/// `spawn_guest_thread`), and read (never mutated) at seal time —
+/// `drive_fork_capture_seal_and_launch_child`, right after the guest's own
+/// `wpk_fork_unwind_end` + `fm_finish_unwind` confirm the ENTIRE unwind (and
+/// therefore every possible capture call) has finished — to serialize the
+/// accumulated graph into the KFMS scratch arena via [`write_module_state_
+/// arena`], mirroring `sealCapture()`'s `references.sealInto(arena)` +
+/// `arena.seal()`.
+struct NativeReferenceCapture {
+    /// The native port of `ForkReferenceTransaction`'s node/vector tables —
+    /// see `fork_codec::ReferenceGraphBuilder`'s own doc comment for why
+    /// interning by resolved COORDINATE (funcref `(activation, ordinal)`)
+    /// rather than by live JS-style identity is the faithful mirror here:
+    /// native has no live value to key on other than the raw `Func` handle
+    /// itself, which the `__wpk_fork_ref_encode_funcref` host body
+    /// (`spawn_guest_thread`) resolves to a coordinate via a funcref-catalog
+    /// lookup table (`Func::to_raw` -> ordinal) before ever touching this
+    /// builder.
+    graph: fork_codec::ReferenceGraphBuilder,
+    /// Bump offset into [`FORK_MODULE_CAPTURE_SCRATCH_BYTES`]'s reserved
+    /// page, backing `scratch_reserve`/`_release`. Reset to `0` alongside
+    /// `graph` at the start of every capture.
+    scratch_cursor: u32,
+}
+
+impl NativeReferenceCapture {
+    fn new() -> Self {
+        Self { graph: fork_codec::ReferenceGraphBuilder::begin(), scratch_cursor: 0 }
+    }
+
+    /// Begin a fresh capture, discarding whatever the PREVIOUS fork's
+    /// capture (if any) left behind — mirrors `arena.begin()` + a fresh
+    /// `ForkReferenceTransaction` at the top of `beginCapture`. Called from
+    /// `kernel_fork`'s `Idle` arm, before `fm_begin_unwind`.
+    fn reset(&mut self) {
+        self.graph = fork_codec::ReferenceGraphBuilder::begin();
+        self.scratch_cursor = 0;
+    }
+
+    /// `__wpk_fork_ref_scratch_reserve(size) -> ptr|0`: a bump allocator over
+    /// a fixed-size page (`scratch_len`, always [`FORK_MODULE_CAPTURE_
+    /// SCRATCH_BYTES`] in practice) reserved once per guest OS thread. This
+    /// is deliberately a THIN allocator, not a general-purpose one: capture
+    /// is single-threaded, bounded to one fork's unwind, and reset to empty
+    /// at the start of every capture, so a bump pointer that only reclaims
+    /// the MOST RECENT reservation (see `scratch_release`) is sufficient —
+    /// matching grounding §5's "a bump/free-list allocator ... no
+    /// engine-floor issue" sizing. Returns `None` (mapped to a host-import
+    /// error, not a silent wraparound) if `size` would overrun the page.
+    fn scratch_reserve(&mut self, scratch_base: u32, scratch_len: u32, size: u32) -> Option<u32> {
+        let end = self.scratch_cursor.checked_add(size)?;
+        if end > scratch_len {
+            return None;
+        }
+        let ptr = scratch_base.checked_add(self.scratch_cursor)?;
+        self.scratch_cursor = end;
+        Some(ptr)
+    }
+
+    /// `__wpk_fork_ref_scratch_release(ptr, size) -> ()`: reclaims `[ptr,
+    /// ptr+size)` if and only if it is the single most-recent reservation
+    /// (a LIFO fast path — the common case for a codec that reserves,
+    /// fills, and immediately consumes one scratch buffer per node). A
+    /// non-LIFO release is a safe, silent no-op leak: the whole page resets
+    /// to empty at the start of the NEXT capture (`reset`), so nothing is
+    /// ever leaked across forks, only (at most) within one already-bounded
+    /// capture pass.
+    fn scratch_release(&mut self, scratch_base: u32, ptr: u32, size: u32) {
+        if let Some(top) = scratch_base.checked_add(self.scratch_cursor) {
+            if ptr.checked_add(size) == Some(top) {
+                self.scratch_cursor = self.scratch_cursor.saturating_sub(size);
+            }
+        }
+    }
+}
+
 pub(crate) fn compute_guest_fork_format(wasm_bytes: &[u8]) -> anyhow::Result<Option<GuestForkFormat>> {
     let Some(fixed_prefix_size) = read_linked_frame_fixed_prefix_size(wasm_bytes)? else {
         return Ok(None);
@@ -2892,15 +3030,25 @@ pub struct ForkModule {
     /// catalog` — see [`compute_guest_fork_format`] and its caller in
     /// `spawn_guest_thread`.
     pub catalog_scratch_base: usize,
-    /// N1-I5 Task 3: the page-aligned guest address of the synthesized,
-    /// genuinely-valid but EMPTY (zero-record) KFMS module-state arena this
-    /// `instantiate_fork_module` call wrote via
-    /// [`write_empty_module_state_arena`] — the `module_state_root`
-    /// [`drive_reference_replay`]'s `fm_begin_reference_replay` call passes.
-    /// See that function's doc comment for why an empty arena is the correct
-    /// (not fabricated) value for every native fork today: native has no
-    /// module-state CAPTURE mechanism yet, so no fork produces a REAL one.
+    /// The page-aligned guest address of the KFMS module-state (reference
+    /// transaction) arena [`drive_reference_replay`]'s `fm_begin_reference_
+    /// replay` call reads. `instantiate_fork_module` writes the canonical
+    /// null-only floor here once, via [`write_empty_module_state_arena`]
+    /// (see that function's doc comment for why that floor is correct, not
+    /// fabricated, for a guest that never captures a reference); N1-I5b Task
+    /// 1's `drive_fork_capture_seal_and_launch_child` overwrites this SAME
+    /// address with THIS fork's real, capture-filled graph (via
+    /// [`write_module_state_arena`]) once its unwind completes, before
+    /// either the child's or the parent's own `drive_reference_replay` call
+    /// reads it — see that function's doc comment for why the same address,
+    /// reused per-fork, is sufficient (native never has two forks' capture
+    /// passes live at once on one guest OS thread).
     pub empty_module_state_root: u32,
+    /// N1-I5b Task 1: the page-aligned guest address of the
+    /// [`FORK_MODULE_CAPTURE_SCRATCH_BYTES`] scratch page backing
+    /// `__wpk_fork_ref_scratch_reserve`/`_release` — see
+    /// [`NativeReferenceCapture::scratch_reserve`]'s doc comment.
+    pub capture_scratch_base: u32,
 
     // -- Coordinator (`fm_*`) exports, bound once here so callers never
     // re-look-up a name (a typo would only surface at the FIRST call site,
@@ -3154,6 +3302,18 @@ pub(crate) fn instantiate_fork_module(
     let reference_scratch_base = u32::try_from(reference_scratch_base)
         .map_err(|_| anyhow::anyhow!("reference-replay scratch address {reference_scratch_base:#x} does not fit in wasm32"))?;
 
+    // N1-I5b Task 1: reserve a SECOND page, immediately after the KFMS
+    // scratch page above, for the capture-side `scratch_reserve`/`_release`
+    // imports — see [`FORK_MODULE_CAPTURE_SCRATCH_BYTES`]'s doc comment for
+    // why this is a separate page rather than sharing the KFMS one.
+    let capture_scratch_base = reference_scratch_base as usize + WASM_PAGE_SIZE;
+    anyhow::ensure!(
+        capture_scratch_base + FORK_MODULE_CAPTURE_SCRATCH_BYTES <= memory_base + region_bytes,
+        "fork-module capture-scratch page does not fit in the module's shadow-stack padding"
+    );
+    let capture_scratch_base = u32::try_from(capture_scratch_base)
+        .map_err(|_| anyhow::anyhow!("capture-scratch address {capture_scratch_base:#x} does not fit in wasm32"))?;
+
     grow_to_cover(guest_mem, memory_base + region_bytes)?;
     write_empty_module_state_arena(guest_mem, reference_scratch_base)?;
 
@@ -3312,6 +3472,7 @@ pub(crate) fn instantiate_fork_module(
         drive_table,
         static_root_catalog_table,
         empty_module_state_root: reference_scratch_base,
+        capture_scratch_base,
     })
 }
 
@@ -3488,6 +3649,26 @@ fn spawn_guest_thread(
         // `native_fork_refs.c`). Sharing is what makes both call sites resolve
         // the same handle to the identical `Rooted<ExternRef>`.
         let externref_registry = Arc::new(Mutex::new(ExternrefRegistry::new()));
+        // N1-I5b Task 1: ONE reference-CAPTURE accumulator per guest OS
+        // thread — see `NativeReferenceCapture`'s doc comment. Reset at the
+        // start of every capture (`kernel_fork`'s `Idle` arm below), filled
+        // by the guest's own per-frame commits, sealed at
+        // `drive_fork_capture_seal_and_launch_child`.
+        let capture = Arc::new(Mutex::new(NativeReferenceCapture::new()));
+        // N1-I5b Task 1: raw `Func::to_raw` pointer -> this guest's own
+        // funcref-catalog ordinal (activation 0 — single-activation only,
+        // matching the REPLAY-side funcref-catalog mirror below), populated
+        // once, right after this guest's `Instance` exists (see that mirror
+        // block), and read by the `__wpk_fork_ref_encode_funcref` host body
+        // to resolve a captured `funcref` VALUE back to the `(activation,
+        // ordinal)` coordinate `fork_codec::ReferenceGraphBuilder::
+        // intern_funcref` needs. Wasmtime's `Func` has no `PartialEq` impl
+        // (confirmed: `wasmtime::Func` derives only `Copy, Clone, Debug`),
+        // so identity is compared via `Func::to_raw`'s raw `VMFuncRef`
+        // pointer instead — valid for the lifetime of this one `Store`
+        // (one guest OS thread == one fork generation, same lifetime
+        // argument `ExternrefRegistry`'s doc comment already makes).
+        let funcref_catalog_lookup: Arc<Mutex<BTreeMap<usize, u32>>> = Arc::new(Mutex::new(BTreeMap::new()));
         if use_fork_module {
             match instantiate_fork_module(&engine, &mut store, &guest_mem, &layout, Arc::clone(&externref_registry)) {
                 Ok(fm) => {
@@ -3786,6 +3967,7 @@ fn spawn_guest_thread(
             let fm_for_import = fork_module.clone();
             let has_format = fork_format.is_some();
             let coord = Arc::clone(&coord);
+            let capture_for_fork = Arc::clone(&capture);
             linker
                 .func_wrap(
                     "kernel",
@@ -3821,6 +4003,14 @@ fn spawn_guest_thread(
 
                         match coord.phase() {
                             ForkCoordPhase::Idle => {
+                                // N1-I5b Task 1: start a FRESH capture,
+                                // discarding whatever the previous fork (if
+                                // any) left behind — mirrors `arena.begin()`
+                                // + a fresh `ForkReferenceTransaction` at the
+                                // top of `worker-main.ts`'s `beginCapture`,
+                                // BEFORE the unwind that follows this call
+                                // ever commits a frame.
+                                capture_for_fork.lock().unwrap().reset();
                                 coord.set_mode(mode as u32);
                                 let root = fm.fm_begin_unwind.call(&mut caller, (0, ch as u32))?;
                                 let errno = fm.fm_last_errno.call(&mut caller, ())?;
@@ -4136,6 +4326,177 @@ fn spawn_guest_thread(
                     return;
                 }
             }
+
+            // N1-I5b Task 1: the 6 funcref-CAPTURE imports — REAL native
+            // `Func`s over `NativeReferenceCapture`, not a flip to a
+            // fork-module export (capture has no module-owned counterpart
+            // on ANY host — see `NativeReferenceCapture`'s doc comment and
+            // `docs/plans/2026-09-05-n1-i5b-reference-capture-grounding.md`
+            // §1/§2/§4). Must run BEFORE the blanket `define_unknown_
+            // imports_as_traps` call below, exactly like every other
+            // conditional wire in this block. The remaining 10 capture-side
+            // imports (`encode_externref` + the 9 typed-GC family) are OUT
+            // OF SCOPE for this task — N1-I5b Task 2 gates them to
+            // `EOPNOTSUPP`; until then they are left trapping via that same
+            // blanket call, unchanged from before this task, so a fork whose
+            // capture never reaches one of them (every funcref-only fixture)
+            // is unaffected.
+            let encode_funcref_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_ENCODE_FUNCREF;
+            if guest_declares(encode_funcref_name) {
+                let capture_for_encode = Arc::clone(&capture);
+                let lookup_for_encode = Arc::clone(&funcref_catalog_lookup);
+                let result = linker.func_wrap(
+                    "env",
+                    encode_funcref_name,
+                    move |mut caller: Caller<'_, ()>,
+                          f: Option<wasmtime::Func>|
+                          -> wasmtime::Result<i32> {
+                        // Mirrors `encodeFuncref`: a null value is always
+                        // recipe 0, the canonical null node every graph
+                        // seeds at `begin()` — see `fork-reference-
+                        // transaction.ts:255`.
+                        let Some(f) = f else {
+                            return Ok(0);
+                        };
+                        let raw = f.to_raw(&mut caller) as usize;
+                        let ordinal = *lookup_for_encode.lock().unwrap().get(&raw).ok_or_else(|| {
+                            wasmtime::Error::msg(
+                                "encode_funcref: value is not present in this activation's own \
+                                 __wpk_fork_function_catalog export (single-activation only — \
+                                 see spawn_guest_thread's funcref_catalog_lookup doc comment)",
+                            )
+                        })?;
+                        let id = capture_for_encode
+                            .lock()
+                            .unwrap()
+                            .graph
+                            .intern_funcref(0, ordinal)
+                            .map_err(|e| wasmtime::Error::msg(format!("intern_funcref failed: {e:?}")))?;
+                        Ok(id as i32)
+                    },
+                );
+                if let Err(e) = result {
+                    eprintln!("wiring env.{encode_funcref_name} failed: {e:#}");
+                    return;
+                }
+            }
+
+            let vector_begin_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_VECTOR_BEGIN;
+            if guest_declares(vector_begin_name) {
+                let capture_for_begin = Arc::clone(&capture);
+                let result = linker.func_wrap(
+                    "env",
+                    vector_begin_name,
+                    move |_caller: Caller<'_, ()>, _expected_length: i32| -> wasmtime::Result<i32> {
+                        // `expected_length` is validated guest-side (the
+                        // instrumenter never emits `vector_begin` for an
+                        // empty slot run — see `crates/fork-instrument/src/
+                        // instrument.rs`'s `build_reference_save_dispatch`)
+                        // and unused by `ReferenceGraphBuilder::begin_vector`
+                        // itself, exactly like the Rust builder's own API.
+                        capture_for_begin
+                            .lock()
+                            .unwrap()
+                            .graph
+                            .begin_vector()
+                            .map(|h| h as i32)
+                            .map_err(|e| wasmtime::Error::msg(format!("begin_vector failed: {e:?}")))
+                    },
+                );
+                if let Err(e) = result {
+                    eprintln!("wiring env.{vector_begin_name} failed: {e:#}");
+                    return;
+                }
+            }
+
+            let vector_append_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_VECTOR_APPEND;
+            if guest_declares(vector_append_name) {
+                let capture_for_append = Arc::clone(&capture);
+                let result = linker.func_wrap(
+                    "env",
+                    vector_append_name,
+                    move |_caller: Caller<'_, ()>, handle: i32, recipe_id: i32| -> wasmtime::Result<()> {
+                        capture_for_append
+                            .lock()
+                            .unwrap()
+                            .graph
+                            .append_vector(handle as u32, recipe_id as u32)
+                            .map_err(|e| wasmtime::Error::msg(format!("append_vector failed: {e:?}")))
+                    },
+                );
+                if let Err(e) = result {
+                    eprintln!("wiring env.{vector_append_name} failed: {e:#}");
+                    return;
+                }
+            }
+
+            let vector_finish_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_VECTOR_FINISH;
+            if guest_declares(vector_finish_name) {
+                let capture_for_finish = Arc::clone(&capture);
+                let result = linker.func_wrap(
+                    "env",
+                    vector_finish_name,
+                    move |_caller: Caller<'_, ()>, handle: i32| -> wasmtime::Result<i32> {
+                        capture_for_finish
+                            .lock()
+                            .unwrap()
+                            .graph
+                            .finish_vector(handle as u32)
+                            .map(|ordinal| ordinal as i32)
+                            .map_err(|e| wasmtime::Error::msg(format!("finish_vector failed: {e:?}")))
+                    },
+                );
+                if let Err(e) = result {
+                    eprintln!("wiring env.{vector_finish_name} failed: {e:#}");
+                    return;
+                }
+            }
+
+            let scratch_reserve_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_SCRATCH_RESERVE;
+            if guest_declares(scratch_reserve_name) {
+                let capture_for_reserve = Arc::clone(&capture);
+                let scratch_base = fm.capture_scratch_base;
+                let result = linker.func_wrap(
+                    "env",
+                    scratch_reserve_name,
+                    move |_caller: Caller<'_, ()>, size: i32| -> wasmtime::Result<i32> {
+                        let size = u32::try_from(size)
+                            .map_err(|_| wasmtime::Error::msg("scratch_reserve: negative size"))?;
+                        capture_for_reserve
+                            .lock()
+                            .unwrap()
+                            .scratch_reserve(scratch_base, FORK_MODULE_CAPTURE_SCRATCH_BYTES as u32, size)
+                            .map(|p| p as i32)
+                            .ok_or_else(|| {
+                                wasmtime::Error::msg("scratch_reserve: capture scratch page exhausted")
+                            })
+                    },
+                );
+                if let Err(e) = result {
+                    eprintln!("wiring env.{scratch_reserve_name} failed: {e:#}");
+                    return;
+                }
+            }
+
+            let scratch_release_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_SCRATCH_RELEASE;
+            if guest_declares(scratch_release_name) {
+                let capture_for_release = Arc::clone(&capture);
+                let scratch_base = fm.capture_scratch_base;
+                let result = linker.func_wrap(
+                    "env",
+                    scratch_release_name,
+                    move |_caller: Caller<'_, ()>, ptr: i32, size: i32| -> wasmtime::Result<()> {
+                        let size = u32::try_from(size)
+                            .map_err(|_| wasmtime::Error::msg("scratch_release: negative size"))?;
+                        capture_for_release.lock().unwrap().scratch_release(scratch_base, ptr as u32, size);
+                        Ok(())
+                    },
+                );
+                if let Err(e) = result {
+                    eprintln!("wiring env.{scratch_release_name} failed: {e:#}");
+                    return;
+                }
+            }
         }
 
         // The fork-exec import set is imported but never reached on this
@@ -4253,6 +4614,16 @@ fn spawn_guest_thread(
                     for i in 0..len {
                         match guest_catalog.get(&mut store, i) {
                             Some(v @ Ref::Func(_)) => {
+                                // N1-I5b Task 1: also index this SAME guest
+                                // catalog entry (activation 0 — single-
+                                // activation only, matching this whole
+                                // mirror block's scope) by raw `Func`
+                                // pointer, for the capture-side `encode_
+                                // funcref` host body's reverse lookup — see
+                                // `funcref_catalog_lookup`'s doc comment.
+                                if let Ref::Func(Some(f)) = v {
+                                    funcref_catalog_lookup.lock().unwrap().insert(f.to_raw(&mut store) as usize, i as u32);
+                                }
                                 if let Err(e) = fm.function_catalog_table.set(&mut store, i, v) {
                                     eprintln!(
                                         "populating fork-module __wpk_fork_function_catalog[{i}] failed: {e:#}"
@@ -4388,6 +4759,7 @@ fn spawn_guest_thread(
             layout.channel_offset,
             fork_module.as_ref(),
             &coord,
+            &capture,
             fork_entry,
         );
 
@@ -4543,15 +4915,20 @@ fn is_thrown_exception_escape(e: &wasmtime::Error) -> bool {
 ///     version of this function tried reusing that root and empirically
 ///     failed (`fm_last_errno` `EINVAL`: `decode_module_state` rejects it,
 ///     since the continuation root points at the KFRE frame journal, a
-///     different wire format). Native has no module-state CAPTURE mechanism
-///     yet, so [`write_empty_module_state_arena`] synthesizes a genuinely
-///     valid KFMS arena carrying the canonical null-only reference
-///     transaction instead — see its doc comment for why that (not a
-///     literally record-less chunk) is the true floor of "this fork captured
-///     no reference," and not a fabricated success. `pid`
-///     is retained in both this export's and `fm_build_gc_plan`'s signatures
-///     for the host call site but unused since M2 (see `fm_begin_reference_
-///     replay`'s own Rust doc comment); any constant value is correct.
+///     different wire format). `fm.empty_module_state_root` names the SAME
+///     scratch address for every fork on this guest OS thread, but N1-I5b
+///     Task 1 makes its CONTENT per-fork: `drive_fork_capture_seal_and_
+///     launch_child` overwrites it with THIS fork's real, capture-filled
+///     graph (via [`write_module_state_arena`]) right before either replay
+///     call below ever runs; a guest that never captures a live reference
+///     leaves it at the canonical-null floor [`write_empty_module_state_
+///     arena`] wrote at instantiation — see that function's doc comment for
+///     why that (not a literally record-less chunk) is the true floor of
+///     "this fork captured no reference," and not a fabricated success.
+///     `pid` is retained in both this export's and `fm_build_gc_plan`'s
+///     signatures for the host call site but unused since M2 (see `fm_begin_
+///     reference_replay`'s own Rust doc comment); any constant value is
+///     correct.
 ///  3. `fm_build_gc_plan(pid)` + `fm_gc_plan_count()` — builds (and sizes) the
 ///     topological GC drive plan for whatever the fork's graph contains
 ///     (possibly zero steps: a funcref/externref-only fork has no typed-GC
@@ -4652,6 +5029,7 @@ fn run_fork_capable_entry(
     channel_offset: usize,
     fork_module: Option<&ForkModule>,
     coord: &Arc<ForkCoordState>,
+    capture: &Arc<Mutex<NativeReferenceCapture>>,
     fork_entry: ForkEntry,
 ) {
     if matches!(fork_entry, ForkEntry::ChildPendingStub) {
@@ -4814,6 +5192,7 @@ fn run_fork_capable_entry(
                     channel_offset,
                     fm,
                     coord,
+                    capture,
                 ) {
                     return;
                 }
@@ -4840,11 +5219,26 @@ fn run_fork_capable_entry(
 ///  1. The guest's `wpk_fork_unwind_end` export (closes the capture,
 ///     flipping `_wpk_fork_state` back to committed/NORMAL).
 ///  2. `fm_finish_unwind` — seals the module's journal.
-///  3. `fm_serialize_journal_alloc(channel_base)` + `fm_journal_image_len` —
+///  3. N1-I5b Task 1: SEAL the accumulated reference capture — by this point
+///     EVERY possible capture call (the guest's own per-frame commits during
+///     the just-finished unwind) has already happened, so `capture`'s
+///     `ReferenceGraphBuilder` holds the fork's complete, final graph.
+///     Serialize it (via [`write_module_state_arena`], the SAME encoder
+///     [`write_empty_module_state_arena`] uses for the floor) into `fm.
+///     empty_module_state_root` — mirrors `sealCapture()`'s `references.
+///     sealInto(arena)` + `arena.seal()` (`worker-main.ts:5109-5119`).
+///     Crucially, this write lands in the STILL-parent-owned `guest_mem`
+///     BEFORE step 4's real `SYS_FORK`/`SYS_VFORK` channel post below — so
+///     the child's own private memory copy (taken when `handle_fork`
+///     services that post) inherits these exact bytes, and both the child's
+///     and the parent's own subsequent `drive_reference_replay` call (both
+///     reading the SAME `fm.empty_module_state_root` address) see this
+///     fork's real graph, not the canonical-null floor.
+///  4. `fm_serialize_journal_alloc(channel_base)` + `fm_journal_image_len` —
 ///     serializes the sealed journal as a KFRE image INTO THE SAME (still
 ///     parent-owned) guest memory; both values are recorded so the real
 ///     `SYS_FORK`/`SYS_VFORK` request below can smuggle them to `handle_fork`.
-///  4. THE REAL channel post: `SYS_FORK`/`SYS_VFORK` + `mode` (from
+///  5. THE REAL channel post: `SYS_FORK`/`SYS_VFORK` + `mode` (from
 ///     `coord.mode`, set at capture time) plus the coordinator's `root`/
 ///     `image_ptr`/`image_len` written into this channel's DATA region
 ///     (mirrors `kernel_clone`'s `fn_ptr`/`arg` smuggling) — `handle_fork`
@@ -4854,14 +5248,14 @@ fn run_fork_capable_entry(
 ///     Blocks (busy-polls the channel status word, exactly like `kernel_
 ///     clone`/the legacy `kernel_fork` passthrough) for `handle_fork`'s
 ///     reply: the child's pid, or a negative errno.
-///  5. `fm_begin_replay` — begins the PARENT's own rewind.
-///  6. The guest's `wpk_fork_rewind_begin(root)` export — flips
+///  6. `fm_begin_replay` — begins the PARENT's own rewind.
+///  7. The guest's `wpk_fork_rewind_begin(root)` export — flips
 ///     `_wpk_fork_state` to REWINDING so the guest's OWN `wpk_fork_resume_
 ///     start` (the caller's NEXT call, once this returns `true`) walks its
 ///     resume-table dispatch back down to the exact `fork()` call site,
 ///     re-entering `kernel_fork` at `ForkCoordPhase::Replaying` to learn the
 ///     REAL return value this function recorded in `coord.fork_result`
-///     (step 4's child pid, or a negative errno).
+///     (step 5's child pid, or a negative errno).
 ///
 /// Returns `false` (having already logged the truthful failure) on the
 /// first `fm_*`/guest-export failure; the caller then ends this OS thread
@@ -4875,6 +5269,7 @@ fn drive_fork_capture_seal_and_launch_child(
     ch: usize,
     fm: &ForkModule,
     coord: &Arc<ForkCoordState>,
+    capture: &Arc<Mutex<NativeReferenceCapture>>,
 ) -> bool {
     let Some(unwind_end) = get_guest_export_typed::<(), ()>(
         &mut *store,
@@ -4899,6 +5294,16 @@ fn drive_fork_capture_seal_and_launch_child(
         }
         Err(e) => {
             eprintln!("fm_last_errno after fm_finish_unwind failed: {e:#}");
+            return false;
+        }
+    }
+    // N1-I5b Task 1: seal the just-completed capture into the KFMS scratch
+    // arena, BEFORE the real SYS_FORK/SYS_VFORK channel post below — see
+    // this function's doc comment, step 3.
+    {
+        let accumulated = capture.lock().unwrap();
+        if let Err(e) = write_module_state_arena(guest_mem, fm.empty_module_state_root, &accumulated.graph) {
+            eprintln!("sealing the captured reference graph into the KFMS scratch arena failed: {e:#}");
             return false;
         }
     }
