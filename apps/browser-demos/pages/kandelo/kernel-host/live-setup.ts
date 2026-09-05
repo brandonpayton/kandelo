@@ -1086,6 +1086,14 @@ function reportInitError(
   message: string,
   tick: (msg: string) => void,
 ): void {
+  // A machine this page gave up did not fail. Handing one over, halting one and
+  // ending a replication all set the status before they destroy the kernel, and
+  // destroying it is what makes init exit — so init's exit arrives after the
+  // page already said it holds nothing. Reporting it would end a completed
+  // handover in `error`, with the giver showing a broken web preview for a
+  // machine that is running perfectly well on the other computer.
+  const status = host.getStatus();
+  if (status === "idle" || status === "halted") return;
   tick(message);
   if (profile.init?.web) {
     host.setWebPreview({

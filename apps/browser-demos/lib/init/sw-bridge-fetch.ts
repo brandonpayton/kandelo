@@ -21,6 +21,8 @@ interface ServiceWorkerFetchBridgeOptions {
   onPendingRequests?: (count: number) => void;
 }
 
+let activeNeedBridgeListener: ((event: MessageEvent) => void) | null = null;
+
 /** Hook a single bridge instance up to fetchInKernel. */
 export function attachBridgeToKernel(
   bridge: HttpBridgeHost,
@@ -89,7 +91,18 @@ export async function setupServiceWorkerFetchBridge(
   attachBridgeToKernel(bridge, kernel, port, options);
 
   if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.addEventListener("message", (event) => {
+    // One listener per page, wired to the newest machine. A page boots one
+    // machine at a time but boots more than one over its lifetime (a demo
+    // relaunch, a takeover), and a listener left behind by a retired machine
+    // would answer the restart handshake with a port wired to a destroyed
+    // kernel.
+    if (activeNeedBridgeListener) {
+      navigator.serviceWorker.removeEventListener(
+        "message",
+        activeNeedBridgeListener,
+      );
+    }
+    const listener = (event: MessageEvent) => {
       if (event.data?.type !== "need-bridge") return;
       const replyPort = event.ports[0];
       if (!replyPort) return;
@@ -100,7 +113,9 @@ export async function setupServiceWorkerFetchBridge(
         [fresh.getSwPort()],
       );
       options?.debugLog?.("Bridge restored after service worker restart");
-    });
+    };
+    activeNeedBridgeListener = listener;
+    navigator.serviceWorker.addEventListener("message", listener);
   }
 
   return bridge;

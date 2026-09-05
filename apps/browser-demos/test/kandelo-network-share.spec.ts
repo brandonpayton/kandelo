@@ -504,6 +504,83 @@ test("shows the viewer the page the user's machine is serving", async ({
   }
 });
 
+test("a keeper that gave its machine away follows it rather than failing", async ({
+  browser,
+  baseURL,
+  browserName,
+}) => {
+  test.skip(
+    browserName !== "chromium",
+    "only headless Chromium can form a loopback ICE pair",
+  );
+  test.setTimeout(420_000);
+  expect(baseURL).toBeTruthy();
+
+  // A supervised profile, because this is about what init's exit means. Giving
+  // a machine up destroys its kernel, and destroying it kills init — so the
+  // keeper hears `dinit exited with code 137` moments after it said it holds
+  // nothing. Read as a failure that is the status `error`, which takes neither
+  // role: the keeper would stop asking to follow the machine it just sent, and
+  // sit on a dead page reporting a machine that is running perfectly well on
+  // the other computer. fbDOOM cannot show this — it boots its binary directly
+  // and has no init to exit.
+  const keeperContext = await browser.newContext();
+  const takerContext = await browser.newContext();
+  const keeper = await keeperContext.newPage();
+  const taker = await takerContext.newPage();
+  try {
+    await keeper.goto(appUrl("/?demo=nginx"), { waitUntil: "domcontentloaded" });
+    await taker.goto(appUrl("/"), { waitUntil: "domcontentloaded" });
+    await expect(keeper.frameLocator('iframe[title="nginx"]').locator("body"))
+      .toContainText("Hello from nginx on WebAssembly!", { timeout: 300_000 });
+
+    await connectPeers(keeper, taker, (reason) => test.skip(true, reason));
+    await expectReplica(taker);
+
+    // Every status the keeper passes through, not just the one it settles on.
+    // The keeper reaches `running` again either way once its own replica boots,
+    // so polling the settled value proves nothing — the failure is a status it
+    // passes through on the way there.
+    await keeper.evaluate(() => {
+      const seen: string[] = [];
+      (window as unknown as { __statuses: string[] }).__statuses = seen;
+      const read = () => {
+        const status = document.querySelector(".kdock-status-text")
+          ?.getAttribute("data-status");
+        if (status && seen[seen.length - 1] !== status) seen.push(status);
+      };
+      read();
+      new MutationObserver(read).observe(document.body, {
+        attributes: true,
+        childList: true,
+        subtree: true,
+        attributeFilter: ["data-status"],
+      });
+    });
+
+    await openNetworkPopover(taker);
+    await takeOverButton(taker).click();
+    await closeDockPopovers([keeper, taker]);
+
+    await expect(taker.locator(".kdock-status"))
+      .toHaveAttribute("data-role", "user", { timeout: 300_000 });
+    await expect(taker.frameLocator('iframe[title="nginx"]').locator("body"))
+      .toContainText("Hello from nginx on WebAssembly!", { timeout: 300_000 });
+
+    // The keeper follows the machine it gave away, and never called giving it
+    // away a failure.
+    await expectReplica(keeper);
+    expect(
+      await keeper.evaluate(
+        () => (window as unknown as { __statuses: string[] }).__statuses,
+      ),
+    ).not.toContain("error");
+  } finally {
+    await takerContext.close();
+    await keeperContext.close();
+  }
+});
+
 /** A cheap frame fingerprint: enough to tell one frame from the next. */
 function canvasSignature(canvas: Locator): Promise<number> {
   return canvas.evaluate((el: HTMLCanvasElement) => {
