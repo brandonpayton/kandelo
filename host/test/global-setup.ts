@@ -128,6 +128,7 @@ const TEST_PROGRAMS = [
   "checkpoint-threads.c",
   "checkpoint-dlopen.c",
   "checkpoint-handles.c",
+  "checkpoint-pty-echo.c",
 ];
 
 /** Extra compiler flags a test program needs beyond the shared invocation. */

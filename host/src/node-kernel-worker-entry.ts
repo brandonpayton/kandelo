@@ -1393,6 +1393,14 @@ async function handleInit(msg: InitMessage) {
         );
       }
       await restoreProcessFromBucket(bucket, programModule);
+      const restoredPtyIdx = kernelWorker.ptyIndexFor(bucket.pid);
+      if (restoredPtyIdx !== undefined) {
+        const restoredPid = bucket.pid;
+        ptyByPid.set(restoredPid, restoredPtyIdx);
+        kernelWorker.onPtyOutput(restoredPtyIdx, (data: Uint8Array) => {
+          post({ type: "pty_output", pid: restoredPid, data });
+        });
+      }
     }
     for (const framebuffer of msg.restoreCheckpoint.framebuffers) {
       // Seeding through fbWrite replays the captured frame down the same

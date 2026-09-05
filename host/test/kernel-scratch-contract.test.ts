@@ -644,6 +644,12 @@ const reviewedScalarKernelExportCalls: AuditAllowance[] = [
     "host/src/kernel-worker.ts::CentralizedKernelWorker.#applyRestoredHostHandleRemapsWithinKernelEntry::kernel-export-direct-use::lseek(dir.fd, low, high, SEEK_SET)",
   ),
   reviewedScalarKernelExportCall(
+    "host/src/kernel-worker.ts::CentralizedKernelWorker.#applyRestoredHostHandleRemapsWithinKernelEntry::kernel-export-direct-use::remap( 0, BigInt(stream.oldHandle), BigInt(stream.newHandle), )",
+  ),
+  reviewedScalarKernelExportCall(
+    "host/src/kernel-worker.ts::CentralizedKernelWorker.#applyRestoredHostHandleRemapsWithinKernelEntry::kernel-export-direct-use::remap(1, BigInt(dir.oldHandle), BigInt(dir.newHandle))",
+  ),
+  reviewedScalarKernelExportCall(
     "host/src/kernel-worker.ts::CentralizedKernelWorker.#bindKernelTid::kernel-export-direct-use::setTid(pid, tid)",
   ),
   reviewedScalarKernelExportCall(
@@ -705,6 +711,9 @@ const reviewedScalarKernelExportCalls: AuditAllowance[] = [
     "host/src/kernel-worker.ts::CentralizedKernelWorker.#prepareTcpListenerRegistration::kernel-export-direct-use::getAcceptWake?.(pid, fd)",
   ),
   reviewedScalarKernelExportCall(
+    "host/src/kernel-worker.ts::CentralizedKernelWorker.#rearmRestoredIntervalTimerWithinKernelEntry::kernel-export-direct-use::rearm(pid)",
+  ),
+  reviewedScalarKernelExportCall(
     "host/src/kernel-worker.ts::CentralizedKernelWorker.#releaseBlockingRetrySnapshot::kernel-export-direct-use::release( channel.pid, this.guestTidForChannel(channel), snapshot.retryToken, )",
   ),
   reviewedScalarKernelExportCall(
@@ -724,6 +733,9 @@ const reviewedScalarKernelExportCalls: AuditAllowance[] = [
   ),
   reviewedScalarKernelExportCall(
     "host/src/kernel-worker.ts::CentralizedKernelWorker.#replaceProcessMetadataWithinKernelEntry::kernel-export-direct-use::commit(pid, token)",
+  ),
+  reviewedScalarKernelExportCall(
+    "host/src/kernel-worker.ts::CentralizedKernelWorker.#reseedRestoredPtyIndexWithinKernelEntry::kernel-export-direct-use::ptyIndexForPid(pid)",
   ),
   reviewedScalarKernelExportCall(
     "host/src/kernel-worker.ts::CentralizedKernelWorker.#reserveHostRegionAtWithinKernelEntry::kernel-export-direct-use::reserveHostRegionAtFn( pid, this.toKernelPtr(request.pointer), this.toKernelPtr(request.length), )",
@@ -1671,14 +1683,7 @@ describe("kernel scratch static contract", () => {
       sourceFiles: repositoryRuntimeSourceFiles(repoRoot),
       ownershipSeeds,
       allowances: auditAllowances,
-      // M1/M2 defer every new kernel export to T2.5's single versioned ABI
-      // change (PLAN rule 7), so exports the scratch registry already names
-      // are absent from the committed snapshot until then. T2.5 removes this
-      // list by regenerating abi/snapshot.json.
-      kernelExportNames: [
-        ...abiKernelExportNames,
-        "kernel_enumerate_host_handles",
-      ],
+      kernelExportNames: [...abiKernelExportNames],
       kernelDestinationFactoryDeclarations: [
         "host/src/kernel.ts::WasmPosixKernel.#rustLentKernelDestination",
       ],

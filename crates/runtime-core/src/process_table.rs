@@ -1596,6 +1596,34 @@ impl ProcessTable {
         Ok(rewritten)
     }
 
+    /// Name the PTY pair serving as `pid`'s terminal.
+    ///
+    /// A restored kernel memory carries the whole PTY table, but the host's
+    /// pid → PTY routing (keyboard input, winsize, output drain) died with
+    /// the captured machine. The slave side lives in the process's own file
+    /// descriptors, so the lowest slave descriptor names the terminal.
+    /// Returns `ESRCH` for a dead pid and `ENOENT` for a process holding no
+    /// PTY slave descriptor.
+    pub fn pty_index_for_pid(&self, pid: u32) -> Result<u32, Errno> {
+        let Some(proc) = self.processes.get(&pid) else {
+            return Err(Errno::ESRCH);
+        };
+        let mut named: Option<(i32, u32)> = None;
+        for (fd, entry) in proc.fd_table.iter() {
+            let Some(ofd) = proc.ofd_table.get(entry.ofd_ref.0) else {
+                continue;
+            };
+            if ofd.file_type != FileType::PtySlave || ofd.host_handle < 0 {
+                continue;
+            }
+            match named {
+                Some((named_fd, _)) if named_fd <= fd => {}
+                _ => named = Some((fd, ofd.host_handle as u32)),
+            }
+        }
+        named.map(|(_, pty_idx)| pty_idx).ok_or(Errno::ENOENT)
+    }
+
     /// Collect PIDs that should be visible through procfs.
     ///
     /// Exited processes remain visible as zombies until their parent reaps
@@ -4414,5 +4442,57 @@ mod tests {
         table.remove_process(pid_a).unwrap();
         table.remove_process(pid_b).unwrap();
         assert_eq!(host_handle_ref_count(FILE_HANDLE_NEW), 0);
+    }
+
+    #[test]
+    fn pty_index_for_pid_names_the_lowest_slave_descriptor() {
+        use crate::fd::OpenFileDescRef;
+        use crate::ofd::OfdTable;
+        use wasm_posix_shared::flags::{O_RDONLY, O_RDWR};
+
+        // Unique high value: other tests share the global PTY table while
+        // the runner executes in parallel, and this index must name none of
+        // theirs.
+        const PTY_INDEX: i64 = 900_211_001;
+
+        let mut table = ProcessTable::new();
+        let pid = table.create_process().unwrap();
+        let bare_pid = table.create_process().unwrap();
+
+        let proc = table.get_mut(pid).unwrap();
+        proc.fd_table = crate::fd::FdTable::new();
+        proc.ofd_table = OfdTable::new();
+        let file_ofd = proc.ofd_table.create(
+            FileType::Regular,
+            O_RDONLY,
+            900_211_101,
+            b"/tmp/pty-file".to_vec(),
+        );
+        proc.fd_table.alloc(OpenFileDescRef(file_ofd), 0).unwrap();
+        let slave_ofd = proc.ofd_table.create(
+            FileType::PtySlave,
+            O_RDWR,
+            PTY_INDEX,
+            b"/dev/pts/900211001".to_vec(),
+        );
+        let slave_fd = proc.fd_table.alloc(OpenFileDescRef(slave_ofd), 0).unwrap();
+        let dup_fd = proc.fd_table.alloc(OpenFileDescRef(slave_ofd), 0).unwrap();
+        assert!(slave_fd < dup_fd);
+        let later_ofd = proc.ofd_table.create(
+            FileType::PtySlave,
+            O_RDWR,
+            PTY_INDEX + 1,
+            b"/dev/pts/900211002".to_vec(),
+        );
+        let later_fd = proc.fd_table.alloc(OpenFileDescRef(later_ofd), 0).unwrap();
+        assert!(dup_fd < later_fd);
+
+        let bare = table.get_mut(bare_pid).unwrap();
+        bare.fd_table = crate::fd::FdTable::new();
+        bare.ofd_table = OfdTable::new();
+
+        assert_eq!(table.pty_index_for_pid(pid), Ok(PTY_INDEX as u32));
+        assert_eq!(table.pty_index_for_pid(bare_pid), Err(Errno::ENOENT));
+        assert_eq!(table.pty_index_for_pid(4_000_000), Err(Errno::ESRCH));
     }
 }

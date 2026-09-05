@@ -459,6 +459,74 @@ describe("checkpoint validation", () => {
   );
 
   it(
+    "routes terminal input and output to a restored process",
+    { timeout: 120_000 },
+    async () => {
+      let keeperOutput = "";
+      const keeper = new NodeKernelHost({
+        rootfsImage: "default",
+        onPtyOutput: (_pid, data) => {
+          keeperOutput += new TextDecoder().decode(data);
+        },
+      });
+      await keeper.init();
+      let checkpoint: MachineCheckpoint;
+      try {
+        let spawnedPid = 0;
+        await new Promise<void>((resolve) => {
+          void keeper.spawn(programBytes("checkpoint-pty-echo.wasm"), [
+            "checkpoint-pty-echo",
+          ], {
+            pty: true,
+            onStarted: (startedPid) => {
+              spawnedPid = startedPid;
+              resolve();
+            },
+          });
+        });
+        await expect
+          .poll(() => keeperOutput.includes("READY"), { timeout: 30_000 })
+          .toBe(true);
+        keeper.ptyWrite(spawnedPid, new TextEncoder().encode("a\n"));
+        await expect
+          .poll(() => keeperOutput.includes("GOT:a"), { timeout: 30_000 })
+          .toBe(true);
+        const response = await keeper.captureCheckpointBytes(TIMEOUTS);
+        if (response.status !== "captured") {
+          throw new Error(`capture failed: ${JSON.stringify(response)}`);
+        }
+        checkpoint = response.checkpoint;
+      } finally {
+        await keeper.destroy();
+      }
+      expect(checkpoint.processes.length).toBe(1);
+      const pid = checkpoint.processes[0]!.pid;
+
+      // Input written to the restored terminal must reach the process and
+      // its tagged echo must come back: the captured machine's pid → PTY
+      // routing died with it, so the receiver has to re-derive the pair
+      // from the restored kernel memory.
+      let restoredOutput = "";
+      const receiver = new NodeKernelHost({
+        rootfsImage: "default",
+        restoreCheckpoint: checkpoint,
+        onPtyOutput: (_pid, data) => {
+          restoredOutput += new TextDecoder().decode(data);
+        },
+      });
+      await receiver.init();
+      try {
+        receiver.ptyWrite(pid, new TextEncoder().encode("b\n"));
+        await expect
+          .poll(() => restoredOutput.includes("GOT:b"), { timeout: 30_000 })
+          .toBe(true);
+      } finally {
+        await receiver.destroy();
+      }
+    },
+  );
+
+  it(
     "restores a checkpointed process whose pthread keeps running",
     { timeout: 120_000 },
     async () => {

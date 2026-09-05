@@ -3,6 +3,7 @@ import {
   PROCESS_MEMORY_PAGES_PER_THREAD_SLOT,
   PROCESS_MEMORY_THREAD_SLOT_DECL_EXPORT,
   PROCESS_MEMORY_WASM_PAGE_SIZE,
+  WPK_CHECKPOINT_PROCESS_IMPORT,
   WPK_FORK_CAPABILITIES_SECTION,
   WPK_FORK_CAPABILITIES_VERSION,
   WPK_FORK_CAP_KNOWN_MASK,
@@ -2015,6 +2016,34 @@ function describeForkArtifactContractFailures(
           signatureText(
             WPK_FORK_PROCESS_IMPORT.params,
             WPK_FORK_PROCESS_IMPORT.results,
+            4,
+          )
+        }`,
+      );
+    }
+  }
+
+  const checkpointIdentity =
+    `${WPK_CHECKPOINT_PROCESS_IMPORT.module}.${WPK_CHECKPOINT_PROCESS_IMPORT.name}`;
+  const checkpointSignatures = facts.functionImports.get(checkpointIdentity);
+  if (checkpointSignatures) {
+    if (checkpointSignatures.length !== 1) {
+      failures.push(
+        `duplicate ABI 44 process-checkpoint import ${checkpointIdentity}`,
+      );
+    } else if (
+      !signatureMatches(
+        checkpointSignatures[0],
+        WPK_CHECKPOINT_PROCESS_IMPORT.params,
+        WPK_CHECKPOINT_PROCESS_IMPORT.results,
+        4,
+      )
+    ) {
+      failures.push(
+        `ABI 44 process-checkpoint import ${checkpointIdentity} has the wrong signature; expected ${
+          signatureText(
+            WPK_CHECKPOINT_PROCESS_IMPORT.params,
+            WPK_CHECKPOINT_PROCESS_IMPORT.results,
             4,
           )
         }`,

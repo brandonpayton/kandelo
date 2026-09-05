@@ -484,7 +484,7 @@ fi
 
 cat >"$work/checkpoint-only.wat" <<'WAT'
 (module
-  (import "kernel" "kernel_checkpoint" (func (result i32)))
+  (import "kernel" "kernel_checkpoint" (func))
   (func (export "_start")))
 WAT
 wat2wasm "$work/checkpoint-only.wat" -o "$work/checkpoint-only.wasm"

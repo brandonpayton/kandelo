@@ -4,9 +4,9 @@ use std::process::Command;
 
 const INPUT_WAT: &str = r#"
 (module
-  (import "kernel" "kernel_checkpoint" (func $checkpoint (result i32)))
+  (import "kernel" "kernel_checkpoint" (func $checkpoint))
   (memory 1)
-  (func $syscaller (export "_start") (result i32)
+  (func $syscaller (export "_start")
     call $checkpoint))
 "#;
 

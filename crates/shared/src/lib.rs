@@ -111,7 +111,12 @@ pub mod process_layout;
 ///     ioctl transfers use request-sized arguments, `/dev/dsp` descriptors
 ///     share a refcounted stream across fork and exec, and the host consumes a
 ///     versioned bounded transport paced by the audio clock.
-pub const ABI_VERSION: u32 = 43;
+/// 44: machine checkpoints reserve a channel request word directly below the
+///     signal delivery area, freshly built programs import the no-argument,
+///     no-result `kernel.kernel_checkpoint` unwind hook from the post-syscall
+///     trampoline, and machine restore uses the host-handle enumerate and
+///     remap, host-timer re-arm, and PTY-index kernel exports.
+pub const ABI_VERSION: u32 = 44;
 
 /// Byte width of Kandelo's Linux-compatible kernel CPU-affinity mask.
 ///
@@ -2444,6 +2449,21 @@ pub mod abi {
         results: &[I32],
     };
 
+    /// Exact process-worker import that seeds checkpoint discovery.
+    ///
+    /// The glue calls it from the post-syscall hook when the channel
+    /// checkpoint request word is set. The capture pass unwinds instead of
+    /// returning and a rewind resumes the guest after the carrying syscall,
+    /// so the import takes nothing and returns nothing. Side modules do not
+    /// import it; the requirement is therefore validated conditionally only
+    /// when a program imports `kernel.kernel_checkpoint`.
+    pub const WPK_CHECKPOINT_PROCESS_IMPORT: ProgramArtifactImport = ProgramArtifactImport {
+        module: "kernel",
+        name: "kernel_checkpoint",
+        params: &[],
+        results: &[],
+    };
+
     pub const WPK_FORK_REQUIRED_IMPORTS: &[ProgramArtifactImport] = &[
         ProgramArtifactImport {
             module: WPK_FORK_FRAME_IMPORT_MODULE,
@@ -3687,7 +3707,8 @@ pub mod abi {
             WPK_FORK_MODULE_STATE_TABLE_BASELINE_FINGERPRINT_SIZE,
             WPK_FORK_MODULE_STATE_TABLE_DESCRIPTOR_PAYLOAD_SIZE,
             WPK_FORK_MODULE_STATE_TABLE_PAGE_SHIFT, WPK_FORK_REQUIRED_EXPORTS,
-            WPK_FORK_PROCESS_IMPORT, WPK_FORK_REQUIRED_IMPORTS, WPK_FORK_REQUIRED_TABLE_IMPORTS,
+            WPK_CHECKPOINT_PROCESS_IMPORT, WPK_FORK_PROCESS_IMPORT, WPK_FORK_REQUIRED_IMPORTS,
+            WPK_FORK_REQUIRED_TABLE_IMPORTS,
             extended_syscalls::SYSCALLS, wpk_fork_linked_chunk_header_size,
             wpk_fork_linked_node_header_size, wpk_fork_module_state_chunk_header_size,
         };
@@ -3816,6 +3837,11 @@ pub mod abi {
             assert_eq!(WPK_FORK_PROCESS_IMPORT.name, "kernel_fork");
             assert_eq!(WPK_FORK_PROCESS_IMPORT.params, &[super::ProgramArtifactValueType::I32]);
             assert_eq!(WPK_FORK_PROCESS_IMPORT.results, &[super::ProgramArtifactValueType::I32]);
+
+            assert_eq!(WPK_CHECKPOINT_PROCESS_IMPORT.module, "kernel");
+            assert_eq!(WPK_CHECKPOINT_PROCESS_IMPORT.name, "kernel_checkpoint");
+            assert!(WPK_CHECKPOINT_PROCESS_IMPORT.params.is_empty());
+            assert!(WPK_CHECKPOINT_PROCESS_IMPORT.results.is_empty());
 
             assert_eq!(WPK_FORK_LINKED_FRAME_FORMAT_MAGIC, *b"KLCF");
             assert_eq!(WPK_FORK_LINKED_FRAME_DESCRIPTOR_SIZE, 24);

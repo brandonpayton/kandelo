@@ -1,9 +1,24 @@
 {
-  "abi_version": 43,
+  "abi_version": 44,
   "channel_buffers": {
     "data_offset": 72,
     "data_size": 65536,
     "min_channel_size": 65608
+  },
+  "channel_checkpoint_area": {
+    "area_size": 8,
+    "base": 65544,
+    "request_unwind": 1,
+    "reserved_tail_size": 4,
+    "slots": [
+      {
+        "meaning": "u32 request word, host-published, guest-cleared (0=none)",
+        "name": "CHECKPOINT_REQUEST",
+        "offset": 65544,
+        "size": 4
+      }
+    ],
+    "wire_size": 4
   },
   "channel_header": {
     "fields": [
@@ -976,7 +991,7 @@
   },
   "host_adapter": {
     "manifest": {
-      "abi_version": 43,
+      "abi_version": 44,
       "channel_data_offset": 72,
       "channel_data_size": 65536,
       "channel_header_size": 72,
@@ -1952,6 +1967,11 @@
     },
     {
       "kind": "func",
+      "name": "kernel_enumerate_host_handles",
+      "signature": "(i32,i32) -> (i32)"
+    },
+    {
+      "kind": "func",
       "name": "kernel_environ_count",
       "signature": "() -> (i32)"
     },
@@ -2777,6 +2797,11 @@
     },
     {
       "kind": "func",
+      "name": "kernel_pty_index_for_pid",
+      "signature": "(i32) -> (i32)"
+    },
+    {
+      "kind": "func",
       "name": "kernel_pty_master_read",
       "signature": "(i32,i32,i32) -> (i32)"
     },
@@ -2842,6 +2867,11 @@
     },
     {
       "kind": "func",
+      "name": "kernel_rearm_host_timers",
+      "signature": "(i32) -> (i32)"
+    },
+    {
+      "kind": "func",
       "name": "kernel_recv",
       "signature": "(i32,i32,i32,i32) -> (i32)"
     },
@@ -2854,6 +2884,11 @@
       "kind": "func",
       "name": "kernel_recvmsg",
       "signature": "(i32,i32,i32,i64) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_remap_host_handles",
+      "signature": "(i32,i64,i64) -> (i32)"
     },
     {
       "kind": "func",
@@ -5500,6 +5535,13 @@
         "required_flags": 4,
         "section": "kandelo.wpk_fork.capabilities",
         "version": 1
+      },
+      "checkpoint_import": {
+        "kind": "func",
+        "module": "kernel",
+        "name": "kernel_checkpoint",
+        "params": [],
+        "results": []
       },
       "exception_codec": {
         "activation_import": {

@@ -499,11 +499,11 @@ _Noreturn void kernel_exit(int32_t status);
  * from here is what gives it every function that can be live at a syscall
  * return. Programs that never fork, such as fbDOOM, have no other seed.
  *
- * The capture pass does not return: the frames unwind into linear memory. The
- * only return the guest ever observes comes from a rewind, which is why the
- * value distinguishes a resumed-in-place process from a restored one. */
+ * The capture pass does not return: the frames unwind into linear memory. A
+ * rewind returns here and the guest continues after the syscall that carried
+ * the request, so the import has nothing to report. */
 __attribute__((import_module("kernel"), import_name("kernel_checkpoint")))
-int32_t kernel_checkpoint(void);
+void kernel_checkpoint(void);
 
 /*
  * Complete one ordinary guest-owned channel request after a host import that
@@ -783,7 +783,7 @@ static void __take_pending_checkpoint(uintptr_t base)
      * returning, so a clear placed after it never runs, and the restored
      * process would read the request again and checkpoint itself forever. */
     *request_ptr = 0;
-    (void)kernel_checkpoint();
+    kernel_checkpoint();
 }
 
 /* ------------------------------------------------------------------ */

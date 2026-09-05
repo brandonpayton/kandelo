@@ -2463,6 +2463,21 @@ pub extern "C" fn kernel_rearm_host_timers(pid: u32) -> i32 {
     }
 }
 
+/// Name the PTY pair serving as `pid`'s terminal, for restore.
+///
+/// A restored kernel memory carries the captured machine's whole PTY table,
+/// but the host routing that feeds keyboard input to a PTY master died with
+/// the captured machine. Returns the PTY index (>= 0), -ENOENT when the
+/// process holds no PTY slave descriptor, and -ESRCH for a dead pid.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_pty_index_for_pid(pid: u32) -> i32 {
+    let table = unsafe { &*PROCESS_TABLE.0.get() };
+    match table.pty_index_for_pid(pid) {
+        Ok(pty_idx) => pty_idx as i32,
+        Err(e) => -(e as i32),
+    }
+}
+
 /// Snapshot the process table for the host (Kandelo Inspector → Procs tab,
 /// and any host that wants a `ps`-equivalent view without spawning a user
 /// process). Walks every active pid and writes a compact, length-prefixed

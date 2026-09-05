@@ -48,7 +48,7 @@ describe("checkpoint hook", () => {
   it("refuses a checkpoint that arrives before the process can unwind", () => {
     const memory = new WebAssembly.Memory({ initial: 2 });
     const imports = buildKernelImportsForTest(memory, 0, 4);
-    const checkpoint = imports.kernel_checkpoint as () => number;
+    const checkpoint = imports.kernel_checkpoint as () => void;
 
     // The capturing implementation replaces this one once the process
     // instance and its continuation exist, exactly as kernel_fork does.

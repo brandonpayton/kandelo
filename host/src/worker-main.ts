@@ -306,7 +306,7 @@ function continuationMunmap(
  * pointer width before any guest-memory view is created.
  */
 type KernelImports = Record<string, WebAssembly.ExportValue> & {
-  kernel_checkpoint: () => number;
+  kernel_checkpoint: () => void;
   kernel_exit: (status: number) => void;
   kernel_fork: (mode: number) => number;
 };
@@ -314,7 +314,6 @@ type KernelImports = Record<string, WebAssembly.ExportValue> & {
 const STARTUP_E2BIG = 7;
 const STARTUP_EAGAIN = 11;
 const STARTUP_EFAULT = 14;
-const STARTUP_EBUSY = 16;
 const STARTUP_EINVAL = 22;
 const STARTUP_ERANGE = 34;
 
@@ -585,7 +584,7 @@ function buildKernelImports(
     // its continuation coordinator exist, exactly as kernel_fork is. Reaching
     // this one means a checkpoint was requested before the process could
     // unwind, so fail loudly rather than let the guest continue as if it had.
-    kernel_checkpoint: (): number => {
+    kernel_checkpoint: (): void => {
       throw new Error(
         "kernel_checkpoint reached before the process continuation exists.",
       );
@@ -3905,8 +3904,8 @@ export async function centralizedWorkerMain(
         return 0; // ignored during unwind
       };
 
-      kernelImports.kernel_checkpoint = (): number => {
-        if (!processInstance) return -38; // ENOSYS
+      kernelImports.kernel_checkpoint = (): void => {
+        if (!processInstance) return;
         const phase = processContinuation.phaseName();
         if (phase === "parent-replay" || phase === "child-replay") {
           try {
@@ -3914,10 +3913,7 @@ export async function centralizedWorkerMain(
           } finally {
             releaseProcessForkArchiveReader();
           }
-          // Zero is "resumed in place". A process restored on another host
-          // returns through this same site and must be told apart from one the
-          // keeper rewound after a failed handover.
-          return 0;
+          return;
         }
         // A checkpoint request is published while the process is parked in a
         // syscall, so the continuation is idle by the time the post-syscall
@@ -3928,7 +3924,7 @@ export async function centralizedWorkerMain(
             `pid=${pid}: checkpoint import reached while process continuation is ${phase}`,
           );
         }
-        if (borrowedForkChild) return -STARTUP_EAGAIN;
+        if (borrowedForkChild) return;
         if (!initData.checkpointFreezeGate) {
           throw new Error(`pid=${pid}: checkpoint request without a freeze gate`);
         }
@@ -3944,7 +3940,7 @@ export async function centralizedWorkerMain(
             pid,
             reason: error.message,
           } satisfies WorkerToHostMessage);
-          return -STARTUP_EBUSY;
+          return;
         }
         const arena = newModuleStateArena();
         try {
@@ -3963,10 +3959,9 @@ export async function centralizedWorkerMain(
             arena.release();
           }
           releaseProcessForkArchiveReader();
-          if (error instanceof ContinuationAllocationError) return -error.errno;
+          if (error instanceof ContinuationAllocationError) return;
           throw error;
         }
-        return 0; // ignored during unwind
       };
 
       const dylinkForkActivationOwner = hasDylinkForkRole
@@ -5864,8 +5859,8 @@ export async function centralizedThreadWorkerMain(
         return 0;
       };
 
-      kernelImports.kernel_checkpoint = (): number => {
-        if (!threadInstance || !threadProcessContinuation) return -38; // ENOSYS
+      kernelImports.kernel_checkpoint = (): void => {
+        if (!threadInstance || !threadProcessContinuation) return;
         const phase = threadProcessContinuation.phaseName();
         if (phase === "parent-replay" || phase === "child-replay") {
           try {
@@ -5877,7 +5872,7 @@ export async function centralizedThreadWorkerMain(
           } finally {
             releasePthreadForkLock();
           }
-          return 0;
+          return;
         }
         if (phase !== "idle") {
           throw new Error(
@@ -5922,7 +5917,7 @@ export async function centralizedThreadWorkerMain(
             tid,
             reason: error.message,
           } satisfies WorkerToHostMessage);
-          return -STARTUP_EBUSY;
+          return;
         }
 
         // The process image is shared, so the main thread writes the sparse
@@ -5944,10 +5939,9 @@ export async function centralizedThreadWorkerMain(
             threadProcessContinuation.restoreProcessTableStateOwnership();
           }
           releasePthreadForkLock();
-          if (error instanceof ContinuationAllocationError) return -error.errno;
+          if (error instanceof ContinuationAllocationError) return;
           throw error;
         }
-        return 0;
       };
     } else {
       kernelImports.kernel_fork = (_mode: number): number => {

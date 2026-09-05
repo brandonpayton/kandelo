@@ -7340,6 +7340,11 @@ export class CentralizedKernelWorker {
     return result;
   }
 
+  /** The PTY index serving `pid`'s terminal, when this machine knows one. */
+  ptyIndexFor(pid: number): number | undefined {
+    return this.ptyIndexByPid.get(pid);
+  }
+
   #setupPtyWithinKernelEntry(
     pid: number,
     entry: KernelWorkerEntryContext,
@@ -9923,6 +9928,7 @@ export class CentralizedKernelWorker {
     }
     for (const { pid } of restoredProcesses) {
       this.#rearmRestoredIntervalTimerWithinKernelEntry(pid, entry);
+      this.#reseedRestoredPtyIndexWithinKernelEntry(pid, entry);
     }
   }
 
@@ -10005,6 +10011,33 @@ export class CentralizedKernelWorker {
         `restored pid ${pid}: interval timer re-arm failed: ${result}`,
       );
     }
+  }
+
+  /**
+   * Re-seed the host's pid → PTY routing for one restored process.
+   *
+   * The adopted kernel memory carries the whole PTY table, but the maps that
+   * route host keyboard input, winsize changes, and output drains to a PTY
+   * died with the captured machine. The kernel's own PTY slave descriptors
+   * name the pair, so the mapping is re-derived instead of trusted from
+   * checkpoint metadata.
+   */
+  #reseedRestoredPtyIndexWithinKernelEntry(
+    pid: number,
+    entry: KernelWorkerEntryContext,
+  ): void {
+    const ptyIndexForPid = this.#kernelInstanceForEntry(entry).exports
+      .kernel_pty_index_for_pid as ((pid: number) => number) | undefined;
+    if (!ptyIndexForPid) {
+      throw new Error("Kernel missing kernel_pty_index_for_pid export");
+    }
+    const result = ptyIndexForPid(pid);
+    if (result === -ENOENT) return;
+    if (result < 0) {
+      throw new Error(`restored pid ${pid}: PTY index read failed: ${result}`);
+    }
+    this.ptyIndexByPid.set(pid, result);
+    this.activePtyIndices.add(result);
   }
 
   #attachRestoredThreadChannelWithinKernelEntry(

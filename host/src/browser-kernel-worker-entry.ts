@@ -1397,6 +1397,10 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
         );
       }
       await restoreProcessFromBucket(bucket, programModule);
+      const restoredPtyIdx = kernelWorker.ptyIndexFor(bucket.pid);
+      if (restoredPtyIdx !== undefined) {
+        ptyByPid.set(bucket.pid, restoredPtyIdx);
+      }
     }
   }
 

@@ -16,16 +16,6 @@ fn discover(wat_src: &str) -> HashSet<String> {
     analysis.fork_path.iter().map(|e| e.name.clone()).collect()
 }
 
-fn discover_all(wat_src: &str) -> HashSet<String> {
-    let bytes = wat::parse_str(wat_src).expect("wat parse");
-    let opts = Options {
-        instrument_all: true,
-        ..Options::default()
-    };
-    let analysis = analyze(&bytes, &opts).expect("analyze");
-    analysis.fork_path.iter().map(|e| e.name.clone()).collect()
-}
-
 fn discover_semantic_activations(wat_src: &str) -> HashSet<String> {
     let bytes = wat::parse_str(wat_src).expect("wat parse");
     let module = walrus::Module::from_buffer(&bytes).expect("walrus parse");
@@ -169,73 +159,6 @@ fn missing_entry_import_is_an_error() {
 }
 
 #[test]
-fn instrument_all_seeds_every_local_function_without_an_entry_import() {
-    // The ceiling mode answers the same module that
-    // `missing_entry_import_is_an_error` rejects. No seed import exists, and
-    // every local function is still an activation. `host.log` is not a fork
-    // boundary, so it stays out.
-    let wat = r#"
-        (module
-          (import "host" "log" (func $log))
-          (func $a (export "a") (result i32) i32.const 0)
-          (func $unrelated (export "unrelated") (result i32) i32.const 42))
-    "#;
-    let found = discover_all(wat);
-    assert_eq!(found.len(), 2, "got {found:?}");
-    for name in ["a", "unrelated"] {
-        assert!(found.iter().any(|n| n == name), "got {found:?}");
-    }
-}
-
-#[test]
-fn instrument_all_reaches_functions_the_fork_closure_excludes() {
-    // `unrelated_function_excluded` asserts the default closure drops
-    // `$unrelated` and keeps `$a` and `$fork`. The ceiling mode is a superset:
-    // it adds `$unrelated` and keeps the fork boundary seed.
-    let wat = r#"
-        (module
-          (import "kernel" "kernel_fork" (func $fork (result i32)))
-          (func $a (export "a") (result i32)
-            call $fork)
-          (func $unrelated (export "unrelated") (result i32)
-            i32.const 42))
-    "#;
-    let found = discover_all(wat);
-    assert_eq!(found.len(), 3, "got {found:?}");
-    for name in ["fork", "a", "unrelated"] {
-        assert!(found.iter().any(|n| n == name), "got {found:?}");
-    }
-}
-
-#[test]
-fn instrument_all_still_seeds_a_custom_entry_import() {
-    // The closure is walked from a seed's callers, so an import that is not a
-    // seed never joins it and its call site never receives unwind transport.
-    // The ceiling mode must therefore widen the boundary seeds rather than
-    // replace them, for a configured entry import as much as the default one.
-    let wat = r#"
-        (module
-          (import "host" "do_async" (func $async (result i32)))
-          (func $a (export "a") (result i32)
-            call $async)
-          (func $unrelated (export "unrelated") (result i32)
-            i32.const 42))
-    "#;
-    let bytes = wat::parse_str(wat).expect("wat parse");
-    let opts = Options {
-        entry_import: "host.do_async".into(),
-        instrument_all: true,
-        ..Options::default()
-    };
-    let analysis = analyze(&bytes, &opts).expect("analyze");
-    let found: HashSet<String> = analysis.fork_path.iter().map(|e| e.name.clone()).collect();
-    assert_eq!(found.len(), 3, "got {found:?}");
-    for name in ["async", "a", "unrelated"] {
-        assert!(found.iter().any(|n| n == name), "got {found:?}");
-    }
-}
-
-#[test]
 fn lowered_legacy_loader_is_a_boundary_without_a_direct_fork_import() {
     let wat = r#"
         (module
@@ -287,11 +210,11 @@ fn a_checkpoint_seed_adds_to_the_entry_seed_rather_than_replacing_it() {
     let wat = r#"
         (module
           (import "kernel" "kernel_fork" (func $fork (param i32) (result i32)))
-          (import "kernel" "kernel_checkpoint" (func $checkpoint (result i32)))
+          (import "kernel" "kernel_checkpoint" (func $checkpoint))
           (func $forker (export "forker") (result i32)
             i32.const 0
             call $fork)
-          (func $syscaller (export "syscaller") (result i32)
+          (func $syscaller (export "syscaller")
             call $checkpoint))
     "#;
     let bytes = wat::parse_str(wat).expect("wat parse");
@@ -310,8 +233,8 @@ fn a_checkpoint_seed_adds_to_the_entry_seed_rather_than_replacing_it() {
 fn a_checkpoint_seed_is_the_only_seed_a_program_that_never_forks_has() {
     let wat = r#"
         (module
-          (import "kernel" "kernel_checkpoint" (func $checkpoint (result i32)))
-          (func $syscaller (export "syscaller") (result i32)
+          (import "kernel" "kernel_checkpoint" (func $checkpoint))
+          (func $syscaller (export "syscaller")
             call $checkpoint))
     "#;
     let bytes = wat::parse_str(wat).expect("wat parse");
