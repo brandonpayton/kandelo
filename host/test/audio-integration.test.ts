@@ -64,10 +64,14 @@ async function runAudioProgram(
   let initialProducer = 0n;
   let initialConsumer = 0n;
   let initialDiscard = 0n;
+  // Resolving a programs/ path re-checks program-index freshness through
+  // xtask on every call; keep that resolver cost out of the real-time
+  // pacing measurement below.
+  const programPath = resolveBinary(relativePath);
   const start = performance.now();
   try {
     const result = await runCentralizedProgram({
-      programPath: resolveBinary(relativePath),
+      programPath,
       argv,
       env: ["SDL_AUDIODRIVER=dsp"],
       timeout: timeoutMs,
@@ -514,9 +518,12 @@ describe("audio integration", () => {
   }, 30_000);
 
   it("paces SDL through the production dedicated Node kernel worker", async () => {
+    const programPath = resolveBinary(
+      "programs/sdl-dsp-test/sdl2-dsp-test.wasm",
+    );
     const start = performance.now();
     const result = await runCentralizedProgram({
-      programPath: resolveBinary("programs/sdl-dsp-test/sdl2-dsp-test.wasm"),
+      programPath,
       argv: ["sdl2-dsp-test"],
       env: ["SDL_AUDIODRIVER=dsp"],
       timeout: 20_000,
