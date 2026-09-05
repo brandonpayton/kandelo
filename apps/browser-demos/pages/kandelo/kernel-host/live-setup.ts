@@ -1312,6 +1312,10 @@ async function bootProfile(
   const seenPorts = new Set<number>();
   let bridgeSent = false;
   maybeUpdateWebReadiness = () => {
+    // A replica's preview readiness is not this machinery's to decide: it
+    // went "running" the moment its bridge could pair fetches with replayed
+    // exchanges, and a probe here would consume one.
+    if (replicationReplay !== undefined) return;
     maybeMarkWebReady(
       host,
       profile,
@@ -1321,6 +1325,7 @@ async function bootProfile(
       dinitBootTracker,
       tick,
       isCurrent,
+      restoreCheckpoint !== undefined,
     );
   };
   let kernel: BrowserKernel | null = null;
@@ -1395,11 +1400,16 @@ async function bootProfile(
 
     if (profile.init?.web) {
       tick("initializing HTTP bridge...");
+      // A replica's bridge never injects: the kernel worker serves its page
+      // from the responses the replayed injections produced, so the machine
+      // only ever sees the connections the other computer's log carries.
       host.setWebPreview({
         label: profile.init.web.label,
         url: APP_PREFIX,
         status: "starting",
-        message: "Waiting for services",
+        message: replicationReplay === undefined
+          ? "Waiting for services"
+          : "Following the other computer's browsing",
       });
       try {
         // Unique id for this machine instance. Scopes the service worker's
@@ -1424,7 +1434,21 @@ async function bootProfile(
         );
         assertCurrent();
         bridgeSent = true;
-        maybeUpdateWebReadiness();
+        if (replicationReplay === undefined) {
+          maybeUpdateWebReadiness();
+        } else {
+          // No probe and no port or service gates: those readiness signals
+          // belong to a machine serving its own requests. This one follows
+          // the other computer's browsing, so its preview is ready as soon
+          // as its bridge can pair the page's fetches with replayed
+          // exchanges.
+          host.setWebPreview({
+            label: profile.init.web.label,
+            url: APP_PREFIX,
+            status: "running",
+            message: "Following the other computer's browsing",
+          });
+        }
       } catch (err) {
         if (!isCurrent()) throw err;
         const message = err instanceof Error ? err.message : String(err);
@@ -1944,16 +1968,25 @@ function maybeMarkWebReady(
   dinitBootTracker: DinitBootStatusTracker,
   tick: (msg: string) => void,
   isCurrent: () => boolean,
+  restored: boolean,
 ): void {
   const web = profile.init?.web;
   if (!web) return;
   if (readiness.failed) return;
-  const portsReady = web.requiredPorts.every((p) => seenPorts.has(p));
-  const servicesReady = (web.requiredServices ?? []).every((serviceName) =>
-    dinitBootTracker.hasSucceeded(serviceName),
-  );
+  // A restored machine bound its ports and booted its services before the
+  // capture, on the computer it came from. Those signals never replay here,
+  // so readiness falls through to the HTTP probe: the one check the restored
+  // machine can still answer.
+  const portsReady =
+    restored || web.requiredPorts.every((p) => seenPorts.has(p));
+  const servicesReady =
+    restored ||
+    (web.requiredServices ?? []).every((serviceName) =>
+      dinitBootTracker.hasSucceeded(serviceName),
+    );
   if (!portsReady || !servicesReady || !bridgeSent) return;
-  const readyMessage = web.probeHttp
+  const probeHttp = Boolean(web.probeHttp) || restored;
+  const readyMessage = probeHttp
     ? "HTTP bridge ready"
     : "Service stack ready";
   if (readiness.ready) {
@@ -1966,7 +1999,7 @@ function maybeMarkWebReady(
     });
     return;
   }
-  if (!web.probeHttp) {
+  if (!probeHttp) {
     readiness.ready = true;
     tick("Web preview ready");
     host.setWebPreview({

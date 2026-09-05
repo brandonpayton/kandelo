@@ -110,6 +110,15 @@ export const App: React.FC = () => {
   const replication = useMachineReplication(host, peer.link);
   const handover = useMachineHandover(host, peer.link, replication.replicating);
 
+  const [previewReloadToken, setPreviewReloadToken] = React.useState(0);
+  React.useEffect(() => {
+    if (!replication.publishing) return;
+    // The recording started after the page the user is on was fetched, so
+    // its exchanges are not in the log. A reload re-fetches them through the
+    // bridge, into the recording, so the viewer has something to render.
+    setPreviewReloadToken((token) => token + 1);
+  }, [replication.publishing]);
+
   const desc = host.getBootDescriptor();
   const resolvedThemeMode = theme.mode === "auto" ? systemThemeMode : theme.mode;
 
@@ -417,6 +426,15 @@ export const App: React.FC = () => {
             activeTerminalId={activeTerminalId}
             onActiveTerminalId={setActiveTerminalId}
             onAddTerminal={onAddTerminal}
+            onPreviewPathChange={
+              replication.publishing ? replication.navigation.publish : undefined
+            }
+            previewViewerPath={
+              replication.replicating
+                ? replication.navigation.viewerPath
+                : undefined
+            }
+            previewReloadToken={previewReloadToken}
           />
         )}
       </main>

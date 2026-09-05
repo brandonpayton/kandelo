@@ -465,6 +465,45 @@ test("moves the keyboard with the machine, in both directions", async ({
   }
 });
 
+test("shows the viewer the page the user's machine is serving", async ({
+  browser,
+  baseURL,
+  browserName,
+}) => {
+  test.skip(
+    browserName !== "chromium",
+    "only headless Chromium can form a loopback ICE pair",
+  );
+  test.setTimeout(300_000);
+  expect(baseURL).toBeTruthy();
+
+  const sharerContext = await browser.newContext();
+  const viewerContext = await browser.newContext();
+  const sharer = await sharerContext.newPage();
+  const viewer = await viewerContext.newPage();
+  try {
+    await sharer.goto(appUrl("/?demo=nginx"), { waitUntil: "domcontentloaded" });
+    await viewer.goto(appUrl("/"), { waitUntil: "domcontentloaded" });
+
+    // The machine serves its page to its own person first.
+    await expect(sharer.frameLocator('iframe[title="nginx"]').locator("body"))
+      .toContainText("Hello from nginx on WebAssembly!", { timeout: 300_000 });
+
+    await connectPeers(sharer, viewer, (reason) => test.skip(true, reason));
+    await expectReplica(viewer);
+
+    // The viewer's page is served by the viewer's own machine: the sharer's
+    // preview reloaded into the recording when it started, the replica
+    // replayed those injections, and the viewer's preview followed the
+    // sharer's to the page they produced. No pixel of it crossed the wire.
+    await expect(viewer.frameLocator('iframe[title="nginx"]').locator("body"))
+      .toContainText("Hello from nginx on WebAssembly!", { timeout: 180_000 });
+  } finally {
+    await viewerContext.close();
+    await sharerContext.close();
+  }
+});
+
 /** A cheap frame fingerprint: enough to tell one frame from the next. */
 function canvasSignature(canvas: Locator): Promise<number> {
   return canvas.evaluate((el: HTMLCanvasElement) => {

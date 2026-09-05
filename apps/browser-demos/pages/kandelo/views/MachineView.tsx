@@ -168,6 +168,11 @@ export interface MachineViewProps {
   activeTerminalId: string;
   onActiveTerminalId: (id: string) => void;
   onAddTerminal: () => void;
+  onPreviewPathChange?: (path: string) => void;
+  previewViewerPath?: string | null;
+  /** Reloads the web preview when it changes, so a recording that just
+   *  started carries the exchanges behind the page the user is on. */
+  previewReloadToken?: number;
 }
 
 export const MachineView: React.FC<MachineViewProps> = ({
@@ -181,9 +186,17 @@ export const MachineView: React.FC<MachineViewProps> = ({
   activeTerminalId,
   onActiveTerminalId,
   onAddTerminal,
+  onPreviewPathChange,
+  previewViewerPath,
+  previewReloadToken,
 }) => {
   const demoGuide = useDemoGuide();
   const displayRef = React.useRef<DisplayHandle | null>(null);
+
+  React.useEffect(() => {
+    if (!previewReloadToken) return;
+    displayRef.current?.reloadPreview();
+  }, [previewReloadToken]);
   const {
     activePrimary,
     demoSurface,
@@ -248,6 +261,8 @@ export const MachineView: React.FC<MachineViewProps> = ({
                 autoFocus={activePrimary === demoSurface}
                 surface={demoSurface ?? undefined}
                 onDockControlsChange={onDemoDockControlsChange}
+                onPreviewPathChange={onPreviewPathChange}
+                previewViewerPath={previewViewerPath}
               />
             </PrimarySurfaceSlot>
           )}

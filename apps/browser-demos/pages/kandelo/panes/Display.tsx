@@ -13,6 +13,7 @@ export interface WordPressLoginOptions {
 
 export interface DisplayHandle {
   loginToWordPress(options: WordPressLoginOptions): Promise<void>;
+  reloadPreview(): void;
 }
 
 export interface DisplayProps extends FramebufferProps {
@@ -24,6 +25,15 @@ export interface DisplayProps extends FramebufferProps {
    */
   surface?: PrimarySurface;
   onDockControlsChange?: (controls: React.ReactNode | null) => void;
+  /** Reports every page the preview lands on, for a publisher mirroring it. */
+  onPreviewPathChange?: (path: string) => void;
+  /**
+   * The path the other computer's preview is on, for a viewer following it.
+   * Undefined on a machine browsing for itself; null on a viewer the user
+   * has not navigated for yet, which shows the preview's message instead of
+   * loading a page the replayed exchanges may not hold.
+   */
+  previewViewerPath?: string | null;
 }
 
 export const Display = React.forwardRef<DisplayHandle, DisplayProps>(({ surface, onDockControlsChange, ...props }, ref) => {
@@ -43,10 +53,13 @@ Display.displayName = "Display";
 const WebPreviewPane = React.forwardRef<DisplayHandle, FramebufferProps & {
   preview: NonNullable<ReturnType<typeof useWebPreview>>;
   onDockControlsChange?: (controls: React.ReactNode | null) => void;
-}>(({ preview, autoFocus = false, onDockControlsChange }, ref) => {
+  onPreviewPathChange?: (path: string) => void;
+  previewViewerPath?: string | null;
+}>(({ preview, autoFocus = false, onDockControlsChange, onPreviewPathChange, previewViewerPath }, ref) => {
   const [path, setPath] = React.useState("/");
   const [iframeSrc, setIframeSrc] = React.useState(() => buildPreviewUrl(preview.url, "/"));
-  const ready = preview.status === "running";
+  const ready = preview.status === "running"
+    && (previewViewerPath === undefined || previewViewerPath !== null);
   const pendingRequests = preview.pendingRequests ?? 0;
   const iframeRef = React.useRef<HTMLIFrameElement | null>(null);
 
@@ -117,11 +130,23 @@ const WebPreviewPane = React.forwardRef<DisplayHandle, FramebufferProps & {
       const next = relativePathFromHref(preview.url, href);
       if (!next) return;
       setPath(next);
+      onPreviewPathChange?.(next);
     } catch {
       // Cross-origin navigations are not expected for the service bridge,
       // but ignore them so the preview itself keeps working.
     }
-  }, [preview.url]);
+  }, [onPreviewPathChange, preview.url]);
+
+  // A viewer's preview goes where the other computer's went, and nowhere on
+  // its own: until the first mirrored path arrives, `ready` above keeps the
+  // frame unmounted so it does not load a page the replayed exchanges may
+  // not hold.
+  React.useEffect(() => {
+    if (previewViewerPath === undefined || previewViewerPath === null) return;
+    const next = normalizePreviewPath(previewViewerPath, preview.url);
+    setPath(next);
+    navigateFrame(buildPreviewUrl(preview.url, next));
+  }, [navigateFrame, preview.url, previewViewerPath]);
 
   const dockControls = React.useMemo(() => (
     <WebPreviewDockControls
@@ -142,6 +167,7 @@ const WebPreviewPane = React.forwardRef<DisplayHandle, FramebufferProps & {
   }, [dockControls, onDockControlsChange]);
 
   React.useImperativeHandle(ref, () => ({
+    reloadPreview,
     async loginToWordPress(options) {
       if (!ready) throw new Error("Web preview is not ready");
       const loginPath = options.loginPath ?? "/wp-login.php";
@@ -171,7 +197,7 @@ const WebPreviewPane = React.forwardRef<DisplayHandle, FramebufferProps & {
         await navigateAndWait(adminPath, isWordPressAdminVisible);
       }
     },
-  }), [navigateAndWait, ready]);
+  }), [navigateAndWait, ready, reloadPreview]);
 
   return (
     <div className="kdisplay-surface">

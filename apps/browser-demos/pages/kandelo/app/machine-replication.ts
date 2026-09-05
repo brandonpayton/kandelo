@@ -86,6 +86,19 @@ export interface MachineReplication {
   /** True while this machine's decisions are being sent to the viewer. */
   readonly publishing: boolean;
   /**
+   * Where the two web previews meet.
+   *
+   * The machine's web pages already replicate as injected-request decisions;
+   * what the log cannot say is which page the user is looking at. A
+   * publishing page calls `publish` when its preview navigates; a
+   * replicating page follows `viewerPath`, which is null until the user's
+   * first navigation reaches it.
+   */
+  readonly navigation: {
+    readonly publish: (path: string) => void;
+    readonly viewerPath: string | null;
+  };
+  /**
    * True from asking the user for its machine until this one is running it.
    *
    * A replica arriving and a machine being taken over are two boots of the
@@ -105,6 +118,7 @@ const IDLE: MachineReplication = {
   joining: false,
   replicating: false,
   failure: null,
+  navigation: { publish: () => {}, viewerPath: null },
 };
 
 export function useMachineReplication(
@@ -115,16 +129,27 @@ export function useMachineReplication(
   const [joining, setJoining] = React.useState(false);
   const [replicating, setReplicating] = React.useState(false);
   const [failure, setFailure] = React.useState<string | null>(null);
+  const [viewerPath, setViewerPath] = React.useState<string | null>(null);
+  // The wire outlives renders; a publish callback that closed over one
+  // render's wire would post into a link that was already replaced.
+  const wireRef = React.useRef<LocalReplicationLog<CapturedMachine> | null>(
+    null,
+  );
+  const publishNavigation = React.useCallback((path: string) => {
+    wireRef.current?.publishNavigation(path);
+  }, []);
 
   React.useEffect(() => {
     setPublishing(false);
     setJoining(false);
     setReplicating(false);
     setFailure(null);
+    setViewerPath(null);
     if (!link) return;
     // The transport wraps the link's channel; the link owns and closes it, so
     // dropping a transport here must not close the channel underneath it.
     const wire = new LocalReplicationLog<CapturedMachine>(link.replication);
+    wireRef.current = wire;
 
     let role: "none" | "user" | "viewer" = "none";
     let leaveRole: (() => void) | null = null;
@@ -193,6 +218,7 @@ export function useMachineReplication(
         if (!replica) return;
         replica = false;
         setReplicating(false);
+        setViewerPath(null);
         void host.stopReplicatingMachine();
       };
       leaveRole = () => {
@@ -219,6 +245,9 @@ export function useMachineReplication(
             entries: (entries) => {
               writer.push(entries);
               host.drainReplicationReplay();
+            },
+            navigated: (path) => {
+              setViewerPath(path);
             },
             ended: () => {
               writer.end();
@@ -314,9 +343,16 @@ export function useMachineReplication(
       gone = true;
       stopStatus();
       leave();
+      if (wireRef.current === wire) wireRef.current = null;
     };
   }, [host, link]);
 
   if (!link) return IDLE;
-  return { publishing, joining, replicating, failure };
+  return {
+    publishing,
+    joining,
+    replicating,
+    failure,
+    navigation: { publish: publishNavigation, viewerPath },
+  };
 }
