@@ -2357,23 +2357,76 @@ impl ExternrefRegistry {
 /// Define `env.resolve_externref(handle: i32) -> externref` (nullable
 /// externref, matching the fork-module's declared import type — see
 /// `crates/fork-module-inject/src/main.rs`'s `import_resolve_externref`) as a
-/// REAL `Func`, backed by a fresh [`ExternrefRegistry`] captured by the
-/// closure. Must be called BEFORE `Linker::define_unknown_imports_as_traps`
-/// so that pass does not shadow this with a trapping stub.
+/// REAL `Func`, backed by the given [`ExternrefRegistry`]. Must be called
+/// BEFORE `Linker::define_unknown_imports_as_traps` so that pass does not
+/// shadow this with a trapping stub.
+///
+/// N1-I5 Task 3: `registry` is now a PARAMETER, not created fresh inside this
+/// function — one `Arc<Mutex<ExternrefRegistry>>` is created once per guest OS
+/// thread (in `spawn_guest_thread`, alongside its `Store`) and passed to BOTH
+/// this call (wiring the fork-module's own `env.resolve_externref`) and the
+/// GUEST's own `env.resolve_externref` import, when the guest declares one
+/// directly (a fixture calling `resolve_externref` itself to obtain a
+/// directly-held externref — see `native_fork_refs.c`). Sharing ONE registry
+/// is what makes "the guest's own call and the fork-module's replay-time
+/// decode both resolve the SAME handle to the IDENTICAL `Rooted<ExternRef>`"
+/// true — a per-call-site-fresh registry would defeat the whole idempotence
+/// contract grounding §5 requires. This is still `resolve_externref_is_
+/// idempotent_per_handle`'s exact guarantee, just shared across two
+/// definitions of the same import name instead of one.
 ///
 /// The closure only receives a transient `Caller<'_, ()>` per call (this
 /// `Store`'s data is `()`, matching every other host import in this file —
 /// see e.g. `define_kernel_host_imports`'s `Arc<Mutex<_>>`-captured-state
 /// pattern), so the registry itself is captured by `Arc<Mutex<_>>`, not
 /// stored in `Store` data.
-fn define_resolve_externref(linker: &mut Linker<()>) -> anyhow::Result<()> {
-    let registry = Arc::new(Mutex::new(ExternrefRegistry::new()));
+fn define_resolve_externref(
+    linker: &mut Linker<()>,
+    registry: Arc<Mutex<ExternrefRegistry>>,
+) -> anyhow::Result<()> {
     linker.func_wrap(
         "env",
         "resolve_externref",
         move |mut caller: Caller<'_, ()>, handle: i32| -> wasmtime::Result<Option<wasmtime::OwnedRooted<ExternRef>>> {
             let mut registry = registry.lock().unwrap();
             registry.resolve(&mut caller, handle as u32).map(Some)
+        },
+    )?;
+    Ok(())
+}
+
+/// N1-I5 Task 3: define `env.native_test_externref_payload(v: externref) ->
+/// i32` — a TEST-ONLY diagnostic import, never declared by a real program,
+/// that unwraps the `u32` payload [`ExternrefRegistry::resolve`] wrapped an
+/// externref around (via `ExternRef::new(&mut store, handle: u32)`). This is
+/// the observable side channel the `native_fork_refs.c` fixture needs: C has
+/// no operator that can read/compare an opaque `__externref_t` value, so the
+/// fixture's ONLY way to prove "the externref I got back after replaying my
+/// fork still carries the SAME handle I resolved before forking" is to hand
+/// it back to the host and let the host tell it. A null externref (should
+/// never happen for a value `resolve_externref` minted) reports `-1`, a
+/// truthful sentinel distinct from every valid `u32` handle this fixture uses
+/// (which are all small positive constants) — never a silently-wrong `0`.
+///
+/// Wired ONLY when a guest module actually declares this import (mirrors the
+/// `guest_declares(name)` gating every other optional reference wire in
+/// `spawn_guest_thread`), so it is a no-op for every other program, including
+/// every other pre-existing fixture.
+fn define_externref_payload_probe(linker: &mut Linker<()>) -> anyhow::Result<()> {
+    linker.func_wrap(
+        "env",
+        "native_test_externref_payload",
+        move |caller: Caller<'_, ()>, v: Option<wasmtime::Rooted<ExternRef>>| -> wasmtime::Result<i32> {
+            let Some(v) = v else {
+                return Ok(-1);
+            };
+            match v.data(&caller)? {
+                Some(data) => match data.downcast_ref::<u32>() {
+                    Some(handle) => Ok(*handle as i32),
+                    None => Ok(-1),
+                },
+                None => Ok(-1),
+            }
         },
     )?;
     Ok(())
@@ -3048,6 +3101,7 @@ pub(crate) fn instantiate_fork_module(
     store: &mut Store<()>,
     guest_mem: &SharedMemory,
     layout: &ProcessLayout,
+    externref_registry: Arc<Mutex<ExternrefRegistry>>,
 ) -> anyhow::Result<ForkModule> {
     let fork_module_wasm_path = crate::fork_module_path();
     let wasm_bytes = std::fs::read(&fork_module_wasm_path)
@@ -3172,7 +3226,11 @@ pub(crate) fn instantiate_fork_module(
 
     // N1-I5 Task 2: `env.resolve_externref` is a REAL import now — define it
     // before the catch-all trap pass below so that pass does not shadow it.
-    define_resolve_externref(&mut linker)?;
+    // N1-I5 Task 3: shares `externref_registry` with the GUEST's own
+    // `env.resolve_externref` wiring in `spawn_guest_thread` — see
+    // `define_resolve_externref`'s doc comment for why one shared registry
+    // (not a fresh one per definition) is required for identity.
+    define_resolve_externref(&mut linker, externref_registry)?;
 
     // Every remaining function import is the exception-path seam
     // (`wpk_fork_host.host_last_errno`/`host_mint_exception_tag`/
@@ -3421,8 +3479,17 @@ fn spawn_guest_thread(
         // the entry loop at the end of this function — see
         // `ForkCoordState`'s doc comment.
         let coord = ForkCoordState::new();
+        // N1-I5 Task 3: ONE registry per guest OS thread (this `Store`'s own
+        // lifetime is already "one fork generation" — see `ExternrefRegistry`'s
+        // doc comment), shared between the fork-module's own
+        // `env.resolve_externref` (wired inside `instantiate_fork_module`) and
+        // this SAME guest's own `env.resolve_externref` import, if it declares
+        // one directly (a fixture that resolves an externref itself — see
+        // `native_fork_refs.c`). Sharing is what makes both call sites resolve
+        // the same handle to the identical `Rooted<ExternRef>`.
+        let externref_registry = Arc::new(Mutex::new(ExternrefRegistry::new()));
         if use_fork_module {
-            match instantiate_fork_module(&engine, &mut store, &guest_mem, &layout) {
+            match instantiate_fork_module(&engine, &mut store, &guest_mem, &layout, Arc::clone(&externref_registry)) {
                 Ok(fm) => {
                     const FRAME_IMPORT_NAMES: [&str; 5] = [
                         "__wpk_fork_frame_reserve",
@@ -4042,6 +4109,31 @@ fn spawn_guest_thread(
                         eprintln!("wiring env.{name} failed: {e:#}");
                         return;
                     }
+                }
+            }
+
+            // N1-I5 Task 3: the GUEST's OWN direct `env.resolve_externref`
+            // and `env.native_test_externref_payload` imports, when
+            // declared — see `native_fork_refs.wat`'s doc comment and
+            // `define_resolve_externref`'s doc comment for why sharing
+            // `externref_registry` with the fork-module's OWN
+            // `env.resolve_externref` (wired inside `instantiate_fork_
+            // module`, a SEPARATE `Linker`) is what makes a directly-held
+            // externref the guest itself minted BEFORE a fork resolve to
+            // the IDENTICAL `Rooted<ExternRef>` after the module
+            // reconstructs it during rewind. Neither import is declared by
+            // a real (non-test) program, so this is a no-op for every other
+            // fixture.
+            if guest_declares("resolve_externref") {
+                if let Err(e) = define_resolve_externref(&mut linker, Arc::clone(&externref_registry)) {
+                    eprintln!("wiring the guest's own env.resolve_externref failed: {e:#}");
+                    return;
+                }
+            }
+            if guest_declares("native_test_externref_payload") {
+                if let Err(e) = define_externref_payload_probe(&mut linker) {
+                    eprintln!("wiring env.native_test_externref_payload failed: {e:#}");
+                    return;
                 }
             }
         }
@@ -7589,7 +7681,13 @@ mod fork_module_tests {
         let (guest_mem, layout) = compute_guest_memory(&engine, &guest_module)?;
 
         let mut fm_store = Store::new(&engine, ());
-        let fork_module = instantiate_fork_module(&engine, &mut fm_store, &guest_mem, &layout)?;
+        let fork_module = instantiate_fork_module(
+            &engine,
+            &mut fm_store,
+            &guest_mem,
+            &layout,
+            Arc::new(Mutex::new(ExternrefRegistry::new())),
+        )?;
 
         assert!(fork_module.region_bytes > 0, "expected a non-empty reserved region");
         assert!(
@@ -7625,7 +7723,7 @@ mod fork_module_tests {
         let engine = crate::kernel_engine()?;
         let mut store = Store::new(&engine, ());
         let mut linker: Linker<()> = Linker::new(&engine);
-        define_resolve_externref(&mut linker)?;
+        define_resolve_externref(&mut linker, Arc::new(Mutex::new(ExternrefRegistry::new())))?;
 
         let func = linker
             .get(&mut store, "env", "resolve_externref")

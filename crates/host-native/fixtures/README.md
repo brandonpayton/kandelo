@@ -77,3 +77,41 @@ Like `native_hello.wasm`, the program's `__abi_version` must match the
 kernel's ABI, and re-running step 2 after any `crates/fork-instrument` change
 picks up the current instrumentation tool automatically (see
 `scripts/run-wasm-fork-instrument.sh`'s own input-hash rebuild check).
+
+## `native_fork_refs.instrumented.wasm`
+
+`smoke_fork_reconstructs_references`'s fixture (N1-I5 Task 3, currently
+`#[ignore]`d — see that test's doc comment for why). Unlike every other
+fixture here, the source is hand-written WAT
+(`native_fork_refs.wat`), not C: a genuine WASM `funcref`/`externref`
+*value* held live across `fork()` is not reachable from portable C on this
+SDK's clang/LLVM 21 toolchain (`__funcref`-qualified pointer types parse but
+reproducibly ICE the compiler on every realistic use tried), matching the
+Node/browser hosts' own reason for hand-writing `host/test/fixtures/
+funcref-local-fork-fresh-worker.wat` / `externref-local-fork-fresh-worker.wat`.
+`native_fork_refs.wat`'s own doc comment has the full design (what each
+reference kind proves, exit-code table) and current status (assembles and
+instruments cleanly; the RUN currently traps during CAPTURE on native's
+documented, pre-existing "no module-state capture mechanism yet" gap — see
+`guest.rs`'s `write_empty_module_state_arena` doc comment).
+
+Regenerate from within the dev shell:
+
+```sh
+# 1. Assemble the hand-written WAT (WABT's wat2wasm, not the SDK's clang):
+scripts/dev-shell.sh bash -lc '
+  cd crates/host-native/fixtures
+  wat2wasm --enable-exceptions --enable-threads \
+    native_fork_refs.wat -o native_fork_refs.wasm
+'
+
+# 2. Instrument it, exactly like native_fork.wasm:
+scripts/dev-shell.sh bash -lc '
+  cd crates/host-native/fixtures
+  <repo>/scripts/run-wasm-fork-instrument.sh \
+    native_fork_refs.wasm -o native_fork_refs.instrumented.wasm \
+    --entry kernel.kernel_fork
+'
+```
+
+Like every other fixture, `__abi_version` must match the kernel's ABI.
