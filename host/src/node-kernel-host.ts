@@ -29,6 +29,7 @@ import type {
   ResolveExecRequestMessage,
 } from "./node-kernel-protocol";
 import type { ProcessSnapshot, SyscallTraceEvent } from "./kernel-worker";
+import type { CheckpointCaptureResponse } from "./migration/checkpoint";
 import type { HttpRequest, HttpResponse } from "./networking/in-kernel-http";
 import type { LazyDownloadEvent } from "./vfs/memory-fs";
 import { compiledWorkerEntryIsCurrent } from "./compiled-worker-entry";
@@ -780,6 +781,27 @@ export class NodeKernelHost {
       pid,
     });
     return (result as string | null) ?? null;
+  }
+
+  /**
+   * Freeze this machine, read it, and resume it.
+   *
+   * A timeout is an ordinary outcome, not an error: a process that makes no
+   * syscall never reaches its unwind hook. The machine keeps running either
+   * way, and the reason says which happened.
+   */
+  async captureCheckpoint(options: {
+    unwindTimeoutMs: number;
+    vforkTimeoutMs: number;
+  }): Promise<CheckpointCaptureResponse> {
+    const requestId = this._nextRequestId++;
+    const result = await this.request(requestId, {
+      type: "capture_checkpoint",
+      requestId,
+      unwindTimeoutMs: options.unwindTimeoutMs,
+      vforkTimeoutMs: options.vforkTimeoutMs,
+    });
+    return result as CheckpointCaptureResponse;
   }
 
   /**

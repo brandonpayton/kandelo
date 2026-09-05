@@ -245,6 +245,7 @@ audit_wasm_imports() {
         env.memory
         kernel.kernel_apply_fork_fd_actions
         kernel.kernel_argv_read
+        kernel.kernel_checkpoint
         kernel.kernel_clear_fork_exec
         kernel.kernel_environ_count
         kernel.kernel_environ_get

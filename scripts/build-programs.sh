@@ -175,11 +175,14 @@ LINK_POST_LIBS=(
     -Wl,--export=__abi_version
 )
 
-# Fork support comes from wasm-fork-instrument. The tool auto-discovers
-# fork-path functions via call-graph analysis from `kernel.kernel_fork`;
-# no onlylist is needed.
-# See docs/fork-instrumentation.md.
+# Fork support comes from wasm-fork-instrument. The tool auto-discovers the
+# functions it must instrument via call-graph analysis from the seed imports;
+# no onlylist is needed. Both seeds are named, because a program that never
+# forks still reaches its unwind through `kernel.kernel_checkpoint`, and
+# seeding only the fork boundary leaves such a program with no instrumentation
+# at all. See docs/fork-instrumentation.md.
 FORK_INSTRUMENT="$REPO_ROOT/scripts/run-wasm-fork-instrument.sh"
+FORK_INSTRUMENT_SEEDS=(--checkpoint-entry kernel.kernel_checkpoint)
 
 build_program() {
     local src="$1"
@@ -244,7 +247,7 @@ build_program() {
     # boundary byte-for-byte unchanged, so it is safe to run unconditionally.
     # Side modules and loader-capable mains still receive process-image state
     # helpers even when they have no local fork import.
-    "$FORK_INSTRUMENT" "$raw_wasm" -o "$next_wasm"
+    "$FORK_INSTRUMENT" "${FORK_INSTRUMENT_SEEDS[@]}" "$raw_wasm" -o "$next_wasm"
     mv "$next_wasm" "$wasm"
     rm -f "$raw_wasm"
 }
@@ -293,7 +296,7 @@ build_cpp_program() {
 
     # Publish the resolver-visible path only after instrumentation and its
     # complete ABI 43 artifact contract succeed.
-    "$FORK_INSTRUMENT" "$raw_wasm" -o "$next_wasm"
+    "$FORK_INSTRUMENT" "${FORK_INSTRUMENT_SEEDS[@]}" "$raw_wasm" -o "$next_wasm"
     mv "$next_wasm" "$wasm"
     rm -f "$raw_wasm"
 }

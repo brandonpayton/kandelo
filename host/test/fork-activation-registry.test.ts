@@ -329,6 +329,74 @@ describe("ForkActivationRegistry", () => {
     expect(owner.tableDirty(1).pageAt(9, 2)).toBe(2n);
   });
 
+  it("retires every table coordinate when a checkpoint gives up ownership", () => {
+    const memory = new WebAssembly.Memory({ initial: 2 });
+    const first = new WebAssembly.Table({
+      element: "anyfunc",
+      initial: 8,
+      maximum: 8,
+    });
+    const second = new WebAssembly.Table({
+      element: "anyfunc",
+      initial: 8,
+      maximum: 8,
+    });
+    const owner = registry(memory, "checkpoint table ownership");
+    owner.registerActivation({
+      ...registration(0, []),
+      instance: {
+        exports: { __wpk_fork_table_3: first, __wpk_fork_table_4: second },
+      } as unknown as WebAssembly.Instance,
+    });
+    expect(owner.tableDirty(0).ownsState(3)).toBe(true);
+    expect(owner.tableDirty(0).ownsState(4)).toBe(true);
+
+    owner.releaseProcessTableStateOwnership();
+
+    // A pthread that is not the checkpoint's arena owner must neither write the
+    // shared sparse state nor reapply it on resume.
+    expect(owner.tableDirty(0).ownsState(3)).toBe(false);
+    expect(owner.tableDirty(0).ownsState(4)).toBe(false);
+  });
+
+  it("re-elects one canonical owner per table when a fork follows a checkpoint", () => {
+    const memory = new WebAssembly.Memory({ initial: 2 });
+    const shared = new WebAssembly.Table({
+      element: "anyfunc",
+      initial: 8,
+      maximum: 8,
+    });
+    const unshared = new WebAssembly.Table({
+      element: "anyfunc",
+      initial: 8,
+      maximum: 8,
+    });
+    const owner = registry(memory, "checkpoint table restore");
+    owner.registerActivation({
+      ...registration(0, []),
+      instance: {
+        exports: { __wpk_fork_table_3: shared, __wpk_fork_table_4: unshared },
+      } as unknown as WebAssembly.Instance,
+    });
+    owner.registerActivation({
+      ...registration(1, []),
+      instance: {
+        exports: { __wpk_fork_table_9: shared },
+      } as unknown as WebAssembly.Instance,
+    });
+    expect(owner.tableDirty(0).ownsState(3)).toBe(true);
+    expect(owner.tableDirty(1).ownsState(9)).toBe(false);
+
+    owner.releaseProcessTableStateOwnership();
+    owner.restoreProcessTableStateOwnership();
+
+    // The election runs again rather than electing every coordinate: the alias
+    // at 1:9 stays retired, or one physical table would be written twice.
+    expect(owner.tableDirty(0).ownsState(3)).toBe(true);
+    expect(owner.tableDirty(0).ownsState(4)).toBe(true);
+    expect(owner.tableDirty(1).ownsState(9)).toBe(false);
+  });
+
   it("rejects host mutations of tables outside activation catalogs", () => {
     const memory = new WebAssembly.Memory({ initial: 2 });
     const owner = registry(memory, "unknown host table");

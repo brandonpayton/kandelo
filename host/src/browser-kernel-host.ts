@@ -13,6 +13,7 @@ import {
 } from "./vfs/memory-fs";
 import { FramebufferRegistry } from "./framebuffer/registry";
 import type { ProcessSnapshot, SyscallTraceEvent } from "./kernel-worker";
+import type { CheckpointCaptureResponse } from "./migration/checkpoint";
 import type {
   HostDiagnostic,
   MainToKernelMessage,
@@ -773,6 +774,28 @@ export class BrowserKernel {
       pid,
     });
     return (result as string | null) ?? null;
+  }
+
+  /**
+   * Freeze this machine, read it, and resume it. Mirrors
+   * `NodeKernelHost.captureCheckpoint`.
+   *
+   * A timeout is an ordinary outcome, not an error: a process that makes no
+   * syscall never reaches its unwind hook. The machine keeps running either
+   * way, and the reason says which happened.
+   */
+  async captureCheckpoint(options: {
+    unwindTimeoutMs: number;
+    vforkTimeoutMs: number;
+  }): Promise<CheckpointCaptureResponse> {
+    const requestId = this.nextRequestId++;
+    const result = await this.request(requestId, {
+      type: "capture_checkpoint",
+      requestId,
+      unwindTimeoutMs: options.unwindTimeoutMs,
+      vforkTimeoutMs: options.vforkTimeoutMs,
+    });
+    return result as CheckpointCaptureResponse;
   }
 
   /**

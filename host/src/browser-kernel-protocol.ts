@@ -360,6 +360,22 @@ export interface ReadProcMapsRequestMessage {
   pid: number;
 }
 
+/**
+ * Freeze the machine, read it, and resume it. Mirrors the Node host's
+ * capture_checkpoint request in node-kernel-protocol.ts.
+ *
+ * Response carries a `CheckpointCaptureResponse`: a summary when the freeze
+ * completed, or the reason it timed out or failed. A process that makes no
+ * syscall never reaches its unwind hook, so a timeout is an ordinary outcome
+ * and the machine keeps running.
+ */
+export interface CaptureCheckpointRequestMessage {
+  type: "capture_checkpoint";
+  requestId: number;
+  unwindTimeoutMs: number;
+  vforkTimeoutMs: number;
+}
+
 /** Enable / disable the syscall trace ring buffer. Off by default — flip
  * on when a subscriber attaches, off when the last one detaches. */
 export interface SetSyscallTraceMessage {
@@ -454,6 +470,7 @@ export type MainToKernelMessage =
   | AudioDrainMessage
   | EnumProcsRequestMessage
   | ReadProcMapsRequestMessage
+  | CaptureCheckpointRequestMessage
   | SetSyscallTraceMessage
   | DrainSyscallTraceMessage
   | HttpRequestMessage

@@ -78,6 +78,12 @@ import {
   ForkReplayGateCoordinator,
   observeForkReplayWorker,
 } from "./fork-replay-gate";
+import { CheckpointFreezeGateCoordinator } from "./checkpoint-freeze-gate";
+import { ProcessExecutionGenerationAllocator } from "./process-execution-generation";
+import {
+  captureMachineCheckpointSummary,
+  type CheckpointMachine,
+} from "./migration/checkpoint";
 import { ForkExternrefProcessOwner } from "./fork-externref-process-owner";
 import type { ForkExternrefGeneration } from "./fork-reference-broker";
 import {
@@ -161,6 +167,41 @@ const pendingLazyRegistrationMessages: LazyRegistrationMessage[] = [];
 let lazyRegistrationTail: Promise<void> = Promise.resolve();
 const rootfsSnapshotGate = new RootfsSnapshotGate();
 const processMemoryCreators = new ProcessMemoryCreatorGate();
+
+/**
+ * The freeze's view of this machine. The ordering between these members lives
+ * in `migration/checkpoint.ts`, which both hosts share.
+ */
+const checkpointMachine: CheckpointMachine = {
+  runWithoutWorkerCreation: (operation, exclusive) =>
+    processMemoryCreators.runExclusive(operation, exclusive),
+  runWithoutRootfsMutation: (operation) => rootfsSnapshotGate.runSnapshot(operation),
+  settleActiveVforkBorrows: () => vforkLifetimes.settleActiveBorrows(),
+  holdProcessDispatch: () => kernelWorker.holdProcessDispatchForCheckpoint(),
+  releaseProcessDispatch: () => kernelWorker.releaseProcessDispatchForCheckpoint(),
+  armUnwindRequests: () => kernelWorker.armCheckpointUnwind(),
+  disarmUnwindRequests: () => kernelWorker.disarmCheckpointUnwind(),
+  copyKernelMemory: () => kernelWorker.copyKernelMemoryForCheckpoint(),
+  filesystemBuffer: () => {
+    if (!memfs) {
+      throw new Error("this machine has no MemoryFileSystem rootfs to checkpoint");
+    }
+    return memfs.sharedBuffer;
+  },
+  liveProcesses: () =>
+    [...processes.entries()].map(([pid, info]) => ({
+      pid,
+      executionGeneration: info.executionGeneration,
+      ptrWidth: info.ptrWidth,
+      channelOffset: info.channelOffset,
+      layout: info.layout,
+      argv: info.argv,
+      memory: info.memory,
+      threadAllocatorState: () => info.threadAllocator.snapshotState(),
+      forkReplayContext: info.forkReplayContext,
+      checkpointFreeze: info.checkpointFreeze,
+    })),
+};
 let vforkMechanismTraceEnabled = false;
 let injectVforkWorkerStartFailure = false;
 let injectedVforkWorkerStartFailure = false;
@@ -193,6 +234,8 @@ interface VforkWorkspaceOwnership {
 interface ProcessInfo extends ProcessGenerationOwnership {
   /** Host-only identity for one execution image. A PID persists across exec. */
   generation: number;
+  /** Serialisable identity for the same image, carried by a checkpoint. */
+  executionGeneration: number;
   memory: WebAssembly.Memory;
   memoryLease: ProcessMemoryLease;
   workerQuiescence: WorkerQuiescence;
@@ -218,8 +261,11 @@ interface ProcessInfo extends ProcessGenerationOwnership {
   forkReplayContext?: ForkReplayContext;
   /** Parent-owned control slot borrowed only until exact exec/exit teardown. */
   vforkWorkspace?: VforkWorkspaceOwnership;
+  /** Host half of this process's checkpoint freeze, reused for its lifetime. */
+  checkpointFreeze: CheckpointFreezeGateCoordinator;
 }
 const processes = new Map<number, ProcessInfo>();
+const processExecutionGenerations = new ProcessExecutionGenerationAllocator();
 const vforkLifetimes = new VforkLifetimeCoordinator<ProcessInfo>();
 const externrefProcessOwner = new ForkExternrefProcessOwner();
 const forkHostImportOwnerRuntime =
@@ -506,6 +552,11 @@ const processGenerationDetaches =
       const current = processes.get(pid);
       if (current !== exactGeneration) return;
       vmInterruptTimers.clear(pid, current);
+      // A freeze waiting on this generation's unwind will never get one.
+      // Fail it now rather than let it sit until its timeout.
+      current.checkpointFreeze.abandon(
+        "the process ended during the checkpoint freeze",
+      );
       processes.delete(pid);
       threadModuleCache.delete(pid);
       threadedProcessPids.delete(pid);
@@ -1496,6 +1547,7 @@ async function handleSpawn(msg: Extract<MainToKernelMessage, { type: "spawn" }>)
       },
     });
     createdForkHostImports = forkHostImports;
+    const checkpointFreeze = new CheckpointFreezeGateCoordinator(`pid=${pid}`);
     const initData: CentralizedWorkerInitMessage = {
       type: "centralized_init",
       pid,
@@ -1505,6 +1557,7 @@ async function handleSpawn(msg: Extract<MainToKernelMessage, { type: "spawn" }>)
       secureExec,
       externrefGenerationId: externrefGeneration.id,
       forkHostImports: forkHostImports.init,
+      checkpointFreezeGate: checkpointFreeze.gate,
       env: launchEnv,
       argv: msg.argv,
       cwd: msg.cwd,
@@ -1519,6 +1572,7 @@ async function handleSpawn(msg: Extract<MainToKernelMessage, { type: "spawn" }>)
     bindForkHostImports(worker, forkHostImports);
     createdGeneration = {
       generation: allocateProcessGeneration(),
+      executionGeneration: processExecutionGenerations.allocate(),
       memory,
       memoryLease,
       workerQuiescence: createWorkerQuiescence(),
@@ -1534,6 +1588,7 @@ async function handleSpawn(msg: Extract<MainToKernelMessage, { type: "spawn" }>)
       layout,
       threadAllocator,
       externrefGeneration,
+      checkpointFreeze,
     };
     processes.set(pid, createdGeneration);
 
@@ -1721,6 +1776,16 @@ function installProcessWorkerListeners(
     }
     if (m.type === "exec_retired" && m.tid === undefined) {
       process.execRetirement.settle();
+    }
+    if (
+      m.type === "checkpoint_unwound"
+      && m.pid === pid
+      && m.tid === undefined
+    ) {
+      // The frames exist only until the gate reopens, so the report and the
+      // read that follows it are the whole capture window.
+      process.checkpointFreeze.unwound();
+      return;
     }
     if (intentionallyTerminated.has(worker as object)) return;
     if (m.type === "error") {
@@ -2029,6 +2094,8 @@ async function handleVfork(
       },
     });
     childForkHostImports = forkHostImports;
+    const childCheckpointFreeze =
+      new CheckpointFreezeGateCoordinator(`pid=${childPid}`);
     const childInitData: CentralizedWorkerInitMessage = {
       type: "centralized_init",
       pid: childPid,
@@ -2039,6 +2106,7 @@ async function handleVfork(
       secureExec: kernelWorker.processSecureExec(childPid),
       externrefGenerationId: externrefGrant.generation.id,
       forkHostImports: forkHostImports.init,
+      checkpointFreezeGate: childCheckpointFreeze.gate,
       isForkChild: true,
       forkMode: PROCESS_FORK_MODE_VFORK,
       forkMemoryOwnership: "borrowed",
@@ -2072,6 +2140,7 @@ async function handleVfork(
     bindForkHostImports(childWorker, forkHostImports);
     childGeneration = {
       generation: allocateProcessGeneration(),
+      executionGeneration: processExecutionGenerations.allocate(),
       memory: parentMemory,
       memoryLease: childMemoryLease,
       workerQuiescence: createWorkerQuiescence(),
@@ -2090,6 +2159,7 @@ async function handleVfork(
       forkReplayContext,
       externrefGeneration: externrefGrant.generation,
       vforkWorkspace: workspaceOwnership,
+      checkpointFreeze: childCheckpointFreeze,
     };
     if (memoryStatsBefore && memoryStatsAfterAlias) {
       traceVforkMechanism(
@@ -2410,6 +2480,8 @@ async function handleOrdinaryFork(
       },
     });
     childForkHostImports = forkHostImports;
+    const childCheckpointFreeze =
+      new CheckpointFreezeGateCoordinator(`pid=${childPid}`);
     const childInitData: CentralizedWorkerInitMessage = {
       type: "centralized_init",
       pid: childPid,
@@ -2420,6 +2492,7 @@ async function handleOrdinaryFork(
       secureExec: kernelWorker.processSecureExec(childPid),
       externrefGenerationId: externrefGrant.generation.id,
       forkHostImports: forkHostImports.init,
+      checkpointFreezeGate: childCheckpointFreeze.gate,
       isForkChild: true,
       forkMode: mode,
       forkBufAddr,
@@ -2439,6 +2512,7 @@ async function handleOrdinaryFork(
     bindForkHostImports(worker, forkHostImports);
     childGeneration = {
       generation: allocateProcessGeneration(),
+      executionGeneration: processExecutionGenerations.allocate(),
       memory: childMemory,
       memoryLease: childMemoryLease,
       workerQuiescence: createWorkerQuiescence(),
@@ -2456,6 +2530,7 @@ async function handleOrdinaryFork(
       threadAllocator: threadAllocatorForLayout(childLayout, ptrWidth, childPid),
       forkReplayContext,
       externrefGeneration: externrefGrant.generation,
+      checkpointFreeze: childCheckpointFreeze,
     };
     processes.set(childPid, childGeneration);
 
@@ -2784,6 +2859,8 @@ async function handleExec(
         },
       });
 
+      const replacementCheckpointFreeze =
+        new CheckpointFreezeGateCoordinator(`pid=${pid}`);
       const execInitData: CentralizedWorkerInitMessage = {
         type: "centralized_init",
         pid,
@@ -2794,6 +2871,7 @@ async function handleExec(
         secureExec,
         externrefGenerationId: replacementExternrefGeneration.id,
         forkHostImports: replacementForkHostImports.init,
+        checkpointFreezeGate: replacementCheckpointFreeze.gate,
         argv: launchArgv,
         env: envp,
         ptrWidth,
@@ -2848,6 +2926,7 @@ async function handleExec(
 
       processes.set(pid, {
         generation: allocateProcessGeneration(),
+        executionGeneration: processExecutionGenerations.allocate(),
         memory: newMemory,
         memoryLease: newMemoryLease,
         workerQuiescence: createWorkerQuiescence(),
@@ -2864,6 +2943,7 @@ async function handleExec(
         layout: newLayout,
         threadAllocator: newThreadAllocator,
         externrefGeneration: replacementExternrefGeneration,
+        checkpointFreeze: replacementCheckpointFreeze,
       });
       preparedTransferred = true;
 
@@ -3167,6 +3247,7 @@ async function handlePosixSpawn(
       },
     });
     forkHostImports = processForkHostImports;
+    const checkpointFreeze = new CheckpointFreezeGateCoordinator(`pid=${childPid}`);
     const initData: CentralizedWorkerInitMessage = {
       type: "centralized_init",
       pid: childPid,
@@ -3177,6 +3258,7 @@ async function handlePosixSpawn(
       secureExec,
       externrefGenerationId: processExternrefGeneration.id,
       forkHostImports: processForkHostImports.init,
+      checkpointFreezeGate: checkpointFreeze.gate,
       argv,
       env: envp,
       ptrWidth,
@@ -3191,6 +3273,7 @@ async function handlePosixSpawn(
     bindForkHostImports(worker, processForkHostImports);
     childGeneration = {
       generation: allocateProcessGeneration(),
+      executionGeneration: processExecutionGenerations.allocate(),
       memory: newMemory,
       memoryLease,
       workerQuiescence: createWorkerQuiescence(),
@@ -3207,6 +3290,7 @@ async function handlePosixSpawn(
       layout: newLayout,
       threadAllocator,
       externrefGeneration: processExternrefGeneration,
+      checkpointFreeze,
     };
     processes.set(childPid, childGeneration);
 
@@ -3400,6 +3484,7 @@ async function handleClone(
     ptrWidth: processInfo.ptrWidth,
     kernelAbiVersion: kernelWorker.getKernelAbiVersion(),
     kernelAbiContractDigest: kernelWorker.getKernelAbiContractDigest() ?? undefined,
+    checkpointFreezeGate: processInfo.checkpointFreeze.registerThread(tid),
   };
 
   threadWorker = new DeferredWorkerHandle(
@@ -3444,6 +3529,9 @@ async function handleClone(
       // and ultimately prevents safe retirement of the process backing.
       processInfo.memoryRetirementSafe = false;
     }
+    // A freeze still waiting on this thread would wait until its timeout, so
+    // release its participant slot as the thread goes away.
+    processInfo.checkpointFreeze.unregisterThread(tid);
     if (belongsToCurrentProcessImage()) {
       threadExits.release(pid, alloc.channelOffset);
     }
@@ -3488,6 +3576,10 @@ async function handleClone(
     const m = msg as WorkerToHostMessage;
     if (m.type === "exec_retired" && m.tid === tid) {
       threadEntry.execRetirement.settle();
+    } else if (m.type === "checkpoint_unwound" && m.tid === tid) {
+      // The frames exist only until the gate reopens, so the report and the
+      // read that follows it are the whole capture window.
+      processInfo.checkpointFreeze.unwound(tid);
     } else if (m.type === "thread_exit") {
       if (!isCurrentThreadGeneration()) {
         void terminateThreadEntry();
@@ -4444,6 +4536,17 @@ sw.onmessage = (e: MessageEvent) => {
       } catch (err) {
         respondError(msg.requestId, (err as Error)?.message ?? String(err));
       }
+      break;
+    }
+    case "capture_checkpoint": {
+      const { requestId, unwindTimeoutMs, vforkTimeoutMs } = msg;
+      void captureMachineCheckpointSummary(checkpointMachine, {
+        unwindTimeoutMs,
+        vforkTimeoutMs,
+      }).then(
+        (result) => respond(requestId, result),
+        (err) => respondError(requestId, (err as Error)?.message ?? String(err)),
+      );
       break;
     }
     case "set_syscall_trace": {

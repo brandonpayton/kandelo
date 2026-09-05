@@ -1646,6 +1646,45 @@ export class ForkActivationRegistry {
     return entry.table;
   }
 
+  /**
+   * Retire every table coordinate this worker holds as sparse-state owner.
+   *
+   * A fork gives each child its own process image, so every capturing thread
+   * saves the physical table state. A checkpoint has one image and one set of
+   * process-owned tables, so all but the owning thread must skip them. The
+   * generated KFMS helpers gate save and restore on the same ownership answer,
+   * so a retired worker still captures its frames, its scalar globals and its
+   * per-instance reference globals, and neither writes nor reapplies the
+   * shared table overlay.
+   */
+  releaseProcessTableStateOwnership(): void {
+    for (const [activationId, entries] of this.activationTables) {
+      const tracker = this.getActivation(activationId).tableDirty;
+      for (const { ownerId } of entries) {
+        tracker.setStateOwner(ownerId, false);
+      }
+    }
+  }
+
+  /**
+   * Re-elect a canonical sparse-state owner for every registered table.
+   *
+   * A thread that retired its coordinates for a checkpoint keeps that registry
+   * for the rest of its life, so a later fork on the same thread would give its
+   * child no table state at all. Re-running the election restores the exact
+   * assignment registration made, and the election is idempotent, so it is
+   * also correct when nothing was retired.
+   */
+  restoreProcessTableStateOwnership(): void {
+    const tables = new Set<WebAssembly.Table>();
+    for (const entries of this.activationTables.values()) {
+      for (const { table } of entries) tables.add(table);
+    }
+    for (const table of tables) {
+      this.bindTableCoordinates(table);
+    }
+  }
+
   private bindTableCoordinates(table: WebAssembly.Table): void {
     const coordinates = this.tableCoordinates.get(table);
     if (!coordinates || coordinates.length === 0) return;

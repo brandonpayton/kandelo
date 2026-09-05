@@ -21,6 +21,27 @@ export interface ThreadAllocation {
   tlsAllocAddr: number;
 }
 
+/**
+ * The allocator state a byte copy of process memory does not carry.
+ *
+ * The slot pages live in linear memory, but which of them are handed out lives
+ * in this host object. A process restored without it reallocates a live
+ * thread's pages.
+ */
+export interface ThreadPageAllocatorState {
+  /** Next slot start page when neither a free slot nor a reserver supplies one. */
+  readonly nextPage: number;
+  /** Slot start pages returned by an exited thread, newest last. */
+  readonly freePages: readonly number[];
+  /** Slots counted against the process pthread quota. */
+  readonly activeCount: number;
+  /**
+   * Slot start pages held outside the pthread quota, so `free` returns them
+   * without crediting the quota. A vfork child's control slot is one.
+   */
+  readonly hostControlPages: readonly number[];
+}
+
 export interface ThreadPageAllocatorOptions {
   /** First page whose start address begins a pthread slot. */
   firstSlotStartPage?: number;
@@ -173,6 +194,16 @@ export class ThreadPageAllocator {
       forkSaveOffset,
       channelOffset,
       tlsAllocAddr: tlsOffset,
+    };
+  }
+
+  /** Copy the state a checkpoint must carry alongside the process memory. */
+  snapshotState(): ThreadPageAllocatorState {
+    return {
+      nextPage: this.nextPage,
+      freePages: [...this.freePages],
+      activeCount: this.activeCount,
+      hostControlPages: [...this.hostControlPages],
     };
   }
 

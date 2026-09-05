@@ -288,6 +288,22 @@ export interface ReadProcMapsRequestMessage {
   pid: number;
 }
 
+/**
+ * Freeze the machine, read it, and resume it. Mirrors the browser host's
+ * capture_checkpoint request in browser-kernel-protocol.ts.
+ *
+ * Response carries a {@link CheckpointCaptureResponse}: a summary when the
+ * freeze completed, or the reason it timed out or failed. A process that makes
+ * no syscall never reaches its unwind hook, so a timeout is an ordinary
+ * outcome and the machine keeps running.
+ */
+export interface CaptureCheckpointRequestMessage {
+  type: "capture_checkpoint";
+  requestId: number;
+  unwindTimeoutMs: number;
+  vforkTimeoutMs: number;
+}
+
 /** Enable / disable the syscall trace ring. Mirrors the browser host. */
 export interface SetSyscallTraceMessage {
   type: "set_syscall_trace";
@@ -362,6 +378,7 @@ export type MainToKernelMessage =
   | ResolveExecResponseMessage
   | EnumProcsRequestMessage
   | ReadProcMapsRequestMessage
+  | CaptureCheckpointRequestMessage
   | SetSyscallTraceMessage
   | DrainSyscallTraceMessage
   | HttpRequestMessage

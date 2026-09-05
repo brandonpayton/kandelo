@@ -9,7 +9,9 @@
 export class ProcessMemoryCreatorGate {
   private open = true;
   private activeCreators = 0;
+  private exclusiveOperation: string | undefined;
   private readonly drainWaiters = new Set<() => void>();
+  private readonly exclusiveDrainWaiters = new Set<() => void>();
   private destroyOperation: Promise<unknown> | undefined;
 
   /**
@@ -31,6 +33,11 @@ export class ProcessMemoryCreatorGate {
     if (!this.open) {
       throw new Error(
         `kernel worker is being destroyed; cannot start ${operation}`,
+      );
+    }
+    if (this.exclusiveOperation !== undefined) {
+      throw new Error(
+        `${this.exclusiveOperation} is in progress; cannot start ${operation}`,
       );
     }
     this.activeCreators += 1;
@@ -82,6 +89,41 @@ export class ProcessMemoryCreatorGate {
   }
 
   /**
+   * Hold admission closed for one reversible operation, then reopen it.
+   *
+   * A checkpoint freeze needs the same exclusion `closeAndWait()` provides but
+   * must give it back: a machine that resumes after a failed handover has to
+   * fork, exec, `posix_spawn`, and start pthreads again. Admission reopens in a
+   * `finally`, so a throwing or rejecting operation cannot strand the gate.
+   */
+  async runExclusive<T>(
+    operation: string,
+    exclusive: () => T | PromiseLike<T>,
+  ): Promise<T> {
+    if (!this.open) {
+      throw new Error(
+        `kernel worker is being destroyed; cannot start ${operation}`,
+      );
+    }
+    if (this.exclusiveOperation !== undefined) {
+      throw new Error(
+        `${this.exclusiveOperation} is in progress; cannot start ${operation}`,
+      );
+    }
+    this.exclusiveOperation = operation;
+    try {
+      if (this.activeCreators !== 0) {
+        await new Promise<void>((resolve) => {
+          this.exclusiveDrainWaiters.add(resolve);
+        });
+      }
+      return await exclusive();
+    } finally {
+      this.exclusiveOperation = undefined;
+    }
+  }
+
+  /**
    * Permanently close admission and wait for creators that entered first.
    *
    * Repeated calls are idempotent because whole-worker destroy is terminal.
@@ -121,6 +163,10 @@ export class ProcessMemoryCreatorGate {
       throw new Error("process memory creator admission released twice");
     }
     this.activeCreators -= 1;
+    if (this.activeCreators === 0) {
+      for (const resolve of this.exclusiveDrainWaiters) resolve();
+      this.exclusiveDrainWaiters.clear();
+    }
     if (this.open || this.activeCreators !== 0) return;
     for (const resolve of this.drainWaiters) resolve();
     this.drainWaiters.clear();

@@ -468,8 +468,8 @@ install_local_binary() {
     fi
     case "$declared_policy" in
         auto)
-            local artifact_role=executable role_status=0 imports_kernel_fork=0
-            wasm_imports_kernel_fork "$src" && imports_kernel_fork=1
+            local artifact_role=executable role_status=0 imports_migration_seed=0
+            wasm_imports_migration_seed "$src" && imports_migration_seed=1
             # `dylink.0` is an exact Wasm custom-section name, so it is present
             # as plain bytes. Use that only as a cheap prefilter: structural
             # role classification remains authoritative for every candidate.
@@ -482,7 +482,7 @@ install_local_binary() {
                     return 1
                 fi
             fi
-            if { [ "$imports_kernel_fork" = 1 ] || [ "$artifact_role" = side-module ]; } \
+            if { [ "$imports_migration_seed" = 1 ] || [ "$artifact_role" = side-module ]; } \
                 && ! wasm_has_complete_fork_instrumentation "$src"; then
                 # WHY reject every partial ABI marker before reinstrumenting:
                 # adding a second copy can turn one stale descriptor or frame
@@ -494,7 +494,9 @@ install_local_binary() {
                 echo "  applying wasm-fork-instrument to $(basename "$src")"
                 local instrumented
                 instrumented="$(mktemp "${TMPDIR:-/tmp}/wpk-fork-instrument.XXXXXX.wasm")"
-                if ! "$repo_root/scripts/run-wasm-fork-instrument.sh" "$src" -o "$instrumented"; then
+                if ! "$repo_root/scripts/run-wasm-fork-instrument.sh" "$src" \
+                    --checkpoint-entry kernel.kernel_checkpoint \
+                    -o "$instrumented"; then
                     rm -f "$instrumented"
                     return 1
                 fi

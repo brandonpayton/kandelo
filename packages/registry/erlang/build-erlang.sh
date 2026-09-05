@@ -704,13 +704,14 @@ prepare_runtime_wasm() {
     local artifact_abi
 
     wasm-strip "$artifact"
-    if wasm_imports_kernel_fork "$artifact" && ! wasm_has_complete_fork_instrumentation "$artifact"; then
+    if wasm_imports_migration_seed "$artifact" && ! wasm_has_complete_fork_instrumentation "$artifact"; then
         if wasm_has_any_fork_instrumentation "$artifact"; then
             wasm_require_fork_instrumentation_if_needed "$artifact"
             return 1
         fi
         instrumented=$(mktemp "$WORK_DIR/erlang-fork-instrument.XXXXXX.wasm")
-        "$REPO_ROOT/scripts/run-wasm-fork-instrument.sh" "$artifact" -o "$instrumented"
+        "$REPO_ROOT/scripts/run-wasm-fork-instrument.sh" "$artifact" \
+            --checkpoint-entry kernel.kernel_checkpoint -o "$instrumented"
         chmod 0755 "$instrumented"
         mv "$instrumented" "$artifact"
     fi

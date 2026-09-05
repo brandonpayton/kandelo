@@ -303,6 +303,29 @@ export class ForkProcessContinuationCoordinator {
   }
 
   /**
+   * Retire this worker as owner of the process-owned sparse table state.
+   *
+   * Only a checkpoint needs this: its threads share one process image, so one
+   * of them must write the shared tables and the rest must not.
+   */
+  releaseProcessTableStateOwnership(): void {
+    this.requirePhase("idle", "release process table state ownership");
+    this.registry.releaseProcessTableStateOwnership();
+  }
+
+  /**
+   * Re-elect this worker as owner of the process-owned sparse table state.
+   *
+   * A checkpoint retires the coordinates for the length of one capture only. A
+   * later fork on the same worker needs them back, because a fork child gets
+   * its own process image and must carry the physical table state.
+   */
+  restoreProcessTableStateOwnership(): void {
+    this.requirePhase("idle", "restore process table state ownership");
+    this.registry.restoreProcessTableStateOwnership();
+  }
+
+  /**
    * Snapshot all activations, allocate their private runtime prefixes, and put
    * every instance in UNWINDING before the private transport crosses modules.
    */

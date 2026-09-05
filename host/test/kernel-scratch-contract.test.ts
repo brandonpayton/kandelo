@@ -1243,6 +1243,11 @@ const auditAllowances: AuditAllowance[] = [
     why: "The trusted Node/browser audio driver must retain the shared backing for the checked PCM control-and-ring range; the exact claim entry validates the pointer, length, shared backing, and transport header before this machine-level descriptor is published.",
   },
   {
+    key: "host/src/kernel-worker.ts::CentralizedKernelWorker.copyKernelMemoryForCheckpoint::kernel-memory-escape::kernelEntryIntrinsicApply( kernelEntryIntrinsicMemoryBuffer, this.#kernelMemory, [], )",
+    disposition: "kernel-read",
+    why: "A checkpoint's kernel bucket is the whole kernel memory, so this is the one read with no pointer or length left to check; the backing never escapes, because the view is copied with slice() in the same expression and only the detached copy is returned.",
+  },
+  {
     key: "host/src/kernel-worker.ts::CentralizedKernelWorker.#createTestAuthority::scratch-address-contract::options.instance",
     disposition: "kernel-control",
     why: "The module-secret test initializer assigns this instance only after both the allocator-private region ownership check and the entry-gate ownership check prove the same exact gated generation.",

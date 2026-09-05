@@ -88,6 +88,7 @@ import {
   requireForkUnwindTag,
 } from "./fork-unwind-transport";
 import { waitForForkReplayCommit } from "./fork-replay-gate";
+import { waitForCheckpointFreezeResume } from "./checkpoint-freeze-gate";
 import {
   computeForkModuleTemplateId,
   computeForkModuleTemplateIdSync,
@@ -559,13 +560,13 @@ function buildKernelImports(
       return result;
     },
 
-    // Checkpoint capture is not implemented yet. The glue only calls this when
-    // the channel's checkpoint request word is set, and nothing sets it, so
-    // reaching it means a request was published without a capture path behind
-    // it. Fail loudly rather than let the guest continue as if it had unwound.
+    // Replaced by the capturing implementation once the process instance and
+    // its continuation coordinator exist, exactly as kernel_fork is. Reaching
+    // this one means a checkpoint was requested before the process could
+    // unwind, so fail loudly rather than let the guest continue as if it had.
     kernel_checkpoint: (): number => {
       throw new Error(
-        "kernel_checkpoint reached, but checkpoint capture is not implemented.",
+        "kernel_checkpoint reached before the process continuation exists.",
       );
     },
 
@@ -3319,6 +3320,12 @@ export async function centralizedWorkerMain(
     );
     // Fork state — captured by kernel_fork closure
     let forkResult = 0;
+    // Which import opened the capture the entry loop is about to seal. Both
+    // unwind through the same instrumented path, but only fork sends a fork
+    // syscall afterwards. The loop reads it through a call so control-flow
+    // analysis uses the declared type rather than the initializer.
+    let captureReason: "fork" | "checkpoint" = "fork";
+    const capturingCheckpoint = (): boolean => captureReason === "checkpoint";
     let forkMode: ProcessForkMode = initData.isForkChild
       ? (processForkMode(initData.forkMode ?? -1) ?? (() => {
           throw new Error(`pid=${pid}: fork child is missing a valid fork mode`);
@@ -3714,12 +3721,17 @@ export async function centralizedWorkerMain(
         if (!processDlopenSupport || !processTableReplication) {
           throw new Error(`pid=${pid}: fork archive owner is not initialized`);
         }
+        // A checkpoint freeze has every thread of the process holding one of
+        // these readers until the freeze resumes, and reconcileNow needs the
+        // writer, which cannot be taken while a peer holds a reader.
+        // Reconciling only when the replica is actually behind keeps that
+        // writer out of the common path.
         for (;;) {
-          processTableReplication.reconcileNow();
           processDlopenSupport.acquireArchiveReader();
           processForkArchiveReaderHeld = true;
           if (processTableReplication.isCurrentUnderLock()) return;
           releaseProcessForkArchiveReader();
+          processTableReplication.reconcileNow();
         }
       };
 
@@ -3779,6 +3791,7 @@ export async function centralizedWorkerMain(
         }
         if (borrowedForkChild) return -STARTUP_EAGAIN;
         forkMode = mode;
+        captureReason = "fork";
 
         // The arena and every activation prefix are allocated before any user
         // frame commits. If this fails, fork returns errno with no partially
@@ -3802,6 +3815,59 @@ export async function centralizedWorkerMain(
           }
           releaseProcessForkArchiveReader();
           forkBufAddr = 0;
+          if (error instanceof ContinuationAllocationError) return -error.errno;
+          throw error;
+        }
+        return 0; // ignored during unwind
+      };
+
+      kernelImports.kernel_checkpoint = (): number => {
+        if (!processInstance) return -38; // ENOSYS
+        const phase = processContinuation.phaseName();
+        if (phase === "parent-replay" || phase === "child-replay") {
+          try {
+            processContinuation.finishReplay();
+          } finally {
+            releaseProcessForkArchiveReader();
+          }
+          // Zero is "resumed in place". A process restored on another host
+          // returns through this same site and must be told apart from one the
+          // keeper rewound after a failed handover.
+          return 0;
+        }
+        // A checkpoint request is published while the process is parked in a
+        // syscall, so the continuation is idle by the time the post-syscall
+        // hook runs. Any other phase means a fork is mid-flight on this stack
+        // and the two captures would share one arena.
+        if (phase !== "idle") {
+          throw new Error(
+            `pid=${pid}: checkpoint import reached while process continuation is ${phase}`,
+          );
+        }
+        if (borrowedForkChild) return -STARTUP_EAGAIN;
+        if (!initData.checkpointFreezeGate) {
+          throw new Error(`pid=${pid}: checkpoint request without a freeze gate`);
+        }
+        captureReason = "checkpoint";
+
+        acquireCurrentProcessForkArchiveReader();
+        const arena = newModuleStateArena();
+        try {
+          arena.begin();
+          processContinuation.beginCapture(arena);
+          importedStateCapture?.appendTo(arena);
+        } catch (error) {
+          if (processContinuation.phaseName() !== "idle") {
+            try {
+              processContinuation.abort();
+            } catch {
+              // Preserve the capture failure; abort has already made the
+              // transaction unreachable before attempting cleanup.
+            }
+          } else if (arena.hasActiveArena()) {
+            arena.release();
+          }
+          releaseProcessForkArchiveReader();
           if (error instanceof ContinuationAllocationError) return -error.errno;
           throw error;
         }
@@ -4302,6 +4368,22 @@ export async function centralizedWorkerMain(
               `pid=${pid}: private fork-unwind exception escaped while ` +
                 `process continuation is ${phase}`,
             );
+          }
+          if (phase === "capture" && capturingCheckpoint()) {
+            processContinuation.sealCapture();
+            // The frames only exist between this seal and the replay below, so
+            // the keeper must read this memory inside that window. Report, then
+            // park until it says the machine is resuming.
+            port.postMessage({
+              type: "checkpoint_unwound",
+              pid,
+            } satisfies WorkerToHostMessage);
+            waitForCheckpointFreezeResume(
+              initData.checkpointFreezeGate as SharedArrayBuffer,
+              `pid=${pid}`,
+            );
+            processContinuation.beginParentReplay();
+            continue;
           }
           if (phase === "capture") {
             processContinuation.sealCapture();
@@ -5586,6 +5668,9 @@ export async function centralizedThreadWorkerMain(
     };
     let forkResult = 0;
     let forkMode: ProcessForkMode = PROCESS_FORK_MODE_FORK;
+    let threadCaptureReason: "fork" | "checkpoint" = "fork";
+    const threadCapturingCheckpoint = (): boolean =>
+      threadCaptureReason === "checkpoint";
 
     let kernelThreadExitStatus: number | null = null;
     const kernelImports = buildKernelImports(
@@ -5642,14 +5727,15 @@ export async function centralizedThreadWorkerMain(
           );
         }
         forkMode = mode;
+        threadCaptureReason = "fork";
 
         try {
-          // Reconciliation may instantiate a missing side module and execute
-          // its start function, so it requires writer ownership. Afterward,
-          // acquire the long-lived fork reader and verify no publication won
-          // the handoff race before capturing activation state.
+          // Take the long-lived fork reader and verify no publication won the
+          // handoff race before capturing activation state. Reconciliation may
+          // instantiate a missing side module and execute its start function,
+          // so it requires writer ownership, which no peer's reader may be
+          // outstanding for; ask for it only when the replica is behind.
           for (;;) {
-            threadTableReplication?.reconcileNow();
             acquirePthreadForkLock();
             if (
               !threadTableReplication ||
@@ -5658,6 +5744,7 @@ export async function centralizedThreadWorkerMain(
               break;
             }
             releasePthreadForkLock();
+            threadTableReplication.reconcileNow();
           }
         } catch (error) {
           releasePthreadForkLock();
@@ -5671,6 +5758,76 @@ export async function centralizedThreadWorkerMain(
           threadImportedStateCapture?.appendTo(arena);
         } catch (error) {
           if (arena.hasActiveArena()) arena.release();
+          releasePthreadForkLock();
+          if (error instanceof ContinuationAllocationError) return -error.errno;
+          throw error;
+        }
+        return 0;
+      };
+
+      kernelImports.kernel_checkpoint = (): number => {
+        if (!threadInstance || !threadProcessContinuation) return -38; // ENOSYS
+        const phase = threadProcessContinuation.phaseName();
+        if (phase === "parent-replay" || phase === "child-replay") {
+          try {
+            threadProcessContinuation.finishReplay();
+            // The restore must follow finishReplay: beginParentReplay's
+            // registry.restoreModuleState() has to read the same ownership
+            // answer the save read.
+            threadProcessContinuation.restoreProcessTableStateOwnership();
+          } finally {
+            releasePthreadForkLock();
+          }
+          return 0;
+        }
+        if (phase !== "idle") {
+          throw new Error(
+            `pid=${pid} tid=${tid}: checkpoint import reached while process ` +
+              `continuation is ${phase}`,
+          );
+        }
+        if (!initData.checkpointFreezeGate) {
+          throw new Error(
+            `pid=${pid} tid=${tid}: checkpoint request without a freeze gate`,
+          );
+        }
+        threadCaptureReason = "checkpoint";
+
+        try {
+          for (;;) {
+            acquirePthreadForkLock();
+            if (
+              !threadTableReplication ||
+              threadTableReplication.isCurrentUnderLock()
+            ) {
+              break;
+            }
+            releasePthreadForkLock();
+            threadTableReplication.reconcileNow();
+          }
+        } catch (error) {
+          releasePthreadForkLock();
+          throw error;
+        }
+
+        // The process image is shared, so the main thread writes the sparse
+        // table state and every pthread leaves it alone.
+        threadProcessContinuation.releaseProcessTableStateOwnership();
+
+        const arena = newThreadModuleStateArena();
+        try {
+          arena.begin();
+          threadProcessContinuation.beginCapture(arena);
+          threadImportedStateCapture?.appendTo(arena);
+        } catch (error) {
+          if (arena.hasActiveArena()) arena.release();
+          // A capture that never starts has no replay to take the coordinates
+          // back in, and the guest keeps running. beginCapture cancels itself
+          // to idle, so any other phase is a transaction this thread cannot
+          // finish and its ownership is the smaller problem.
+          if (threadProcessContinuation.phaseName() === "idle") {
+            threadProcessContinuation.restoreProcessTableStateOwnership();
+          }
           releasePthreadForkLock();
           if (error instanceof ContinuationAllocationError) return -error.errno;
           throw error;
@@ -5885,7 +6042,19 @@ export async function centralizedThreadWorkerMain(
           "the pthread instance has no shared table/stack binding",
       );
     }
-    threadTableReplication?.reconcileNow();
+    // A thread can start while its peers are parked in a checkpoint freeze
+    // holding archive readers, and reconcileNow needs the writer. Check the
+    // replica under a reader first so a thread with nothing to adopt reaches
+    // its first syscall, sees the pending unwind request, and reports.
+    if (threadTableReplication) {
+      for (;;) {
+        acquirePthreadForkLock();
+        const behind = !threadTableReplication.isCurrentUnderLock();
+        releasePthreadForkLock();
+        if (!behind) break;
+        threadTableReplication.reconcileNow();
+      }
+    }
 
     // Initialize Wasm TLS for this thread in the slot's explicit TLS/control page.
     const wasmInitTls = instance.exports.__wasm_init_tls as
@@ -5980,6 +6149,22 @@ export async function centralizedThreadWorkerMain(
             `pid=${pid} tid=${tid}: private fork-unwind exception escaped ` +
               `while process continuation is ${phase}`,
           );
+        }
+        if (phase === "capture" && threadCapturingCheckpoint()) {
+          threadProcessContinuation.sealCapture();
+          // The frames exist only until the gate reopens, so the report and
+          // the read that follows it are the whole capture window.
+          port.postMessage({
+            type: "checkpoint_unwound",
+            pid,
+            tid,
+          } satisfies WorkerToHostMessage);
+          waitForCheckpointFreezeResume(
+            initData.checkpointFreezeGate as SharedArrayBuffer,
+            `pid=${pid} tid=${tid}`,
+          );
+          threadProcessContinuation.beginParentReplay();
+          continue;
         }
         if (phase === "capture") {
           threadProcessContinuation.sealCapture();

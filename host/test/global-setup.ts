@@ -5,8 +5,8 @@
  *
  * Uses wasm32posix-cc from the SDK for C, and wat2wasm (wabt) for WAT
  * fixtures. C outputs are rebuilt unless their embedded content digest covers
- * the exact source, compiler wrapper/version, installed sysroot, and (where
- * used) instrumenter binary. The chromium check is a no-op when the binary is
+ * the exact source, compiler wrapper/version, installed sysroot, and (for
+ * wasm32) instrumenter binary. The chromium check is a no-op when the binary is
  * already cached.
  */
 
@@ -38,7 +38,6 @@ const C_TEST_FIXTURES = [
     // developer-facing example/local program.
     src: join(fixturesDir, "fork-memory-clone.c"),
     out: join(fixturesDir, "fork-memory-clone.wasm"),
-    forkInstrument: true,
   },
 ];
 
@@ -124,19 +123,12 @@ const TEST_PROGRAMS = [
   "thread-exit-group.c",
   "fifo_lifecycle_test.c",
   "kernel_allocator_churn_test.c",
+  "checkpoint-loop.c",
+  "checkpoint-threads.c",
 ];
 
 /** Memory64 counterparts needed to prove pointer-width-neutral syscall input. */
 const WASM64_TEST_PROGRAMS = ["lseek_invalid_test.c"];
-
-const FORK_INSTRUMENTED_PROGRAMS = new Set([
-  "environment_lifecycle_test.c",
-  "pthread_channel_reuse_test.c",
-  "unix_listener_exec_test.c",
-  "wait_lifecycle_test.c",
-  "fifo_lifecycle_test.c",
-  "kernel_allocator_churn_test.c",
-]);
 
 /** WAT fixtures used by host runtime tests. */
 const WAT_FIXTURES = [
@@ -153,19 +145,22 @@ function needsRebuild(srcFile: string, outFile: string): boolean {
   return srcStat.mtimeMs > outStat.mtimeMs;
 }
 
-function compileCTestProgram(
-  src: string,
-  out: string,
-  forkInstrument: boolean,
-): void {
-  if (!forkInstrument) {
-    execFileSync("wasm32posix-cc", [src, "-o", out], {
-      cwd: repoRoot,
-      stdio: "pipe",
-    });
-    return;
-  }
+/**
+ * The second seed import named when instrumenting a wasm32 fixture, matching
+ * `scripts/build-programs.sh`. A program that never forks reaches its unwind
+ * only through `kernel.kernel_checkpoint`, and instrumenting such a program
+ * without this seed emits no `wpk_fork_*` exports at all.
+ */
+const FORK_INSTRUMENT_SEEDS = ["--checkpoint-entry", "kernel.kernel_checkpoint"];
 
+/**
+ * Compile one wasm32 fixture the way `scripts/build-programs.sh` does.
+ *
+ * Instrumentation is unconditional. A fixture built any other way is a
+ * different artifact from the one the SDK publishes, and a Vitest run that
+ * rebuilds it would silently replace the published one on disk.
+ */
+function compileCTestProgram(src: string, out: string): void {
   const linked = `${out}.linked`;
   try {
     execFileSync("wasm32posix-cc", [src, "-o", linked], {
@@ -176,6 +171,7 @@ function compileCTestProgram(
       "bash",
       [
         join(repoRoot, "scripts/run-wasm-fork-instrument.sh"),
+        ...FORK_INSTRUMENT_SEEDS,
         linked,
         "-o",
         out,
@@ -187,10 +183,15 @@ function compileCTestProgram(
   }
 }
 
+/**
+ * Fork rewind instrumentation is a wasm32 artifact contract, so a wasm32
+ * fixture always carries it and a wasm64 fixture never does. This is the same
+ * split `scripts/build-programs.sh` applies.
+ */
 function fixtureBuildContract(
   arch: "wasm32" | "wasm64",
-  forkInstrumented: boolean,
 ): ProgramFixtureBuildContract {
+  const forkInstrumented = arch === "wasm32";
   const compiler = `${arch}posix-cc`;
   const compilerVersion = execFileSync(compiler, ["--version"], {
     cwd: repoRoot,
@@ -221,9 +222,14 @@ function fixtureBuildContract(
       instrumenter,
     );
   }
+  // The seed arguments belong in the identity: they change what the
+  // instrumenter emits without changing any of the input files above, so a
+  // fixture built under different seeds must not read as current.
   return captureProgramFixtureBuildContract(
     repoRoot,
-    `${arch}\nfork=${forkInstrumented}\n${compilerVersion}`,
+    `${arch}\nfork=${forkInstrumented}\nseeds=${
+      forkInstrumented ? FORK_INSTRUMENT_SEEDS.join(" ") : ""
+    }\n${compilerVersion}`,
     inputs,
   );
 }
@@ -263,19 +269,17 @@ export async function setup() {
     { cwd: repoRoot, stdio: "pipe" },
   );
 
-  const wasm32Contract = fixtureBuildContract("wasm32", false);
-  const wasm32ForkContract = fixtureBuildContract("wasm32", true);
-  const wasm64Contract = fixtureBuildContract("wasm64", false);
+  const wasm32Contract = fixtureBuildContract("wasm32");
+  const wasm64Contract = fixtureBuildContract("wasm64");
 
-  for (const { src, out, forkInstrument = false } of C_TEST_FIXTURES) {
-    const contract = forkInstrument ? wasm32ForkContract : wasm32Contract;
-    if (!programFixtureNeedsRebuild(src, out, contract)) continue;
+  for (const { src, out } of C_TEST_FIXTURES) {
+    if (!programFixtureNeedsRebuild(src, out, wasm32Contract)) continue;
 
     console.log(
       `[global-setup] Compiling ${src.slice(repoRoot.length + 1)}...`,
     );
-    compileCTestProgram(src, out, forkInstrument);
-    stampProgramFixture(src, out, contract);
+    compileCTestProgram(src, out);
+    stampProgramFixture(src, out, wasm32Contract);
   }
 
   for (const { arch, src, out } of RESOLVED_PROGRAM_FIXTURES) {
@@ -286,10 +290,14 @@ export async function setup() {
     console.log(
       `[global-setup] Compiling ${src.slice(repoRoot.length + 1)} (${arch})...`,
     );
-    execFileSync(`${arch}posix-cc`, [src, "-o", out], {
-      cwd: repoRoot,
-      stdio: "pipe",
-    });
+    if (arch === "wasm64") {
+      execFileSync("wasm64posix-cc", [src, "-o", out], {
+        cwd: repoRoot,
+        stdio: "pipe",
+      });
+    } else {
+      compileCTestProgram(src, out);
+    }
     stampProgramFixture(src, out, contract);
   }
 
@@ -301,15 +309,11 @@ export async function setup() {
       console.warn(`[global-setup] Source not found: ${src}, skipping`);
       continue;
     }
-
-    const contract = FORK_INSTRUMENTED_PROGRAMS.has(cFile)
-      ? wasm32ForkContract
-      : wasm32Contract;
-    if (!programFixtureNeedsRebuild(src, out, contract)) continue;
+    if (!programFixtureNeedsRebuild(src, out, wasm32Contract)) continue;
 
     console.log(`[global-setup] Compiling ${cFile}...`);
-    compileCTestProgram(src, out, FORK_INSTRUMENTED_PROGRAMS.has(cFile));
-    stampProgramFixture(src, out, contract);
+    compileCTestProgram(src, out);
+    stampProgramFixture(src, out, wasm32Contract);
   }
 
   for (const cFile of WASM64_TEST_PROGRAMS) {

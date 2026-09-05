@@ -92,6 +92,8 @@ import {
   CH_ARG_SIZE,
   CH_ARGS,
   CH_ARGS_COUNT,
+  CH_CHECKPOINT_REQUEST,
+  CH_CHECKPOINT_REQUEST_UNWIND,
   CH_DATA,
   CH_DATA_SIZE,
   CH_ERRNO,
@@ -327,6 +329,8 @@ const kernelEntryIntrinsicMemoryBuffer =
   )!.get!;
 const kernelEntryIntrinsicDataViewSetBigInt64 =
   KernelEntryIntrinsicDataView.prototype.setBigInt64;
+const kernelEntryIntrinsicDataViewGetUint32 =
+  KernelEntryIntrinsicDataView.prototype.getUint32;
 const kernelEntryIntrinsicDataViewSetUint32 =
   KernelEntryIntrinsicDataView.prototype.setUint32;
 const kernelEntryIntrinsicAtomics = Atomics;
@@ -3046,6 +3050,13 @@ export class CentralizedKernelWorker {
    * kernel wake-event stream, so ordinary syscall completion does not need an
    * extra Wasm state query. */
   private stoppedPids = new Set<number>();
+  /**
+   * Pids whose next non-deferred syscall completion must carry an unwind
+   * request. A checkpoint freeze arms this; it is empty at every other time.
+   */
+  private checkpointUnwindPids = new Set<number>();
+  /** Pids held out of dispatch by a checkpoint freeze rather than by SIGSTOP. */
+  private checkpointHeldPids = new Set<number>();
   /**
    * CONTINUED transitions observed while fork/spawn/exec has a live kernel
    * Process but has not registered its replacement memory/channels yet. The
@@ -7801,6 +7812,99 @@ export class CentralizedKernelWorker {
       }
       return lease.copyOut(0, n);
     });
+  }
+
+  /**
+   * Copy the kernel's linear memory, which is the entire kernel bucket.
+   *
+   * T0.2 measured both kernel mutable globals at their initial values at a
+   * dispatch boundary, so a fresh instantiation against these bytes reproduces
+   * them and nothing else has to be carried. The copy is taken rather than the
+   * Memory handed out: a checkpoint is a value, and a live alias would keep
+   * mutating after the freeze released.
+   */
+  copyKernelMemoryForCheckpoint(): Uint8Array {
+    if (this.#kernelMemory === null) {
+      throw new Error("kernel memory is not instantiated");
+    }
+    // The captured intrinsic getter, applied here rather than through the
+    // process-memory helper: that helper's contract is process backings, and
+    // this is the one place the kernel's own backing is read whole.
+    const buffer = kernelEntryIntrinsicApply(
+      kernelEntryIntrinsicMemoryBuffer,
+      this.#kernelMemory,
+      [],
+    ) as ArrayBufferLike;
+    return new Uint8Array(buffer).slice();
+  }
+
+  /**
+   * Ask every registered process to unwind at its next syscall boundary.
+   *
+   * Returns the pids that were armed. Arming publishes nothing on its own: the
+   * request word reaches a thread only when that thread's own syscall
+   * completes, which is the point at which the guest reads it.
+   */
+  armCheckpointUnwind(): number[] {
+    const pids = [...this.processes.keys()];
+    this.checkpointUnwindPids = new Set(pids);
+    return pids;
+  }
+
+  /**
+   * Stop asking for unwinds. A word already published cannot be recalled, so a
+   * process can still unwind after this returns; its freeze gate is what
+   * releases it.
+   */
+  disarmCheckpointUnwind(): void {
+    this.checkpointUnwindPids.clear();
+  }
+
+  /**
+   * Hold every registered process at its syscall boundary, reusing the
+   * stopped-process dispatch gate rather than a second freeze mechanism.
+   *
+   * This is the checkpoint's leg 1. It deliberately does not touch kernel
+   * process state: `stoppedPids` is the host-side dispatch gate and
+   * `resumeStoppedProcess` requires the authoritative state to be Running, so
+   * a machine frozen this way resumes through the same barrier a SIGCONT uses.
+   * A process the kernel really has stopped is left to that owner.
+   */
+  holdProcessDispatchForCheckpoint(): number[] {
+    const held: number[] = [];
+    for (const pid of this.processes.keys()) {
+      if (this.stoppedPids.has(pid)) continue;
+      this.stoppedPids.add(pid);
+      this.checkpointHeldPids.add(pid);
+      held.push(pid);
+    }
+    return held;
+  }
+
+  /**
+   * Release every process this freeze held, and only those.
+   *
+   * Returns the pids whose resume barrier did not complete. A pid that exited
+   * or was stopped for real while the freeze ran is reported rather than
+   * retried here, because its owner decides what happens next.
+   */
+  releaseProcessDispatchForCheckpoint(): number[] {
+    const unreleased: number[] = [];
+    const held = [...this.checkpointHeldPids];
+    this.checkpointHeldPids.clear();
+    for (const pid of held) {
+      if (!this.stoppedPids.has(pid)) continue;
+      let resumed = false;
+      this.#runImmediateKernelEntry(
+        "checkpoint freeze dispatch release",
+        (entry) => {
+          resumed = this.resumeStoppedProcess(pid, entry);
+          return undefined;
+        },
+      );
+      if (!resumed) unreleased.push(pid);
+    }
+    return unreleased;
   }
 
   /**
@@ -13882,6 +13986,8 @@ export class CentralizedKernelWorker {
       [CH_ERRNO, prepared.errVal, true],
     );
 
+    this.#publishCheckpointUnwindRequest(channel, processView);
+
     // The copied signal record now belongs to the guest. A later syscall may
     // dequeue another signal after this boundary has actually been observed.
     this.resumePreparedSignals?.delete(channel);
@@ -13903,6 +14009,40 @@ export class CentralizedKernelWorker {
     if (prepared.relistenRequested && this.isRegisteredChannel(channel)) {
       this.relistenChannel(channel);
     }
+  }
+
+  /**
+   * Ask this thread to unwind at the post-syscall hook it is about to reach.
+   *
+   * The word lives inside the declared data buffer, so a syscall that transfers
+   * the whole buffer writes across it. Publishing here, on the completion the
+   * guest is about to observe, is the only placement that survives every
+   * syscall shape.
+   *
+   * A deferred completion is not a legal checkpoint boundary. Its caller is
+   * ppoll's own timestamp read, and the guest's post-syscall hook runs for it
+   * exactly as it does for a real syscall, so an unwind there would leave the
+   * enclosing ppoll mid-computation. That is the same reason
+   * `#dequeueSignalForDelivery` declines to write the signal area, and the two
+   * decisions are deliberately made from the same flag. The request stays armed
+   * and the enclosing ppoll publishes it instead.
+   */
+  #publishCheckpointUnwindRequest(
+    channel: ChannelInfo,
+    processView: DataView,
+  ): void {
+    if (!this.checkpointUnwindPids.has(channel.pid)) return;
+    const requestFlags = kernelEntryIntrinsicApply(
+      kernelEntryIntrinsicDataViewGetUint32,
+      processView,
+      [CH_REQUEST_FLAGS, true],
+    ) as number;
+    if ((requestFlags & CH_REQUEST_FLAG_DEFER_SIGNAL_DELIVERY) !== 0) return;
+    kernelEntryIntrinsicApply(
+      kernelEntryIntrinsicDataViewSetUint32,
+      processView,
+      [CH_CHECKPOINT_REQUEST, CH_CHECKPOINT_REQUEST_UNWIND, true],
+    );
   }
 
   private materializePreparedChannelCompletion(

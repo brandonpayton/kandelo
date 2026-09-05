@@ -111,6 +111,22 @@ export class VforkLifetimeCoordinator<
     return this.byMemory.has(memory);
   }
 
+  /**
+   * Resolve once every borrow live at the time of the call has ended.
+   *
+   * A checkpoint freeze cannot read process memory while a vfork child still
+   * aliases its parent's address space, and a borrowing parent is suspended
+   * rather than parked in `__syscall`, so stopping every process does not
+   * cover it. The wait is unbounded by construction: `noteFailedExec` caps
+   * nothing, so a child looping on a failing `execve` holds its parent for as
+   * long as it likes. The caller supplies the timeout.
+   */
+  async settleActiveBorrows(): Promise<void> {
+    await Promise.all(
+      [...this.byMemory.values()].map((lifetime) => lifetime.handle.completion),
+    );
+  }
+
   isActiveBorrower(generation: TGeneration): boolean {
     const lifetime = this.byChild.get(generation);
     return lifetime?.phase === "borrowing";

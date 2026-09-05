@@ -822,6 +822,35 @@ wasm_imports_kernel_fork() {
     grep -a -q 'kernel_fork' "$path" 2>/dev/null
 }
 
+wasm_imports_kernel_checkpoint() {
+    local path="${1:-}"
+    wasm_is_binary "$path" || return 1
+    local scanned
+    if command -v wasm-objdump >/dev/null 2>&1; then
+        _wasm_stream_awk '
+            /<- kernel\.kernel_checkpoint$/ { found = 1 }
+            END { exit(found ? 0 : 1) }
+        ' wasm-objdump -x "$path"
+        scanned=$?
+        # wabt 1.0.37 exits nonzero on a module that uses reference types,
+        # which every instrumented artifact does. A failed decode is no answer,
+        # so scan the bytes rather than report the import absent.
+        [ "$scanned" -le 1 ] && return "$scanned"
+    fi
+    # Fallback for environments without wabt/binaryen tools. The field name is
+    # stored as plain UTF-8 in the import section.
+    grep -a -q 'kernel_checkpoint' "$path" 2>/dev/null
+}
+
+# Return 0 when either instrumentation seed is present. A program that never
+# forks still unwinds for a checkpoint, so `kernel.kernel_checkpoint` alone is
+# enough to require instrumentation.
+wasm_imports_migration_seed() {
+    local path="${1:-}"
+    wasm_imports_kernel_fork "$path" && return 0
+    wasm_imports_kernel_checkpoint "$path"
+}
+
 # Return 0 only for the `env.fork` import used by a dynamically linked Wasm
 # side module. Main process modules use `kernel.kernel_fork` instead.
 wasm_imports_side_module_fork() {

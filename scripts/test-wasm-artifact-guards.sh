@@ -482,6 +482,61 @@ if wasm_has_stale_abi "$work/no-abi.wasm" 18; then
     exit 1
 fi
 
+cat >"$work/checkpoint-only.wat" <<'WAT'
+(module
+  (import "kernel" "kernel_checkpoint" (func (result i32)))
+  (func (export "_start")))
+WAT
+wat2wasm "$work/checkpoint-only.wat" -o "$work/checkpoint-only.wasm"
+if wasm_imports_kernel_fork "$work/checkpoint-only.wasm"; then
+    echo "ERROR: a checkpoint-only program was read as importing kernel_fork" >&2
+    exit 1
+fi
+if ! wasm_imports_kernel_checkpoint "$work/checkpoint-only.wasm"; then
+    echo "ERROR: the checkpoint import predicate missed kernel_checkpoint" >&2
+    exit 1
+fi
+if ! wasm_imports_migration_seed "$work/checkpoint-only.wasm"; then
+    echo "ERROR: a checkpoint-only program carries no migration seed" >&2
+    exit 1
+fi
+if wasm_imports_migration_seed "$work/no-abi.wasm"; then
+    echo "ERROR: a program importing neither seed was read as seeded" >&2
+    exit 1
+fi
+
+mkdir "$work/failing-objdump-bin"
+cat >"$work/failing-objdump-bin/wasm-objdump" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+chmod +x "$work/failing-objdump-bin/wasm-objdump"
+if ! PATH="$work/failing-objdump-bin:$PATH" \
+    wasm_imports_kernel_checkpoint "$work/checkpoint-only.wasm"; then
+    echo "ERROR: a failed wasm-objdump decode reported kernel_checkpoint absent" >&2
+    exit 1
+fi
+if PATH="$work/failing-objdump-bin:$PATH" \
+    wasm_imports_kernel_checkpoint "$work/no-abi.wasm"; then
+    echo "ERROR: a failed wasm-objdump decode invented a kernel_checkpoint import" >&2
+    exit 1
+fi
+
+cat >"$work/fork-only.wat" <<'WAT'
+(module
+  (import "kernel" "kernel_fork" (func (param i32 i32 i32) (result i32)))
+  (func (export "_start")))
+WAT
+wat2wasm "$work/fork-only.wat" -o "$work/fork-only.wasm"
+if wasm_imports_kernel_checkpoint "$work/fork-only.wasm"; then
+    echo "ERROR: a fork-only program was read as importing kernel_checkpoint" >&2
+    exit 1
+fi
+if ! wasm_imports_migration_seed "$work/fork-only.wasm"; then
+    echo "ERROR: a fork-only program carries no migration seed" >&2
+    exit 1
+fi
+
 cat >"$work/unapproved-reserved-import.wat" <<'WAT'
 (module
   (import "env" "__wasm_posix_after_fork_child" (func))

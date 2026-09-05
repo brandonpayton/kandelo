@@ -330,6 +330,38 @@ describe("shared vfork lifetime coordinator", () => {
     expect(coordinator.activeCount).toBe(0);
   });
 
+  it("settles every live borrow for a checkpoint freeze", async () => {
+    const coordinator = new VforkLifetimeCoordinator<Generation>();
+    const firstMemory = sharedMemory();
+    const secondMemory = sharedMemory();
+    const firstChild = generation("first-child", firstMemory);
+    const secondChild = generation("second-child", secondMemory);
+    coordinator.begin(80, 81, generation("first-parent", firstMemory), firstChild);
+    coordinator.begin(
+      90,
+      91,
+      generation("second-parent", secondMemory),
+      secondChild,
+    );
+
+    const settled = coordinator.settleActiveBorrows();
+    await expectPending(settled);
+
+    coordinator.markChildMayAccessMemory(firstChild);
+    coordinator.completeAfterExactTeardown(firstChild, "exit");
+    await expectPending(settled);
+
+    coordinator.markChildMayAccessMemory(secondChild);
+    coordinator.completeAfterExactTeardown(secondChild, "exit");
+    await expect(settled).resolves.toBeUndefined();
+    expect(coordinator.activeCount).toBe(0);
+  });
+
+  it("settles immediately when no borrow is live", async () => {
+    const coordinator = new VforkLifetimeCoordinator<Generation>();
+    await expect(coordinator.settleActiveBorrows()).resolves.toBeUndefined();
+  });
+
   it("supports repeated lifetimes but never reuses a child generation", async () => {
     const coordinator = new VforkLifetimeCoordinator<Generation>();
     const memory = sharedMemory();

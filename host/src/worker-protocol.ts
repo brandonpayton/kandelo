@@ -92,6 +92,14 @@ export interface CentralizedWorkerInitMessage {
    */
   forkReplayGate?: SharedArrayBuffer;
   /**
+   * Checkpoint freeze gate for this process.
+   *
+   * The process announces that its frames are captured, then waits here while
+   * the keeper reads its memory. The keeper reopens the gate to rewind the
+   * process back into the syscall it left.
+   */
+  checkpointFreezeGate?: SharedArrayBuffer;
+  /**
    * Entry-point override for fork children created by a non-main thread.
    *
    * A pthread worker that calls fork() unwinds through its pthread entry
@@ -158,6 +166,12 @@ export interface CentralizedThreadInitMessage {
   kernelAbiVersion?: number;
   /** See [`CentralizedWorkerInitMessage#kernelAbiContractDigest`]. */
   kernelAbiContractDigest?: Uint8Array;
+  /**
+   * This thread's own checkpoint freeze gate, minted by
+   * `CheckpointFreezeGateCoordinator.registerThread`. A resume is consumed by
+   * the worker it wakes, so no two workers can share one gate.
+   */
+  checkpointFreezeGate?: SharedArrayBuffer;
 }
 
 export interface WorkerTerminateMessage {
@@ -178,7 +192,8 @@ export type WorkerToHostMessage =
   | ExecCompleteMessage
   | AlarmSetMessage
   | VmInterruptTimerMessage
-  | ForkHostImportWakeMessage;
+  | ForkHostImportWakeMessage
+  | CheckpointUnwoundMessage;
 
 export interface WorkerReadyMessage {
   type: "ready";
@@ -188,6 +203,20 @@ export interface WorkerReadyMessage {
 export interface ForkReplayReadyMessage {
   type: "fork_replay_ready";
   pid: number;
+}
+
+/**
+ * The worker has sealed its continuation capture and is parked on its
+ * checkpoint freeze gate with its frames still in linear memory.
+ *
+ * A process reports every one of its threads, so the keeper reads the memory
+ * only once all of them are parked.
+ */
+export interface CheckpointUnwoundMessage {
+  type: "checkpoint_unwound";
+  pid: number;
+  /** Absent for the process's main thread. */
+  tid?: number;
 }
 
 export interface WorkerExitMessage {
