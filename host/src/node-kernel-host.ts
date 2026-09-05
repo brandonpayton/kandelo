@@ -32,10 +32,11 @@ import type {
 import type { ReplicationLogEntry } from "./replication/log";
 import type { ReplicationReplaySpec } from "./replication/worker";
 import type { ProcessSnapshot, SyscallTraceEvent } from "./kernel-worker";
-import type {
-  CheckpointCaptureResponse,
-  CheckpointFreezeResult,
-  MachineCheckpoint,
+import {
+  machineCheckpointTransferList,
+  type CheckpointCaptureResponse,
+  type CheckpointFreezeResult,
+  type MachineCheckpoint,
 } from "./migration/checkpoint";
 import type { HttpRequest, HttpResponse } from "./networking/in-kernel-http";
 import type { LazyDownloadEvent } from "./vfs/memory-fs";
@@ -164,6 +165,15 @@ export interface NodeKernelHostOptions {
    * anything and refuses it loudly when it cannot be adopted.
    */
   restoreCheckpoint?: MachineCheckpoint;
+  /**
+   * Transfer the checkpoint's buffers to the kernel worker instead of
+   * structured-cloning them, detaching them from the caller. A checkpoint
+   * that arrived from another computer is single-use, and cloning one can
+   * exceed what the runtime will allocate for a large machine. Defaults to
+   * copy semantics for callers that restore one checkpoint more than once.
+   * Mirrors `BrowserKernelOwnedImageInitOptions.takeRestoreCheckpointOwnership`.
+   */
+  takeRestoreCheckpointOwnership?: boolean;
   /**
    * Run this machine on a primary's decisions from its very first instruction.
    *
@@ -458,6 +468,10 @@ export class NodeKernelHost {
             (asset) => asset.bytes.buffer as ArrayBuffer,
           ),
           ...new Set(Object.values(execProgramBytes ?? {})),
+          ...(this.options.takeRestoreCheckpointOwnership &&
+              this.options.restoreCheckpoint
+            ? machineCheckpointTransferList(this.options.restoreCheckpoint)
+            : []),
         ];
         this.worker.postMessage(initMsg, transfer);
       });

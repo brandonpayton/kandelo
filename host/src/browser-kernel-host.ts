@@ -13,10 +13,11 @@ import {
 } from "./vfs/memory-fs";
 import { FramebufferRegistry } from "./framebuffer/registry";
 import type { ProcessSnapshot, SyscallTraceEvent } from "./kernel-worker";
-import type {
-  CheckpointCaptureResponse,
-  CheckpointFreezeResult,
-  MachineCheckpoint,
+import {
+  machineCheckpointTransferList,
+  type CheckpointCaptureResponse,
+  type CheckpointFreezeResult,
+  type MachineCheckpoint,
 } from "./migration/checkpoint";
 import type {
   HostDiagnostic,
@@ -206,6 +207,14 @@ export interface BrowserKernelOwnedImageInitOptions {
    */
   restoreCheckpoint?: MachineCheckpoint;
   /**
+   * Transfer the checkpoint's buffers to the kernel worker instead of
+   * structured-cloning them, detaching them from the caller. A checkpoint
+   * that arrived from another computer is single-use, and cloning one can
+   * exceed what the browser will allocate for a large machine. Defaults to
+   * copy semantics for callers that restore one checkpoint more than once.
+   */
+  takeRestoreCheckpointOwnership?: boolean;
+  /**
    * Run this machine on a primary's decisions from its very first instruction.
    *
    * This is how a replica joins a machine that is already running: a restored
@@ -356,6 +365,7 @@ export class BrowserKernel {
     closedLazyAssets?: readonly ClosedLazyAsset[];
     rootfsMountSpec?: readonly MountSpec[];
     restoreCheckpoint?: MachineCheckpoint;
+    takeRestoreCheckpointOwnership?: boolean;
     replicationReplay?: ReplicationReplaySpec;
   }): Promise<void> {
     const [wasmBytes, vfsImage] = await Promise.all([
@@ -375,6 +385,8 @@ export class BrowserKernel {
       closedLazyAssets: options.closedLazyAssets,
       rootfsMountSpec: options.rootfsMountSpec,
       restoreCheckpoint: options.restoreCheckpoint,
+      takeRestoreCheckpointOwnership:
+        options.takeRestoreCheckpointOwnership ?? false,
       replicationReplay: options.replicationReplay,
       takeVfsImageOwnership: false,
     });
@@ -405,6 +417,8 @@ export class BrowserKernel {
       closedLazyAssets: options.closedLazyAssets,
       rootfsMountSpec: options.rootfsMountSpec,
       restoreCheckpoint: options.restoreCheckpoint,
+      takeRestoreCheckpointOwnership:
+        options.takeRestoreCheckpointOwnership ?? false,
       replicationReplay: options.replicationReplay,
       takeVfsImageOwnership: true,
     });
@@ -421,6 +435,7 @@ export class BrowserKernel {
     closedLazyAssets?: readonly ClosedLazyAsset[];
     rootfsMountSpec?: readonly MountSpec[];
     restoreCheckpoint?: MachineCheckpoint;
+    takeRestoreCheckpointOwnership: boolean;
     replicationReplay?: ReplicationReplaySpec;
     takeVfsImageOwnership: boolean;
   }): Promise<void> {
@@ -548,6 +563,13 @@ export class BrowserKernel {
           // snapshotClosedLazyAssets always allocates one ordinary ArrayBuffer
           // per binding, so transferring it cannot detach caller-owned bytes.
           transfer.push(asset.bytes.buffer as ArrayBuffer);
+        }
+        if (opts.takeRestoreCheckpointOwnership && opts.restoreCheckpoint) {
+          // WHY: a large machine's checkpoint (every process memory plus every
+          // memory-backed mount) can exceed what structured clone will
+          // allocate; a caller that hands over ownership gets a transfer
+          // instead of a second checkpoint-sized allocation.
+          transfer.push(...machineCheckpointTransferList(opts.restoreCheckpoint));
         }
         this.kernelWorkerHandle.postMessage(initMsg, transfer);
       });

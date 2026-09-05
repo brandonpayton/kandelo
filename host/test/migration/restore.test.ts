@@ -940,3 +940,38 @@ describe("what a restore says about the mounts it did not get", () => {
     );
   });
 });
+
+describe("what a restore does with a handed-over checkpoint", () => {
+  it(
+    "transfers the checkpoint's buffers to the worker instead of cloning them",
+    { timeout: 120_000 },
+    async () => {
+      // A replica boots from a checkpoint another computer sent it, and that
+      // checkpoint is restored exactly once. Handing over ownership must move
+      // the buffers — a clone of a large machine is an allocation the runtime
+      // can refuse — and the machine adopted from moved buffers must be whole.
+      const checkpoint = await captureRealCheckpoint();
+      const memories = checkpoint.processes.map((bucket) => bucket.memory);
+      const mounts = checkpoint.filesystems.map((mount) => mount.bytes);
+      expect(checkpoint.kernelMemory.byteLength).toBeGreaterThan(0);
+      expect(memories.length).toBeGreaterThan(0);
+
+      const replica = new NodeKernelHost({
+        rootfsImage: "default",
+        restoreCheckpoint: checkpoint,
+        takeRestoreCheckpointOwnership: true,
+      });
+      await replica.init();
+      try {
+        expect(checkpoint.kernelMemory.byteLength).toBe(0);
+        for (const memory of memories) expect(memory.byteLength).toBe(0);
+        for (const bytes of mounts) expect(bytes.byteLength).toBe(0);
+
+        const second = await replica.captureCheckpoint(TIMEOUTS);
+        expect(second.status).toBe("captured");
+      } finally {
+        await replica.destroy();
+      }
+    },
+  );
+});

@@ -1379,7 +1379,12 @@ async function bootProfile(
       );
     await kernel.initFromImage({
       ...kernelInitOptions,
-      ...(restoreCheckpoint === undefined ? {} : { restoreCheckpoint }),
+      // A checkpoint reaching this boot came from another computer and is
+      // restored exactly once, so hand its buffers to the worker: cloning a
+      // large machine's checkpoint is an allocation the browser can refuse.
+      ...(restoreCheckpoint === undefined
+        ? {}
+        : { restoreCheckpoint, takeRestoreCheckpointOwnership: true }),
       ...(replicationReplay === undefined ? {} : { replicationReplay }),
     });
     assertCurrent();
