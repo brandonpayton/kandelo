@@ -185,6 +185,14 @@ export async function terminalText(
 /**
  * Type into a terminal on a machine that has just arrived by handover.
  *
+ * Waits for the machine's own terminal, not the held screen. While a machine
+ * is moving, `SharedTerminal` keeps the last-watched screen up, dimmed, under
+ * the same `.kshell-host` — a picture that refuses the keyboard
+ * (`disableStdin`), because the machine is not running here yet. The dock
+ * flips to `user` before the arriving machine's Shell mounts, so a test that
+ * types on that signal alone types into the picture. A person reads the
+ * dimming and waits for the prompt to come back; the wait below is that.
+ *
  * Focuses the emulator's input directly instead of clicking the terminal. A
  * taker settles its boot descriptor and then loads the arriving image's demo
  * guide, and `App.tsx` opens that guide once per descriptor and title, so it
@@ -199,7 +207,9 @@ export async function typeIntoTerminal(
   selector: string,
   line: string,
 ): Promise<void> {
-  await page.locator(`${selector} .xterm-helper-textarea`).first().focus();
+  const live = page.locator(`${selector}:not(.kshared-terminal-host)`).first();
+  await expect(live).toBeVisible({ timeout: 120_000 });
+  await live.locator(".xterm-helper-textarea").first().focus();
   await page.keyboard.type(line);
   await page.keyboard.press("Enter");
 }

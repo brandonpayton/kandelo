@@ -49,4 +49,20 @@ else
     fi
 fi
 
+# Every Kandelo executable must be able to park for a machine checkpoint, so
+# an instrumentation run always seeds the checkpoint import alongside the fork
+# entry. A caller that names its own checkpoint seed keeps it; analysis modes
+# (no --output) are left untouched so their reports describe the input as-is.
+HAS_OUTPUT=0
+HAS_CHECKPOINT_ENTRY=0
+for arg in "$@"; do
+    case "$arg" in
+        -o|--output) HAS_OUTPUT=1 ;;
+        --checkpoint-entry) HAS_CHECKPOINT_ENTRY=1 ;;
+    esac
+done
+if [ "$HAS_OUTPUT" = 1 ] && [ "$HAS_CHECKPOINT_ENTRY" = 0 ]; then
+    exec "$TOOL" --checkpoint-entry kernel.kernel_checkpoint "$@"
+fi
+
 exec "$TOOL" "$@"

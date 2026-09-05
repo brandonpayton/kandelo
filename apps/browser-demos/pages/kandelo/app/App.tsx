@@ -37,6 +37,7 @@ type ThemePreference = {
 };
 
 const THEME_STORAGE_KEY = "kandelo.theme";
+const DEMO_GUIDE_SEEN_STORAGE_KEY = "kandelo.demo-guide.seen";
 const THEME_STORAGE_VERSION = 4;
 
 type StoredThemePreference = ThemePreference & {
@@ -72,7 +73,7 @@ export const App: React.FC = () => {
   const [dockPane, setDockPane] = React.useState<DockPaneId | null>(null);
   const [dockHeight, setDockHeight] = React.useState(0);
   const [dockLayout, setDockLayout] = React.useState<DockLayoutState>({ collapsed: false, fullWidth: true });
-  const [demoGuideOpen, setDemoGuideOpen] = React.useState(demoGuide !== null);
+  const [demoGuideOpen, setDemoGuideOpen] = React.useState(false);
   const [demoDockControls, setDemoDockControls] = React.useState<React.ReactNode | null>(null);
   const [demoGuidePopup, setDemoGuidePopup] = React.useState<React.ReactNode | null>(null);
   const [internalsOpen, setInternalsOpen] = React.useState(false);
@@ -169,8 +170,13 @@ export const App: React.FC = () => {
     autoOpenedDemoGuideKey.current = key;
     // A replica's descriptor is the other computer's launch, not this
     // person's; its guide would cover the machine they were already watching.
+    // A guide this browser has already auto-opened stays closed: a machine
+    // that reloads is not a new demo, and the dock button still opens it.
     const replicaBoot = replication.joining || replication.replicating;
-    setDemoGuideOpen(dockPane === null && demoGuide !== null && !replicaBoot);
+    const open = dockPane === null && demoGuide !== null && !replicaBoot
+      && !hasSeenDemoGuide(key);
+    setDemoGuideOpen(open);
+    if (open) rememberSeenDemoGuide(key);
   }, [
     demoGuide?.title,
     desc.id,
@@ -486,7 +492,13 @@ export const App: React.FC = () => {
               : "user"
         }
         themeOpen={themeOpen}
-        status={surface.status}
+        // A machine on its way here is booting, whatever the surface it is
+        // replacing happens to be doing. During a take-over the departing
+        // replica still reports "running", and showing that beside a role
+        // that already says "user" would claim a typeable machine before
+        // there is one: the arriving image boots and restores first, and the
+        // dock says "Running" when that machine is the one running.
+        status={handover.taking || replication.joining ? "booting" : surface.status}
         machineTitle={isEmpty ? "Kandelo" : desc.title}
         viewDisabled={{
           demo: !surface.canOpenDemo,
@@ -735,6 +747,35 @@ function humanBytes(bytes: number): string {
   if (kib < 1024) return `${kib.toFixed(kib < 10 ? 1 : 0)} KiB`;
   const mib = kib / 1024;
   return `${mib.toFixed(mib < 10 ? 1 : 0)} MiB`;
+}
+
+function hasSeenDemoGuide(key: string): boolean {
+  try {
+    const raw = window.localStorage.getItem(DEMO_GUIDE_SEEN_STORAGE_KEY);
+    if (!raw) return false;
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed) && parsed.includes(key);
+  } catch {
+    return false;
+  }
+}
+
+function rememberSeenDemoGuide(key: string): void {
+  try {
+    const raw = window.localStorage.getItem(DEMO_GUIDE_SEEN_STORAGE_KEY);
+    const parsed = raw ? (JSON.parse(raw) as unknown) : [];
+    const seen = Array.isArray(parsed)
+      ? parsed.filter((value): value is string => typeof value === "string")
+      : [];
+    if (seen.includes(key)) return;
+    seen.push(key);
+    window.localStorage.setItem(
+      DEMO_GUIDE_SEEN_STORAGE_KEY,
+      JSON.stringify(seen),
+    );
+  } catch {
+    // User preference storage can be unavailable in private or restricted contexts.
+  }
 }
 
 function readThemePreference(): ThemePreference {
