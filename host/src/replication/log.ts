@@ -299,6 +299,24 @@ export class ReplicationLogReader {
   }
 
   /**
+   * Whether the primary's next decision is already here.
+   *
+   * A replica behind the log head is running the machine later than the
+   * primary did. The waits between those decisions already passed once, on
+   * the primary; a replica that waits them out again keeps the gap it joined
+   * with. The host asks this before serving a sleep or a vblank at its real
+   * pace, and pulls the ring so a decision parked there counts as here.
+   */
+  entryReady(): boolean {
+    if (this.#entries[this.#index] !== undefined) return true;
+    if (this.#extendReady === undefined || this.#ended) return false;
+    const arrived = this.#extendReady();
+    if (arrived === null) return false;
+    this.#append(arrived);
+    return true;
+  }
+
+  /**
    * Deliver every pushed decision the log holds at the current position.
    *
    * A pushed decision has no guest request to answer, so nothing would

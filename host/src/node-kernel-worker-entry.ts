@@ -4835,6 +4835,7 @@ port.on("message", (msg: MainToKernelMessage) => {
         replicationIO.setTimeProvider(baseTimeProvider);
       }
       kernelWorker?.setGlQueryTap(null);
+      kernelWorker?.setReplicationBehindProbe(null);
       post({
         type: "response",
         requestId: msg.requestId,

@@ -102,6 +102,25 @@ describe("replaying time provider", () => {
     expect(source.sleeps).toEqual([[0, 250]]);
   });
 
+  it("skips the sleep while the primary's next reading is already here", () => {
+    const recorder = new ReplicationLogRecorder();
+    new RecordingTimeProvider(tickingClock(), recorder).clockGettime(1);
+    const source = tickingClock();
+    const replica = new ReplayingTimeProvider(
+      source,
+      new ReplicationLogReader(recorder.entries),
+    );
+
+    // Behind the head: the primary already served this wait once.
+    replica.nanosleep(0, 250);
+    expect(source.sleeps).toEqual([]);
+
+    // At the head, the wait is real again.
+    replica.clockGettime(1);
+    replica.nanosleep(0, 250);
+    expect(source.sleeps).toEqual([[0, 250]]);
+  });
+
   it("does not raise a monotonic floor it does not own", () => {
     const source = tickingClock();
     const replica = new ReplayingTimeProvider(

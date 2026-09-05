@@ -271,12 +271,21 @@ describe("live replica join", () => {
         );
         const printed = printedSeconds(primaryOut.read());
         // The replica has no exit promise for a process it never spawned, so
-        // it is followed by what that process prints. It ends where the
-        // primary ended, because it is the same guest reading the same log.
+        // it is followed by what that process prints. It settles when its
+        // transcript is the primary's tail. The final readings repeat —
+        // seconds are coarser than the loop — so matching only the last one
+        // catches a replica still two readings short of the log's end.
         await until(
-          () => replicaOut.read().trimEnd().endsWith(`${printed[printed.length - 1]}`),
+          () => {
+            const replicated = printedSeconds(replicaOut.read());
+            return replicated.length > 0
+              && replicated.length < printed.length
+              && JSON.stringify(replicated)
+                === JSON.stringify(printed.slice(printed.length - replicated.length));
+          },
           FOLLOW_LIMIT_MS,
-          () => `the replica printed ${JSON.stringify(replicaOut.read())}`,
+          () => `the replica printed ${JSON.stringify(replicaOut.read())} `
+            + `while the primary printed ${JSON.stringify(printed)}`,
         );
 
         const replicated = printedSeconds(replicaOut.read());

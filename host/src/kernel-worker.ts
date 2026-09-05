@@ -3393,6 +3393,9 @@ export class CentralizedKernelWorker {
    *  accepts it (an `ImageDataArray` rejects SAB-backed views). */
   private kmsScratchBytes = new Map<number, Uint8ClampedArray<ArrayBuffer>>();
   private vblankTimer: ReturnType<typeof setInterval> | null = null;
+  /** Answers true while this machine is a replica behind the primary's log;
+   *  see `setReplicationBehindProbe`. */
+  #replicationBehindProbe: (() => boolean) | null = null;
   /** Construction-time schedulers include the browser worker's installed
    * polyfill but cannot be replaced by a later guest/host callback. */
   readonly #schedulerReceiver: typeof globalThis;
@@ -18764,6 +18767,12 @@ export class CentralizedKernelWorker {
       );
       return true;
     }
+
+    // A replica behind the log already had this wait served, on the primary.
+    // Completing it immediately is what closes the gap; the guest's next
+    // clock reading still comes from the log, so it cannot tell. After the
+    // signal branch, so an interrupted sleep stays interrupted.
+    if (delayMs > 0 && this.#replicationBehindProbe?.()) delayMs = 0;
 
     if (delayMs > 0) {
       if (
@@ -34274,17 +34283,27 @@ export class CentralizedKernelWorker {
     this.#kernel.setGlQueryTap(tap);
   }
 
+  /**
+   * Replication's hand on sleep and vblank pacing.
+   *
+   * While the probe answers true, this machine is a replica behind the
+   * primary's log: parked sleeps complete immediately and the vblank pump
+   * chains extra ticks, because the primary already served those waits once
+   * and a replica that serves them again keeps the gap it joined with.
+   */
+  setReplicationBehindProbe(probe: (() => boolean) | null): void {
+    this.#replicationBehindProbe = probe;
+  }
+
   /** CRTCs whose canvas a GL context owns.
    *
    *  These are exactly the CRTCs whose frames never pass through a host
    *  buffer: a GL guest paints the canvas directly and writes nothing back.
-   *  A caller that must read the screen — a checkpoint, a mirror — has
-   *  nothing to read for them.
+   *  A mirror has no pixels to read for them; a checkpoint reads the
+   *  guest's GL context state instead and a restore repaints from it.
    *
    *  A CRTC the embedder declared `"webgl2"` is absent until GL claims it.
-   *  Until then the guest paints its GBM buffer object by CPU and the
-   *  checkpoint carries those pixels, so refusing it would name a boundary
-   *  the machine has not reached. */
+   *  Until then the guest paints its GBM buffer object by CPU. */
   glOwnedCrtcs(): number[] {
     return [...this.kmsGlOwned];
   }
@@ -34655,6 +34674,23 @@ export class CentralizedKernelWorker {
           }
           return undefined;
         });
+
+        // A replica behind the log: the primary's guest already saw these
+        // vblanks. Chain one immediate tick so a frame-paced replica consumes
+        // its backlog faster than 60 Hz; at the head the probe answers false
+        // and the pump falls back to its real pace.
+        if (this.kmsCanvases.size > 0 && this.#replicationBehindProbe?.()) {
+          entry.deferProtocolEffect(() => {
+            const chained = this.#registerTimeout(() => {
+              this.#runScheduledListenerRoot("vblank catch-up", () => {
+                if (this.vblankTimer !== timer) return;
+                this.#tickVblank(timer);
+              });
+            }, 0);
+            (chained as { unref?: () => void }).unref?.();
+            return undefined;
+          });
+        }
       },
     );
   }

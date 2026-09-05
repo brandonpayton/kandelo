@@ -409,4 +409,30 @@ describe("replication log reader, following a primary that is still running", ()
       "replication log diverged at 2: the log jumped to 2 where 1 was next",
     );
   });
+
+  it("answers whether the primary's next decision is already here", () => {
+    const reader = new ReplicationLogReader([
+      { seq: 0, decision: reading(1, 7, 0) },
+    ]);
+
+    expect(reader.entryReady()).toBe(true);
+    reader.takeClock(1);
+    expect(reader.entryReady()).toBe(false);
+  });
+
+  it("pulls the ring, so a decision parked there counts as here", () => {
+    const arriving: ReplicationLogEntry[] = [
+      { seq: 0, decision: reading(1, 7, 0) },
+    ];
+    const reader = new ReplicationLogReader(
+      [],
+      undefined,
+      () => arriving.shift() ?? null,
+      () => arriving.shift() ?? null,
+    );
+
+    expect(reader.entryReady()).toBe(true);
+    expect(reader.takeClock(1)).toEqual(reading(1, 7, 0));
+    expect(reader.entryReady()).toBe(false);
+  });
 });

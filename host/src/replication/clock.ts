@@ -13,10 +13,13 @@ import type {
  * one interface every guest clock read already crosses, `TimeProvider`, so no
  * syscall, kernel path, or host adapter has to know which mode it is in.
  *
- * Only the readings come from the log. `nanosleep` stays a real host effect:
- * its duration is a guest argument, already deterministic, and a replica that
- * skipped the wait would run the machine faster than it was recorded rather
- * than differently.
+ * Only the readings come from the log. `nanosleep` stays a real host effect
+ * while the replica is at the log head: its duration is a guest argument,
+ * already deterministic. Behind the head the wait is skipped — the primary
+ * already served it once, and a replica that waits it out again keeps the
+ * gap it joined with forever. Running faster than recorded is what catching
+ * up is; the guest cannot see the difference, because every reading it gets
+ * still comes from the log.
  */
 
 /** Delegate to the real clock, and record what the guest was told. */
@@ -72,6 +75,7 @@ export class ReplayingTimeProvider implements TimeProvider {
   }
 
   nanosleep(sec: number, nsec: number): void {
+    if (this.#reader.entryReady()) return;
     this.#source.nanosleep(sec, nsec);
   }
 }

@@ -5369,6 +5369,7 @@ sw.onmessage = (e: MessageEvent) => {
       replicationReplay = null;
       if (io && baseTimeProvider) io.setTimeProvider(baseTimeProvider);
       kernelWorker?.setGlQueryTap(null);
+      kernelWorker?.setReplicationBehindProbe(null);
       respond(msg.requestId, {
         consumed: replay?.reader.consumed ?? 0,
         total: replay?.reader.known ?? 0,

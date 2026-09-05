@@ -25,11 +25,15 @@ import { ReplicationLogQueueReader } from "./log-queue.js";
  * GL query answers are host-produced values exactly like clock readings —
  * two GPUs answer differently — so a recording or replaying machine puts
  * its hand on `host_gl_query` at the same moment it swaps the guest clock,
- * and takes it off at the same moment too. One installer type keeps Node
- * and the browser doing both identically.
+ * and takes it off at the same moment too. Sleep and vblank pacing are the
+ * other host effect a replica swaps: behind the log head, the waits the
+ * primary already served complete immediately, or the replica keeps the gap
+ * it joined with. One installer type keeps Node and the browser doing both
+ * identically.
  */
 export interface ReplicationGlQueries {
   setGlQueryTap(tap: GlQueryTap | null): void;
+  setReplicationBehindProbe(probe: (() => boolean) | null): void;
 }
 
 /** Record every GL query answer the guest is handed, on the shared log. */
@@ -170,5 +174,6 @@ export function beginReplicationReplay(
   );
   io.setTimeProvider(new ReplayingTimeProvider(clock, reader));
   glQueries.setGlQueryTap(glQueryReplayTap(reader));
+  glQueries.setReplicationBehindProbe(() => reader.entryReady());
   return reader;
 }

@@ -8,9 +8,14 @@ import {
 import type { TimeProvider } from "../../src/vfs/types";
 
 function machineSurface() {
-  const installed: { provider: TimeProvider | null; tap: GlQueryTap | null } = {
+  const installed: {
+    provider: TimeProvider | null;
+    tap: GlQueryTap | null;
+    behindProbe: (() => boolean) | null;
+  } = {
     provider: null,
     tap: null,
+    behindProbe: null,
   };
   return {
     installed,
@@ -22,6 +27,9 @@ function machineSurface() {
     glQueries: {
       setGlQueryTap: (tap: GlQueryTap | null) => {
         installed.tap = tap;
+      },
+      setReplicationBehindProbe: (probe: (() => boolean) | null) => {
+        installed.behindProbe = probe;
       },
     },
     clock: {
@@ -72,6 +80,7 @@ describe("beginReplicationReplay", () => {
       surface.glQueries,
     );
 
+    expect(surface.installed.behindProbe?.()).toBe(true);
     expect(surface.installed.provider!.clockGettime(1)).toEqual({
       sec: 7,
       nsec: 9,
@@ -81,5 +90,6 @@ describe("beginReplicationReplay", () => {
     const answer = surface.installed.tap.take(5);
     expect(answer.rc).toBe(4);
     expect(answer.bytes).toEqual(new Uint8Array([1, 0, 0, 0]));
+    expect(surface.installed.behindProbe?.()).toBe(false);
   });
 });
