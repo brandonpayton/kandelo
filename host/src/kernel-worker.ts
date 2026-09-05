@@ -305,6 +305,7 @@ import {
   readEffectiveConsumerPosition,
   readProducerPosition,
   validatePcmTransport,
+  writeDiscardPosition,
   type PcmTransportDescriptor,
 } from "./audio/pcm-transport";
 
@@ -17930,6 +17931,15 @@ export class CentralizedKernelWorker {
       return;
     }
     if (!this.isRegisteredChannel(channel)) return;
+    // A replica behind the log: the ring this guest is blocked on may hold
+    // audio the primary's listener already heard. Free it and retry instead
+    // of parking a wait the primary already served once.
+    if (this.#discardReplicaAudioBacklog(entry)) {
+      this.#registerImmediate(() => {
+        if (this.isRegisteredChannel(channel)) this.retrySyscall(channel);
+      });
+      return;
+    }
     const retainedRetrySnapshot =
       this.blockingRetrySnapshots.get(channel);
     const retainedGenericSnapshot =
@@ -31180,6 +31190,36 @@ export class CentralizedKernelWorker {
     this.#pcmTransportDescriptor = descriptor;
     if (observeConsumerWake) this.startPcmWakeObserver(descriptor);
     return descriptor;
+  }
+
+  /**
+   * Skip the audio backlog a behind replica is blocked on, if any.
+   *
+   * The physical sink drains the PCM ring at one second per second, which
+   * makes a full ring the one host wait a replica cannot run faster than:
+   * every blocked audio write serves out the primary's original cadence
+   * again, so the gap a replica joined with never closes. The primary's
+   * listener already heard these samples — raising the discard floor to the
+   * producer frees the ring the same way a chained vblank tick serves a
+   * frame-paced replica, and `kernel_pcm_clock_update(0)` reconciles the
+   * kernel's accounting and queues the writable wakeups without moving the
+   * consumer. Returns true when backlog was discarded.
+   */
+  #discardReplicaAudioBacklog(entry: KernelWorkerEntryContext): boolean {
+    if (!this.#replicationBehindProbe?.()) return false;
+    const descriptor = this.#pcmTransportDescriptor;
+    if (descriptor === null) return false;
+    const words = pcmControlWords(descriptor);
+    const producer = readProducerPosition(words);
+    if (readEffectiveConsumerPosition(words) >= producer) return false;
+    writeDiscardPosition(words, producer);
+    const clockUpdate = this.#kernelInstanceForEntry(entry).exports
+      .kernel_pcm_clock_update as ((frames: number) => number) | undefined;
+    if (typeof clockUpdate === "function") clockUpdate(0);
+    this.#drainAndProcessWakeupEventsWithinKernelEntry(entry);
+    this.scheduleWakeBlockedRetries(entry);
+    Atomics.notify(words, PCM_CONTROL.wakeSeq);
+    return true;
   }
 
   /** Advance Node's paced null sink and wake affected write/poll/drain calls. */

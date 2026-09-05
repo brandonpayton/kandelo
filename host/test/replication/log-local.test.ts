@@ -220,6 +220,39 @@ describe("local replication log", () => {
     }
   });
 
+  it("withdraws an abandoned join instead of letting it win the recording", async () => {
+    const channel = `replication-test-${crypto.randomUUID()}`;
+    const computer = new LocalReplicationLog<string>(channel);
+    const replica = new LocalReplicationLog<string>(channel);
+    const recorder = new ReplicationLogRecorder();
+
+    // Asked while no machine answers — the window a viewer attempt lives in
+    // during a take-over — then withdrawn, as an ended attempt withdraws it.
+    const withdraw = new AbortController();
+    const abandoned = replica.join(5_000, withdraw.signal);
+    withdraw.abort();
+    await expect(abandoned).rejects.toThrow(
+      "the request to replicate the machine was withdrawn",
+    );
+
+    // A machine starts answering afterwards. Its serving broadcast re-posts
+    // every question still standing, so the withdrawn one must not stand: it
+    // would win the machine's one recording for an attempt that no longer
+    // watches, and the live join would be refused.
+    const live = replica.join(5_000);
+    const stopServing = computer.serve(async (publish) => {
+      const stopRecord = recorder.onRecord((entry) => publish([entry]));
+      return { machine: "the machine", stop: async () => stopRecord() };
+    });
+    try {
+      await expect(live).resolves.toBe("the machine");
+    } finally {
+      stopServing();
+      computer.close();
+      replica.close();
+    }
+  });
+
   it("loses no entry to a wire that holds its bytes", async () => {
     const [near, far] = FakeDataChannel.pair({ auto: false });
     const publisher = new LocalReplicationLog(new ChunkedMessageChannel(near));

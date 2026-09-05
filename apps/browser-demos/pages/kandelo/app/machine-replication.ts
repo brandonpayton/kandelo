@@ -158,6 +158,12 @@ export function useMachineReplication(
     const becomeViewer = () => {
       role = "viewer";
       let replica = false;
+      // True once this viewer stint is over. The loop below outlives leave():
+      // an awaited join resolves after the role was left and retaken, and a
+      // loop that checked the shared `role` would mistake the next stint for
+      // its own — boot a replica on its ended queue, and leave the live
+      // attempt refused. Each stint answers only for itself.
+      let left = false;
       // One attempt's queue and its subscription, held so leaving the role can
       // release a replica parked on it. A parked kernel worker answers nothing
       // at all, so a page that let go of a quiet user without ending the queue
@@ -190,12 +196,13 @@ export function useMachineReplication(
         void host.stopReplicatingMachine();
       };
       leaveRole = () => {
+        left = true;
         setJoining(false);
         endAttempt();
         dropReplica();
       };
       void (async () => {
-        while (!gone && role === "viewer") {
+        while (!gone && !left) {
           setJoining(true);
           // A fresh queue per attempt. A publisher that stops recording ends
           // the one it was feeding, and a replica handed an ended queue would
@@ -215,6 +222,14 @@ export function useMachineReplication(
             },
             ended: () => {
               writer.end();
+              if (!replica) {
+                // The recording ended before this attempt was running on it —
+                // the machine moved again, or it had briefly recorded for an
+                // asker that withdrew. The queue is dead, so the attempt ends
+                // rather than hand it to a replica, and the loop asks again.
+                endAttempt();
+                return;
+              }
               dropReplica();
             },
             diverged: (error) => {
@@ -223,15 +238,21 @@ export function useMachineReplication(
               dropReplica();
             },
           });
+          // Withdrawing the join is part of ending the attempt. The asker
+          // repeats the question whenever a machine starts answering, so a
+          // question left standing competes with the next attempt's and can
+          // win the machine's one recording for a queue nobody reads.
+          const withdraw = new AbortController();
           attempt = {
             end: () => {
               stopWatching();
               writer.end();
+              withdraw.abort();
             },
           };
           try {
-            const machine = await wire.join(JOIN_TIMEOUT_MS);
-            if (gone || role !== "viewer") return;
+            const machine = await wire.join(JOIN_TIMEOUT_MS, withdraw.signal);
+            if (gone || left) return;
             // The user's descriptor and terminals are another computer's
             // input. Check the descriptor exactly as a take does before this
             // page boots an image it names; `replicateMachine` checks the
@@ -248,14 +269,14 @@ export function useMachineReplication(
             } finally {
               bootingReplica = false;
             }
-            if (gone || role !== "viewer") return;
+            if (gone || left) return;
             replica = true;
             setJoining(false);
             setFailure(null);
             setReplicating(true);
             return;
           } catch (error) {
-            if (gone || role !== "viewer") return;
+            if (gone || left) return;
             endAttempt();
             // Reported and then retried, not reported instead of retried. The
             // person watching is owed the reason their computer is not

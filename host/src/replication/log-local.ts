@@ -72,6 +72,7 @@ type LocalReplicationMessage<TMachine> =
   | { readonly kind: "entries"; readonly entries: readonly ReplicationLogEntry[] }
   | { readonly kind: "ended" }
   | { readonly kind: "join"; readonly joinId: string }
+  | { readonly kind: "withdrawn"; readonly joinId: string }
   | { readonly kind: "serving" }
   | {
       readonly kind: "joined";
@@ -143,6 +144,11 @@ export class LocalReplicationLog<TMachine = never> {
    * recording is live is refused rather than restarting the log, because a
    * restart would begin a new sequence 0 under a replica that is midway
    * through the old one.
+   *
+   * A withdrawn join frees the machine instead of holding it. The asker that
+   * withdrew is gone, so a recording claimed in its name would run for nobody
+   * while every live join is refused — the machine stops it, and says it is
+   * serving again so an asker still waiting re-asks.
    */
   serve(
     capture: (
@@ -157,6 +163,21 @@ export class LocalReplicationLog<TMachine = never> {
     };
     const listener = (event: MessageEvent) => {
       const message = event.data as LocalReplicationMessage<TMachine>;
+      if (message.kind === "withdrawn") {
+        if (message.joinId !== servingId) return;
+        servingId = null;
+        // A capture still in flight sees the id moved on and lets the
+        // recording go when it resolves; a recording already serving stops
+        // now. Either way the machine answers the next asker.
+        if (serving !== null) {
+          const stopping = serving;
+          serving = null;
+          void stopping.stop();
+          this.#post({ kind: "ended" });
+          this.#post({ kind: "serving" });
+        }
+        return;
+      }
       if (message.kind !== "join") return;
       // One asker asks more than once: it repeats the question when it hears
       // this machine start answering, because it cannot tell whether the first
@@ -169,18 +190,42 @@ export class LocalReplicationLog<TMachine = never> {
       }
       capturing = true;
       servingId = message.joinId;
-      void capture((entries) => this.#post({ kind: "entries", entries })).then(
+      // Held back until the join is answered. The recording still starts at
+      // the capture instant — the entries go out, in order, right before the
+      // `joined` — but a capture whose asker withdraws publishes nothing, so
+      // no other watcher absorbs sequence numbers from a recording that
+      // never served anyone.
+      let held: ReplicationLogEntry[] | null = [];
+      void capture((entries) => {
+        if (held !== null) {
+          held.push(...entries);
+          return;
+        }
+        this.#post({ kind: "entries", entries });
+      }).then(
         (joined) => {
           capturing = false;
           if (joined === null) {
+            if (servingId !== message.joinId) return;
             servingId = null;
             refuse(message.joinId, "this machine cannot be read right now");
+            return;
+          }
+          if (servingId !== message.joinId) {
+            // The asker withdrew while the machine was being read.
+            void joined.stop();
+            this.#post({ kind: "serving" });
             return;
           }
           serving = joined;
           // After the recorder is running, so nothing the machine decides
           // between the read and this message is lost: the replica is already
           // watching entries by the time it asks.
+          const releasing = held;
+          held = null;
+          if (releasing !== null && releasing.length > 0) {
+            this.#post({ kind: "entries", entries: releasing });
+          }
           this.#post({
             kind: "joined",
             joinId: message.joinId,
@@ -189,6 +234,7 @@ export class LocalReplicationLog<TMachine = never> {
         },
         (error: unknown) => {
           capturing = false;
+          if (servingId !== message.joinId) return;
           servingId = null;
           refuse(
             message.joinId,
@@ -220,8 +266,14 @@ export class LocalReplicationLog<TMachine = never> {
    * Call {@link watch} first. The publisher starts recording inside the read
    * and sends entries from that instant, so a replica that asks before it is
    * watching would miss the decisions its own state does not yet cover.
+   *
+   * `signal` withdraws the question. The asker re-asks whenever a machine
+   * starts answering, so a join outlives the moment it was posted — and an
+   * abandoned attempt that cannot withdraw goes on competing with the live
+   * one, wins the machine's single recording, and leaves it replicating for
+   * nobody while every real join is refused.
    */
-  join(timeoutMs: number): Promise<TMachine> {
+  join(timeoutMs: number, signal?: AbortSignal): Promise<TMachine> {
     const joinId = crypto.randomUUID();
     return new Promise<TMachine>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -233,6 +285,14 @@ export class LocalReplicationLog<TMachine = never> {
           ),
         );
       }, timeoutMs);
+      const abort = () => {
+        finish();
+        // On the wire as well as here: the question already posted may reach
+        // the machine after this, and a machine that never hears the
+        // withdrawal records for an asker that is gone.
+        this.#post({ kind: "withdrawn", joinId });
+        reject(new Error("the request to replicate the machine was withdrawn"));
+      };
       const listener = (event: MessageEvent) => {
         const message = event.data as LocalReplicationMessage<TMachine>;
         // A machine that started answering after the question was asked never
@@ -254,7 +314,14 @@ export class LocalReplicationLog<TMachine = never> {
       const finish = () => {
         clearTimeout(timer);
         this.#channel.removeEventListener("message", listener);
+        signal?.removeEventListener("abort", abort);
       };
+      if (signal?.aborted) {
+        clearTimeout(timer);
+        reject(new Error("the request to replicate the machine was withdrawn"));
+        return;
+      }
+      signal?.addEventListener("abort", abort);
       this.#channel.addEventListener("message", listener);
       this.#post({ kind: "join", joinId });
     });
