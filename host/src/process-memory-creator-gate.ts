@@ -12,6 +12,8 @@ export class ProcessMemoryCreatorGate {
   private exclusiveOperation: string | undefined;
   private readonly drainWaiters = new Set<() => void>();
   private readonly exclusiveDrainWaiters = new Set<() => void>();
+  private readonly queuedAdmissionWaiters = new Set<() => void>();
+  private readonly queuedLaunchListeners = new Set<() => void>();
   private destroyOperation: Promise<unknown> | undefined;
 
   /**
@@ -28,19 +30,42 @@ export class ProcessMemoryCreatorGate {
    * process generation or abandoning it. Release is idempotent so terminal
    * cleanup can share one path with setup failures without double-releasing
    * the gate.
+   *
+   * A reversible exclusive (a checkpoint freeze) queues this admission rather
+   * than refusing it: a guest's fork or exec must never fail because someone
+   * chose that moment to read the machine. The launch waits out the freeze
+   * and runs when the machine resumes. Only terminal destroy still refuses.
    */
-  acquire(operation: string): { release: () => void } {
+  async acquire(operation: string): Promise<{ release: () => void }> {
+    if (this.open && this.exclusiveOperation !== undefined) {
+      for (const listener of this.queuedLaunchListeners) listener();
+      // Admission is granted inside the exclusive's own release, before any
+      // later exclusive can reclaim the gate. Without that synchronous
+      // hand-off, a capture retry loop and the queued launch would race the
+      // gate on microtask order, and the launch could starve.
+      let granted = false;
+      await new Promise<void>((resolve) => {
+        this.queuedAdmissionWaiters.add(() => {
+          if (this.open && this.exclusiveOperation === undefined) {
+            this.activeCreators += 1;
+            granted = true;
+          }
+          resolve();
+        });
+      });
+      if (granted) return this.admissionHandle();
+      return this.acquire(operation);
+    }
     if (!this.open) {
       throw new Error(
         `kernel worker is being destroyed; cannot start ${operation}`,
       );
     }
-    if (this.exclusiveOperation !== undefined) {
-      throw new Error(
-        `${this.exclusiveOperation} is in progress; cannot start ${operation}`,
-      );
-    }
     this.activeCreators += 1;
+    return this.admissionHandle();
+  }
+
+  private admissionHandle(): { release: () => void } {
     let released = false;
     return {
       release: () => {
@@ -49,6 +74,25 @@ export class ProcessMemoryCreatorGate {
         this.releaseCreator();
       },
     };
+  }
+
+  /**
+   * Say when a launch queues behind the running exclusive.
+   *
+   * A queued launch means its initiating process is parked inside fork, exec,
+   * spawn, or clone rather than at a freeze hook, so a freeze that is waiting
+   * for every process to park is waiting for something that cannot happen.
+   * The freeze listens here to give the machine back at once instead of
+   * timing out against it.
+   */
+  onLaunchQueuedDuringExclusive(listener: () => void): () => void {
+    this.queuedLaunchListeners.add(listener);
+    return () => this.queuedLaunchListeners.delete(listener);
+  }
+
+  /** Whether a launch is already waiting out the running exclusive. */
+  hasQueuedAdmissions(): boolean {
+    return this.queuedAdmissionWaiters.size > 0;
   }
 
   /**
@@ -65,27 +109,17 @@ export class ProcessMemoryCreatorGate {
    * admission. Calling commit more than once is harmless so a common finally
    * path cannot double-release the gate.
    */
-  runUntilCommitted<T>(
+  async runUntilCommitted<T>(
     operation: string,
     creator: (commit: () => void) => T | PromiseLike<T>,
   ): Promise<T> {
-    let admission: { release: () => void };
-    try {
-      admission = this.acquire(operation);
-    } catch (error) {
-      return Promise.reject(error);
-    }
+    const admission = await this.acquire(operation);
     const commit = admission.release;
-    let result: T | PromiseLike<T>;
     try {
-      result = creator(commit);
-    } catch (error) {
+      return await creator(commit);
+    } finally {
       commit();
-      return Promise.reject(error);
     }
-    return Promise.resolve(result).finally(() => {
-      commit();
-    });
   }
 
   /**
@@ -120,6 +154,7 @@ export class ProcessMemoryCreatorGate {
       return await exclusive();
     } finally {
       this.exclusiveOperation = undefined;
+      this.releaseQueuedAdmissions();
     }
   }
 
@@ -130,6 +165,7 @@ export class ProcessMemoryCreatorGate {
    */
   closeAndWait(): Promise<void> {
     this.open = false;
+    this.releaseQueuedAdmissions();
     if (this.activeCreators === 0) return Promise.resolve();
     return new Promise<void>((resolve) => {
       this.drainWaiters.add(resolve);
@@ -156,6 +192,11 @@ export class ProcessMemoryCreatorGate {
     // destroy cannot install a second terminal operation.
     this.destroyOperation = operation;
     return operation;
+  }
+
+  private releaseQueuedAdmissions(): void {
+    for (const resolve of this.queuedAdmissionWaiters) resolve();
+    this.queuedAdmissionWaiters.clear();
   }
 
   private releaseCreator(): void {

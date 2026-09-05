@@ -11,6 +11,7 @@ import {
   type CheckpointMachine,
   type CheckpointProcessSource,
 } from "../../src/migration/checkpoint";
+import { CH_TOTAL_SIZE } from "../../src/generated/abi";
 import type { ProcessMemoryLayout } from "../../src/process-memory";
 import type { CheckpointGlContext } from "../../src/webgl/snapshot";
 
@@ -18,7 +19,9 @@ const KERNEL_MEMORY_BYTES = 64;
 const FILESYSTEM_BYTES = 128;
 const SCRATCH_BYTES = 64;
 const REFUSAL = "a host directory backs this mount and owns no shared buffer";
-const PROCESS_MEMORY_BYTES = 256;
+// Every fixture pid's channel fits inside its memory, the way a real layout
+// guarantees: the read recalls each channel's checkpoint request word.
+const PROCESS_MEMORY_BYTES = 16 * 1024 + CH_TOTAL_SIZE;
 const PROGRAM_BYTES = 32;
 const KERNEL_ABI = 977;
 
@@ -49,6 +52,7 @@ function processSource(pid: number, generation: number): CheckpointProcessSource
     channelOffset: pid * 1024,
     layout: layout(pid * 1024),
     argv: [`/bin/program-${pid}`],
+    env: [`PROGRAM=${pid}`],
     memory,
     programBytes: () => new Uint8Array(PROGRAM_BYTES).fill(pid).buffer,
     threadAllocatorState: () =>
@@ -98,6 +102,9 @@ function testMachine(sources: CheckpointProcessSource[]): TestMachine {
     machine: {
       runWithoutWorkerCreation: (operation, exclusive) =>
         creators.runExclusive(operation, exclusive),
+      hasQueuedLaunch: () => creators.hasQueuedAdmissions(),
+      onLaunchQueuedDuringFreeze: (listener) =>
+        creators.onLaunchQueuedDuringExclusive(listener),
       runWithoutRootfsMutation: (operation) => rootfs.runSnapshot(operation),
       settleActiveVforkBorrows: () => state.settleVforks(),
       holdProcessDispatch: () => {
@@ -208,7 +215,7 @@ describe("machine checkpoint freeze", () => {
     expect(result.checkpoint.processes[0]!.memory.byteLength)
       .toBe(PROCESS_MEMORY_BYTES);
     expect(result.checkpoint.processes[0]!.argv).toEqual(["/bin/program-4"]);
-    expect(result.checkpoint.format).toBe(5);
+    expect(result.checkpoint.format).toBe(6);
     expect(result.checkpoint.kernelAbiVersion).toBe(KERNEL_ABI);
     expect(
       new Uint8Array(result.checkpoint.processes[0]!.programBytes),
@@ -299,22 +306,29 @@ describe("machine checkpoint freeze", () => {
     expect(state.released).toEqual([[4]]);
   });
 
-  it("admits no worker creation and no rootfs mutation while it runs", async () => {
+  it("queues a launch behind the freeze, gives the machine back, and retries", async () => {
     const state = testMachine([processSource(4, 1)]);
     const capture = captureMachineCheckpoint(state.machine, options);
     await flush();
 
-    const spawn = vi.fn();
-    await expect(state.creators.run("spawn", spawn)).rejects.toThrow(
-      "checkpoint freeze is in progress; cannot start spawn",
-    );
+    const spawn = vi.fn(() => 11);
+    const queuedSpawn = state.creators.run("spawn", spawn);
+    // The launch is never refused: the read must not be visible to the
+    // machine as a failed fork or spawn. It waits out the freeze instead.
     expect(spawn).not.toHaveBeenCalled();
     expect(() => state.rootfs.beginMutation("write /etc/passwd")).toThrow(
       "rootfs export is in progress",
     );
 
+    // The queued launch's process is parked inside the launch, so this
+    // attempt gives the machine back at once, the launch runs, and the next
+    // attempt parks a machine that can park.
+    await expect(queuedSpawn).resolves.toBe(11);
+    while (state.sources[0]!.checkpointFreeze.currentPhase !== "armed") {
+      await flush();
+    }
     state.sources[0]!.checkpointFreeze.unwound();
-    await capture;
+    await expect(capture).resolves.toMatchObject({ status: "captured" });
   });
 
   it("resumes the machine when a process never reaches UNWINDING", async () => {

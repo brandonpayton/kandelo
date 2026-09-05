@@ -244,7 +244,10 @@ describe("live replica join", () => {
           { unwindTimeoutMs: 10_000, vforkTimeoutMs: 5_000 },
           (entries) => writer.push(entries),
         );
-        expect(joined.capture.status).toBe("captured");
+        expect(
+          joined.capture.status,
+          joined.capture.status === "captured" ? "" : joined.capture.reason,
+        ).toBe("captured");
         if (joined.capture.status !== "captured") return;
         // The point of the test: something was running when the read happened.
         expect(joined.capture.checkpoint.processes.length).toBeGreaterThan(0);

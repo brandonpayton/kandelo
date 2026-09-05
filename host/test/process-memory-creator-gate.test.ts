@@ -95,7 +95,7 @@ describe("process memory creator destroy gate", () => {
   it("keeps transferred exec-plan ownership in the destroy drain until release", async () => {
     const gate = new ProcessMemoryCreatorGate();
     const sweep = vi.fn();
-    const admission = gate.acquire("an exec replacement plan");
+    const admission = await gate.acquire("an exec replacement plan");
 
     const destroy = gate.closeAndRunAfterDrain(sweep);
     await Promise.resolve();
@@ -105,7 +105,7 @@ describe("process memory creator destroy gate", () => {
     admission.release();
     await expect(destroy).resolves.toBeUndefined();
     expect(sweep).toHaveBeenCalledOnce();
-    expect(() => gate.acquire("a late exec replacement plan")).toThrow(
+    await expect(gate.acquire("a late exec replacement plan")).rejects.toThrow(
       "kernel worker is being destroyed; cannot start a late exec replacement plan",
     );
   });
@@ -172,34 +172,34 @@ describe("process memory creator destroy gate", () => {
     await expect(vfork).resolves.toBe(41);
   });
 
-  it("drains an admitted creator before a freeze runs, then reopens admission", async () => {
+  it("queues a launch behind a freeze and runs it when the machine resumes", async () => {
     const gate = new ProcessMemoryCreatorGate();
     const spawn = deferred();
-    const capture = vi.fn(() => "checkpoint");
-    const lateSpawn = vi.fn();
+    const capture = deferred();
+    const queued = vi.fn();
+    const lateExec = vi.fn(() => 0);
+    const offQueued = gate.onLaunchQueuedDuringExclusive(queued);
     const admittedSpawn = gate.run("spawn", async () => {
       await spawn.promise;
       return 5;
     });
 
-    const freeze = gate.runExclusive("a checkpoint freeze", capture);
-    await expect(
-      gate.run("exec", () => {
-        lateSpawn();
-        return 0;
-      }),
-    ).rejects.toThrow(
-      "a checkpoint freeze is in progress; cannot start exec",
-    );
-    expect(lateSpawn).not.toHaveBeenCalled();
-    expect(capture).not.toHaveBeenCalled();
+    const freeze = gate.runExclusive("a checkpoint freeze", () => capture.promise);
+    const queuedExec = gate.run("exec", lateExec);
+    await Promise.resolve();
+    expect(queued).toHaveBeenCalledOnce();
+    expect(gate.hasQueuedAdmissions()).toBe(true);
+    expect(lateExec).not.toHaveBeenCalled();
 
     spawn.resolve();
     await expect(admittedSpawn).resolves.toBe(5);
-    await expect(freeze).resolves.toBe("checkpoint");
-    expect(capture).toHaveBeenCalledOnce();
+    expect(lateExec).not.toHaveBeenCalled();
 
-    await expect(gate.run("exec", () => 9)).resolves.toBe(9);
+    capture.resolve();
+    await expect(freeze).resolves.toBeUndefined();
+    await expect(queuedExec).resolves.toBe(0);
+    expect(gate.hasQueuedAdmissions()).toBe(false);
+    offQueued();
   });
 
   it("reopens admission when a freeze rejects", async () => {

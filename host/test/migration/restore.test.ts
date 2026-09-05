@@ -16,7 +16,11 @@ import {
 } from "../../src/vfs/default-mounts";
 import { findRepoRoot, resolveBinary } from "../../src/binary-resolver";
 import { doomSharewareWad } from "../support/doom-shareware";
-import { ABI_VERSION } from "../../src/generated/abi";
+import {
+  ABI_VERSION,
+  PROCESS_METADATA_ENTRY_MAX_BYTES,
+  PROCESS_STARTUP_MAX_ARGV_COUNT,
+} from "../../src/generated/abi";
 import { FORK_SAVE_BUFFER_SIZE } from "../../src/process-memory";
 import type { MachineCheckpoint } from "../../src/migration/checkpoint";
 import {
@@ -195,6 +199,28 @@ describe("checkpoint validation", () => {
         const bucket = checkpoint.processes[0]! as { ptrWidth: number };
         bucket.ptrWidth = 8;
       }, /pointer width 8 but its program declares 4/);
+
+      await refusal((checkpoint) => {
+        const bucket = checkpoint.processes[0]! as { argv: unknown };
+        bucket.argv = new Array(PROCESS_STARTUP_MAX_ARGV_COUNT + 1).fill("a");
+      }, /argv list is unusable/);
+
+      await refusal((checkpoint) => {
+        const bucket = checkpoint.processes[0]! as { env: unknown };
+        bucket.env = [7];
+      }, /environment carries a non-string entry/);
+
+      await refusal((checkpoint) => {
+        const bucket = checkpoint.processes[0]! as { env: unknown };
+        bucket.env = ["x".repeat(PROCESS_METADATA_ENTRY_MAX_BYTES + 1)];
+      }, /environment carries a 65537-byte entry/);
+
+      await refusal((checkpoint) => {
+        const bucket = checkpoint.processes[0]! as { env: unknown };
+        bucket.env = new Array(64).fill(
+          "x".repeat(PROCESS_METADATA_ENTRY_MAX_BYTES),
+        );
+      }, /environment exceeds ARG_MAX/);
 
       await refusal((checkpoint) => {
         const bucket = checkpoint.processes[0]! as {

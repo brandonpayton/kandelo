@@ -221,7 +221,7 @@ describe("machine checkpoint of a running guest", () => {
         expect(response.status).toBe("captured");
         if (response.status !== "captured") return;
         const { checkpoint } = response;
-        expect(checkpoint.format).toBe(5);
+        expect(checkpoint.format).toBe(6);
         expect(checkpoint.kernelAbiVersion).toBe(ABI_VERSION);
         expect(checkpoint.kernelMemory.byteLength).toBeGreaterThan(0);
         // `/` alone, because `resolveForNodeKernelSession` gives every scratch
@@ -463,10 +463,10 @@ describe("machine checkpoint of a running guest", () => {
   );
 
   it(
-    "admits no process launch and no rootfs write into the state it reads",
+    "queues a launch and refuses a rootfs write while it reads",
     { timeout: 60_000 },
     async () => {
-      const { host, pid } = await startReadyGuest("checkpoint-loop.wasm");
+      const { host } = await startReadyGuest("checkpoint-loop.wasm");
       const qux = new TextEncoder().encode("qux\n");
       try {
         // Both gates close synchronously inside the capture_checkpoint
@@ -478,23 +478,21 @@ describe("machine checkpoint of a running guest", () => {
           "test-pthread",
         ]);
         const write = host.writeFileToVfs("/tmp/qux", qux);
-
-        await expect(launch).rejects.toThrow(
-          "checkpoint freeze is in progress",
+        const writeRefused = expect(write).rejects.toThrow(
+          "cannot write a rootfs file",
         );
-        await expect(write).rejects.toThrow("cannot write a rootfs file");
+
+        // A launch is never refused: the read must not be visible as a failed
+        // spawn. It waits out the freeze — the capture gives the machine back
+        // and retries around it — and then runs to completion.
+        await expect(launch).resolves.toBe(0);
+        await writeRefused;
 
         const response = await capture;
         expect(response.status).toBe("captured");
-        if (response.status !== "captured") return;
-        // The refused launch left no bucket behind.
-        expect(response.summary.processes.map((p) => p.pid)).toEqual([pid]);
 
-        // Both admissions come back, so the refusals were the freeze holding
-        // them out rather than the machine losing the capability.
-        await expect(
-          host.spawn(programBytes("test-pthread.wasm"), ["test-pthread"]),
-        ).resolves.toBe(0);
+        // The write comes back after the read, so the refusal was the freeze
+        // holding it out rather than the machine losing the capability.
         await host.writeFileToVfs("/tmp/qux", qux);
         expect(await host.readFileFromVfs("/tmp/qux")).toEqual(qux);
       } finally {

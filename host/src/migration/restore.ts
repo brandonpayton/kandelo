@@ -1,5 +1,11 @@
 import { detectPtrWidth, WASM_PAGE_SIZE } from "../constants";
-import { CH_TOTAL_SIZE } from "../generated/abi";
+import {
+  CH_TOTAL_SIZE,
+  POSIX_ARG_MAX_BYTES,
+  PROCESS_METADATA_ENTRY_MAX_BYTES,
+  PROCESS_STARTUP_MAX_ARGV_COUNT,
+  PROCESS_STARTUP_MAX_ENVP_COUNT,
+} from "../generated/abi";
 import {
   FORK_CAP_ACTIVATION_STATE_SAFE,
   readForkInstrumentCapabilityClaim,
@@ -638,6 +644,39 @@ function validateFramebuffer(
   }
 }
 
+/**
+ * Refuse startup metadata a restored worker cannot serve faithfully.
+ *
+ * A restored guest parked inside `_start` re-reads these entries through its
+ * worker's startup imports, under the same generated caps the CRT enforces.
+ * A checkpoint that exceeds them could never have been captured from a real
+ * launch.
+ */
+function validateStartupEntries(
+  pid: number,
+  what: "argv" | "environment",
+  entries: readonly string[],
+  maxCount: number,
+): void {
+  if (!Array.isArray(entries) || entries.length > maxCount) {
+    refuse(`pid ${pid}'s ${what} list is unusable`);
+  }
+  let totalBytes = 0;
+  for (const entry of entries) {
+    if (typeof entry !== "string") {
+      refuse(`pid ${pid}'s ${what} carries a non-string entry`);
+    }
+    const byteLength = new TextEncoder().encode(entry).byteLength;
+    if (byteLength > PROCESS_METADATA_ENTRY_MAX_BYTES) {
+      refuse(`pid ${pid}'s ${what} carries a ${byteLength}-byte entry`);
+    }
+    totalBytes += byteLength + 1;
+  }
+  if (totalBytes > POSIX_ARG_MAX_BYTES) {
+    refuse(`pid ${pid}'s ${what} exceeds ARG_MAX`);
+  }
+}
+
 async function validateProcessBucket(
   bucket: CheckpointProcessBucket,
 ): Promise<WebAssembly.Module> {
@@ -645,6 +684,8 @@ async function validateProcessBucket(
   if (bucket.ptrWidth !== 4 && bucket.ptrWidth !== 8) {
     refuse(`pid ${pid} claims pointer width ${String(bucket.ptrWidth)}`);
   }
+  validateStartupEntries(pid, "argv", bucket.argv, PROCESS_STARTUP_MAX_ARGV_COUNT);
+  validateStartupEntries(pid, "environment", bucket.env, PROCESS_STARTUP_MAX_ENVP_COUNT);
   const memory = bucket.memory;
   if (
     memory.byteOffset !== 0

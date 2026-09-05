@@ -215,6 +215,9 @@ const processMemoryCreators = new ProcessMemoryCreatorGate();
 const checkpointMachine: CheckpointMachine = {
   runWithoutWorkerCreation: (operation, exclusive) =>
     processMemoryCreators.runExclusive(operation, exclusive),
+  hasQueuedLaunch: () => processMemoryCreators.hasQueuedAdmissions(),
+  onLaunchQueuedDuringFreeze: (listener) =>
+    processMemoryCreators.onLaunchQueuedDuringExclusive(listener),
   runWithoutRootfsMutation: (operation) => rootfsSnapshotGate.runSnapshot(operation),
   settleActiveVforkBorrows: () => vforkLifetimes.settleActiveBorrows(),
   holdProcessDispatch: () => kernelWorker.holdProcessDispatchForCheckpoint(),
@@ -263,6 +266,7 @@ const checkpointMachine: CheckpointMachine = {
       channelOffset: info.channelOffset,
       layout: info.layout,
       argv: info.argv,
+      env: info.env,
       memory: info.memory,
       programBytes: () => info.programBytes,
       threadAllocatorState: () => info.threadAllocator.snapshotState(),
@@ -319,6 +323,8 @@ interface ProcessInfo extends ProcessGenerationOwnership {
   programModule?: WebAssembly.Module;
   worker: ReturnType<BrowserWorkerAdapter["createWorker"]>;
   argv: string[];
+  /** Launch environment for this exact image; a resumed `_start` re-reads it. */
+  env: string[];
   channelOffset: number;
   ptrWidth: 4 | 8;
   /** Kernel-owned sticky secure-execution state for this exact image. */
@@ -1422,7 +1428,7 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
             );
       },
       onExec: async (request) => {
-        const creatorAdmission = processMemoryCreators.acquire(
+        const creatorAdmission = await processMemoryCreators.acquire(
           "an exec process Worker",
         );
         try {
@@ -1836,6 +1842,11 @@ async function restoreProcessFromBucket(
       externrefGenerationId: externrefGeneration.id,
       forkHostImports: forkHostImports.init,
       checkpointFreezeGate: checkpointFreeze.gate,
+      // A guest captured inside _start resumes into its argv/environ copy
+      // loops, which re-read these startup imports. Relaunching without them
+      // would trip the CRT's startup contract.
+      argv: [...bucket.argv],
+      env: [...bucket.env],
       isForkChild: true,
       forkMode: PROCESS_FORK_MODE_FORK,
       forkBufAddr,
@@ -1872,6 +1883,7 @@ async function restoreProcessFromBucket(
       programModule,
       worker,
       argv: [...bucket.argv],
+      env: [...bucket.env],
       channelOffset,
       ptrWidth,
       secureExec,
@@ -2282,6 +2294,7 @@ async function handleSpawn(msg: Extract<MainToKernelMessage, { type: "spawn" }>)
       programBytes,
       worker,
       argv: msg.argv,
+      env: launchEnv,
       channelOffset,
       ptrWidth,
       secureExec,
@@ -2861,6 +2874,7 @@ async function handleVfork(
       programModule: parentInfo.programModule,
       worker: childWorker,
       argv: parentInfo.argv,
+      env: parentInfo.env,
       channelOffset: childChannelOffset,
       ptrWidth,
       secureExec: childInitData.secureExec,
@@ -3233,6 +3247,7 @@ async function handleOrdinaryFork(
       programModule: parentInfo.programModule,
       worker,
       argv: parentInfo.argv,
+      env: parentInfo.env,
       channelOffset: childChannelOffset,
       ptrWidth,
       secureExec: childInitData.secureExec,
@@ -3647,6 +3662,7 @@ async function handleExec(
         programModule,
         worker: replacementWorker,
         argv: launchArgv,
+        env: envp,
         channelOffset: newChannelOffset,
         ptrWidth,
         secureExec,
@@ -3994,6 +4010,7 @@ async function handlePosixSpawn(
       programModule,
       worker,
       argv,
+      env: envp,
       channelOffset: newChannelOffset,
       ptrWidth,
       secureExec,

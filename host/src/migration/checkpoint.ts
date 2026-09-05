@@ -1,3 +1,7 @@
+import {
+  CH_CHECKPOINT_REQUEST,
+  CH_CHECKPOINT_REQUEST_RESTART,
+} from "../generated/abi";
 import type { CheckpointFreezeGateCoordinator } from "../checkpoint-freeze-gate";
 import type { ProcessMemoryLayout } from "../process-memory";
 import type { ThreadPageAllocatorState } from "../thread-allocator";
@@ -121,6 +125,13 @@ export interface CheckpointProcessSource {
   readonly channelOffset: number;
   readonly layout: ProcessMemoryLayout;
   readonly argv: readonly string[];
+  /**
+   * Launch environment for this exact image. A guest captured inside `_start`
+   * re-reads argv and environment from its worker's startup imports when it
+   * resumes, so a restore must relaunch the worker with the same values or
+   * the CRT's startup contract truthfully traps.
+   */
+  readonly env: readonly string[];
   readonly memory: WebAssembly.Memory;
   /**
    * The exact program image this generation runs. Read under the freeze:
@@ -187,6 +198,19 @@ export interface CheckpointMachine {
   readonly monotonicNowNs: () => number;
   readonly kernelAbiVersion: () => number;
   readonly liveProcesses: () => readonly CheckpointProcessSource[];
+  /**
+   * Whether a process launch is waiting out the freeze's exclusivity.
+   *
+   * A fork, exec, posix_spawn, or pthread launch that arrives during the
+   * freeze queues on the worker-creation gate rather than failing — the read
+   * must never be visible to the machine as a failed launch. Its initiating
+   * process is parked inside that launch, so the freeze's park can never
+   * complete while one is queued. The freeze checks here and listens below to
+   * give the machine back at once and retry, instead of timing out.
+   */
+  readonly hasQueuedLaunch?: () => boolean;
+  /** Listen for a launch queueing during the freeze. Returns an unsubscribe. */
+  readonly onLaunchQueuedDuringFreeze?: (listener: () => void) => () => void;
 }
 
 /**
@@ -253,6 +277,8 @@ export interface CheckpointProcessBucket {
   readonly channelOffset: number;
   readonly layout: ProcessMemoryLayout;
   readonly argv: readonly string[];
+  /** Launch environment; a guest resumed inside `_start` re-reads it. */
+  readonly env: readonly string[];
   readonly memory: Uint8Array;
   /** Live reference, never mutated: exec replaces the buffer, in place. */
   readonly programBytes: ArrayBuffer;
@@ -268,7 +294,7 @@ export interface CheckpointProcessBucket {
  * refuses a checkpoint whose format it does not know rather than guessing at
  * the missing or extra fields.
  */
-export const MACHINE_CHECKPOINT_FORMAT = 5;
+export const MACHINE_CHECKPOINT_FORMAT = 6;
 
 export interface MachineCheckpoint {
   readonly format: typeof MACHINE_CHECKPOINT_FORMAT;
@@ -520,6 +546,22 @@ export interface CheckpointFreezeOptions {
 class CheckpointTimeout extends Error {}
 
 /**
+ * A launch raced the freeze; the capture gives the machine back and retries.
+ *
+ * This is the freeze answering the fork-during-freeze gap truthfully: the
+ * launch is never refused (the guest would see a failure the read caused),
+ * and the freeze never waits out a park that cannot complete.
+ */
+class CheckpointLaunchRace extends Error {}
+
+const LAUNCH_RACE_RETRY_LIMIT = 10;
+
+const LAUNCH_RACE_REASON =
+  "a process launch (fork, exec, posix_spawn, or pthread start) arrived "
+  + "while the freeze was parking the machine; the launch waits out the "
+  + "freeze, so its process cannot park";
+
+/**
  * `message` may be a function so a timeout can describe the state it found.
  * A reason built when the race was set up would name what was true before the
  * wait, which is the opposite of what the caller needs.
@@ -587,18 +629,27 @@ export async function captureMachineCheckpoint(
   machine: CheckpointMachine,
   options: CheckpointFreezeOptions,
 ): Promise<CheckpointFreezeResult> {
-  try {
-    return await machine.runWithoutWorkerCreation(
-      "checkpoint freeze",
-      () => machine.runWithoutRootfsMutation(
-        () => freezeAndRead(machine, options),
-      ),
-    );
-  } catch (error) {
-    if (error instanceof CheckpointTimeout) {
-      return { status: "timed-out", reason: error.message };
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await machine.runWithoutWorkerCreation(
+        "checkpoint freeze",
+        () => machine.runWithoutRootfsMutation(
+          () => freezeAndRead(machine, options),
+        ),
+      );
+    } catch (error) {
+      if (error instanceof CheckpointLaunchRace) {
+        // Exclusivity was just given back, so the queued launch runs now and
+        // the next attempt's drain waits for it. A machine that launches
+        // faster than the freeze can park is reported, not waited out.
+        if (attempt < LAUNCH_RACE_RETRY_LIMIT) continue;
+        return { status: "failed", reason: error.message };
+      }
+      if (error instanceof CheckpointTimeout) {
+        return { status: "timed-out", reason: error.message };
+      }
+      return { status: "failed", reason: describe(error) };
     }
-    return { status: "failed", reason: describe(error) };
   }
 }
 
@@ -624,28 +675,53 @@ async function freezeAndRead(
   machine: CheckpointMachine,
   options: CheckpointFreezeOptions,
 ): Promise<CheckpointFreezeResult> {
-  await withTimeout(
-    machine.settleActiveVforkBorrows(),
-    options.vforkTimeoutMs,
-    "a vfork borrow did not resolve before the checkpoint freeze timed out",
-  );
-
-  // The borrow set is read after it settles: a vfork child shares its parent's
-  // address space, so "one memory per execution generation" only holds here.
-  const sources = machine.liveProcesses();
   const armed: CheckpointProcessSource[] = [];
   let unwound = false;
   let held = false;
   let unreleased: number[] = [];
   let checkpoint: MachineCheckpoint | undefined;
+  let sawQueuedLaunch: (() => void) | undefined;
+  const queuedLaunch = new Promise<never>((_resolve, reject) => {
+    sawQueuedLaunch = () => reject(new CheckpointLaunchRace(LAUNCH_RACE_REASON));
+  });
+  // The race can settle on the other side first; a later launch rejection
+  // must not surface as an unhandled rejection.
+  void queuedLaunch.catch(() => undefined);
+  const offQueuedLaunch = sawQueuedLaunch
+    ? machine.onLaunchQueuedDuringFreeze?.(sawQueuedLaunch)
+    : undefined;
+  let sources: readonly CheckpointProcessSource[] = [];
   try {
+    // A launch can have queued between the gate turning exclusive and this
+    // listener attaching; its process is parked inside the launch already.
+    // The vfork settle races the same signal: a vfork child settles its
+    // borrow by exec or exit, and that exec is itself a launch that queues
+    // behind this freeze — waiting out the settle would wait on it.
+    if (machine.hasQueuedLaunch?.()) {
+      throw new CheckpointLaunchRace(LAUNCH_RACE_REASON);
+    }
+    await withTimeout(
+      Promise.race([machine.settleActiveVforkBorrows(), queuedLaunch]),
+      options.vforkTimeoutMs,
+      "a vfork borrow did not resolve before the checkpoint freeze timed out",
+    );
+
+    // The borrow set is read after it settles: a vfork child shares its
+    // parent's address space, so "one memory per execution generation" only
+    // holds here.
+    sources = machine.liveProcesses();
     for (const source of sources) {
       source.checkpointFreeze.arm();
       armed.push(source);
     }
     machine.armUnwindRequests();
     await withTimeout(
-      Promise.all(armed.map((source) => source.checkpointFreeze.waitUntilUnwound())),
+      Promise.race([
+        Promise.all(
+          armed.map((source) => source.checkpointFreeze.waitUntilUnwound()),
+        ),
+        queuedLaunch,
+      ]),
       options.unwindTimeoutMs,
       () => describeUnwindStragglers(armed),
     );
@@ -659,6 +735,7 @@ async function freezeAndRead(
     checkpoint = readMachine(machine, armed);
     options.onRead?.();
   } finally {
+    offQueuedLaunch?.();
     machine.disarmUnwindRequests();
     if (held) unreleased = await machine.releaseProcessDispatch();
     for (const source of armed) {
@@ -704,6 +781,29 @@ async function freezeAndRead(
   return { status: "captured", checkpoint: checkpoint! };
 }
 
+/**
+ * Recall stale checkpoint-unwind requests from one copied process memory.
+ *
+ * The read happens while the freeze is still armed, so a channel word that a
+ * completion republished after the guest cleared it travels in the bytes.
+ * `disarmCheckpointUnwind` recalls those words on the machine that resumes;
+ * this is the same recall for the machine a restore boots — a restored guest
+ * that read the leftover unwind bit would begin a capture with no freeze to
+ * resume it, and park forever. The restart bit stays for the same reason the
+ * disarm keeps it: the guest is owed the syscall it was making.
+ */
+function recallCheckpointRequests(
+  memory: Uint8Array,
+  channelOffsets: readonly number[],
+): void {
+  const view = new DataView(memory.buffer, memory.byteOffset, memory.byteLength);
+  for (const channelOffset of channelOffsets) {
+    const address = channelOffset + CH_CHECKPOINT_REQUEST;
+    const published = view.getUint32(address, true);
+    view.setUint32(address, published & CH_CHECKPOINT_REQUEST_RESTART, true);
+  }
+}
+
 function readMachine(
   machine: CheckpointMachine,
   sources: readonly CheckpointProcessSource[],
@@ -735,20 +835,29 @@ function readMachine(
     })),
     kms: machine.kmsState(),
     gl: machine.glContexts(),
-    processes: sources.map((source) => ({
-      pid: source.pid,
-      executionGeneration: source.executionGeneration,
-      ptrWidth: source.ptrWidth,
-      channelOffset: source.channelOffset,
-      layout: source.layout,
-      argv: [...source.argv],
-      memory: new Uint8Array(source.memory.buffer).slice(),
-      programBytes: source.programBytes(),
-      threadAllocator: source.threadAllocatorState(),
-      threads: source.threads(),
-      ...(source.forkReplayContext
-        ? { forkReplayContext: source.forkReplayContext }
-        : {}),
-    })),
+    processes: sources.map((source) => {
+      const memory = new Uint8Array(source.memory.buffer).slice();
+      const threads = source.threads();
+      recallCheckpointRequests(memory, [
+        source.channelOffset,
+        ...threads.map((thread) => thread.channelOffset),
+      ]);
+      return {
+        pid: source.pid,
+        executionGeneration: source.executionGeneration,
+        ptrWidth: source.ptrWidth,
+        channelOffset: source.channelOffset,
+        layout: source.layout,
+        argv: [...source.argv],
+        env: [...source.env],
+        memory,
+        programBytes: source.programBytes(),
+        threadAllocator: source.threadAllocatorState(),
+        threads,
+        ...(source.forkReplayContext
+          ? { forkReplayContext: source.forkReplayContext }
+          : {}),
+      };
+    }),
   };
 }
