@@ -9,6 +9,10 @@ import { descriptorFromGalleryItem } from "../gallery-descriptor";
 import { Gallery } from "../views/Gallery";
 import { EmptyState } from "../views/EmptyState";
 import { createShellTerminal, type ShellTerminal } from "../panes/Shell";
+import { SharedTerminal } from "../panes/SharedTerminal";
+import { NetworkPopup } from "./NetworkPopup";
+import { usePeerSession } from "./peer-session";
+import { useTerminalPublisher } from "./shared-terminal";
 import { Inspector, INSPECTOR_TABS } from "../panes/Inspector";
 import { navigateToGalleryItemUrl } from "../url-state";
 import type {
@@ -60,6 +64,7 @@ export const App: React.FC = () => {
   const demoGuide = useDemoGuide();
   const lazyDownloads = useLazyDownloads();
   const surface = useMachineSurfaceController();
+  const peer = usePeerSession();
 
   const [dockPane, setDockPane] = React.useState<DockPaneId | null>(null);
   const [dockHeight, setDockHeight] = React.useState(0);
@@ -69,6 +74,7 @@ export const App: React.FC = () => {
   const [demoGuidePopup, setDemoGuidePopup] = React.useState<React.ReactNode | null>(null);
   const [internalsOpen, setInternalsOpen] = React.useState(false);
   const [internalsTab, setInternalsTab] = React.useState<InternalsTab>("syslog");
+  const [networkOpen, setNetworkOpen] = React.useState(false);
   const [theme, setTheme] = React.useState<ThemePreference>(() => readThemePreference());
   const [systemThemeMode, setSystemThemeMode] = React.useState<ResolvedThemeMode>(() => getSystemThemeMode());
   const [themeOpen, setThemeOpen] = React.useState(false);
@@ -78,6 +84,12 @@ export const App: React.FC = () => {
   const [audioError, setAudioError] = React.useState<string | null>(null);
   const nextTerminalIndex = React.useRef(2);
   const autoOpenedDemoGuideKey = React.useRef<string | null>(null);
+
+  const sharingTerminal = useTerminalPublisher(
+    host,
+    peer.link,
+    terminals.find((terminal) => terminal.id === activeTerminalId)?.path,
+  );
 
   const desc = host.getBootDescriptor();
   const resolvedThemeMode = theme.mode === "auto" ? systemThemeMode : theme.mode;
@@ -144,6 +156,7 @@ export const App: React.FC = () => {
     setDemoDockControls(null);
     setDemoGuidePopup(null);
     setInternalsOpen(false);
+    setNetworkOpen(false);
     setThemeOpen(false);
   }, [desc.id]);
 
@@ -154,6 +167,7 @@ export const App: React.FC = () => {
   const selectDockPane = React.useCallback((pane: DockPaneId | null) => {
     setInternalsOpen(false);
     setDemoGuideOpen(false);
+    setNetworkOpen(false);
     setThemeOpen(false);
     setDockPane((current) => current === pane ? null : pane);
   }, []);
@@ -161,6 +175,7 @@ export const App: React.FC = () => {
   const selectMachineView = React.useCallback((view: DockViewId) => {
     setDockPane(null);
     setInternalsOpen(false);
+    setNetworkOpen(false);
     setThemeOpen(false);
     surface.chooseView(view);
   }, [surface]);
@@ -169,6 +184,7 @@ export const App: React.FC = () => {
     if (!demoGuide) return;
     setDockPane(null);
     setInternalsOpen(false);
+    setNetworkOpen(false);
     setThemeOpen(false);
     setDemoGuideOpen((open) => !open);
   }, [demoGuide]);
@@ -177,14 +193,24 @@ export const App: React.FC = () => {
     if (!surface.canUseInternals) return;
     setDockPane(null);
     setDemoGuideOpen(false);
+    setNetworkOpen(false);
     setThemeOpen(false);
     setInternalsOpen((open) => !open);
   }, [surface.canUseInternals]);
+
+  const toggleNetwork = React.useCallback(() => {
+    setDockPane(null);
+    setDemoGuideOpen(false);
+    setInternalsOpen(false);
+    setThemeOpen(false);
+    setNetworkOpen((open) => !open);
+  }, []);
 
   const toggleTheme = React.useCallback(() => {
     setDockPane(null);
     setDemoGuideOpen(false);
     setInternalsOpen(false);
+    setNetworkOpen(false);
     setThemeOpen((open) => !open);
   }, []);
 
@@ -289,7 +315,9 @@ export const App: React.FC = () => {
   return (
     <div className={appClassName} style={appStyle} data-audio-state={audioState}>
       <main className={`kmain kdocked-main${isEmpty ? " kmain-flush" : ""}`}>
-        {isEmpty ? (
+        {isEmpty && peer.link ? (
+          <SharedTerminal link={peer.link} />
+        ) : isEmpty ? (
           <EmptyState
             onLaunchItem={onLaunchGalleryItem}
             onBrowseAll={() => setDockPane("gallery")}
@@ -349,11 +377,16 @@ export const App: React.FC = () => {
         viewControls={viewControls}
         guidePopup={demoGuidePopup}
         internalsPopup={internalsPopup}
+        networkPopup={
+          <NetworkPopup session={peer} sharing={sharingTerminal} />
+        }
         themePopup={<ThemePopup theme={theme} resolvedMode={resolvedThemeMode} onThemeChange={setTheme} />}
         guideAvailable={!isEmpty && demoGuide !== null}
         guideOpen={!isEmpty && demoGuide !== null && demoGuideOpen}
         internalsAvailable={!isEmpty && surface.canUseInternals}
         internalsOpen={!isEmpty && surface.canUseInternals && internalsOpen}
+        networkOpen={networkOpen}
+        networkConnected={peer.link !== null}
         themeOpen={themeOpen}
         status={surface.status}
         machineTitle={desc.title}
@@ -365,9 +398,11 @@ export const App: React.FC = () => {
         onSelectView={selectMachineView}
         onToggleGuide={toggleDemoGuide}
         onToggleInternals={toggleInternals}
+        onToggleNetwork={toggleNetwork}
         onToggleTheme={toggleTheme}
         onCloseGuide={() => setDemoGuideOpen(false)}
         onCloseInternals={() => setInternalsOpen(false)}
+        onCloseNetwork={() => setNetworkOpen(false)}
         onCloseTheme={() => setThemeOpen(false)}
         onHeightChange={setDockHeight}
         onLayoutChange={onDockLayoutChange}

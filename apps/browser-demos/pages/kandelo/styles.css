@@ -1036,6 +1036,10 @@
   --kdock-popover-width: 360px;
 }
 
+.kdock-network-popover {
+  --kdock-popover-width: 460px;
+}
+
 .kdock-internals-popover {
   --kdock-popover-width: 980px;
   height: min(680px, calc(100dvh - var(--kdock-popover-bottom, 100px) - 12px));
@@ -1043,6 +1047,7 @@
 
 .kdock-popover .kdemo,
 .kdock-popover .ktheme-popup,
+.kdock-popover .knetwork-popup,
 .kdock-internals-popover .kinternals-popup {
   flex: 1;
   max-height: inherit;
@@ -1053,6 +1058,7 @@
 
 :root[data-k-mode="dark"] .kdock-popover .kdemo,
 :root[data-k-mode="dark"] .kdock-popover .ktheme-popup,
+:root[data-k-mode="dark"] .kdock-popover .knetwork-popup,
 :root[data-k-mode="dark"] .kdock-internals-popover .kinternals-popup {
   background: transparent;
 }
@@ -4699,4 +4705,100 @@
 }
 @keyframes kweb-spin {
   to { transform: rotate(360deg); }
+}
+
+.knetwork-popup {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 14px;
+  background: var(--k-surface);
+  color: var(--k-text);
+}
+
+.knetwork-section {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.knetwork-label {
+  color: var(--k-text-muted);
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0.06em;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+
+.knetwork-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.knetwork-button {
+  padding: 6px 10px;
+  border: 1px solid var(--k-border);
+  border-radius: 8px;
+  background: var(--k-surface-raised, transparent);
+  color: var(--k-text);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.knetwork-button:hover {
+  border-color: var(--k-accent, var(--k-border));
+}
+
+.knetwork-disconnect {
+  align-self: flex-start;
+}
+
+.knetwork-code {
+  min-height: 64px;
+  resize: vertical;
+  padding: 8px;
+  border: 1px solid var(--k-border);
+  border-radius: 8px;
+  background: var(--k-surface);
+  color: var(--k-text);
+  font-family: var(--k-font-mono, monospace);
+  font-size: 11px;
+  line-height: 1.4;
+  word-break: break-all;
+}
+
+.knetwork-status {
+  color: var(--k-text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.kdock-item.is-connected .kdock-icon {
+  color: var(--k-ok, var(--k-accent, currentColor));
+}
+
+.kshared-terminal {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.kshared-terminal-head {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--k-border);
+  color: var(--k-text-muted);
+  font-size: 12px;
+}
+
+.kshared-terminal-host {
+  flex: 1;
+  min-height: 0;
+  padding: 8px;
 }

@@ -59,6 +59,44 @@ describe("local framebuffer mirror", () => {
     }
   });
 
+  it("re-announces onto a watcher without rebinding it", async () => {
+    // A congested publisher re-announces on every drain. Rebinding on each
+    // one installs a fresh zeroed buffer and makes renderers re-attach onto
+    // black, which is a blink for as long as the wire stays slow.
+    const channel = `mirror-test-${crypto.randomUUID()}`;
+    const publisher = new LocalFramebufferMirror(channel);
+    const watcher = new LocalFramebufferMirror(channel);
+    const source = publishedRegistry([1, 2, 3, 4, 5, 6, 7, 8]);
+    const sink = new FramebufferRegistry();
+    const changes: string[] = [];
+    sink.onChange((pid, event) => changes.push(`${pid}:${event}`));
+    const stopPublish = publisher.publish(source, 7);
+    const stopWatch = watcher.watch(sink);
+    try {
+      await vi.waitFor(() => expect(sink.get(7)).toBeDefined());
+      expect(changes).toEqual(["7:bind"]);
+
+      // A second watcher's hello makes the publisher announce again, which
+      // is the same message a drain resynchronisation sends.
+      const rejoining = new LocalFramebufferMirror(channel);
+      const sinkB = new FramebufferRegistry();
+      const stopWatchB = rejoining.watch(sinkB);
+      try {
+        await vi.waitFor(() => expect(sinkB.get(7)).toBeDefined());
+        expect(changes).toEqual(["7:bind"]);
+        expect([...sink.get(7)!.hostBuffer!]).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      } finally {
+        stopWatchB();
+        rejoining.close();
+      }
+    } finally {
+      stopPublish();
+      stopWatch();
+      publisher.close();
+      watcher.close();
+    }
+  });
+
   it("announces a binding that appears after publishing started", async () => {
     const channel = `mirror-test-${crypto.randomUUID()}`;
     const publisher = new LocalFramebufferMirror(channel);
@@ -113,7 +151,7 @@ describe("local framebuffer mirror", () => {
     }
   });
 
-  it("skips writes on a congested channel and resynchronises on drain", () => {
+  it("skips writes on a congested channel and resynchronises on drain", async () => {
     const [publisherWire, watcherWire] = FakeDataChannel.pair({ auto: false });
     const publisherChannel = new ChunkedMessageChannel(publisherWire);
     const watcherChannel = new ChunkedMessageChannel(watcherWire);
@@ -128,8 +166,10 @@ describe("local framebuffer mirror", () => {
     const stopPublish = publisher.publish(source, 7);
     const stopWatch = watcher.watch(sink);
     try {
-      publisherWire.flush();
-      expect([...sink.get(7)!.hostBuffer!]).toEqual([1, 1, 1, 1, 1, 1, 1, 1]);
+      await vi.waitFor(() => {
+        publisherWire.flush();
+        expect([...sink.get(7)!.hostBuffer!]).toEqual([1, 1, 1, 1, 1, 1, 1, 1]);
+      });
 
       publisherChannel.postMessage({
         kind: "stuffing",
@@ -138,11 +178,12 @@ describe("local framebuffer mirror", () => {
       expect(publisherChannel.congested()).toBe(true);
       source.fbWrite(7, 0, new Uint8Array([2, 2, 2, 2, 2, 2, 2, 2]));
 
-      // The first flush frees the wire; the drain re-announce carries the
-      // written pixels as a fresh full frame, never as the skipped write.
-      publisherWire.flush();
-      publisherWire.flush();
-      expect([...sink.get(7)!.hostBuffer!]).toEqual([2, 2, 2, 2, 2, 2, 2, 2]);
+      // The flushes free the wire; the drain re-announce carries the written
+      // pixels as a fresh full frame, never as the skipped write.
+      await vi.waitFor(() => {
+        publisherWire.flush();
+        expect([...sink.get(7)!.hostBuffer!]).toEqual([2, 2, 2, 2, 2, 2, 2, 2]);
+      });
       expect(receivedKinds).not.toContain("write");
     } finally {
       stopPublish();

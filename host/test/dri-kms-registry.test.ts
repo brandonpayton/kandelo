@@ -22,6 +22,22 @@ describe("KmsRegistry", () => {
     expect(kms.currentFb(1)).toBeUndefined();
   });
 
+  it("boundCrtcs lists every modeset CRTC and survives rmFb", () => {
+    const kms = new KmsRegistry(new GbmBoRegistry());
+    expect(kms.boundCrtcs()).toEqual([]);
+
+    kms.addFb(fb(10));
+    expect(kms.boundCrtcs()).toEqual([]);
+
+    kms.setFb(1, 10);
+    kms.setFb(2, 10);
+    expect(kms.boundCrtcs()).toEqual([1, 2]);
+
+    kms.rmFb(10);
+    expect(kms.currentFb(1)).toBeUndefined();
+    expect(kms.boundCrtcs()).toEqual([1, 2]);
+  });
+
   it("setMasterPid / dropMaster / isMasterPid", () => {
     const kms = new KmsRegistry(new GbmBoRegistry());
     expect(kms.isMasterPid(7)).toBe(false);

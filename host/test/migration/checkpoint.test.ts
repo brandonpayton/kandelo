@@ -66,6 +66,7 @@ interface TestMachine {
   readonly disarmed: { count: number };
   settleVforks: () => Promise<void>;
   unreleasable: number[];
+  modesetCrtcs: number[];
 }
 
 function testMachine(sources: CheckpointProcessSource[]): TestMachine {
@@ -85,6 +86,7 @@ function testMachine(sources: CheckpointProcessSource[]): TestMachine {
     disarmed,
     settleVforks: () => Promise.resolve(),
     unreleasable: [],
+    modesetCrtcs: [],
     machine: {
       runWithoutWorkerCreation: (operation, exclusive) =>
         creators.runExclusive(operation, exclusive),
@@ -110,6 +112,7 @@ function testMachine(sources: CheckpointProcessSource[]): TestMachine {
       copyKernelMemory: () => new Uint8Array(KERNEL_MEMORY_BYTES).fill(7),
       filesystemBuffer: () => new SharedArrayBuffer(FILESYSTEM_BYTES),
       framebuffers: () => [],
+      modesetCrtcs: () => state.modesetCrtcs,
       monotonicNowNs: () => 7_000_000_000,
       kernelAbiVersion: () => KERNEL_ABI,
       liveProcesses: () => sources,
@@ -287,6 +290,21 @@ describe("machine checkpoint freeze", () => {
       reason: "pid=4: the process ended during the checkpoint freeze",
     });
     expect(state.held).toEqual([]);
+  });
+
+  it("refuses a modeset machine without freezing it", async () => {
+    const state = testMachine([processSource(4, 1)]);
+    state.modesetCrtcs = [31];
+
+    await expect(captureMachineCheckpoint(state.machine, options)).resolves.toEqual({
+      status: "failed",
+      reason:
+        "checkpoint does not carry KMS state, and CRTC 31 holds a bound framebuffer",
+    });
+    expect(state.held).toEqual([]);
+    expect(state.armed).toEqual([]);
+    expect(Atomics.load(new Int32Array(state.sources[0]!.checkpointFreeze.gate), 0))
+      .toBe(0);
   });
 
   it("fails without freezing when a thread dies before the read", async () => {

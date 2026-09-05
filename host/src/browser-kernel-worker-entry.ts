@@ -200,6 +200,7 @@ const checkpointMachine: CheckpointMachine = {
     const now = io.clockGettime(1);
     return now.sec * 1_000_000_000 + now.nsec;
   },
+  modesetCrtcs: () => kernelWorker.kms.boundCrtcs(),
   framebuffers: () =>
     kernelWorker.framebuffers.list().map((binding) => ({
       pid: binding.pid,

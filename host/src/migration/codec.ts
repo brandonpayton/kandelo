@@ -30,7 +30,7 @@ function isBinaryMarker(node: unknown): node is BinaryMarker {
   );
 }
 
-export function encodeMessage(message: unknown): Uint8Array {
+export function encodeMessage(message: unknown): Uint8Array<ArrayBuffer> {
   const blobs: Uint8Array[] = [];
   const json = JSON.stringify(message, (_key, node: unknown) => {
     if (node instanceof Uint8Array) {

@@ -7,8 +7,9 @@
  * channel — ownership, input authority, and the machine itself move through
  * `LocalCheckpointHandover` alone, so a watching tab sees the game move but
  * cannot move it. A watcher announces itself and the publisher answers with
- * the binding geometry plus a full-frame snapshot, so a tab opened mid-game
- * starts from the current frame instead of a black canvas. Only write-based
+ * one message carrying the binding geometry and a full frame together, so a
+ * tab opened mid-game starts from the current frame and a resynchronising
+ * one never shows an empty binding. Only write-based
  * bindings can be mirrored: an mmap-based binding has no write stream to
  * forward, and publishing one fails loudly rather than showing a stale
  * frame as live. Node's `BroadcastChannel` implements the same contract, so
@@ -37,10 +38,6 @@ type LocalMirrorMessage =
       readonly w: number;
       readonly h: number;
       readonly stride: number;
-    }
-  | {
-      readonly kind: "frame";
-      readonly pid: number;
       readonly pixels: Uint8Array;
     }
   | {
@@ -74,14 +71,17 @@ export class LocalFramebufferMirror {
           `pid ${pid}: only a write-based framebuffer binding can be mirrored`,
         );
       }
+      // Geometry and pixels travel as one message. Sent apart, the watcher
+      // holds a bound-but-empty framebuffer for as long as the wire takes to
+      // deliver the second one, and renders that emptiness.
       this.#post({
         kind: "bind",
         pid,
         w: binding.w,
         h: binding.h,
         stride: binding.stride,
+        pixels: new Uint8Array(binding.hostBuffer),
       });
-      this.#post({ kind: "frame", pid, pixels: new Uint8Array(binding.hostBuffer) });
     };
     const stopChange = registry.onChange((boundPid, event) => {
       if (boundPid === pid && event === "bind") announce();
@@ -121,28 +121,38 @@ export class LocalFramebufferMirror {
   /**
    * Replay every published stream into `registry`.
    *
-   * Binds arrive as write-based bindings, snapshots and writes as
-   * `fbWrite` pushes, so `registry.onChange` tells the consumer which pid
-   * to render and the ordinary canvas renderer draws the rest. Says hello
-   * so a running publisher answers with the current frame. Returns a stop
-   * function.
+   * A new geometry arrives as a write-based binding, every frame and write
+   * as an `fbWrite` push, so `registry.onChange` tells the consumer which
+   * pid to render and the ordinary canvas renderer draws the rest. Says
+   * hello so a running publisher answers with the current frame. Returns a
+   * stop function.
    */
   watch(registry: FramebufferRegistry): () => void {
     const listener = (event: MessageEvent) => {
       const message = event.data as LocalMirrorMessage;
       if (message.kind === "bind") {
-        registry.bind({
-          pid: message.pid,
-          addr: 0,
-          len: 0,
-          w: message.w,
-          h: message.h,
-          stride: message.stride,
-          fmt: "BGRA32",
-        });
-        return;
-      }
-      if (message.kind === "frame") {
+        // Only a real geometry change rebinds. `bind` installs a fresh zeroed
+        // buffer and reports a "bind" change, which makes a renderer detach
+        // and re-attach onto black; a publisher re-announces on every drain,
+        // so rebinding each time is a blink for as long as the wire is slow.
+        const current = registry.get(message.pid);
+        if (
+          !current
+          || !current.hostBuffer
+          || current.w !== message.w
+          || current.h !== message.h
+          || current.stride !== message.stride
+        ) {
+          registry.bind({
+            pid: message.pid,
+            addr: 0,
+            len: 0,
+            w: message.w,
+            h: message.h,
+            stride: message.stride,
+            fmt: "BGRA32",
+          });
+        }
         registry.fbWrite(message.pid, 0, message.pixels);
         return;
       }

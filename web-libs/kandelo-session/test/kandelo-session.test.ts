@@ -376,6 +376,108 @@ describe("LiveKernelHost: process events", () => {
   });
 });
 
+describe("LiveKernelHost: terminal sharing", () => {
+  function seedPtySession(host: LiveKernelHost, path: string, pid: number) {
+    const listeners = new Set<(bytes: Uint8Array) => void>();
+    const session = {
+      path,
+      pid,
+      logicalGeneration: 0,
+      processGeneration: 0,
+      restartTimer: null,
+      removed: false,
+      closed: false,
+      cols: 100,
+      rows: 30,
+      history: [new TextEncoder().encode("kandelo:~$ ")],
+      dataListeners: {
+        add: (cb: (bytes: Uint8Array) => void) => {
+          listeners.add(cb);
+          return () => listeners.delete(cb);
+        },
+      },
+    };
+    (host as any).ptySessions.set(path, session);
+    (host as any).emitTerminalSessions();
+    return {
+      emit: (text: string) => {
+        const bytes = new TextEncoder().encode(text);
+        for (const cb of [...listeners]) cb(bytes);
+      },
+      listenerCount: () => listeners.size,
+    };
+  }
+
+  function sharingHost(): { host: LiveKernelHost; ptyWrite: ReturnType<typeof vi.fn> } {
+    const host = new LiveKernelHost();
+    const ptyWrite = vi.fn();
+    host.attachKernel({
+      ptyWrite,
+      terminateProcess: vi.fn(async () => {}),
+    } as any);
+    return { host, ptyWrite };
+  }
+
+  it("offers nothing to share until a terminal is attached", () => {
+    const { host } = sharingHost();
+    expect(host.getTerminalSessions()).toEqual([]);
+    // A terminal nobody opened is not one to share, and the host says so
+    // rather than handing back a handle onto nothing.
+    expect(host.sharePty("/dev/pts/0")).toBeNull();
+  });
+
+  it("reports the terminals that exist as they come and go", () => {
+    const { host } = sharingHost();
+    const seen: string[][] = [];
+    const off = host.subscribeTerminalSessions((paths) => seen.push(paths));
+    seedPtySession(host, "/dev/pts/0", 42);
+    seedPtySession(host, "/dev/pts/1", 43);
+    host.removePty("/dev/pts/0");
+    off();
+    seedPtySession(host, "/dev/pts/2", 44);
+    expect(seen).toEqual([
+      ["/dev/pts/0"],
+      ["/dev/pts/0", "/dev/pts/1"],
+      ["/dev/pts/1"],
+    ]);
+  });
+
+  it("seeds a sharer with the history and adopts the session's geometry", () => {
+    const { host } = sharingHost();
+    const pty = seedPtySession(host, "/dev/pts/0", 42);
+    const shared = host.sharePty("/dev/pts/0")!;
+    const chunks: string[] = [];
+    shared.onData((bytes) => chunks.push(new TextDecoder().decode(bytes)));
+    pty.emit("ls\r\n");
+    expect(chunks).toEqual(["kandelo:~$ ", "ls\r\n"]);
+    expect(shared.size()).toEqual({ cols: 100, rows: 30 });
+  });
+
+  it("writes a sharer's keystrokes to the session's pty", () => {
+    const { host, ptyWrite } = sharingHost();
+    seedPtySession(host, "/dev/pts/0", 42);
+    const shared = host.sharePty("/dev/pts/0")!;
+    shared.write("ls\n");
+    expect(ptyWrite).toHaveBeenCalledWith(42, new TextEncoder().encode("ls\n"));
+  });
+
+  it("close detaches the sharer without disturbing the session", () => {
+    const { host, ptyWrite } = sharingHost();
+    const pty = seedPtySession(host, "/dev/pts/0", 42);
+    const shared = host.sharePty("/dev/pts/0")!;
+    shared.onData(() => {});
+    expect(pty.listenerCount()).toBe(1);
+
+    shared.close();
+    expect(pty.listenerCount()).toBe(0);
+    // The logical PTY outlives the sharer: closing a share must not silence
+    // the terminal the machine's own user is looking at.
+    expect(host.getTerminalSessions()).toEqual(["/dev/pts/0"]);
+    shared.write("ls\n");
+    expect(ptyWrite).not.toHaveBeenCalled();
+  });
+});
+
 describe("LiveKernelHost: lazy download events", () => {
   it("fans out kernel lazy download events and records history", () => {
     let kernelCb: ((event: LazyDownloadEvent) => void) | null = null;

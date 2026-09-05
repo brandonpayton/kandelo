@@ -333,12 +333,23 @@ export interface DmesgLine {
   msg: string;
 }
 
-export interface PtyHandle {
+/**
+ * A second reader and writer for a terminal somebody else is driving.
+ *
+ * It carries no geometry authority: the emulator that attached the session
+ * owns `cols`/`rows`, and a sharer reads them to size its own view. Anything
+ * that could change the session belongs on {@link PtyHandle}.
+ */
+export interface SharedPtyHandle {
   write(bytes: string | Uint8Array): void;
   onData(cb: (bytes: Uint8Array) => void): () => void;
-  resize(cols: number, rows: number): void;
-  /** Detach this UI handle and its listeners without removing the logical PTY. */
+  size(): { cols: number; rows: number };
+  /** Detach this handle and its listeners without removing the logical PTY. */
   close(): void;
+}
+
+export interface PtyHandle extends SharedPtyHandle {
+  resize(cols: number, rows: number): void;
 }
 
 export interface TerminalProgram {
@@ -644,6 +655,11 @@ export interface KernelHost {
 
   // shell / pty
   attachPty(path?: string, opts?: { cols: number; rows: number }): Promise<PtyHandle>;
+  /** Join an already-attached PTY to share it; null when there is none. */
+  sharePty(path: string): SharedPtyHandle | null;
+  /** Paths of the terminals that currently exist. */
+  getTerminalSessions(): string[];
+  subscribeTerminalSessions(cb: (paths: string[]) => void): () => void;
   /** Remove the logical PTY, including its process and pending restart. */
   removePty(path: string): void;
   /** Resolve after a command has been written, without waiting for a prompt. */
@@ -973,6 +989,7 @@ export class LiveKernelHost implements KernelHost {
   private webPreviewListeners = new ListenerSet<WebPreviewState | null>();
   private presentationListeners = new ListenerSet<DemoPresentation>();
   private surfaceListeners = new ListenerSet<SurfaceAvailability>();
+  private terminalSessionListeners = new ListenerSet<string[]>();
   private galleryListeners = new ListenerSet<void>();
   private demoGuideListeners = new ListenerSet<DemoGuideConfig | null>();
   private demoIngestListeners = new ListenerSet<DemoIngestConfig | null>();
@@ -1492,12 +1509,70 @@ export class LiveKernelHost implements KernelHost {
         if (!this.isCurrentPtySession(sessionKey, session) || session.closed) return;
         kernel.ptyResize(session.pid, rows, cols);
       },
+      size: () => ({ cols: session.cols, rows: session.rows }),
       close: () => {
         if (closed) return;
         closed = true;
         for (const detach of Array.from(dataSubscriptions)) detach();
         // Detach this UI handle only. The PTY-backed shell intentionally
         // persists across drawer open/close so users keep command history.
+      },
+    };
+  }
+
+  getTerminalSessions(): string[] {
+    return [...this.ptySessions.keys()];
+  }
+
+  subscribeTerminalSessions(cb: (paths: string[]) => void): () => void {
+    return this.terminalSessionListeners.add(cb);
+  }
+
+  private emitTerminalSessions(): void {
+    this.terminalSessionListeners.emit(this.getTerminalSessions());
+  }
+
+  /**
+   * Join a terminal that is already attached, to share it with a peer.
+   *
+   * Unlike {@link attachPty} it starts nothing and resizes nothing: the
+   * emulator that attached the session keeps geometry authority, and a
+   * sharer adopts what is already there. Returns null when no session holds
+   * that path, because a terminal nobody opened is not one to share.
+   */
+  sharePty(path: string): SharedPtyHandle | null {
+    const sessionKey = path || "/dev/pts/0";
+    const session = this.ptySessions.get(sessionKey);
+    const kernel = this.kernel;
+    if (!session || !kernel) return null;
+
+    const encoder = new TextEncoder();
+    let closed = false;
+    const dataSubscriptions = new Set<() => void>();
+
+    return {
+      write: (bytes) => {
+        if (closed) return;
+        const buf = typeof bytes === "string" ? encoder.encode(bytes) : bytes;
+        if (!this.isCurrentPtySession(sessionKey, session) || session.closed) return;
+        kernel.ptyWrite(session.pid, buf);
+      },
+      onData: (cb) => {
+        if (closed) return () => {};
+        const off = session.dataListeners.add(cb);
+        const detach = () => {
+          dataSubscriptions.delete(detach);
+          off();
+        };
+        dataSubscriptions.add(detach);
+        for (const chunk of session.history.slice()) cb(chunk);
+        return detach;
+      },
+      size: () => ({ cols: session.cols, rows: session.rows }),
+      close: () => {
+        if (closed) return;
+        closed = true;
+        for (const detach of Array.from(dataSubscriptions)) detach();
       },
     };
   }
@@ -1510,6 +1585,7 @@ export class LiveKernelHost implements KernelHost {
     this.ptySessions.delete(sessionKey);
     this.ptyAttachPromises.delete(sessionKey);
     this.ptyCommandQueues.delete(sessionKey);
+    this.emitTerminalSessions();
   }
 
   private async withPtyAttachLock(
@@ -1575,6 +1651,7 @@ export class LiveKernelHost implements KernelHost {
         supervised: policy !== undefined,
       };
       this.ptySessions.set(sessionKey, session);
+      this.emitTerminalSessions();
     } else {
       session.cols = opts.cols;
       session.rows = opts.rows;
@@ -1845,6 +1922,7 @@ export class LiveKernelHost implements KernelHost {
     this.ptyAttachPromises.clear();
     this.ptyCommandQueues.clear();
     this.shellPids.clear();
+    this.emitTerminalSessions();
   }
 
   private async isPtySessionAlive(pid: number): Promise<boolean> {

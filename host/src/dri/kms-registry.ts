@@ -42,6 +42,13 @@ export class KmsRegistry {
     return null;
   }
 
+  /** Every CRTC the guest has driven `drmModeSetCrtc` on. A binding outlives
+   *  `rmFb` on its framebuffer, matching DRM, where removing a scanned-out
+   *  framebuffer leaves the CRTC modeset. */
+  boundCrtcs(): readonly number[] {
+    return [...this.crtcBindings.keys()];
+  }
+
   scanoutBytes(crtc_id: number): Uint8Array | undefined {
     const fb = this.currentFb(crtc_id);
     if (!fb) return undefined;

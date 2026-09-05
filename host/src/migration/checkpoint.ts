@@ -102,6 +102,9 @@ export interface CheckpointMachine {
   readonly filesystemBuffer: () => SharedArrayBuffer;
   /** Read under the freeze: bindings and write-based pixels are quiescent. */
   readonly framebuffers: () => readonly CheckpointFramebuffer[];
+  /** A checkpoint carries no KMS state, so a machine with any modeset CRTC is
+   *  refused rather than captured as one that never had a display. */
+  readonly modesetCrtcs: () => readonly number[];
   /** This machine's CLOCK_MONOTONIC in nanoseconds. */
   readonly monotonicNowNs: () => number;
   readonly kernelAbiVersion: () => number;
@@ -291,6 +294,15 @@ export async function captureMachineCheckpoint(
   machine: CheckpointMachine,
   options: CheckpointFreezeOptions,
 ): Promise<CheckpointFreezeResult> {
+  const modeset = machine.modesetCrtcs();
+  if (modeset.length > 0) {
+    return {
+      status: "failed",
+      reason:
+        `checkpoint does not carry KMS state, and CRTC ` +
+        `${modeset.join(", ")} holds a bound framebuffer`,
+    };
+  }
   try {
     return await machine.runWithoutWorkerCreation(
       "checkpoint freeze",

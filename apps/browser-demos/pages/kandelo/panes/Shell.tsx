@@ -262,7 +262,8 @@ const PreBoot: React.FC<{ status: string }> = ({ status }) => (
   </div>
 );
 
-function readShellTheme(element: HTMLElement | null) {
+/** The xterm palette the current Kandelo theme resolves to. */
+export function readShellTheme(element: HTMLElement | null) {
   const styles = getComputedStyle(element ?? document.documentElement);
   const background = cssToken(styles, "--k-shell-bg", "#1e2327");
   return {
