@@ -1293,9 +1293,7 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
         dropped.push(mount.mountPoint);
         continue;
       }
-      const sab = new SharedArrayBuffer(mount.bytes.byteLength);
-      new Uint8Array(sab).set(mount.bytes);
-      target.backend = target.backend.mountCapturedBytes(sab);
+      target.backend = target.backend.mountCapturedBytes(mount.bytes);
     }
     const gaps = describeCheckpointMountGaps(msg.restoreCheckpoint, dropped);
     if (gaps !== null) {

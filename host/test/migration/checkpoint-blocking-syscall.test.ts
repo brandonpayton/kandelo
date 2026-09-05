@@ -81,7 +81,9 @@ describe("checkpoint of a process parked in a blocking syscall", () => {
 
         // Without the restart bit the freeze has no boundary to reach and
         // ends in "a process did not reach UNWINDING".
-        expect(response.status, JSON.stringify(response)).toBe("captured");
+        if (response.status !== "captured") {
+          throw new Error(`capture failed: ${JSON.stringify(response)}`);
+        }
 
         // The freeze completed the parked read with EINTR to reach the hook.
         // The guest must never see that: no signal was caught, so an EINTR
@@ -118,7 +120,9 @@ describe("checkpoint of a process parked in a blocking syscall", () => {
 
         // The loop parked again, so the machine is still freezable.
         const response = await host.captureCheckpointBytes(TIMEOUTS);
-        expect(response.status, JSON.stringify(response)).toBe("captured");
+        if (response.status !== "captured") {
+          throw new Error(`capture failed: ${JSON.stringify(response)}`);
+        }
       } finally {
         await host.destroy();
       }

@@ -93,10 +93,9 @@ describe("machine restore during an exec storm", () => {
       try {
         for (let round = 0; round < CAPTURE_ROUNDS; round++) {
           const response = await host.captureCheckpointBytes(TIMEOUTS);
-          expect(
-            response.status,
-            `round ${round}: ${JSON.stringify(response)}`,
-          ).toBe("captured");
+          if (response.status !== "captured") {
+            throw new Error(`round ${round}: ${JSON.stringify(response)}`);
+          }
           const checkpoint = (response as { checkpoint: MachineCheckpoint })
             .checkpoint;
 

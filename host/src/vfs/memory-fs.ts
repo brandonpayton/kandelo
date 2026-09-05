@@ -4208,8 +4208,23 @@ export class MemoryFileSystem implements FileSystemBackend {
    * Each entry is adopted only where the captured inode, its generation and
    * its data sequence all still match, so a file the captured machine already
    * materialized keeps its captured bytes.
+   *
+   * The buffer is allocated here, growable to the ceiling the captured
+   * superblock records. A capture is a live filesystem's buffer, grown on
+   * demand and so nearly full; mounted on a fixed buffer of its own length,
+   * the first write that needs a fresh block — materializing a deferred
+   * program on exec, most visibly — fails with ENOSPC.
    */
-  mountCapturedBytes(sab: SharedArrayBuffer): MemoryFileSystem {
+  mountCapturedBytes(bytes: Uint8Array): MemoryFileSystem {
+    const capacity = SharedFS.inspectImageCapacity(bytes);
+    const SharedArrayBufferCtor = SharedArrayBuffer as new (
+      byteLength: number,
+      options?: { maxByteLength?: number },
+    ) => SharedArrayBuffer;
+    const sab = new SharedArrayBufferCtor(bytes.byteLength, {
+      maxByteLength: capacity.maxByteLength,
+    });
+    new Uint8Array(sab).set(bytes);
     const captured = new MemoryFileSystem(
       SharedFS.mount(sab),
       cloneMetadata(this.imageMetadata),

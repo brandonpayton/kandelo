@@ -1208,12 +1208,10 @@ async function buildVirtualPlatformIO(
         dropped.push(restored.mountPoint);
         continue;
       }
-      const sab = new SharedArrayBuffer(restored.bytes.byteLength);
-      new Uint8Array(sab).set(restored.bytes);
       mounts[index] = {
         ...mounts[index]!,
         backend: (mounts[index]!.backend as MemoryFileSystem)
-          .mountCapturedBytes(sab),
+          .mountCapturedBytes(restored.bytes),
       };
     }
     const gaps = describeCheckpointMountGaps(restoredCheckpoint, dropped);

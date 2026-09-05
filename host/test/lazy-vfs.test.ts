@@ -138,7 +138,7 @@ describe("Lazy VFS files", () => {
       MemoryFileSystem.fromExisting(capturedBytes).isPathDeferred("/usr/bin/tool"),
     ).toBe(false);
 
-    const restored = image.mountCapturedBytes(capturedBytes);
+    const restored = image.mountCapturedBytes(new Uint8Array(capturedBytes));
     expect(restored.isPathDeferred("/usr/bin/tool")).toBe(true);
 
     globalThis.fetch = vi.fn().mockResolvedValue({
@@ -179,13 +179,33 @@ describe("Lazy VFS files", () => {
     // The image still calls this path deferred, and the entry it offers no
     // longer describes the inode in the capture. Adopting it would replace six
     // captured bytes with a download.
-    const restored = image.mountCapturedBytes(capturedBytes);
+    const restored = image.mountCapturedBytes(new Uint8Array(capturedBytes));
     expect(restored.isPathDeferred("/usr/bin/tool")).toBe(false);
 
     const fd = restored.open("/usr/bin/tool", O_RDONLY, 0);
     const buf = new Uint8Array(8);
     expect(restored.read(fd, buf, null, 8)).toBe(6);
     restored.close(fd);
+  });
+
+  it("mountCapturedBytes keeps the captured filesystem's room to grow", () => {
+    // A capture is a live filesystem's buffer, grown on demand and so nearly
+    // full, while its superblock records a larger ceiling. Mounted without
+    // that ceiling, the restored machine's first write that needs a fresh
+    // block — materializing a deferred program on exec, most visibly — fails
+    // with ENOSPC.
+    const sab = new SharedArrayBuffer(256 * 1024);
+    const image = MemoryFileSystem.create(sab, 4 * 1024 * 1024);
+
+    const capturedBytes = new Uint8Array(image.sharedBuffer.byteLength);
+    capturedBytes.set(new Uint8Array(image.sharedBuffer));
+    const restored = image.mountCapturedBytes(capturedBytes);
+
+    const data = new Uint8Array(1024 * 1024).fill(7);
+    const fd = restored.open("/tool", O_WRONLY | O_CREAT | O_TRUNC, 0o755);
+    expect(restored.write(fd, data, null, data.length)).toBe(data.length);
+    restored.close(fd);
+    expect(restored.stat("/tool").size).toBe(data.length);
   });
 
   it("materialized file shows real size instead of declared size", () => {

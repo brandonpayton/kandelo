@@ -247,7 +247,7 @@ describe("format-neutral deferred trees", () => {
     expect(MemoryFileSystem.fromExisting(captured).isPathDeferred("/captured-a/tool"))
       .toBe(false);
 
-    const restored = image.mountCapturedBytes(captured);
+    const restored = image.mountCapturedBytes(new Uint8Array(captured));
     expect(restored.isPathDeferred("/captured-a/tool")).toBe(true);
 
     // The computer that took the machine can hand it on again, so what it
@@ -255,7 +255,7 @@ describe("format-neutral deferred trees", () => {
     // unverified would refuse to serialize and strand the machine there.
     const handedOn = new SharedArrayBuffer(restored.sharedBuffer.byteLength);
     new Uint8Array(handedOn).set(new Uint8Array(restored.sharedBuffer));
-    const restoredAgain = restored.mountCapturedBytes(handedOn);
+    const restoredAgain = restored.mountCapturedBytes(new Uint8Array(handedOn));
     restoredAgain.setLazyFetcher(async (url) => new Response(payloads.get(url)!));
     await expect(restoredAgain.preparePath("/captured-a/tool")).resolves.toBe(true);
     expect(readText(restoredAgain, "/captured-a/tool")).toBe("payload");
