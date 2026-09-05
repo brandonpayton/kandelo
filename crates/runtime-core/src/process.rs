@@ -169,6 +169,20 @@ pub trait HostIO {
     /// Notify the host that an AF_INET socket is now listening, so the host
     /// can open a real TCP server on the given port.
     fn host_net_listen(&mut self, fd: i32, port: u16, addr: &[u8; 4]) -> Result<(), Errno>;
+    /// Whether `pid` may take the connection at the head of the shared accept
+    /// queue of the listener whose readiness token is `accept_wake_idx`.
+    ///
+    /// Which process wins a shared accept queue is host scheduling rather than
+    /// machine state: every pre-fork server worker blocks in `accept` on one
+    /// queue, and the connection goes to whichever worker the host runs first.
+    /// That choice is invisible to the machine's own memory, so a replica that
+    /// hands the request to a different worker than the primary did stops being
+    /// the same machine. A host that records or replays a machine answers from
+    /// its log here; every other host has no opinion and answers true.
+    fn accept_select(&mut self, accept_wake_idx: u32, pid: u32) -> bool {
+        let _ = (accept_wake_idx, pid);
+        true
+    }
     fn host_udp_bind(&mut self, handle: i32, addr: &[u8; 4], port: u16) -> Result<(), Errno> {
         let _ = (handle, addr, port);
         Ok(())

@@ -441,6 +441,17 @@ export interface ReplicationReplayDrainMessage {
 export interface ReplicationReplayProgress {
   readonly consumed: number;
   readonly total: number;
+  /**
+   * Clock reads served the machine-latest reading because their process's
+   * own next reading was not coming. See
+   * `ReplicationLogReader.borrowedClockReadings`.
+   */
+  readonly borrowedClockReadings: number;
+  /**
+   * Accepts taken by whichever worker asked because the primary never said
+   * which one won. See `ReplicationLogReader.borrowedAcceptSelections`.
+   */
+  readonly borrowedAcceptSelections: number;
 }
 
 /** Send an HTTP request to a server running in the kernel and wait for the

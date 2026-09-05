@@ -7,13 +7,15 @@
  * is what stops one host from batching, waiting, or ending differently from
  * the other.
  */
-import type { GlQueryTap } from "../kernel.js";
+import type { AcceptSelectionTap, GlQueryTap } from "../kernel.js";
 import type { HttpExchangeTap } from "../networking/in-kernel-http.js";
 import type { TimeProvider } from "../vfs/types.js";
 import {
   ReplicationLogReader,
   ReplicationLogRecorder,
+  type ReplicationDivergence,
   type ReplicationLogEntry,
+  type ReplicationLogBoundedExtender,
   type ReplicationLogExtender,
   type ReplicationPushedDecision,
 } from "./log.js";
@@ -28,15 +30,29 @@ import { ReplicationLogQueueReader } from "./log-queue.js";
  * its hand on `host_gl_query` at the same moment it swaps the guest clock,
  * and takes it off at the same moment too. An injected HTTP request is a
  * host-delivered input exactly like a keystroke, so the same hand goes on
- * `sendHttpRequest`. Sleep and vblank pacing are the other host effect a
- * replica swaps: behind the log head, the waits the primary already served
- * complete immediately, or the replica keeps the gap it joined with. One
- * installer type keeps Node and the browser doing all of it identically.
+ * `sendHttpRequest`. Which worker of a pre-fork server wins a shared accept
+ * queue is host scheduling in the same way, so the same hand goes on
+ * `host_accept_select`. Wait pacing is the other host effect a replica swaps:
+ * a guest's timeout is a duration on the machine's clock, so a replica reads
+ * that duration off the log rather than off its own computer, and the waits
+ * the primary already spent complete at once. Without it the replica keeps
+ * the gap it joined with. One installer type keeps Node and the browser doing
+ * all of it identically.
  */
 export interface ReplicationMachineTaps {
   setGlQueryTap(tap: GlQueryTap | null): void;
-  setReplicationBehindProbe(probe: (() => boolean) | null): void;
+  setAcceptSelectionTap(tap: AcceptSelectionTap | null): void;
+  setReplicationAheadProbe(
+    probe: ((pid: number) => number | null) | null,
+  ): void;
   setHttpExchangeTap(tap: HttpExchangeTap | null): void;
+  /**
+   * The process whose syscall this machine is serving, or 0 for work the host
+   * does for itself. A clock reading is logged against it, so a replica
+   * replays each process's own readings instead of one global order the two
+   * computers never share.
+   */
+  currentGuestPid(): number;
 }
 
 /** Record every GL query answer the guest is handed, on the shared log. */
@@ -54,6 +70,28 @@ export function glQueryReplayTap(reader: ReplicationLogReader): GlQueryTap {
   return {
     mode: "replay",
     take: (op) => reader.takeGlQuery(op),
+  };
+}
+
+/** Record which worker won each shared accept queue, on the shared log. */
+export function acceptSelectionRecordTap(
+  recorder: ReplicationLogRecorder,
+): AcceptSelectionTap {
+  return {
+    mode: "record",
+    record: (listener, pid) => {
+      recorder.record({ kind: "accept", listener, pid });
+    },
+  };
+}
+
+/** Hold each connection for the worker the primary gave it to. */
+export function acceptSelectionReplayTap(
+  reader: ReplicationLogReader,
+): AcceptSelectionTap {
+  return {
+    mode: "replay",
+    select: (listener, pid) => reader.takeAcceptWinner(listener, pid),
   };
 }
 
@@ -179,8 +217,11 @@ export function beginReplicationStream(
   taps: ReplicationMachineTaps,
 ): ReplicationLogRecorder {
   const recorder = createStreamingRecorder(publish);
-  io.setTimeProvider(new RecordingTimeProvider(clock, recorder));
+  io.setTimeProvider(
+    new RecordingTimeProvider(clock, recorder, () => taps.currentGuestPid()),
+  );
   taps.setGlQueryTap(glQueryRecordTap(recorder));
+  taps.setAcceptSelectionTap(acceptSelectionRecordTap(recorder));
   taps.setHttpExchangeTap(httpExchangeRecordTap(recorder));
   return recorder;
 }
@@ -197,12 +238,17 @@ export function beginReplicationStream(
  */
 function createQueueExtenders(
   queue: SharedArrayBuffer | undefined,
-): { extend?: ReplicationLogExtender; extendReady?: ReplicationLogExtender } {
+): {
+  extend?: ReplicationLogExtender;
+  extendReady?: ReplicationLogExtender;
+  extendWithin?: ReplicationLogBoundedExtender;
+} {
   if (queue === undefined) return {};
   const reader = new ReplicationLogQueueReader(queue);
   return {
     extend: () => reader.take(),
     extendReady: () => reader.takeReady(),
+    extendWithin: (budgetMs) => reader.takeWithin(budgetMs),
   };
 }
 
@@ -247,17 +293,25 @@ export function beginReplicationReplay(
   spec: ReplicationReplaySpec,
   taps: ReplicationMachineTaps,
   applyPushed?: (decision: ReplicationPushedDecision) => void,
+  onDiverged?: (error: ReplicationDivergence) => void,
 ): ReplicationLogReader {
-  const { extend, extendReady } = createQueueExtenders(spec.queue);
+  const { extend, extendReady, extendWithin } = createQueueExtenders(
+    spec.queue,
+  );
   const reader = new ReplicationLogReader(
     spec.entries,
     applyPushed,
     extend,
     extendReady,
+    onDiverged,
+    extendWithin,
   );
-  io.setTimeProvider(new ReplayingTimeProvider(clock, reader));
+  io.setTimeProvider(
+    new ReplayingTimeProvider(clock, reader, () => taps.currentGuestPid()),
+  );
   taps.setGlQueryTap(glQueryReplayTap(reader));
-  taps.setReplicationBehindProbe(() => reader.entryReady());
+  taps.setAcceptSelectionTap(acceptSelectionReplayTap(reader));
+  taps.setReplicationAheadProbe((pid) => reader.aheadMs(pid));
   taps.setHttpExchangeTap({ mode: "replay" });
   return reader;
 }

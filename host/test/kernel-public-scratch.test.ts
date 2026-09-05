@@ -1370,6 +1370,64 @@ describe("Rust-owned host import ranges", () => {
       .toThrow("replication log diverged at 3");
   });
 
+  it("lets every worker take a connection on an unreplicated machine", () => {
+    const { kernel, memory } = fullKernelHarness();
+    const imports = kernel.testAuthority.buildImportObject(memory) as {
+      env: Record<string, (...args: any[]) => any>;
+    };
+
+    expect(imports.env.host_accept_select(3, 101)).toBe(1);
+    expect(imports.env.host_accept_select(3, 104)).toBe(1);
+  });
+
+  it("records which worker won the accept queue", () => {
+    const { kernel, memory } = fullKernelHarness();
+    const recorded: { listener: number; pid: number }[] = [];
+    kernel.setAcceptSelectionTap({
+      mode: "record",
+      record: (listener, pid) => recorded.push({ listener, pid }),
+    });
+    const imports = kernel.testAuthority.buildImportObject(memory) as {
+      env: Record<string, (...args: any[]) => any>;
+    };
+
+    expect(imports.env.host_accept_select(3, 104)).toBe(1);
+    expect(recorded).toEqual([{ listener: 3, pid: 104 }]);
+  });
+
+  it("holds the connection for the logged worker on replay", () => {
+    const { kernel, memory } = fullKernelHarness();
+    kernel.setAcceptSelectionTap({
+      mode: "replay",
+      select: (listener, pid) => {
+        expect(listener).toBe(3);
+        return pid === 104;
+      },
+    });
+    const imports = kernel.testAuthority.buildImportObject(memory) as {
+      env: Record<string, (...args: any[]) => any>;
+    };
+
+    expect(imports.env.host_accept_select(3, 101)).toBe(0);
+    expect(imports.env.host_accept_select(3, 104)).toBe(1);
+  });
+
+  it("lets a replay divergence out of host_accept_select", () => {
+    const { kernel, memory } = fullKernelHarness();
+    kernel.setAcceptSelectionTap({
+      mode: "replay",
+      select: () => {
+        throw new Error("replication log diverged at 3");
+      },
+    });
+    const imports = kernel.testAuthority.buildImportObject(memory) as {
+      env: Record<string, (...args: any[]) => any>;
+    };
+
+    expect(() => imports.env.host_accept_select(3, 104))
+      .toThrow("replication log diverged at 3");
+  });
+
   it.each([4, 8] as const)(
     "writes the generated KMS mode size at the exact wasm%d memory boundary",
     (pointerWidth) => {

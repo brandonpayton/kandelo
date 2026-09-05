@@ -22,20 +22,36 @@ import type {
  * still comes from the log.
  */
 
+/**
+ * Which process is being served, for the reading about to cross the log.
+ *
+ * A guest clock read reaches the host inside the syscall the kernel worker is
+ * serving, so the worker already knows whose read it is. Passing the accessor
+ * rather than a value is what keeps that true for every read.
+ */
+export type ReplicationGuestPid = () => number;
+
 /** Delegate to the real clock, and record what the guest was told. */
 export class RecordingTimeProvider implements TimeProvider {
   readonly #source: TimeProvider;
   readonly #recorder: ReplicationLogRecorder;
+  readonly #pid: ReplicationGuestPid;
 
-  constructor(source: TimeProvider, recorder: ReplicationLogRecorder) {
+  constructor(
+    source: TimeProvider,
+    recorder: ReplicationLogRecorder,
+    pid: ReplicationGuestPid,
+  ) {
     this.#source = source;
     this.#recorder = recorder;
+    this.#pid = pid;
   }
 
   clockGettime(clockId: number): { sec: number; nsec: number } {
     const reading = this.#source.clockGettime(clockId);
     this.#recorder.record({
       kind: "clock",
+      pid: this.#pid(),
       clockId,
       sec: reading.sec,
       nsec: reading.nsec,
@@ -56,14 +72,20 @@ export class RecordingTimeProvider implements TimeProvider {
 export class ReplayingTimeProvider implements TimeProvider {
   readonly #source: TimeProvider;
   readonly #reader: ReplicationLogReader;
+  readonly #pid: ReplicationGuestPid;
 
-  constructor(source: TimeProvider, reader: ReplicationLogReader) {
+  constructor(
+    source: TimeProvider,
+    reader: ReplicationLogReader,
+    pid: ReplicationGuestPid,
+  ) {
     this.#source = source;
     this.#reader = reader;
+    this.#pid = pid;
   }
 
   clockGettime(clockId: number): { sec: number; nsec: number } {
-    const reading = this.#reader.takeClock(clockId);
+    const reading = this.#reader.takeClock(clockId, this.#pid());
     return { sec: reading.sec, nsec: reading.nsec };
   }
 

@@ -217,6 +217,32 @@ export class ReplicationLogQueueReader {
   }
 
   /**
+   * Take one entry, waiting at most `budgetMs` for it.
+   *
+   * For the clock read whose own decision may never come: the wait runs on
+   * the kernel worker and holds every process of the machine, so the caller
+   * bounds it and decides what a `"timedout"` means. `null` keeps the meaning
+   * `take` gives it — the recording ended and the ring is empty.
+   */
+  takeWithin(budgetMs: number): ReplicationLogEntry | null | "timedout" {
+    const deadline = Date.now() + budgetMs;
+    for (;;) {
+      if (Atomics.load(this.#header, AVAILABLE) >= FRAME_HEADER_BYTES) {
+        return this.#read();
+      }
+      if (Atomics.load(this.#header, STATE) === ENDED) return null;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return "timedout";
+      Atomics.wait(
+        this.#header,
+        AVAILABLE,
+        0,
+        Math.min(WAIT_SLICE_MS, remaining),
+      );
+    }
+  }
+
+  /**
    * Take one entry if the ring already holds one, and never wait.
    *
    * For the drain that runs when the guest is not reading the clock: a

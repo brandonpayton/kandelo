@@ -47,7 +47,7 @@ function fakeSink(): {
 /** A recorder driven the way a machine's clock drives one. */
 function recordClocks(recorder: ReplicationLogRecorder, count: number): void {
   for (let at = 0; at < count; at++) {
-    recorder.record({ kind: "clock", clockId: 0, sec: 1_700_000 + at, nsec: 0 });
+    recorder.record({ kind: "clock", pid: 102, clockId: 0, sec: 1_700_000 + at, nsec: 0 });
   }
 }
 
@@ -153,7 +153,7 @@ describe("local replication log", () => {
     const sink = fakeSink();
     const stopWatch = watcher.watch(sink.sink);
     try {
-      const clock = { kind: "clock", clockId: 0, sec: 1, nsec: 0 } as const;
+      const clock = { kind: "clock", pid: 102, clockId: 0, sec: 1, nsec: 0 } as const;
       injector.postMessage({ kind: "entries", entries: [{ seq: 0, decision: clock }] });
       await vi.waitFor(() => expect(sink.taken()).toHaveLength(1));
       // Seq 1 never arrives. Handing seq 2 to a replica would advance it past

@@ -3019,7 +3019,10 @@ pub mod abi {
 
     pub const HOST_ADAPTER_MANIFEST_MAGIC: u32 = 0x4d4b_5057; // "WPKM", little-endian.
     pub const HOST_ADAPTER_MANIFEST_VERSION: u16 = 1;
-    pub const HOST_ADAPTER_VERSION: u32 = 1;
+    /// Version 2 adds the `host_accept_select` import. A host that predates it
+    /// cannot instantiate this kernel, and the manifest check is what turns
+    /// that into a named refusal instead of a raw Wasm link error.
+    pub const HOST_ADAPTER_VERSION: u32 = 2;
     pub const HOST_ADAPTER_MANIFEST_SIZE: u16 = core::mem::size_of::<HostAdapterManifest>() as u16;
 
     pub const HOST_FEATURE_SHARED_ARRAY_BUFFER: u32 = 1 << 0;

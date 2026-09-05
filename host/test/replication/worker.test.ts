@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { GlQueryTap } from "../../src/kernel";
+import type { AcceptSelectionTap, GlQueryTap } from "../../src/kernel";
 import type { HttpExchangeTap } from "../../src/networking/in-kernel-http";
 import type { ReplicationLogEntry } from "../../src/replication/log";
 import {
@@ -13,13 +13,17 @@ function machineSurface() {
   const installed: {
     provider: TimeProvider | null;
     tap: GlQueryTap | null;
-    behindProbe: (() => boolean) | null;
+    acceptTap: AcceptSelectionTap | null;
+    aheadProbe: ((pid: number) => number | null) | null;
     httpTap: HttpExchangeTap | null;
+    pid: number;
   } = {
     provider: null,
     tap: null,
-    behindProbe: null,
+    acceptTap: null,
+    aheadProbe: null,
     httpTap: null,
+    pid: 102,
   };
   return {
     installed,
@@ -32,12 +36,18 @@ function machineSurface() {
       setGlQueryTap: (tap: GlQueryTap | null) => {
         installed.tap = tap;
       },
-      setReplicationBehindProbe: (probe: (() => boolean) | null) => {
-        installed.behindProbe = probe;
+      setAcceptSelectionTap: (tap: AcceptSelectionTap | null) => {
+        installed.acceptTap = tap;
+      },
+      setReplicationAheadProbe: (
+        probe: ((pid: number) => number | null) | null,
+      ) => {
+        installed.aheadProbe = probe;
       },
       setHttpExchangeTap: (tap: HttpExchangeTap | null) => {
         installed.httpTap = tap;
       },
+      currentGuestPid: () => installed.pid,
     },
     clock: {
       clockGettime: () => ({ sec: 1, nsec: 2 }),
@@ -47,7 +57,7 @@ function machineSurface() {
 }
 
 describe("beginReplicationStream", () => {
-  it("puts the recorder's hand on the clock and on GL queries", async () => {
+  it("puts the recorder's hand on every host-produced value", async () => {
     const surface = machineSurface();
     const published: ReplicationLogEntry[] = [];
     beginReplicationStream(
@@ -61,6 +71,9 @@ describe("beginReplicationStream", () => {
     expect(surface.installed.tap?.mode).toBe("record");
     if (surface.installed.tap?.mode !== "record") return;
     surface.installed.tap.record(5, 4, new Uint8Array([1, 0, 0, 0]));
+    expect(surface.installed.acceptTap?.mode).toBe("record");
+    if (surface.installed.acceptTap?.mode !== "record") return;
+    surface.installed.acceptTap.record(3, 104);
     expect(surface.installed.httpTap?.mode).toBe("record");
     if (surface.installed.httpTap?.mode !== "record") return;
     surface.installed.httpTap.record({
@@ -73,20 +86,25 @@ describe("beginReplicationStream", () => {
     expect(published.map((entry) => entry.decision.kind)).toEqual([
       "clock",
       "gl",
+      "accept",
       "http",
     ]);
   });
 });
 
 describe("beginReplicationReplay", () => {
-  it("serves the recorded clock and GL answers back through both hands", () => {
+  it("serves the recorded values back through every hand", () => {
     const surface = machineSurface();
     const entries: ReplicationLogEntry[] = [
-      { seq: 0, decision: { kind: "clock", clockId: 1, sec: 7, nsec: 9 } },
+      {
+        seq: 0,
+        decision: { kind: "clock", pid: 102, clockId: 1, sec: 7, nsec: 9 },
+      },
       {
         seq: 1,
         decision: { kind: "gl", op: 5, rc: 4, bytes: new Uint8Array([1, 0, 0, 0]) },
       },
+      { seq: 2, decision: { kind: "accept", listener: 3, pid: 104 } },
     ];
     beginReplicationReplay(
       surface.io,
@@ -95,7 +113,7 @@ describe("beginReplicationReplay", () => {
       surface.taps,
     );
 
-    expect(surface.installed.behindProbe?.()).toBe(true);
+    expect(surface.installed.aheadProbe?.(0)).toBe(Number.POSITIVE_INFINITY);
     expect(surface.installed.provider!.clockGettime(1)).toEqual({
       sec: 7,
       nsec: 9,
@@ -105,7 +123,11 @@ describe("beginReplicationReplay", () => {
     const answer = surface.installed.tap.take(5);
     expect(answer.rc).toBe(4);
     expect(answer.bytes).toEqual(new Uint8Array([1, 0, 0, 0]));
-    expect(surface.installed.behindProbe?.()).toBe(false);
+    expect(surface.installed.acceptTap?.mode).toBe("replay");
+    if (surface.installed.acceptTap?.mode !== "replay") return;
+    expect(surface.installed.acceptTap.select(3, 101)).toBe(false);
+    expect(surface.installed.acceptTap.select(3, 104)).toBe(true);
+    expect(surface.installed.aheadProbe?.(0)).toBeNull();
     expect(surface.installed.httpTap?.mode).toBe("replay");
   });
 });

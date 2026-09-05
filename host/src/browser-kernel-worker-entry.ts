@@ -47,12 +47,14 @@ import {
   ReplicationLogRecorder,
   ptsDeviceIndex,
   ptsDevicePath,
+  type ReplicationDivergence,
   type ReplicationLogEntry,
   type ReplicationLogReader,
   type ReplicationPushedDecision,
 } from "./replication/log";
 import { RecordingTimeProvider } from "./replication/clock";
 import {
+  acceptSelectionRecordTap,
   beginReplicationReplay,
   beginReplicationStream,
   glQueryRecordTap,
@@ -801,6 +803,22 @@ function reportHostDiagnostic(
   if (level === "warn") console.warn(diagnostic.message);
   else console.error(diagnostic.message);
   post({ type: "host_diagnostic", ...diagnostic });
+}
+
+/**
+ * Say out loud that this replica stopped being the machine it follows.
+ *
+ * The guest's read fails with an errno whatever happens here, and a program
+ * handed a failed clock goes wrong quietly: nginx stamps 1970 and the worker
+ * behind it dies. Reporting is what puts the reason in front of the person
+ * watching instead of leaving them a machine that merely looks broken.
+ */
+function reportReplicationDivergence(error: ReplicationDivergence): void {
+  reportHostDiagnostic({
+    pid: kernelWorker.currentGuestPid(),
+    source: "replication",
+    message: error.message,
+  });
 }
 
 function terminatePoisonedKernelWorker(error: Error): void {
@@ -1576,6 +1594,7 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
         msg.replicationReplay,
         kernelWorker,
         applyPushedDecision,
+        reportReplicationDivergence,
       ),
     };
   }
@@ -5422,9 +5441,13 @@ sw.onmessage = (e: MessageEvent) => {
         }
         replicationRecorder = new ReplicationLogRecorder();
         target.setTimeProvider(
-          new RecordingTimeProvider(clock, replicationRecorder),
+          new RecordingTimeProvider(clock, replicationRecorder, () =>
+            kernelWorker.currentGuestPid()),
         );
         kernelWorker.setGlQueryTap(glQueryRecordTap(replicationRecorder));
+        kernelWorker.setAcceptSelectionTap(
+          acceptSelectionRecordTap(replicationRecorder),
+        );
         kernelWorker.setHttpExchangeTap(
           httpExchangeRecordTap(replicationRecorder),
         );
@@ -5436,6 +5459,7 @@ sw.onmessage = (e: MessageEvent) => {
       replicationRecorder = null;
       if (io && baseTimeProvider) io.setTimeProvider(baseTimeProvider);
       kernelWorker?.setGlQueryTap(null);
+      kernelWorker?.setAcceptSelectionTap(null);
       kernelWorker?.setHttpExchangeTap(null);
       respond(msg.requestId, recorder?.entries ?? []);
       break;
@@ -5449,6 +5473,7 @@ sw.onmessage = (e: MessageEvent) => {
             msg,
             kernelWorker,
             applyPushedDecision,
+            reportReplicationDivergence,
           ),
         };
       });
@@ -5459,12 +5484,16 @@ sw.onmessage = (e: MessageEvent) => {
       replicationReplay = null;
       if (io && baseTimeProvider) io.setTimeProvider(baseTimeProvider);
       kernelWorker?.setGlQueryTap(null);
-      kernelWorker?.setReplicationBehindProbe(null);
+      kernelWorker?.setAcceptSelectionTap(null);
+      kernelWorker?.setReplicationAheadProbe(null);
       kernelWorker?.setHttpExchangeTap(null);
       replayedHttpExchanges.drop();
       respond(msg.requestId, {
         consumed: replay?.reader.consumed ?? 0,
         total: replay?.reader.known ?? 0,
+        borrowedClockReadings: replay?.reader.borrowedClockReadings ?? 0,
+        borrowedAcceptSelections:
+          replay?.reader.borrowedAcceptSelections ?? 0,
       });
       break;
     }

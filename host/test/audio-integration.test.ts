@@ -83,7 +83,7 @@ async function runAudioProgram(
         // without adding a production-only ioctl counter or weakening the ABI.
         readyKernel.enableSyscallTrace();
         if (replicationBehind) {
-          readyKernel.setReplicationBehindProbe(() => true);
+          readyKernel.setReplicationAheadProbe(() => Number.POSITIVE_INFINITY);
         }
         transport = readyKernel.claimPcmTransport(false);
         const words = pcmControlWords(transport);

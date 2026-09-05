@@ -148,6 +148,7 @@ unsafe extern "C" {
         addr_c: u32,
         addr_d: u32,
     ) -> i32;
+    fn host_accept_select(accept_wake_idx: u32, pid: u32) -> i32;
     fn host_udp_bind(
         handle: i32,
         addr_a: u32,
@@ -833,6 +834,10 @@ impl HostIO for WasmHostIO {
             )
         };
         i32_to_result(result)
+    }
+
+    fn accept_select(&mut self, accept_wake_idx: u32, pid: u32) -> bool {
+        unsafe { host_accept_select(accept_wake_idx, pid) != 0 }
     }
 
     fn host_udp_bind(&mut self, handle: i32, addr: &[u8; 4], port: u16) -> Result<(), Errno> {

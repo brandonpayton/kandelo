@@ -8686,7 +8686,6 @@ pub fn rearm_host_interval_timer(
     Ok(true)
 }
 
-
 /// rt_sigtimedwait -- wait for a signal from a specified set.
 ///
 /// Checks if any signal in `mask` is already pending and dequeues it.
@@ -12478,7 +12477,7 @@ fn discard_accepted_socket_without_fd(proc: &mut Process, sock_idx: usize) {
 ///
 /// Pops a pending connection from the listener's backlog, creates an OFD + FD
 /// for the accepted socket, and returns the new fd.
-pub fn sys_accept(proc: &mut Process, _host: &mut dyn HostIO, fd: i32) -> Result<i32, Errno> {
+pub fn sys_accept(proc: &mut Process, host: &mut dyn HostIO, fd: i32) -> Result<i32, Errno> {
     use crate::socket::{SocketDomain, SocketInfo, SocketState, SocketType};
 
     let ofd_idx = resolve_io_ofd(proc, fd)?;
@@ -12507,6 +12506,17 @@ pub fn sys_accept(proc: &mut Process, _host: &mut dyn HostIO, fd: i32) -> Result
         let bind_addr6 = sock.bind_addr6;
         let bind_path = sock.bind_path.clone();
         let bind_port = sock.bind_port;
+        let accept_wake_idx = sock.accept_wake_idx.unwrap_or(0);
+        // Which process wins this queue is host scheduling, so a host that
+        // records or replays the machine decides it instead. Asked only with a
+        // connection waiting, so an empty queue never consumes a decision, and
+        // asked before the pop, so a deferred process leaves the connection
+        // where its recorded winner will find it. See `HostIO::accept_select`.
+        let waiting =
+            unsafe { crate::socket::shared_listener_backlog_table().len(shared_idx) } > 0;
+        if waiting && !host.accept_select(accept_wake_idx, proc.pid) {
+            return Err(Errno::EAGAIN);
+        }
         let pending = unsafe { crate::socket::shared_listener_backlog_table().pop(shared_idx) };
         if let Some(pc) = pending {
             let mut accepted = SocketInfo::new(domain, SocketType::Stream, 0);
@@ -17759,6 +17769,10 @@ mod tests {
         net_send_result: Result<usize, Errno>,
         net_connect_calls: Vec<(i32, Vec<u8>, u16)>,
         net_listen_calls: Vec<(i32, u16, [u8; 4])>,
+        /// Which process may take the next connection off a shared accept
+        /// queue. `None` is the unreplicated host, which has no opinion.
+        accept_winner: Option<u32>,
+        accept_select_calls: Vec<(u32, u32)>,
         getaddrinfo_bytes: Option<Vec<u8>>,
         getaddrinfo_reported: usize,
         chown_calls: Vec<(Vec<u8>, u32, u32)>,
@@ -17842,6 +17856,8 @@ mod tests {
                 net_send_result: Err(Errno::ENOTCONN),
                 net_connect_calls: Vec::new(),
                 net_listen_calls: Vec::new(),
+                accept_winner: None,
+                accept_select_calls: Vec::new(),
                 getaddrinfo_bytes: None,
                 getaddrinfo_reported: 0,
                 chown_calls: Vec::new(),
@@ -18551,6 +18567,10 @@ mod tests {
         fn host_net_listen(&mut self, fd: i32, port: u16, addr: &[u8; 4]) -> Result<(), Errno> {
             self.net_listen_calls.push((fd, port, *addr));
             Ok(())
+        }
+        fn accept_select(&mut self, accept_wake_idx: u32, pid: u32) -> bool {
+            self.accept_select_calls.push((accept_wake_idx, pid));
+            self.accept_winner.is_none_or(|winner| winner == pid)
         }
         fn host_getaddrinfo(&mut self, _name: &[u8], result: &mut [u8]) -> Result<usize, Errno> {
             let Some(bytes) = self.getaddrinfo_bytes.as_deref() else {
@@ -33756,6 +33776,89 @@ mod tests {
             accept_idx
         );
         assert_eq!(wake_buf[4], crate::wakeup::WAKE_ACCEPT);
+    }
+
+    #[test]
+    fn test_accept_leaves_the_connection_for_the_host_named_winner() {
+        let _lock = UNIX_REGISTRY_LOCK.lock().unwrap();
+        let mut proc = Process::new(9013);
+        let mut host = MockHostIO::new();
+        let path = b"/tmp/select_9013.sock";
+        let resolved = crate::path::resolve_path(path, &proc.cwd);
+        unsafe { crate::unix_socket::global_unix_socket_registry() }.unregister(&resolved);
+
+        let server_fd = sys_socket(&mut proc, &mut host, 1, 1, 0).unwrap();
+        let mut addr = [
+            0u8;
+            wasm_posix_shared::kernel_scratch_wire::SOCKADDR_UNIX_BYTES as usize
+        ];
+        addr[0] = 1; // AF_UNIX
+        addr[2..2 + path.len()].copy_from_slice(path);
+        let addrlen = 2 + path.len() + 1;
+        sys_bind(&mut proc, &mut host, server_fd, &addr[..addrlen]).unwrap();
+        sys_listen(&mut proc, &mut host, server_fd, 5).unwrap();
+
+        let accept_idx = {
+            let entry = proc.fd_table.get(server_fd).unwrap();
+            let ofd = proc.ofd_table.get(entry.ofd_ref.0).unwrap();
+            let sock_idx = (-(ofd.host_handle + 1)) as usize;
+            proc.sockets.get(sock_idx).unwrap().accept_wake_idx.unwrap()
+        };
+
+        let client_fd = sys_socket(&mut proc, &mut host, 1, 1, 0).unwrap();
+        sys_connect(&mut proc, &mut host, client_fd, &addr[..addrlen]).unwrap();
+
+        // A worker the host did not name gets EAGAIN and leaves the pending
+        // connection queued, so the worker the host did name still finds it.
+        host.accept_winner = Some(7777);
+        assert_eq!(
+            sys_accept(&mut proc, &mut host, server_fd).unwrap_err(),
+            Errno::EAGAIN
+        );
+        host.accept_winner = Some(9013);
+        let accepted_fd = sys_accept(&mut proc, &mut host, server_fd).unwrap();
+
+        assert_eq!(host.accept_select_calls, vec![
+            (accept_idx, 9013),
+            (accept_idx, 9013),
+        ]);
+
+        sys_close(&mut proc, &mut host, accepted_fd).unwrap();
+        sys_close(&mut proc, &mut host, client_fd).unwrap();
+        sys_close(&mut proc, &mut host, server_fd).unwrap();
+        unsafe { crate::unix_socket::global_unix_socket_registry() }.unregister(&resolved);
+    }
+
+    #[test]
+    fn test_accept_does_not_ask_the_host_about_an_empty_queue() {
+        let _lock = UNIX_REGISTRY_LOCK.lock().unwrap();
+        let mut proc = Process::new(9014);
+        let mut host = MockHostIO::new();
+        let path = b"/tmp/select_9014.sock";
+        let resolved = crate::path::resolve_path(path, &proc.cwd);
+        unsafe { crate::unix_socket::global_unix_socket_registry() }.unregister(&resolved);
+
+        let server_fd = sys_socket(&mut proc, &mut host, 1, 1, 0).unwrap();
+        let mut addr = [
+            0u8;
+            wasm_posix_shared::kernel_scratch_wire::SOCKADDR_UNIX_BYTES as usize
+        ];
+        addr[0] = 1; // AF_UNIX
+        addr[2..2 + path.len()].copy_from_slice(path);
+        let addrlen = 2 + path.len() + 1;
+        sys_bind(&mut proc, &mut host, server_fd, &addr[..addrlen]).unwrap();
+        sys_listen(&mut proc, &mut host, server_fd, 5).unwrap();
+
+        // Nothing is waiting, so there is no selection to spend: a replaying
+        // host must not lose a recorded winner to a worker's idle poll.
+        assert_eq!(
+            sys_accept(&mut proc, &mut host, server_fd).unwrap_err(),
+            Errno::EAGAIN
+        );
+        assert!(host.accept_select_calls.is_empty());
+
+        sys_close(&mut proc, &mut host, server_fd).unwrap();
+        unsafe { crate::unix_socket::global_unix_socket_registry() }.unregister(&resolved);
     }
 
     #[test]

@@ -23,7 +23,7 @@ import type { ReplicationLogEntry } from "../../src/replication/log";
 function clockAt(seq: number): ReplicationLogEntry {
   return {
     seq,
-    decision: { kind: "clock", clockId: 0, sec: 1_700_000 + seq, nsec: seq },
+    decision: { kind: "clock", pid: 102, clockId: 0, sec: 1_700_000 + seq, nsec: seq },
   };
 }
 
@@ -98,6 +98,23 @@ describe("replication log queue", () => {
     writer.end();
     expect(reader.takeReady()).toBeNull();
     expect(reader.take()).toBeNull();
+  });
+
+  it("gives a bounded wait back its time, and the meanings take() has", () => {
+    const queue = createReplicationLogQueue(64 * 1024);
+    const writer = new ReplicationLogQueueWriter(queue);
+    const reader = new ReplicationLogQueueReader(queue);
+
+    // The bound is what keeps one starved process from parking the machine:
+    // an empty ring answers "timedout" once the budget elapses.
+    const before = Date.now();
+    expect(reader.takeWithin(50)).toBe("timedout");
+    expect(Date.now() - before).toBeGreaterThanOrEqual(50);
+
+    writer.push([clockAt(0)]);
+    expect(reader.takeWithin(50)).toEqual(clockAt(0));
+    writer.end();
+    expect(reader.takeWithin(50)).toBeNull();
   });
 
   it("holds a replica that caught up until the primary records again", async () => {

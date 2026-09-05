@@ -832,6 +832,24 @@ export type GlQueryTap =
     readonly take: (op: number) => { rc: number; bytes: Uint8Array };
   };
 
+/**
+ * Replication's seam on `host_accept_select`.
+ *
+ * Record mode notes which process the kernel is about to hand the connection
+ * to. Replay mode answers instead: `false` leaves the connection queued and
+ * turns that worker's `accept` into `EAGAIN`, so the worker the primary chose
+ * still finds it. `select` may throw to refuse a replay that has diverged.
+ */
+export type AcceptSelectionTap =
+  | {
+    readonly mode: "record";
+    readonly record: (listener: number, pid: number) => void;
+  }
+  | {
+    readonly mode: "replay";
+    readonly select: (listener: number, pid: number) => boolean;
+  };
+
 export class WasmPosixKernel {
   private config: KernelConfig;
   private io: PlatformIO;
@@ -931,9 +949,20 @@ export class WasmPosixKernel {
    * following along. See `replication/log.ts`.
    */
   private glQueryTap: GlQueryTap | null = null;
+  /**
+   * Replication's hand on `host_accept_select`; null when this machine is
+   * neither recording nor replaying, and then every process that asks may
+   * take the connection it found — the behaviour of a machine that is not
+   * being replicated.
+   */
+  private acceptSelectionTap: AcceptSelectionTap | null = null;
 
   setGlQueryTap(tap: GlQueryTap | null): void {
     this.glQueryTap = tap;
+  }
+
+  setAcceptSelectionTap(tap: AcceptSelectionTap | null): void {
+    this.acceptSelectionTap = tap;
   }
 
   /**
@@ -1938,6 +1967,15 @@ export class WasmPosixKernel {
         },
         host_net_listen: (fd: number, port: number, addrA: number, addrB: number, addrC: number, addrD: number): number => {
           return this.#hostNetListen(fd, port, addrA, addrB, addrC, addrD);
+        },
+        host_accept_select: (listener: number, pid: number): number => {
+          const tap = this.acceptSelectionTap;
+          if (tap === null) return 1;
+          if (tap.mode === "record") {
+            tap.record(listener, pid);
+            return 1;
+          }
+          return tap.select(listener, pid) ? 1 : 0;
         },
         host_udp_bind: (handle: number, addrA: number, addrB: number, addrC: number, addrD: number, port: number): number => {
           return this.#hostUdpBind(handle, addrA, addrB, addrC, addrD, port);

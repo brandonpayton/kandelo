@@ -29,6 +29,7 @@ import {
   getWasmPosixKernelRuntimeAccess,
   negErrno,
   WasmPosixKernel,
+  type AcceptSelectionTap,
   type GlQueryTap,
   type KernelPointer,
 } from "./kernel";
@@ -3399,9 +3400,10 @@ export class CentralizedKernelWorker {
    *  accepts it (an `ImageDataArray` rejects SAB-backed views). */
   private kmsScratchBytes = new Map<number, Uint8ClampedArray<ArrayBuffer>>();
   private vblankTimer: ReturnType<typeof setInterval> | null = null;
-  /** Answers true while this machine is a replica behind the primary's log;
-   *  see `setReplicationBehindProbe`. */
-  #replicationBehindProbe: (() => boolean) | null = null;
+  /** Answers how far past the named process's own point the primary already
+   *  went, in machine milliseconds, or null when it has not; see
+   *  `setReplicationAheadProbe`. */
+  #replicationAheadProbe: ((pid: number) => number | null) | null = null;
   /** Construction-time schedulers include the browser worker's installed
    * polyfill but cannot be replaced by a later guest/host callback. */
   readonly #schedulerReceiver: typeof globalThis;
@@ -16596,13 +16598,25 @@ export class CentralizedKernelWorker {
     }
   }
 
-  /** Reuse one absolute deadline across readiness retries for this syscall. */
+  /** Reuse one absolute deadline across readiness retries for this syscall.
+   *
+   *  A replica measures the deadline against the primary's log rather than
+   *  against this computer's clock. The primary already spent this wait, and
+   *  its process read the clock on the far side of it; a replica that spends
+   *  it again keeps the gap it joined with, and the gap is the whole
+   *  machine's, because every decision the log carries after that read waits
+   *  behind it. The readiness check itself is unchanged — the wait ends here
+   *  only when the kernel reports nothing ready, which is the answer the
+   *  primary's guest was given too. */
   private getReadinessDeadline(channel: ChannelInfo, timeoutMs: number): number {
     const testHook = this.#scratchBoundaryTestHooks?.getReadinessDeadline;
     if (testHook) return testHook(channel, timeoutMs);
     if (timeoutMs <= 0) return -1;
     if (channel.readinessDeadline === undefined) {
       channel.readinessDeadline = Date.now() + timeoutMs;
+    }
+    if ((this.#replicationAheadProbe?.(channel.pid) ?? -1) >= timeoutMs) {
+      return Date.now();
     }
     return channel.readinessDeadline;
   }
@@ -18787,7 +18801,9 @@ export class CentralizedKernelWorker {
     // Completing it immediately is what closes the gap; the guest's next
     // clock reading still comes from the log, so it cannot tell. After the
     // signal branch, so an interrupted sleep stays interrupted.
-    if (delayMs > 0 && this.#replicationBehindProbe?.()) delayMs = 0;
+    if (delayMs > 0 && (this.#replicationAheadProbe?.(channel.pid) ?? -1) >= delayMs) {
+      delayMs = 0;
+    }
 
     if (delayMs > 0) {
       if (
@@ -31251,7 +31267,7 @@ export class CentralizedKernelWorker {
    * consumer. Returns true when backlog was discarded.
    */
   #discardReplicaAudioBacklog(entry: KernelWorkerEntryContext): boolean {
-    if (!this.#replicationBehindProbe?.()) return false;
+    if ((this.#replicationAheadProbe?.(0) ?? -1) <= 0) return false;
     const descriptor = this.#pcmTransportDescriptor;
     if (descriptor === null) return false;
     const words = pcmControlWords(descriptor);
@@ -34471,15 +34487,44 @@ export class CentralizedKernelWorker {
   }
 
   /**
-   * Replication's hand on sleep and vblank pacing.
-   *
-   * While the probe answers true, this machine is a replica behind the
-   * primary's log: parked sleeps complete immediately and the vblank pump
-   * chains extra ticks, because the primary already served those waits once
-   * and a replica that serves them again keeps the gap it joined with.
+   * Replication's hand on `host_accept_select`; see
+   * `WasmPosixKernel.setAcceptSelectionTap`.
    */
-  setReplicationBehindProbe(probe: (() => boolean) | null): void {
-    this.#replicationBehindProbe = probe;
+  setAcceptSelectionTap(tap: AcceptSelectionTap | null): void {
+    this.#kernel.setAcceptSelectionTap(tap);
+  }
+
+  /**
+   * Replication's hand on wait pacing.
+   *
+   * A guest's timeout is a duration on the machine's clock, and on a replica
+   * that clock is the primary's log. The probe reads the duration off the
+   * log: it answers how much machine time passed between the reading the
+   * named process was last served and its next recorded one. A wait no longer
+   * than that is one the primary already spent, so this machine completes it
+   * at once rather than serving it again at its original pace and keeping the
+   * gap it joined with.
+   *
+   * The probe is asked about the process that is about to wait, because the
+   * answer differs per process: one ticks on a timer while the others sit
+   * idle. Host work that belongs to no guest names 0 and asks whether the log
+   * carries anything this machine has not reached.
+   */
+  setReplicationAheadProbe(
+    probe: ((pid: number) => number | null) | null,
+  ): void {
+    this.#replicationAheadProbe = probe;
+  }
+
+  /**
+   * The process this machine is serving a syscall for, or 0 for host work.
+   *
+   * Replication logs a clock reading against it. Two computers schedule their
+   * process workers differently, so the order a machine's processes read their
+   * clocks in is not reproducible; which process read is.
+   */
+  currentGuestPid(): number {
+    return this.currentHandlePid;
   }
 
   /** CRTCs whose canvas a GL context owns.
@@ -34866,7 +34911,7 @@ export class CentralizedKernelWorker {
         // vblanks. Chain one immediate tick so a frame-paced replica consumes
         // its backlog faster than 60 Hz; at the head the probe answers false
         // and the pump falls back to its real pace.
-        if (this.kmsCanvases.size > 0 && this.#replicationBehindProbe?.()) {
+        if (this.kmsCanvases.size > 0 && (this.#replicationAheadProbe?.(0) ?? -1) > 0) {
           entry.deferProtocolEffect(() => {
             const chained = this.#registerTimeout(() => {
               this.#runScheduledListenerRoot("vblank catch-up", () => {
