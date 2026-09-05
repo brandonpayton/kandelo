@@ -629,7 +629,7 @@ const reviewedScalarKernelExportCalls: AuditAllowance[] = [
     "apps/browser-demos/test/fixtures/reusable-kernel-export-stack-worker.ts::runProbe::kernel-export-direct-use::exports.kernel_set_current_tid(pid, pid)",
   ),
   reviewedScalarKernelExportCall(
-    "host/src/kernel-worker.ts::CentralizedKernelWorker.#attachThreadChannelWithinKernelEntry::kernel-export-direct-use::setMaxAddr(pid, this.toKernelPtr(tlsPageAddr))",
+    "host/src/kernel-worker.ts::CentralizedKernelWorker.#installThreadChannelTransportWithinKernelEntry::kernel-export-direct-use::setMaxAddr(pid, this.toKernelPtr(tlsPageAddr))",
   ),
   reviewedScalarKernelExportCall(
     "host/src/kernel-worker.ts::CentralizedKernelWorker.#bindKernelTid::kernel-export-direct-use::setTid(pid, tid)",
@@ -1246,6 +1246,17 @@ const auditAllowances: AuditAllowance[] = [
     key: "host/src/kernel-worker.ts::CentralizedKernelWorker.copyKernelMemoryForCheckpoint::kernel-memory-escape::kernelEntryIntrinsicApply( kernelEntryIntrinsicMemoryBuffer, this.#kernelMemory, [], )",
     disposition: "kernel-read",
     why: "A checkpoint's kernel bucket is the whole kernel memory, so this is the one read with no pointer or length left to check; the backing never escapes, because the view is copied with slice() in the same expression and only the detached copy is returned.",
+  },
+  {
+    key: "host/src/kernel-worker.ts::CentralizedKernelWorker.#adoptKernelMemoryImage::kernel-memory-escape::kernelEntryIntrinsicApply( kernelEntryIntrinsicMemoryBuffer, this.#kernelMemory, [], )",
+    disposition: "kernel-control",
+    count: 2,
+    why: "A checkpoint restore overwrites the whole freshly instantiated kernel memory with a validated captured image before the first kernel call; both buffer reads exist only to size and target that one whole-buffer copy, and neither view outlives the method.",
+  },
+  {
+    key: "host/src/kernel-worker.ts::CentralizedKernelWorker.#adoptKernelMemoryImage::kernel-memory-escape::this.#kernelMemory.grow(deltaPages)",
+    disposition: "kernel-control",
+    why: "Host-side growth is normally forbidden because dlmalloc would not know the pages; here the whole buffer is overwritten with the captured image immediately after, so the pages become exactly the pages the captured kernel grew itself and the restored allocator state describes every one of them.",
   },
   {
     key: "host/src/kernel-worker.ts::CentralizedKernelWorker.#createTestAuthority::scratch-address-contract::options.instance",

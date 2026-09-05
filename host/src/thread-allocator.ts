@@ -207,6 +207,21 @@ export class ThreadPageAllocator {
     };
   }
 
+  /**
+   * Become the captured allocator. A restored process's memory carries its
+   * threads' live pages, so a fresh allocator would hand a new thread a page
+   * a restored thread still owns.
+   */
+  adoptState(state: ThreadPageAllocatorState): void {
+    this.nextPage = state.nextPage;
+    this.freePages = [...state.freePages];
+    this.activeCount = state.activeCount;
+    this.hostControlPages.clear();
+    for (const page of state.hostControlPages) {
+      this.hostControlPages.add(page);
+    }
+  }
+
   /** Return pages to the free list after thread exit. */
   free(slotStartPage: number): void {
     this.freePages.push(slotStartPage);

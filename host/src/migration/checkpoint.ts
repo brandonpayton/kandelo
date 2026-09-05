@@ -20,6 +20,26 @@ export interface CheckpointForkReplayContext {
   readonly forkBufAddr: number;
 }
 
+/**
+ * One live pthread the freeze parked, with its frames in process memory.
+ *
+ * The parked frames, channel, and TLS travel inside the process memory copy;
+ * these are the clone-time launch values that memory does not carry. A restore
+ * relaunches the thread's worker from them and rewinds it through the anchor
+ * at `channelOffset - FORK_SAVE_BUFFER_SIZE`.
+ */
+export interface CheckpointProcessThread {
+  readonly tid: number;
+  readonly channelOffset: number;
+  readonly slotStartPage: number;
+  readonly fnPtr: number;
+  readonly argPtr: number;
+  readonly stackPtr: number;
+  readonly tlsPtr: number;
+  readonly ctidPtr: number;
+  readonly tlsOffset: number;
+}
+
 /** One live execution image the freeze can read. */
 export interface CheckpointProcessSource {
   readonly pid: number;
@@ -37,6 +57,8 @@ export interface CheckpointProcessSource {
    */
   readonly programBytes: () => ArrayBuffer;
   readonly threadAllocatorState: () => ThreadPageAllocatorState;
+  /** Read under the freeze: a thread can exit once the machine resumes. */
+  readonly threads: () => readonly CheckpointProcessThread[];
   readonly forkReplayContext?: CheckpointForkReplayContext;
   readonly checkpointFreeze: CheckpointFreezeGateCoordinator;
 }
@@ -74,6 +96,7 @@ export interface CheckpointProcessBucket {
   /** Live reference, never mutated: exec replaces the buffer, in place. */
   readonly programBytes: ArrayBuffer;
   readonly threadAllocator: ThreadPageAllocatorState;
+  readonly threads: readonly CheckpointProcessThread[];
   readonly forkReplayContext?: CheckpointForkReplayContext;
 }
 
@@ -113,6 +136,7 @@ export interface MachineCheckpointSummary {
     readonly argv: readonly string[];
     readonly memoryBytes: number;
     readonly threadAllocator: ThreadPageAllocatorState;
+    readonly threads: readonly CheckpointProcessThread[];
     readonly forkReplayContext?: CheckpointForkReplayContext;
   }[];
 }
@@ -136,6 +160,7 @@ function summarizeMachineCheckpoint(
       argv: bucket.argv,
       memoryBytes: bucket.memory.byteLength,
       threadAllocator: bucket.threadAllocator,
+      threads: bucket.threads,
       ...(bucket.forkReplayContext
         ? { forkReplayContext: bucket.forkReplayContext }
         : {}),
@@ -351,6 +376,7 @@ function readMachine(
       memory: new Uint8Array(source.memory.buffer).slice(),
       programBytes: source.programBytes(),
       threadAllocator: source.threadAllocatorState(),
+      threads: source.threads(),
       ...(source.forkReplayContext
         ? { forkReplayContext: source.forkReplayContext }
         : {}),

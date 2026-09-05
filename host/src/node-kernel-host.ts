@@ -32,6 +32,7 @@ import type { ProcessSnapshot, SyscallTraceEvent } from "./kernel-worker";
 import type {
   CheckpointCaptureResponse,
   CheckpointFreezeResult,
+  MachineCheckpoint,
 } from "./migration/checkpoint";
 import type { HttpRequest, HttpResponse } from "./networking/in-kernel-http";
 import type { LazyDownloadEvent } from "./vfs/memory-fs";
@@ -151,6 +152,15 @@ export interface NodeKernelHostOptions {
   rootfsImage?: "default" | ArrayBuffer | Uint8Array;
   /** Exact image/scratch mount contract. Requires `rootfsImage`. */
   rootfsMountSpec?: readonly MountSpec[];
+  /**
+   * Boot this machine from a captured checkpoint instead of fresh state.
+   *
+   * Requires `rootfsImage`: the mount layout is host configuration a
+   * checkpoint does not carry, so pass the same mounts the captured machine
+   * ran with. The worker validates the checkpoint before instantiating
+   * anything and refuses it loudly when it cannot be adopted.
+   */
+  restoreCheckpoint?: MachineCheckpoint;
   /**
    * Resolve relative lazy URLs embedded in rootfsImage before transport.
    * This is the Node peer of BrowserKernel's lazyUrlBase contract.
@@ -419,6 +429,7 @@ export class NodeKernelHost {
           rootfsMountSpec: this.options.rootfsMountSpec === undefined
             ? undefined
             : this.options.rootfsMountSpec.map((mount) => ({ ...mount })),
+          restoreCheckpoint: this.options.restoreCheckpoint,
           rootfsLazyUrlBase: this.options.rootfsLazyUrlBase,
           rootfsLazyAssets,
           rootfsLazyAssetSources,

@@ -16,6 +16,7 @@ import type { ProcessSnapshot, SyscallTraceEvent } from "./kernel-worker";
 import type {
   CheckpointCaptureResponse,
   CheckpointFreezeResult,
+  MachineCheckpoint,
 } from "./migration/checkpoint";
 import type {
   HostDiagnostic,
@@ -191,6 +192,16 @@ export interface BrowserKernelOwnedImageInitOptions {
   closedLazyAssets?: readonly ClosedLazyAsset[];
   /** Exact image/scratch mount contract for this boot. */
   rootfsMountSpec?: readonly MountSpec[];
+  /**
+   * Boot this machine from a captured checkpoint instead of fresh state.
+   *
+   * `vfsImage` is still required: the mount layout is host configuration a
+   * checkpoint does not carry, so pass the same mounts the captured machine
+   * ran with. The worker validates the checkpoint before instantiating
+   * anything and refuses it loudly when it cannot be adopted. Mirrors
+   * `NodeKernelHostOptions.restoreCheckpoint`.
+   */
+  restoreCheckpoint?: MachineCheckpoint;
 }
 
 async function fetchDefaultBrowserKernelArtifact(
@@ -374,6 +385,7 @@ export class BrowserKernel {
       lazyUrlBase: options.lazyUrlBase ?? import.meta.env.BASE_URL,
       closedLazyAssets: options.closedLazyAssets,
       rootfsMountSpec: options.rootfsMountSpec,
+      restoreCheckpoint: options.restoreCheckpoint,
       takeVfsImageOwnership: true,
     });
   }
@@ -388,6 +400,7 @@ export class BrowserKernel {
     lazyUrlBase?: string;
     closedLazyAssets?: readonly ClosedLazyAsset[];
     rootfsMountSpec?: readonly MountSpec[];
+    restoreCheckpoint?: MachineCheckpoint;
     takeVfsImageOwnership: boolean;
   }): Promise<void> {
     if (
@@ -484,6 +497,7 @@ export class BrowserKernel {
           rootfsMountSpec: opts.rootfsMountSpec === undefined
             ? undefined
             : opts.rootfsMountSpec.map((mount) => ({ ...mount })),
+          restoreCheckpoint: opts.restoreCheckpoint,
           shmSab: this.shmSab,
           workerEntryUrl,
           config: {

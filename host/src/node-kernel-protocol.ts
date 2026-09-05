@@ -20,6 +20,7 @@ import type {
 } from "./vfs/closed-lazy-assets";
 import type { MountSpec } from "./vfs/default-mounts";
 import type { NodeSessionSeedTree } from "./vfs/default-mounts-node";
+import type { MachineCheckpoint } from "./migration/checkpoint";
 
 export type { HttpRequest, HttpResponse };
 export type { HostDiagnostic } from "./host-diagnostic";
@@ -62,6 +63,15 @@ export interface InitMessage {
   rootfsImage?: ArrayBuffer;
   /** Exact image/scratch mount contract. Absent preserves the host default. */
   rootfsMountSpec?: MountSpec[];
+  /**
+   * Boot this machine from a captured checkpoint instead of fresh state.
+   *
+   * The worker validates the checkpoint before instantiating anything, then
+   * adopts its kernel memory and its rootfs bytes. Requires `rootfsImage`:
+   * the mount layout is host configuration a checkpoint does not carry, so
+   * the caller supplies the same mounts the captured machine ran with.
+   */
+  restoreCheckpoint?: MachineCheckpoint;
   /** Base used to resolve relative lazy URLs embedded in rootfsImage. */
   rootfsLazyUrlBase?: string;
   /** Exhaustive exact-byte lazy transport for this rootfs; no network fallback. */

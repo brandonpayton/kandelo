@@ -5035,8 +5035,21 @@ export class CentralizedKernelWorker {
   /**
    * Initialize the kernel.
    * Loads kernel Wasm and validates the host adapter ABI.
+   *
+   * With `adoptKernelMemoryImage`, the freshly instantiated kernel's memory
+   * is overwritten with a captured image before the first kernel call.
+   * Instantiation must come first: it applies the module's data segments,
+   * and copying afterwards leaves no range holding initial values that the
+   * captured kernel had already mutated. The scratch regions below are then
+   * allocated from the restored dlmalloc heap, so their pointers are
+   * consistent with the adopted state; the captured boot's own scratch
+   * regions stay allocated inside it, a bounded leak of two regions per
+   * restore.
    */
-  async init(kernelWasmBytes: BufferSource): Promise<void> {
+  async init(
+    kernelWasmBytes: BufferSource,
+    options?: { readonly adoptKernelMemoryImage?: Uint8Array },
+  ): Promise<void> {
     if (this.#kernelFatalError !== null) {
       throw new Error("cannot reinitialize a failed kernel worker");
     }
@@ -5065,6 +5078,9 @@ export class CentralizedKernelWorker {
       throw new Error("kernel initialization did not publish its runtime");
     }
     this.#kernelPointerWidth = this.#kernel.getKernelPtrWidth();
+    if (options?.adoptKernelMemoryImage !== undefined) {
+      this.#adoptKernelMemoryImage(options.adoptKernelMemoryImage);
+    }
 
     if (this.#kernelEntryGate.shouldDeferVoidIngress) {
       throw new KernelReentrantEntryError("kernel initialization completion");
@@ -7823,6 +7839,43 @@ export class CentralizedKernelWorker {
    * Memory handed out: a checkpoint is a value, and a live alias would keep
    * mutating after the freeze released.
    */
+  /**
+   * Overwrite the kernel's memory with a captured image, before any kernel
+   * call has run against this generation.
+   *
+   * Growing host-side is safe only because the whole buffer is overwritten
+   * next: the pages become exactly the pages the captured kernel grew
+   * itself, so the restored dlmalloc state describes every one of them.
+   */
+  #adoptKernelMemoryImage(image: Uint8Array): void {
+    if (this.#kernelMemory === null) {
+      throw new Error("kernel memory is not instantiated");
+    }
+    const buffer = kernelEntryIntrinsicApply(
+      kernelEntryIntrinsicMemoryBuffer,
+      this.#kernelMemory,
+      [],
+    ) as ArrayBufferLike;
+    if (
+      image.byteLength < buffer.byteLength
+      || image.byteLength % WASM_PAGE_SIZE !== 0
+    ) {
+      throw new Error(
+        `cannot adopt a ${image.byteLength}-byte kernel image into a kernel `
+        + `whose fresh memory is already ${buffer.byteLength} bytes`,
+      );
+    }
+    const deltaPages =
+      (image.byteLength - buffer.byteLength) / WASM_PAGE_SIZE;
+    if (deltaPages > 0) this.#kernelMemory.grow(deltaPages);
+    const grown = kernelEntryIntrinsicApply(
+      kernelEntryIntrinsicMemoryBuffer,
+      this.#kernelMemory,
+      [],
+    ) as ArrayBufferLike;
+    new Uint8Array(grown).set(image);
+  }
+
   copyKernelMemoryForCheckpoint(): Uint8Array {
     if (this.#kernelMemory === null) {
       throw new Error("kernel memory is not instantiated");
@@ -9569,6 +9622,93 @@ export class CentralizedKernelWorker {
     if (registration.memory !== memory) {
       throw new Error(`Process ${pid} changed memory generation`);
     }
+    this.#installThreadChannelTransportWithinKernelEntry(
+      pid,
+      tid,
+      fnPtr,
+      argPtr,
+      channelOffset,
+      registration,
+      entry,
+    );
+    pending.attachedChannelOffset = channelOffset;
+  }
+
+  /**
+   * Reattach a checkpointed pthread's channel in a restored machine.
+   *
+   * The restored kernel memory already owns this task identity: the clone
+   * that minted it ran on the captured machine, so there is no one-shot
+   * attachment capability to consume. The kernel keeps the last word on the
+   * TID through `kernel_validate_task`; the host only rebuilds transport for
+   * a task Rust already has.
+   */
+  attachRestoredThreadChannel(
+    pid: number,
+    tid: number,
+    fnPtr: number,
+    argPtr: number,
+    channelOffset: number,
+  ): void {
+    if (this.#kernelFatalError !== null) throw this.#kernelFatalError;
+    if (this.#kernelEntryGate.shouldDeferVoidIngress) {
+      throw new KernelReentrantEntryError("restored thread channel attachment");
+    }
+    const deferred = this.#runOrDeferKernelEntry(
+      "restored thread channel attachment",
+      (entry) => {
+        this.#attachRestoredThreadChannelWithinKernelEntry(
+          pid,
+          tid,
+          fnPtr,
+          argPtr,
+          channelOffset,
+          entry,
+        );
+        return undefined;
+      },
+    );
+    if (deferred) {
+      throw new KernelReentrantEntryError("restored thread channel attachment");
+    }
+  }
+
+  #attachRestoredThreadChannelWithinKernelEntry(
+    pid: number,
+    tid: number,
+    fnPtr: number,
+    argPtr: number,
+    channelOffset: number,
+    entry: KernelWorkerEntryContext,
+  ): void {
+    if (this.execHandoffPids?.has(pid)) {
+      throw new Error(`Process ${pid} is replacing its image`);
+    }
+    if (!this.#isProcessExecutionActiveWithinKernelEntry(pid, entry)) {
+      throw new Error(`Process ${pid} is not running`);
+    }
+    const registration = this.processes.get(pid);
+    if (!registration) throw new Error(`Process ${pid} not registered`);
+    this.#installThreadChannelTransportWithinKernelEntry(
+      pid,
+      tid,
+      fnPtr,
+      argPtr,
+      channelOffset,
+      registration,
+      entry,
+    );
+  }
+
+  #installThreadChannelTransportWithinKernelEntry(
+    pid: number,
+    tid: number,
+    fnPtr: number,
+    argPtr: number,
+    channelOffset: number,
+    registration: ProcessRegistration,
+    entry: KernelWorkerEntryContext,
+  ): void {
     if (
       !Number.isSafeInteger(tid)
       || tid <= 0
@@ -9645,7 +9785,6 @@ export class CentralizedKernelWorker {
       if (!this.usePolling) {
         this.listenOnChannel(channel);
       }
-      pending.attachedChannelOffset = channelOffset;
     } catch (error) {
       this.#rethrowKernelEntryFatal(error);
       registration.channels = registration.channels.filter(

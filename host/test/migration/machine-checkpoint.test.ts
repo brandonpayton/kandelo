@@ -8,17 +8,13 @@
  */
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NodeKernelHost } from "../../src/node-kernel-host";
 import { ABI_VERSION } from "../../src/generated/abi";
-import {
-  binaryCacheRoot,
-  findRepoRoot,
-  resolveBinary,
-} from "../../src/binary-resolver";
+import { findRepoRoot, resolveBinary } from "../../src/binary-resolver";
+import { doomSharewareWad } from "../support/doom-shareware";
 
 const TIMEOUTS = { unwindTimeoutMs: 10_000, vforkTimeoutMs: 5_000 };
 
@@ -113,51 +109,6 @@ function buildSideModule(): Uint8Array {
   // A fresh copy, because writeFileToVfs transfers the backing buffer and a
   // readFileSync Buffer sits in a pool it does not own.
   return new Uint8Array(readFileSync(soPath));
-}
-
-/**
- * The Doom shareware IWAD the fbDOOM checkpoint test runs against.
- *
- * Same pinned source as `images/vfs/products/browser-main-shell.toml`: the
- * browser demo fetches this file at page load, so the test exercises the same
- * asset the product ships. Fetched once, verified against the pinned sha256,
- * and cached beside the resolver's package generations.
- */
-const DOOM_WAD_URL =
-  "https://cdn.jsdelivr.net/gh/gaborbata/vanilla-mocha-doom@15825a07a48806bcfb242a42afd5ee7cb3c9a3a4/wads/doom1.wad";
-const DOOM_WAD_SHA256 =
-  "1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771";
-
-async function doomSharewareWad(): Promise<Uint8Array> {
-  const cachePath = join(
-    binaryCacheRoot(),
-    "archives",
-    `doom-shareware-${DOOM_WAD_SHA256.slice(0, 8)}.wad`,
-  );
-  const sha256 = (bytes: Uint8Array) =>
-    createHash("sha256").update(bytes).digest("hex");
-  try {
-    // A fresh copy, because writeFileToVfs transfers the backing buffer and
-    // a readFileSync Buffer sits in a pool it does not own.
-    const cached = new Uint8Array(readFileSync(cachePath));
-    if (sha256(cached) === DOOM_WAD_SHA256) return cached;
-  } catch {
-    // Not cached yet.
-  }
-  const response = await fetch(DOOM_WAD_URL);
-  if (!response.ok) {
-    throw new Error(`fetching ${DOOM_WAD_URL} failed: ${response.status}`);
-  }
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  const digest = sha256(bytes);
-  if (digest !== DOOM_WAD_SHA256) {
-    throw new Error(
-      `${DOOM_WAD_URL} hashed to ${digest}, expected ${DOOM_WAD_SHA256}`,
-    );
-  }
-  mkdirSync(join(binaryCacheRoot(), "archives"), { recursive: true });
-  writeFileSync(cachePath, bytes);
-  return bytes;
 }
 
 describe("machine checkpoint of a running guest", () => {

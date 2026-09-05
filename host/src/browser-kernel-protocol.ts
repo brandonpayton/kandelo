@@ -13,6 +13,7 @@ import type { HostDiagnostic, HostDiagnosticMessage } from "./host-diagnostic";
 import type { ClosedLazyAsset } from "./vfs/closed-lazy-assets";
 import type { PcmTransportDescriptor } from "./audio/pcm-transport";
 import type { MountSpec } from "./vfs/default-mounts";
+import type { MachineCheckpoint } from "./migration/checkpoint";
 import {
   type BrowserCorsProxyConfig,
   validateBrowserCorsProxyConfig,
@@ -73,6 +74,16 @@ export interface InitMessage {
   vfsImage: Uint8Array;
   /** Exact image/scratch mount contract. Absent preserves the host default. */
   rootfsMountSpec?: MountSpec[];
+  /**
+   * Boot this machine from a captured checkpoint instead of fresh state.
+   *
+   * The worker validates the checkpoint before instantiating anything, then
+   * adopts its kernel memory and its rootfs bytes. `vfsImage` is still
+   * required: the mount layout is host configuration a checkpoint does not
+   * carry, so the caller supplies the same mounts the captured machine ran
+   * with.
+   */
+  restoreCheckpoint?: MachineCheckpoint;
   /** Base URL for relative lazy file/archive URLs stored in vfsImage. */
   lazyUrlBase?: string;
   /** Exhaustive exact-byte lazy transport for this image; no network fallback. */

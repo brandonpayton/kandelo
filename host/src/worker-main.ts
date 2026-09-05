@@ -5453,6 +5453,7 @@ export async function centralizedThreadWorkerMain(
   } = initData;
   const tlsOffset = initData.tlsOffset ?? initData.tlsAllocAddr;
   const ptrWidth = initData.ptrWidth ?? 4;
+  const restoredForkBufAddr = initData.restoredForkBufAddr;
 
   // WHY: synchronize the received memory before this isolate binds any view
   // or Wasm instance to a possibly stale fixed-length view of its backing.
@@ -5623,16 +5624,19 @@ export async function centralizedThreadWorkerMain(
           ),
         `pid=${pid} tid=${tid}`,
       );
+    const threadExternrefRecipes = hasForkInstrumentation
+      ? new ForkExternrefTokenRecipeProvider(
+          threadExternrefTokens!,
+          (value) =>
+            threadHostImportRuntime!.localExceptions.normalizeUnclaimedForkValue(
+              value,
+            ),
+        )
+      : null;
     const threadActivationRegistry = hasForkInstrumentation
       ? new ForkActivationRegistry(
           memory,
-          new ForkExternrefTokenRecipeProvider(
-            threadExternrefTokens!,
-            (value) =>
-              threadHostImportRuntime!.localExceptions.normalizeUnclaimedForkValue(
-                value,
-              ),
-          ),
+          threadExternrefRecipes!,
           `pid=${pid} tid=${tid}: fork activations`,
           (size) =>
             continuationMmap(
@@ -6025,6 +6029,121 @@ export async function centralizedThreadWorkerMain(
         label: `pid=${pid} tid=${tid}`,
       });
     }
+
+    // A restored pthread mirrors the fork-child main boot: its frames and
+    // module state are already parked in the shared memory copy, so validate
+    // and attach that captured transaction instead of entering `fnPtr` fresh.
+    let restoredArena: ForkModuleStateArena | null = null;
+    let restoredDecodedReferences:
+      | DecodedSegmentedForkReferenceTransaction
+      | null = null;
+    let restoredEarlyReferences: ForkEarlyChildReferenceProvider | null = null;
+    let restoredPlanner: ForkImportedGlobalPlanner | null = null;
+    if (restoredForkBufAddr !== undefined) {
+      if (
+        !hasForkInstrumentation ||
+        !threadProcessContinuation ||
+        !threadActivationRegistry ||
+        !threadExternrefRecipes
+      ) {
+        throw new Error(
+          `pid=${pid} tid=${tid}: a restored pthread requires complete ` +
+            "wasm-fork-instrument exports",
+        );
+      }
+      const anchorView = new DataView(memory.buffer);
+      const inheritedRoot =
+        ptrWidth === 8
+          ? Number(anchorView.getBigUint64(forkAnchorAddr, true))
+          : anchorView.getUint32(forkAnchorAddr, true);
+      if (inheritedRoot !== restoredForkBufAddr) {
+        throw new Error(
+          `pid=${pid} tid=${tid}: inherited thread launch root ` +
+            `${inheritedRoot} does not match launch root ${restoredForkBufAddr}`,
+        );
+      }
+      if (!Number.isSafeInteger(inheritedRoot) || inheritedRoot <= 0) {
+        throw new Error(
+          `pid=${pid} tid=${tid}: restored pthread has no inherited launch root`,
+        );
+      }
+      const restoredDylinkState = threadDlopenSupport.readForkState();
+      if (
+        restoredDylinkState.libraries.some(
+          (library) => library.activationId !== undefined,
+        )
+      ) {
+        throw new Error(
+          `pid=${pid} tid=${tid}: restoring a pthread with dynamically ` +
+            "loaded side activations is not implemented yet",
+        );
+      }
+      const moduleStateRoot = readForkModuleStateRoot(
+        memory,
+        inheritedRoot,
+        ptrWidth,
+      );
+      restoredArena = newThreadModuleStateArena();
+      restoredArena.attach(
+        ptrWidth === 8 ? BigInt(moduleStateRoot) : moduleStateRoot,
+      );
+      const records = restoredArena.recordViews();
+      restoredDecodedReferences = decodeSegmentedForkReferenceTransaction(
+        records,
+        FORK_REFERENCE_TRANSACTION_OWNER_ID,
+      );
+      restoredEarlyReferences = new ForkEarlyChildReferenceProvider({
+        records,
+        transaction: restoredDecodedReferences,
+        declarations: [
+          {
+            activationId: 0,
+            gcDescriptor: readForkGcCodecDescriptor(module),
+            exceptionDescriptor: readForkExceptionCodecDescriptor(module),
+          },
+        ],
+        externrefs: threadExternrefRecipes,
+        transit: {
+          prepare: (maxRecipeId) =>
+            threadActivationRegistry.prepareEarlyGcTransit(maxRecipeId),
+          publish: (recipeId, value) =>
+            threadActivationRegistry.publishEarlyGcTransit(recipeId, value),
+          read: (recipeId) =>
+            threadActivationRegistry.readEarlyGcTransit(recipeId),
+          abort: () => threadActivationRegistry.abortEarlyGcTransit(),
+        },
+        memory,
+        allocateScratch: (size) =>
+          continuationMmap(
+            memory,
+            channelOffset,
+            size,
+            `pid=${pid} tid=${tid}: early reference scratch`,
+          ),
+        deallocateScratch: (addr, size) =>
+          continuationMunmap(
+            memory,
+            channelOffset,
+            addr,
+            size,
+            `pid=${pid} tid=${tid}: early reference scratch`,
+          ),
+        label: `pid=${pid} tid=${tid}: early restored references`,
+      });
+      restoredPlanner = new ForkImportedGlobalPlanner(
+        records,
+        new Map<number, WebAssembly.Module>([[0, module]]),
+        restoredEarlyReferences,
+        `pid=${pid} tid=${tid}: restored imported activation state`,
+      );
+      const plannedOrder = restoredPlanner.instantiationOrder();
+      if (plannedOrder.length !== 1 || plannedOrder[0] !== 0) {
+        throw new Error(
+          `pid=${pid} tid=${tid}: restored pthread replay expects only the ` +
+            `main activation, but the archive provides ${plannedOrder.join(",")}`,
+        );
+      }
+    }
     const threadCoordinator = threadProcessContinuation;
     const threadForkEnvImports =
       threadCoordinator && threadActivationRegistry && threadExceptionBroker
@@ -6082,14 +6201,22 @@ export async function centralizedThreadWorkerMain(
           importObject,
         )
       : importObject;
+    // Reconstruction supplies the captured imported identities; capture wraps
+    // that resolved view exactly as the fork-child main boot does.
+    const reconstructedThreadImports = restoredPlanner
+      ? restoredPlanner.importsForActivation(
+          0,
+          routedThreadImportObject as unknown as ForkWasmImports,
+        )
+      : routedThreadImportObject;
     const threadMainImportedState =
       threadImportedStateCapture?.prepareActivation(
         0,
         module,
-        routedThreadImportObject,
+        reconstructedThreadImports,
       );
     const threadInstanceImports = (threadMainImportedState?.imports ??
-      routedThreadImportObject) as WebAssembly.Imports;
+      reconstructedThreadImports) as WebAssembly.Imports;
     const instance = new WebAssembly.Instance(module, threadInstanceImports);
     threadInstance = instance;
     threadMainImportedState?.complete(instance);
@@ -6107,16 +6234,60 @@ export async function centralizedThreadWorkerMain(
         );
       }
       threadExceptionProvider = forkExceptionProviderFromInstance(0, instance);
+      const threadTypedReferenceProvider = restoredPlanner
+        ? forkGcCodecProviderFromInstance(0, module, instance)
+        : undefined;
+      const threadRegistration = forkActivationRegistrationFromInstance({
+        activationId: 0,
+        module,
+        instance,
+        templateId: threadTemplateId,
+        exceptionProvider: threadExceptionProvider,
+        ...(threadTypedReferenceProvider
+          ? { typedReferenceProvider: threadTypedReferenceProvider }
+          : {}),
+      });
       threadProcessContinuation.registerActivation(
-        forkActivationRegistrationFromInstance({
-          activationId: 0,
-          module,
-          instance,
-          templateId: threadTemplateId,
-          exceptionProvider: threadExceptionProvider,
-        }),
+        threadRegistration,
         forkResumeTargetsFromInstance(module, instance),
       );
+      restoredPlanner?.registerInstance(0, instance);
+      if (restoredEarlyReferences && threadTypedReferenceProvider) {
+        // These catalogs contain fresh-instance identities. Register only
+        // after the registry has harvested static roots, before any immutable
+        // import getter can request one.
+        restoredEarlyReferences.registerActivation({
+          activationId: 0,
+          functions: {
+            decode(ordinal) {
+              if (
+                !Number.isInteger(ordinal) ||
+                ordinal < 0 ||
+                ordinal >= threadRegistration.functionCatalog.length
+              ) {
+                throw new RangeError(
+                  `pid=${pid} tid=${tid}: function recipe 0:` +
+                    `${String(ordinal)} is out of bounds`,
+                );
+              }
+              const value = threadRegistration.functionCatalog.get(ordinal);
+              if (typeof value !== "function") {
+                throw new TypeError(
+                  `pid=${pid} tid=${tid}: function recipe 0:${ordinal} ` +
+                    "did not resolve to a function",
+                );
+              }
+              return value as CallableFunction;
+            },
+          },
+          staticRoots: {
+            decode: (ordinal) =>
+              threadActivationRegistry.decodeStaticRoot(0, ordinal),
+          },
+          typed: threadTypedReferenceProvider,
+          exceptions: threadRegistration.exceptionProvider,
+        });
+      }
       try {
         // The pthread bootstrap consumes passive element segments, so static
         // root harvesting and table-dirty registration must precede it just as
@@ -6168,11 +6339,14 @@ export async function centralizedThreadWorkerMain(
     }
 
     // Initialize Wasm TLS for this thread in the slot's explicit TLS/control page.
+    // A restored pthread's TLS content is live state inside the memory copy;
+    // rewriting the template over it would clobber it, and child attach below
+    // restores the __tls_base global from the captured activation state.
     const wasmInitTls = instance.exports.__wasm_init_tls as
       ((addr: number | bigint) => void) | undefined;
     const tlsBlock = tlsOffset;
 
-    if (wasmInitTls && tlsBlock > 0) {
+    if (wasmInitTls && tlsBlock > 0 && restoredForkBufAddr === undefined) {
       wasmInitTls(ptrWidth === 8 ? BigInt(tlsBlock) : tlsBlock);
     }
 
@@ -6201,6 +6375,46 @@ export async function centralizedThreadWorkerMain(
       initData.programBytes,
       ptrWidth,
     );
+
+    if (restoredArena) {
+      if (
+        !threadProcessContinuation ||
+        !threadActivationRegistry ||
+        !restoredPlanner ||
+        !restoredEarlyReferences
+      ) {
+        throw new Error(
+          `pid=${pid} tid=${tid}: restored pthread lost its validated ` +
+            "replay state",
+        );
+      }
+      restoredPlanner.bindTableDirtyTrackers(
+        new Map(
+          threadActivationRegistry
+            .activations()
+            .map((activation) => [
+              activation.activationId,
+              activation.tableDirty,
+            ]),
+        ),
+      );
+      const early = restoredEarlyReferences;
+      const adoptEarlyReferences = (): void => {
+        early.adoptInto(threadActivationRegistry.currentReferences());
+        restoredEarlyReferences = null;
+      };
+      // Child attach restores __tls_base/__stack_pointer from the captured
+      // activation state and puts the coordinator in child-replay, so the run
+      // loop below selects wpk_fork_resume_thread instead of a fresh entry.
+      threadProcessContinuation.attachChild(
+        restoredArena,
+        adoptEarlyReferences,
+        restoredDecodedReferences ?? undefined,
+      );
+      restoredDecodedReferences = null;
+      restoredPlanner.clear();
+      restoredPlanner = null;
+    }
 
     // Call the thread function via indirect function table
     const table = threadTable;

@@ -50,6 +50,7 @@ function processSource(pid: number, generation: number): CheckpointProcessSource
         firstSlotStartPage: 4,
         maxPageExclusive: 64,
       }).snapshotState(),
+    threads: () => [],
     checkpointFreeze: new CheckpointFreezeGateCoordinator(`pid=${pid}`),
   };
 }

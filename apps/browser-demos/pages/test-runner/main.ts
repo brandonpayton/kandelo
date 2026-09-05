@@ -24,12 +24,39 @@ import {
 } from "../../lib/kernel-owned-boot";
 import { resolveBrowserCorsProxyConfig } from "../../lib/browser-cors-proxy";
 import kernelWasmUrl from "@kernel-wasm?url";
+import type { MachineCheckpoint } from "@host/migration/checkpoint";
 import type { ExecBinarySupport } from "./exec-binaries";
 
 interface DataFile {
   path: string;
   data?: number[]; // byte array (transferred as JSON-safe array)
   useWasmBytes?: boolean; // if true, use the wasmBytes as file content
+}
+
+interface MigrationDataFile {
+  path: string;
+  base64: string;
+}
+
+interface MigrationRestoreOptions {
+  dataFiles?: MigrationDataFile[];
+  env?: string[];
+  pty?: boolean;
+  readyMarker: string;
+  settleMs?: number;
+}
+
+interface MachineCheckpointThreadsSummary {
+  pids: number[];
+  threads: { pid: number; tids: number[]; activeCount: number }[];
+}
+
+interface MigrationRestoreResult {
+  captured: MachineCheckpointThreadsSummary;
+  signaled: boolean;
+  recaptured: MachineCheckpointThreadsSummary;
+  output: string;
+  hostDiagnostics: string[];
 }
 
 interface PtyInput {
@@ -99,6 +126,17 @@ declare global {
       hostDiagnostics: HostDiagnostic[];
     }>;
     __testCount: number;
+    /**
+     * Freeze a running guest into a machine checkpoint, tear the machine
+     * down, boot a second machine from the checkpoint, and prove the restored
+     * guest resumed by recapturing it — a capture completes only when every
+     * task crosses a syscall boundary and unwinds again.
+     */
+    __runMigrationRestoreTest: (
+      wasmBytes: ArrayBuffer,
+      argv: string[],
+      options: MigrationRestoreOptions,
+    ) => Promise<MigrationRestoreResult>;
     /**
      * Start one real-browser `/dev/dsp` run with the AudioContext deliberately
      * suspended. The guest is allowed to fill the bounded PCM ring and block
@@ -493,6 +531,146 @@ async function init() {
       await kernel.destroy();
       await settleWebKitReclaim();
       window.__testCount++;
+    }
+  };
+
+  window.__runMigrationRestoreTest = async (
+    wasmBytes: ArrayBuffer,
+    argv: string[],
+    options: MigrationRestoreOptions,
+  ) => {
+    const decoder = new TextDecoder();
+    let output = "";
+    const hostDiagnostics: string[] = [];
+    const timeouts = { unwindTimeoutMs: 10_000, vforkTimeoutMs: 5_000 };
+
+    const buildImage = async (
+      dataFiles?: MigrationDataFile[],
+    ): Promise<ArrayBuffer> => {
+      const buildFs = await createBuildFsWithEtc();
+      for (const file of dataFiles ?? []) {
+        const parts = file.path.split("/").filter(Boolean);
+        let dirPath = "";
+        for (let i = 0; i < parts.length - 1; i++) {
+          dirPath += "/" + parts[i];
+          try {
+            buildFs.mkdir(dirPath, 0o755);
+          } catch {
+            // Directory may already exist
+          }
+        }
+        const raw = atob(file.base64);
+        const bytes = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+        const fd = buildFs.open(
+          file.path,
+          0x241 /* O_WRONLY|O_CREAT|O_TRUNC */,
+          0o755,
+        );
+        buildFs.write(fd, bytes, null, bytes.length);
+        buildFs.close(fd);
+      }
+      const image = await finalizeKernelOwnedImage(buildFs);
+      const whole = image.buffer instanceof ArrayBuffer
+        && image.byteOffset === 0
+        && image.byteLength === image.buffer.byteLength;
+      return whole ? (image.buffer as ArrayBuffer) : image.slice().buffer;
+    };
+
+    const summarize = (
+      checkpoint: MachineCheckpoint,
+    ): MachineCheckpointThreadsSummary => ({
+      pids: checkpoint.processes.map((bucket) => bucket.pid),
+      threads: checkpoint.processes.map((bucket) => ({
+        pid: bucket.pid,
+        tids: bucket.threads.map((thread) => thread.tid),
+        activeCount: bucket.threadAllocator.activeCount,
+      })),
+    });
+
+    let checkpoint: MachineCheckpoint | null = null;
+    let pid = 0;
+    const keeper = new BrowserKernel({
+      kernelOwnedFs: true,
+      onStdout: (data: Uint8Array) => {
+        output += decoder.decode(data);
+      },
+      onStderr: (data: Uint8Array) => {
+        output += decoder.decode(data);
+      },
+      onHostDiagnostic: (diagnostic) => {
+        hostDiagnostics.push(`${diagnostic.source}: ${diagnostic.message}`);
+      },
+    });
+    try {
+      await keeper.initFromOwnedImage({
+        kernelWasm: kernelWasmBytes!,
+        vfsImage: await buildImage(options.dataFiles),
+      });
+      const exit = keeper.spawn(wasmBytes, argv, {
+        env: options.env,
+        pty: options.pty,
+        onStarted: async (startedPid: number) => {
+          pid = startedPid;
+          if (options.pty) {
+            keeper.onPtyOutput(startedPid, (data) => {
+              output += decoder.decode(data);
+            });
+          }
+        },
+      });
+      exit.catch(() => {});
+      const deadline = performance.now() + 60_000;
+      while (!output.includes(options.readyMarker)) {
+        if (performance.now() > deadline) {
+          throw new Error(
+            `guest never printed ${options.readyMarker}: ${output.slice(-2_000)}`,
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      if (options.settleMs) {
+        await new Promise((resolve) => setTimeout(resolve, options.settleMs));
+      }
+      const capture = await keeper.captureCheckpointBytes(timeouts);
+      if (capture.status !== "captured") {
+        throw new Error(`capture failed: ${JSON.stringify(capture)}`);
+      }
+      checkpoint = capture.checkpoint;
+    } finally {
+      await keeper.destroy().catch(() => {});
+      await settleWebKitReclaim();
+    }
+
+    if (!checkpoint) throw new Error("capture returned no checkpoint");
+
+    const receiver = new BrowserKernel({
+      kernelOwnedFs: true,
+      onHostDiagnostic: (diagnostic) => {
+        hostDiagnostics.push(`${diagnostic.source}: ${diagnostic.message}`);
+      },
+    });
+    try {
+      await receiver.initFromOwnedImage({
+        kernelWasm: kernelWasmBytes!,
+        vfsImage: await buildImage(),
+        restoreCheckpoint: checkpoint,
+      });
+      const signaled = await receiver.signalProcess(pid, 0);
+      const recapture = await receiver.captureCheckpointBytes(timeouts);
+      if (recapture.status !== "captured") {
+        throw new Error(`recapture failed: ${JSON.stringify(recapture)}`);
+      }
+      return {
+        captured: summarize(checkpoint),
+        signaled,
+        recaptured: summarize(recapture.checkpoint),
+        output,
+        hostDiagnostics,
+      };
+    } finally {
+      await receiver.destroy().catch(() => {});
+      await settleWebKitReclaim();
     }
   };
 

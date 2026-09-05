@@ -2387,6 +2387,59 @@ pub extern "C" fn kernel_fd_supports_mmap_writeback(pid: u32, fd: i32) -> i32 {
     }
 }
 
+/// Enumerate every live host handle held inside kernel memory.
+///
+/// A machine checkpoint's kernel memory names host resources through opaque
+/// handles the receiver cannot find by scanning bytes. This walk names each
+/// one: every open file description slot holding a non-negative handle, per
+/// descriptor that can reach it. A handle shared by dup, fork, or spawn
+/// appears once per (pid, fd) naming it, so the reader sees the sharing and
+/// deduplicates by (kind, handle). Negative handles are kernel-internal
+/// encodings (sockets, backing tables, synthetic and sentinel values) and
+/// are never emitted.
+///
+/// Wire format (all integers little-endian):
+///
+///   u32  count
+///   for each record (20 bytes):
+///     u32  pid
+///     u32  fd
+///     u32  kind      -- 0 = stream slot, 1 = directory iterator slot
+///     i64  handle
+///
+/// Returns total bytes written, or -ENOSPC when the buffer is too small.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_enumerate_host_handles(out_ptr: *mut u8, out_len: u32) -> i32 {
+    let table = unsafe { &*PROCESS_TABLE.0.get() };
+    let out = unsafe { slice::from_raw_parts_mut(out_ptr, out_len as usize) };
+    match table.write_host_handle_records(out) {
+        Ok(written) => written as i32,
+        Err(e) => -(e as i32),
+    }
+}
+
+/// Remap one live host handle to its receiver-side replacement, machine-wide.
+///
+/// Generalises `kernel_convert_pipe_to_host`: instead of rewriting one open
+/// file description of the current process, this rewrites every description
+/// in every process whose slot of the given kind holds `old_handle`, and
+/// moves the cross-process refcount entry with them, so shared descriptions
+/// stay shared. `kind` 0 names the stream slot (`host_handle`), `kind` 1 the
+/// directory iterator slot (`dir_host_handle`).
+///
+/// Returns the number of rewritten slots (> 0), -EINVAL for a bad kind or a
+/// negative handle, -EEXIST when a different resource already answers to
+/// `new_handle`, and -EBADF when no slot holds `old_handle`. An identity
+/// remap (`old_handle == new_handle`) is legal.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_remap_host_handles(kind: u32, old_handle: i64, new_handle: i64) -> i32 {
+    let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+    match table.remap_host_handles(kind, old_handle, new_handle) {
+        Ok(rewritten) => rewritten as i32,
+        Err(e) => -(e as i32),
+    }
+}
+
 /// Snapshot the process table for the host (Kandelo Inspector → Procs tab,
 /// and any host that wants a `ps`-equivalent view without spawning a user
 /// process). Walks every active pid and writes a compact, length-prefixed

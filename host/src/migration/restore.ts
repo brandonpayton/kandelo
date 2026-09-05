@@ -152,5 +152,55 @@ async function validateProcessBucket(
       + (error instanceof Error ? error.message : String(error)),
     );
   }
+
+  if (!Array.isArray(bucket.threads)) {
+    refuse(`pid ${pid}'s bucket carries no thread list`);
+  }
+  if (bucket.threads.length !== bucket.threadAllocator.activeCount) {
+    refuse(
+      `pid ${pid} carries ${bucket.threads.length} thread record(s) but its `
+      + `allocator holds ${bucket.threadAllocator.activeCount} live slot(s)`,
+    );
+  }
+  const tids = new Set<number>();
+  for (const thread of bucket.threads) {
+    if (
+      !Number.isSafeInteger(thread.tid)
+      || thread.tid <= 0
+      || thread.tid === pid
+    ) {
+      refuse(
+        `pid ${pid} carries a thread with kernel TID ${String(thread.tid)}`,
+      );
+    }
+    if (tids.has(thread.tid)) {
+      refuse(`pid ${pid} carries kernel TID ${thread.tid} twice`);
+    }
+    tids.add(thread.tid);
+    if (
+      !Number.isSafeInteger(thread.channelOffset)
+      || thread.channelOffset <= FORK_SAVE_BUFFER_SIZE
+      || thread.channelOffset + CH_TOTAL_SIZE > memory.byteLength
+      || thread.channelOffset === bucket.channelOffset
+    ) {
+      refuse(
+        `pid ${pid} tid ${thread.tid}'s syscall channel at `
+        + `${String(thread.channelOffset)} does not fit inside its `
+        + `${memory.byteLength}-byte memory`,
+      );
+    }
+    try {
+      readForkContinuationAnchor(
+        { buffer: memory.buffer },
+        thread.channelOffset - FORK_SAVE_BUFFER_SIZE,
+        bucket.ptrWidth,
+      );
+    } catch (error) {
+      refuse(
+        `pid ${pid} tid ${thread.tid}'s continuation root is unusable: `
+        + (error instanceof Error ? error.message : String(error)),
+      );
+    }
+  }
   return module;
 }

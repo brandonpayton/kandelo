@@ -172,6 +172,15 @@ export interface CentralizedThreadInitMessage {
    * the worker it wakes, so no two workers can share one gate.
    */
   checkpointFreezeGate?: SharedArrayBuffer;
+  /**
+   * Launch root of a checkpointed pthread relaunched in a restored machine.
+   *
+   * Its frames are already parked in the restored memory behind the anchor at
+   * `channelOffset - FORK_SAVE_BUFFER_SIZE`. When present, the worker attaches
+   * that captured continuation and rewinds through `wpk_fork_resume_thread`
+   * instead of entering `fnPtr` fresh.
+   */
+  restoredForkBufAddr?: number;
 }
 
 export interface WorkerTerminateMessage {

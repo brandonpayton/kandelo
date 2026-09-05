@@ -74,8 +74,10 @@ import {
 } from "./constants";
 import { CH_TOTAL_SIZE, DEFAULT_MAX_PAGES, PAGES_PER_THREAD, WASM_PAGE_SIZE } from "./constants";
 import {
+  ABI_VERSION,
   FILE_MODES,
   OPEN_FLAGS,
+  PROCESS_FORK_MODE_FORK,
   PROCESS_FORK_MODE_VFORK,
   type ProcessForkMode,
 } from "./generated/abi";
@@ -109,7 +111,11 @@ import {
   captureMachineCheckpointSummary,
   machineCheckpointTransferList,
   type CheckpointMachine,
+  type CheckpointProcessBucket,
+  type CheckpointProcessThread,
 } from "./migration/checkpoint";
+import { validateMachineCheckpoint } from "./migration/restore";
+import { readForkContinuationAnchor } from "./fork-continuation";
 import { ForkExternrefProcessOwner } from "./fork-externref-process-owner";
 import type { ForkExternrefGeneration } from "./fork-reference-broker";
 import {
@@ -311,6 +317,8 @@ const checkpointMachine: CheckpointMachine = {
       memory: info.memory,
       programBytes: () => info.programBytes,
       threadAllocatorState: () => info.threadAllocator.snapshotState(),
+      threads: () =>
+        (threadWorkers.get(pid) ?? []).map((thread) => thread.launch),
       forkReplayContext: info.forkReplayContext,
       checkpointFreeze: info.checkpointFreeze,
     })),
@@ -440,6 +448,8 @@ interface ThreadWorkerInfo {
   channelOffset: number;
   tid: number;
   basePage: number;
+  /** Clone-time launch values a checkpoint carries so a restore can relaunch. */
+  launch: CheckpointProcessThread;
   workerQuiescence: WorkerQuiescence;
   execRetirement: WorkerQuiescence;
   termination?: Promise<void>;
@@ -1005,6 +1015,7 @@ async function buildVirtualPlatformIO(
   rootfsLazyUrlBase?: InitMessage["rootfsLazyUrlBase"],
   rootfsLazyAssets?: InitMessage["rootfsLazyAssets"],
   rootfsLazyAssetSources?: InitMessage["rootfsLazyAssetSources"],
+  restoredRootfs?: Uint8Array,
 ): Promise<VirtualPlatformIO> {
   const bootSessionDir = mkdtempSync(join(tmpdir(), "wasm-posix-session-"));
   sessionDir = bootSessionDir;
@@ -1042,6 +1053,26 @@ async function buildVirtualPlatformIO(
     ...specMounts,
     ...extras,
   ];
+  if (restoredRootfs !== undefined) {
+    // The image built the mount layout; the checkpoint supplies the state.
+    // The restored bytes are a live SharedFS, not a serialized image, so the
+    // root backend attaches to them rather than deserializing.
+    const rootIndex = mounts.findIndex((m) => m.mountPoint === "/");
+    if (
+      rootIndex < 0
+      || !(mounts[rootIndex]!.backend instanceof MemoryFileSystem)
+    ) {
+      throw new Error(
+        "a checkpoint restore needs a MemoryFileSystem rootfs at /",
+      );
+    }
+    const sab = new SharedArrayBuffer(restoredRootfs.byteLength);
+    new Uint8Array(sab).set(restoredRootfs);
+    mounts[rootIndex] = {
+      ...mounts[rootIndex]!,
+      backend: MemoryFileSystem.fromExisting(sab),
+    };
+  }
   const rootMount = mounts.find((m) => m.mountPoint === "/");
   rootfsMemfs = rootMount?.backend instanceof MemoryFileSystem
     ? rootMount.backend
@@ -1115,6 +1146,18 @@ async function handleInit(msg: InitMessage) {
   if (!msg.rootfsImage && (msg.sessionSeedTrees?.length ?? 0) > 0) {
     throw new Error("sessionSeedTrees requires rootfsImage");
   }
+  let restoredProgramModules:
+    | ReadonlyMap<number, WebAssembly.Module>
+    | undefined;
+  if (msg.restoreCheckpoint) {
+    if (!msg.rootfsImage) {
+      throw new Error("restoreCheckpoint requires rootfsImage");
+    }
+    restoredProgramModules = await validateMachineCheckpoint(
+      msg.restoreCheckpoint,
+      { kernelAbiVersion: ABI_VERSION },
+    );
+  }
 
   const io: PlatformIO = msg.rootfsImage
     ? await buildVirtualPlatformIO(
@@ -1125,6 +1168,7 @@ async function handleInit(msg: InitMessage) {
       msg.rootfsLazyUrlBase,
       msg.rootfsLazyAssets,
       msg.rootfsLazyAssetSources,
+      msg.restoreCheckpoint?.filesystem,
     )
     : new NodePlatformIO();
   vfsExecIO = msg.rootfsImage ? io : null;
@@ -1295,7 +1339,24 @@ async function handleInit(msg: InitMessage) {
     },
   });
 
-  await kernelWorker.init(msg.kernelWasmBytes);
+  await kernelWorker.init(
+    msg.kernelWasmBytes,
+    msg.restoreCheckpoint === undefined
+      ? undefined
+      : { adoptKernelMemoryImage: msg.restoreCheckpoint.kernelMemory },
+  );
+
+  if (msg.restoreCheckpoint && restoredProgramModules) {
+    for (const bucket of msg.restoreCheckpoint.processes) {
+      const programModule = restoredProgramModules.get(bucket.pid);
+      if (!programModule) {
+        throw new Error(
+          `no validated program module for restored pid ${bucket.pid}`,
+        );
+      }
+      await restoreProcessFromBucket(bucket, programModule);
+    }
+  }
 
   const pcmTransport = kernelWorker.claimPcmTransport(false);
   pcmDriver = new NodePcmDriver({
@@ -1311,6 +1372,382 @@ async function handleInit(msg: InitMessage) {
 
   initReady = true;
   post({ type: "ready" });
+}
+
+/**
+ * Relaunch one checkpointed process inside this freshly restored machine.
+ *
+ * The restored kernel memory already holds the process: its pid, fds, cwd,
+ * credentials, and metadata. This launch therefore creates no kernel process;
+ * it rebuilds the host side — a memory holding the captured bytes, the host
+ * registration, and a worker — and enters the worker down the fork-child
+ * replay path. The captured frames end at the `kernel_checkpoint` import
+ * rather than the fork import, so the replay resumes the process at its
+ * parked syscall boundary; the fork replay commit gate is never reached and
+ * is deliberately not supplied.
+ */
+async function restoreProcessFromBucket(
+  bucket: CheckpointProcessBucket,
+  programModule: WebAssembly.Module,
+): Promise<void> {
+  const { pid, ptrWidth, channelOffset } = bucket;
+  if (bucket.threads.length !== bucket.threadAllocator.activeCount) {
+    // A missing record would leave a live thread's frames parked forever;
+    // a surplus record would relaunch a worker for a slot nobody owns.
+    throw new Error(
+      `restored pid ${pid} carries ${bucket.threads.length} thread record(s) `
+      + `but its allocator holds ${bucket.threadAllocator.activeCount} live slot(s)`,
+    );
+  }
+  const programBytes = bucket.programBytes;
+  const { memory, memoryLease, layout, threadAllocator } =
+    await createFreshProcessMemory(pid, programBytes, ptrWidth);
+  try {
+    for (const key of Object.keys(layout) as (keyof ProcessMemoryLayout)[]) {
+      if (layout[key] !== bucket.layout[key]) {
+        throw new Error(
+          `restored pid ${pid}'s captured layout ${key}=`
+          + `${bucket.layout[key]} does not match this host's computed `
+          + `${key}=${layout[key]}; boot with the captured machine's `
+          + `memory configuration`,
+        );
+      }
+    }
+    const freshBytes = memory.buffer.byteLength;
+    if (bucket.memory.byteLength < freshBytes) {
+      throw new Error(
+        `restored pid ${pid}'s ${bucket.memory.byteLength}-byte image is `
+        + `smaller than its ${freshBytes}-byte initial layout`,
+      );
+    }
+    const deltaPages =
+      (bucket.memory.byteLength - freshBytes) / WASM_PAGE_SIZE;
+    if (deltaPages > 0) memory.grow(deltaPages);
+    new Uint8Array(memory.buffer).set(bucket.memory);
+    threadAllocator.adoptState(bucket.threadAllocator);
+
+    kernelWorker.registerProcess(pid, memory, [channelOffset], {
+      ptrWidth,
+      brkBase: layout.brkBase,
+      mmapBase: layout.mmapBase,
+      maxAddr: layout.maxAddr,
+    });
+    const secureExec = kernelWorker.processSecureExec(pid);
+    const externrefGeneration = externrefProcessOwner.startGeneration(pid);
+    let launchedWorker: ProcessInfo["worker"];
+    const forkHostImports = forkHostImportOwnerRuntime.createWorker({
+      pid,
+      generationId: externrefGeneration.id,
+      authorizeSender: () => {
+        const current = processes.get(pid);
+        if (
+          !current
+          || current.worker !== launchedWorker
+          || current.externrefGeneration !== externrefGeneration
+        ) {
+          throw new Error(`stale fork host-import sender for pid=${pid}`);
+        }
+      },
+    });
+    const checkpointFreeze = new CheckpointFreezeGateCoordinator(`pid=${pid}`);
+    const forkBufAddr = readForkContinuationAnchor(
+      memory,
+      channelOffset - FORK_SAVE_BUFFER_SIZE,
+      ptrWidth,
+    );
+    const initData: CentralizedWorkerInitMessage = {
+      type: "centralized_init",
+      pid,
+      programBytes,
+      programModule,
+      memory,
+      channelOffset,
+      secureExec,
+      externrefGenerationId: externrefGeneration.id,
+      forkHostImports: forkHostImports.init,
+      checkpointFreezeGate: checkpointFreeze.gate,
+      isForkChild: true,
+      forkMode: PROCESS_FORK_MODE_FORK,
+      forkBufAddr,
+      forkChildThreadFnPtr: bucket.forkReplayContext?.fnPtr,
+      forkChildThreadArgPtr: bucket.forkReplayContext?.argPtr,
+      ptrWidth,
+      kernelAbiVersion: kernelWorker.getKernelAbiVersion(),
+    };
+    const worker = workerAdapter.createWorker(initData);
+    launchedWorker = worker;
+    const mainWorkerReady = bucket.threads.length === 0
+      ? undefined
+      : new Promise<void>((resolve, reject) => {
+          worker.on("message", (raw: unknown) => {
+            const message = raw as WorkerToHostMessage;
+            if (message.type === "ready" && message.pid === pid) resolve();
+            else if (message.type === "error" && message.pid === pid) {
+              reject(new Error(message.message));
+            }
+          });
+          worker.on("error", (error: Error) => reject(error));
+        });
+    bindForkHostImports(worker, forkHostImports);
+    processes.set(pid, {
+      memory,
+      memoryLease,
+      executionGeneration: processExecutionGenerations.allocate(),
+      workerQuiescence: createWorkerQuiescence(),
+      execRetirement: createWorkerQuiescence(),
+      programBytes,
+      programModule,
+      worker,
+      argv: [...bucket.argv],
+      channelOffset,
+      ptrWidth,
+      secureExec,
+      layout,
+      threadAllocator,
+      ...(bucket.forkReplayContext
+        ? { forkReplayContext: { ...bucket.forkReplayContext } }
+        : {}),
+      externrefGeneration,
+      checkpointFreeze,
+    });
+    installProcessWorkerListeners(worker, pid);
+    if (mainWorkerReady) {
+      // The fork-child boot resets the shared dlopen archive lock word before
+      // it reports ready, and a pthread boot takes readers on that same word.
+      // No thread worker may start until the reset has happened.
+      await mainWorkerReady;
+      for (const thread of bucket.threads) {
+        await restoreThreadFromRecord(pid, thread);
+      }
+    }
+  } catch (error) {
+    memoryLease.release();
+    throw error;
+  }
+}
+
+/**
+ * Relaunch one checkpointed pthread inside a restored process.
+ *
+ * The restored kernel and process memory already hold the thread: its TID,
+ * its channel, its TLS, and its parked frames. This launch rebuilds only the
+ * host side — the channel transport, the freeze-gate slot, and a worker that
+ * rewinds through the captured continuation at the thread's anchor instead
+ * of entering its entry function fresh. Mirrors handleClone's launch tail.
+ */
+async function restoreThreadFromRecord(
+  pid: number,
+  thread: CheckpointProcessThread,
+): Promise<void> {
+  const processInfo = processes.get(pid);
+  if (!processInfo) throw new Error(`Unknown pid ${pid} for restored thread`);
+  const { tid } = thread;
+  const memory = processInfo.memory;
+
+  let threadModule = threadModuleCache.get(pid);
+  if (!threadModule) {
+    const patched = patchWasmForThread(processInfo.programBytes);
+    threadModule = await WebAssembly.compile(patched);
+    threadModuleCache.set(pid, threadModule);
+  }
+
+  const restoredForkBufAddr = readForkContinuationAnchor(
+    memory,
+    thread.channelOffset - FORK_SAVE_BUFFER_SIZE,
+    processInfo.ptrWidth,
+  );
+  kernelWorker.attachRestoredThreadChannel(
+    pid,
+    tid,
+    thread.fnPtr,
+    thread.argPtr,
+    thread.channelOffset,
+  );
+
+  let threadWorker: DeferredWorkerHandle;
+  let threadEntry: ThreadWorkerInfo;
+  const forkHostImports = forkHostImportOwnerRuntime.createWorker({
+    pid,
+    generationId: processInfo.externrefGeneration.id,
+    authorizeSender: () => {
+      const entries = threadWorkers.get(pid);
+      if (
+        !belongsToCurrentProcessImage()
+        || !threadEntry
+        || threadEntry.worker !== threadWorker
+        || !entries?.includes(threadEntry)
+      ) {
+        throw new Error(
+          `stale fork host-import sender for pid=${pid} tid=${tid}`,
+        );
+      }
+    },
+  });
+  const threadInitData: CentralizedThreadInitMessage = {
+    type: "centralized_thread_init",
+    pid,
+    tid,
+    programBytes: processInfo.programBytes,
+    programModule: threadModule,
+    memory,
+    processChannelOffset: processInfo.channelOffset,
+    channelOffset: thread.channelOffset,
+    secureExec: processInfo.secureExec,
+    externrefGenerationId: processInfo.externrefGeneration.id,
+    forkHostImports: forkHostImports.init,
+    fnPtr: thread.fnPtr,
+    argPtr: thread.argPtr,
+    stackPtr: thread.stackPtr,
+    tlsPtr: thread.tlsPtr,
+    ctidPtr: thread.ctidPtr,
+    tlsOffset: thread.tlsOffset,
+    tlsAllocAddr: thread.tlsOffset,
+    ptrWidth: processInfo.ptrWidth,
+    kernelAbiVersion: kernelWorker.getKernelAbiVersion(),
+    checkpointFreezeGate: processInfo.checkpointFreeze.registerThread(tid),
+    restoredForkBufAddr,
+  };
+
+  threadWorker = new DeferredWorkerHandle(
+    () => workerAdapter.createWorker(threadInitData),
+  );
+  bindForkHostImports(threadWorker, forkHostImports);
+  if (!threadWorkers.has(pid)) threadWorkers.set(pid, []);
+  threadEntry = {
+    worker: threadWorker,
+    channelOffset: thread.channelOffset,
+    tid,
+    basePage: thread.slotStartPage,
+    launch: thread,
+    workerQuiescence: createWorkerQuiescence(),
+    execRetirement: createWorkerQuiescence(),
+  };
+  threadWorkers.get(pid)!.push(threadEntry);
+
+  const belongsToCurrentProcessImage = () =>
+    isCurrentProcessGeneration(
+      processes,
+      pid,
+      processInfo,
+      memory,
+      kernelWorker.isExecHandoffActive(pid),
+    );
+  let reclaimed = false;
+  const reclaimThread = async () => {
+    if (reclaimed) return;
+    reclaimed = true;
+    // The Worker is stopped at this point, so waking the retired host
+    // waitAsync listener cannot race the guest or a newly reused thread slot.
+    await kernelWorker.settleRetiredChannelListeners(
+      pid,
+      memory,
+      thread.channelOffset,
+    );
+    processInfo.threadAllocator.free(thread.slotStartPage);
+    // A freeze still waiting on this thread would wait until its timeout, so
+    // release its participant slot as the thread goes away.
+    processInfo.checkpointFreeze.unregisterThread(tid);
+    if (belongsToCurrentProcessImage()) {
+      threadExits.release(pid, thread.channelOffset);
+    }
+    removeThreadWorkerRegistryEntry(threadWorkers, pid, threadEntry);
+  };
+  const terminateThreadEntry = (): Promise<void> => {
+    if (!threadEntry.termination) {
+      threadEntry.termination = terminateTrackedWorker(threadWorker).then(
+        reclaimThread,
+      );
+    }
+    return threadEntry.termination;
+  };
+  threadExits.register(pid, thread.channelOffset, terminateThreadEntry);
+
+  const isCurrentThreadGeneration = () =>
+    !intentionallyTerminated.has(threadWorker as object)
+    && belongsToCurrentProcessImage();
+  const failThread = (reason: string, awaitQuiescence = false) => {
+    if (!isCurrentThreadGeneration()) {
+      void terminateThreadEntry();
+      return;
+    }
+    const disposition = threadWorkerFailureDisposition(reason);
+    reportHostDiagnostic({
+      pid,
+      status: disposition.kind === "guest-fatal-trap"
+        ? disposition.exitStatus
+        : undefined,
+      source: "restored thread worker failure",
+      message: `[kernel-worker] pid=${pid} tid=${tid}: ${reason}`,
+    });
+    kernelWorker.finalizeThreadExit(pid, tid, thread.channelOffset);
+    if (!awaitQuiescence) void terminateThreadEntry();
+    if (disposition.kind === "guest-fatal-trap") {
+      try { kernelWorker.notifyHostProcessCrashed(pid, disposition.signum); } catch { /* best-effort */ }
+      void finishProcessExit(pid, disposition.exitStatus);
+    }
+  };
+  threadWorker.on("message", (msg: unknown) => {
+    const m = msg as WorkerToHostMessage;
+    if (m.type === "exec_retired" && m.tid === tid) {
+      threadEntry.execRetirement.settle();
+    } else if (m.type === "checkpoint_unwound" && m.tid === tid) {
+      // The frames exist only until the gate reopens, so the report and the
+      // read that follows it are the whole capture window.
+      processInfo.checkpointFreeze.unwound(tid);
+    } else if (m.type === "checkpoint_refused" && m.tid === tid) {
+      processInfo.checkpointFreeze.abandon(m.reason);
+    } else if (m.type === "thread_exit") {
+      if (!isCurrentThreadGeneration()) {
+        void terminateThreadEntry();
+      }
+      // memory_quiescent follows after worker-main returns; terminating here
+      // would discard the exact ownership fence.
+    } else if (m.type === "memory_quiescent" && m.tid === tid) {
+      threadEntry.workerQuiescence.settle();
+      void terminateThreadEntry();
+    } else if (m.type === "error") {
+      failThread(m.message, true);
+    } else if (m.type === "vm_interrupt_timer") {
+      if (isCurrentThreadGeneration() && m.pid === pid) {
+        handleVmInterruptTimer(m, pid, processInfo);
+      }
+    } else if (m.type === "fork_host_import") {
+      dispatchForkHostImport(threadWorker, m);
+    }
+  });
+  threadWorker.on("error", (err: Error) => failThread(`worker error: ${err.message ?? err}`));
+
+  let startDisposition: ReturnType<
+    CentralizedKernelWorker["startProcessWorkerWhenRunnable"]
+  >;
+  try {
+    startDisposition = kernelWorker.startProcessWorkerWhenRunnable(
+      pid,
+      memory,
+      () => { threadWorker.start(); },
+      () => {
+        forkHostImports.close();
+        void threadWorker.terminate();
+      },
+      () => {
+        // No clone syscall is waiting on this launch, so there is nothing to
+        // fail back to the guest; surface the start error to the boot.
+        kernelWorker.finalizeThreadExit(pid, tid, thread.channelOffset);
+        void terminateThreadEntry();
+        return false;
+      },
+    );
+  } catch (error) {
+    kernelWorker.finalizeThreadExit(pid, tid, thread.channelOffset);
+    void terminateThreadEntry();
+    throw error;
+  }
+  if (startDisposition === "stale") {
+    void terminateThreadEntry();
+    throw new Error(
+      `Process ${pid} changed generation before restored thread Worker launch`,
+    );
+  }
 }
 
 // --- Spawn ---
@@ -3145,6 +3582,17 @@ async function handleClone(
     channelOffset: alloc.channelOffset,
     tid,
     basePage: alloc.slotStartPage,
+    launch: {
+      tid,
+      channelOffset: alloc.channelOffset,
+      slotStartPage: alloc.slotStartPage,
+      fnPtr,
+      argPtr,
+      stackPtr,
+      tlsPtr,
+      ctidPtr,
+      tlsOffset: alloc.tlsOffset,
+    },
     workerQuiescence: createWorkerQuiescence(),
     execRetirement: createWorkerQuiescence(),
   };
