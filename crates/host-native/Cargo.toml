@@ -51,6 +51,18 @@ wasmtime = "48"
 # never hand-copied magic numbers.
 wasm-posix-shared = { path = "../shared" }
 
+# N1-I5 Task 2: the portable, `no_std`, wasmtime-free fork core's engine-floor
+# trait (`ForkHostCapabilities`) — the minimal host API surface a fork backend
+# implements for the tag-identity primitives Wasm cannot express itself (see
+# `crates/fork-codec/src/host_capabilities.rs`). `fork-codec`'s own
+# `native_sketch` module is a documentation-only, no-`wasmtime`-dependency
+# SKETCH (gated behind its `native-sketch` feature, which this crate does NOT
+# enable) — it is not meant to become the real backend. This crate provides
+# the REAL Wasmtime-backed impl instead
+# (`crate::fork_host_capabilities::NativeForkHostCapabilities`), since only a
+# `std` crate that already depends on `wasmtime` can hold a `Tag`.
+fork-codec = { path = "../fork-codec" }
+
 # Ergonomic error propagation for the pump (`bail!`, `?` across the many
 # fallible kernel-export calls). Wasmtime already pulls anyhow into the tree.
 anyhow = "1"

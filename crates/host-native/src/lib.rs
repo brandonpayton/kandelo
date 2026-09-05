@@ -34,6 +34,10 @@ use wasmtime::{Config, Engine, ExternType, Linker, MemoryType, Module, SharedMem
 pub mod guest;
 pub use guest::{run_guest, run_trivial_guest, GuestOptions, NativeMount, RunOutcome};
 
+/// N1-I5 Task 2: the real Wasmtime-backed `ForkHostCapabilities` impl (tag
+/// mint/recognize primitives). See that module's doc comment for scope.
+pub mod fork_host_capabilities;
+
 /// ABI version this native host expects the kernel to advertise. Must match
 /// `wasm_posix_shared::ABI_VERSION` (currently 44). A kernel built for a
 /// different ABI will fail the smoke test loudly rather than run wrong.

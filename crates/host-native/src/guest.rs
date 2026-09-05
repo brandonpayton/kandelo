@@ -44,8 +44,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use wasmtime::{
-    Caller, Engine, ExternType, Global, GlobalType, Linker, MemoryType, Module, Mutability, Ref,
-    SharedMemory, Store, Table, Val, ValType,
+    Caller, Engine, ExternRef, ExternType, Global, GlobalType, Linker, MemoryType, Module,
+    Mutability, Ref, SharedMemory, Store, Table, Val, ValType,
 };
 
 use wasm_posix_shared::channel::{
@@ -2140,6 +2140,15 @@ fn compute_guest_memory(engine: &Engine, guest_module: &Module) -> anyhow::Resul
 // (`wpk_fork_host.*` + `env.resolve_externref`) is stubbed as inert traps
 // that this path never calls. No `SYS_FORK`/kernel wiring happens here
 // (Task 2); no capture/replay is driven here (Task 3).
+//
+// N1-I5 Task 2: `env.resolve_externref` is no longer part of that inert-trap
+// set — [`define_resolve_externref`] below defines it as a REAL `Func` before
+// `define_unknown_imports_as_traps` runs. The `wpk_fork_host.*` imports stay
+// trapped: native's `ForkHostCapabilities` primitives
+// (`crate::fork_host_capabilities::NativeForkHostCapabilities`) are direct
+// Rust-to-Wasmtime calls, not Wasm imports the module invokes (see that
+// module's doc comment), so those names are never actually reached by this
+// path.
 
 /// Byte size of the fork-module's own shadow stack, appended above its
 /// static/BSS footprint when reserving its host-owned region. Mirrors
@@ -2147,6 +2156,105 @@ fn compute_guest_memory(engine: &Engine, guest_module: &Module) -> anyhow::Resul
 /// (kept local here, not in `wasm-posix-shared`, because it is a host-side
 /// placement policy constant, not part of the wire ABI).
 const FORK_MODULE_SHADOW_STACK_BYTES: usize = 1 << 20;
+
+/// Handle -> `Rooted<ExternRef>` cache backing `env.resolve_externref` (N1-I5
+/// Task 2; `docs/plans/2026-09-05-n1-i5-references-grounding.md` §5).
+///
+/// `resolve_externref(handle)` must return the exact SAME `Rooted<ExternRef>`
+/// for repeat asks with the same `handle` — this is what preserves externref
+/// identity across the injected `__wpk_fork_ref_decode_externref` shim AND the
+/// `DRIVE_OP_EXTERNREF_TRANSIT` drive step, both of which must observe the
+/// identical value for one recipe (grounding §5's "bookkeeping discipline, not
+/// an engine limitation"). This mirrors the idempotent
+/// `ForkExternrefTokenCache.materialize` on Node/browser
+/// (`host/src/fork-reference-broker.ts:590-632`); native has no JS broker to
+/// consult, so the handle itself becomes the backing Rust value wrapped by a
+/// freshly minted `ExternRef` the first time it is asked for (§5: "a native
+/// externref-producing host import would construct it via `ExternRef::new`
+/// wrapping a genuine Rust value").
+///
+/// Lifetime ("the RootScope tied to the fork's generation"): one
+/// `ExternrefRegistry` is created per [`define_resolve_externref`] call, which
+/// [`instantiate_fork_module`] makes exactly once per guest OS thread —
+/// `spawn_guest_thread` creates a fresh `Store<()>` per launched/forked guest,
+/// so one `Store` already brackets exactly "one fork's reconstruction". Every
+/// `Rooted<ExternRef>` this registry mints is rooted directly against that
+/// `Store` rather than through an explicit nested `wasmtime::RootScope`:
+/// because the `Store` is never reused across generations in this
+/// architecture, its own top-level root scope already has the lifetime a
+/// per-generation `RootScope` would provide, and every root this registry
+/// created is reclaimed together when the guest thread's `Store` drops. An
+/// explicit nested `RootScope` would only add value if a single `Store` had
+/// to host more than one generation in sequence, which does not happen today
+/// (Task 3, which actually drives a fork's reference replay, is where this
+/// would be revisited if that assumption changes).
+struct ExternrefRegistry {
+    map: HashMap<u32, wasmtime::OwnedRooted<ExternRef>>,
+}
+
+impl ExternrefRegistry {
+    fn new() -> Self {
+        Self { map: HashMap::new() }
+    }
+
+    /// Look up (or, on the first ask for this `handle` in this registry's
+    /// lifetime, lazily mint) the externref for `handle`. Never constructs a
+    /// second `ExternRef` for a `handle` already in the map — this is the
+    /// idempotence the decode-externref shim and the externref-transit drive
+    /// step both rely on.
+    ///
+    /// Stored as `OwnedRooted<ExternRef>`, not `Rooted<ExternRef>`: Wasmtime
+    /// implicitly scopes every top-level `Func`/`TypedFunc` call to its own
+    /// short-lived root scope, so a `Rooted<ExternRef>` created during one
+    /// call is unrooted (and traps if later dereferenced) the instant that
+    /// call returns — confirmed empirically here (an earlier version of this
+    /// method that cached `Rooted<ExternRef>` directly failed a second call
+    /// with wasmtime's own "attempted to use a garbage-collected object that
+    /// has been unrooted" error). `OwnedRooted<T>` is the type Wasmtime's own
+    /// docs point to for exactly this "hold past the call's scope" case
+    /// (`Rooted::to_owned_rooted`'s doc comment); cloning it is cheap and
+    /// yields the SAME underlying GC object, which is what identity here
+    /// actually means (see `resolve_externref_is_idempotent_per_handle`,
+    /// which asserts `Rooted::ref_eq`, not `Rooted::rooted_eq`, across two
+    /// separate calls for the same handle).
+    fn resolve(
+        &mut self,
+        mut store: impl wasmtime::AsContextMut,
+        handle: u32,
+    ) -> wasmtime::Result<wasmtime::OwnedRooted<ExternRef>> {
+        if let Some(existing) = self.map.get(&handle) {
+            return Ok(existing.clone());
+        }
+        let owned = ExternRef::new(&mut store, handle)?.to_owned_rooted(&mut store)?;
+        self.map.insert(handle, owned.clone());
+        Ok(owned)
+    }
+}
+
+/// Define `env.resolve_externref(handle: i32) -> externref` (nullable
+/// externref, matching the fork-module's declared import type — see
+/// `crates/fork-module-inject/src/main.rs`'s `import_resolve_externref`) as a
+/// REAL `Func`, backed by a fresh [`ExternrefRegistry`] captured by the
+/// closure. Must be called BEFORE `Linker::define_unknown_imports_as_traps`
+/// so that pass does not shadow this with a trapping stub.
+///
+/// The closure only receives a transient `Caller<'_, ()>` per call (this
+/// `Store`'s data is `()`, matching every other host import in this file —
+/// see e.g. `define_kernel_host_imports`'s `Arc<Mutex<_>>`-captured-state
+/// pattern), so the registry itself is captured by `Arc<Mutex<_>>`, not
+/// stored in `Store` data.
+fn define_resolve_externref(linker: &mut Linker<()>) -> anyhow::Result<()> {
+    let registry = Arc::new(Mutex::new(ExternrefRegistry::new()));
+    linker.func_wrap(
+        "env",
+        "resolve_externref",
+        move |mut caller: Caller<'_, ()>, handle: i32| -> wasmtime::Result<Option<wasmtime::OwnedRooted<ExternRef>>> {
+            let mut registry = registry.lock().unwrap();
+            registry.resolve(&mut caller, handle as u32).map(Some)
+        },
+    )?;
+    Ok(())
+}
 
 /// The `dylink.0` custom section's `mem_info` subsection ID (the WebAssembly
 /// dynamic-linking convention: `WASM_DYLINK_MEM_INFO` in the upstream tool
@@ -2903,15 +3011,20 @@ pub(crate) fn instantiate_fork_module(
     )?;
     linker.define(&mut *store, "env", "__stack_pointer", stack_pointer_global)?;
 
-    // Every remaining function import is the reference/exception-path seam
+    // N1-I5 Task 2: `env.resolve_externref` is a REAL import now — define it
+    // before the catch-all trap pass below so that pass does not shadow it.
+    define_resolve_externref(&mut linker)?;
+
+    // Every remaining function import is the exception-path seam
     // (`wpk_fork_host.host_last_errno`/`host_mint_exception_tag`/
     // `host_recognize_unwind_transport`/`host_provide_unwind_transport_tag`/
-    // `host_spawn_thread`/`host_instantiate_child`, plus `env.
-    // resolve_externref`) — this frames-only path never calls any of them.
-    // `define_unknown_imports_as_traps` reads each import's EXACT declared
-    // `FuncType` and defines a stub with that signature that traps when
-    // called, so a real (buggy) call surfaces loudly instead of silently
-    // returning a wrong-typed default.
+    // `host_spawn_thread`/`host_instantiate_child`) — this frames-only path
+    // never calls any of them, and native's `ForkHostCapabilities` primitives
+    // are direct Rust calls (`crate::fork_host_capabilities`), not Wasm
+    // imports the module reaches. `define_unknown_imports_as_traps` reads
+    // each remaining import's EXACT declared `FuncType` and defines a stub
+    // with that signature that traps when called, so a real (buggy) call
+    // surfaces loudly instead of silently returning a wrong-typed default.
     linker.define_unknown_imports_as_traps(&module)?;
 
     let instance = linker.instantiate(&mut *store, &module)?;
@@ -7130,6 +7243,7 @@ mod libc_errno {
 mod fork_module_tests {
     use super::*;
     use std::path::PathBuf;
+    use wasmtime::Rooted;
 
     /// Mirrors `lib.rs`'s `kernel_path_or_skip`: a fresh checkout without the
     /// locally-built fork-module artifact skips (with a clear message)
@@ -7191,6 +7305,48 @@ mod fork_module_tests {
         fork_module.fm_set_format.call(&mut fm_store, (4, 0))?;
         let errno = fork_module.fm_last_errno.call(&mut fm_store, ())?;
         assert_eq!(errno, 0, "fm_set_format(4, 0) must succeed on a wasm32 guest");
+
+        Ok(())
+    }
+
+    /// N1-I5 Task 2: `env.resolve_externref` is now a real `Func` (no fork-
+    /// module artifact needed to exercise it — it is a plain host import
+    /// binding, so this defines it into a bare `Linker` the same way
+    /// `instantiate_fork_module` does). Proves the exact identity guarantee
+    /// grounding §5 requires: the SAME `Rooted<ExternRef>` root comes back
+    /// for repeat asks with the same handle, and a DIFFERENT root comes back
+    /// for a different handle.
+    #[test]
+    fn resolve_externref_is_idempotent_per_handle() -> anyhow::Result<()> {
+        let engine = crate::kernel_engine()?;
+        let mut store = Store::new(&engine, ());
+        let mut linker: Linker<()> = Linker::new(&engine);
+        define_resolve_externref(&mut linker)?;
+
+        let func = linker
+            .get(&mut store, "env", "resolve_externref")
+            .expect("resolve_externref must be defined")
+            .into_func()
+            .expect("resolve_externref must be a function import");
+        let typed = func.typed::<i32, Option<Rooted<ExternRef>>>(&store)?;
+
+        let first = typed.call(&mut store, 7)?.expect("resolve_externref must not return null");
+        let second = typed.call(&mut store, 7)?.expect("resolve_externref must not return null");
+        // Each top-level call gets its OWN freshly-rooted `Rooted<ExternRef>`
+        // (Wasmtime scopes roots per call — see `ExternrefRegistry::resolve`'s
+        // doc comment), so identity here means "the same underlying GC
+        // object", checked with `ref_eq`, not "the same root", which
+        // `rooted_eq` checks and would always be false across two calls.
+        assert!(
+            Rooted::ref_eq(&store, &first, &second)?,
+            "resolve_externref(7) must resolve to the SAME externref object on repeat asks"
+        );
+
+        let other = typed.call(&mut store, 8)?.expect("resolve_externref must not return null");
+        assert!(
+            !Rooted::ref_eq(&store, &first, &other)?,
+            "resolve_externref must mint a DIFFERENT externref object for a different handle"
+        );
 
         Ok(())
     }
