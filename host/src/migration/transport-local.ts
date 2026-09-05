@@ -7,7 +7,12 @@
  * be transferred across tabs — so a handover copies the checkpoint once into
  * the channel. Node's `BroadcastChannel` implements the same contract, so
  * both hosts share this transport and its tests.
+ *
+ * The protocol is channel-agnostic: the default is a same-origin
+ * `BroadcastChannel`, and any injected `MessageChannelLike` — a chunked
+ * network channel — carries the same messages to a remote peer.
  */
+import type { MessageChannelLike } from "./channel.js";
 import type { MachineCheckpoint } from "./checkpoint";
 
 const LOCAL_HANDOVER_CHANNEL = "kandelo-checkpoint-handover";
@@ -22,10 +27,11 @@ type LocalHandoverMessage =
   | { readonly kind: "refused"; readonly takeId: string; readonly reason: string };
 
 export class LocalCheckpointHandover {
-  readonly #channel: BroadcastChannel;
+  readonly #channel: MessageChannelLike;
 
-  constructor(channelName = LOCAL_HANDOVER_CHANNEL) {
-    this.#channel = new BroadcastChannel(channelName);
+  constructor(channel: string | MessageChannelLike = LOCAL_HANDOVER_CHANNEL) {
+    this.#channel =
+      typeof channel === "string" ? new BroadcastChannel(channel) : channel;
   }
 
   /**

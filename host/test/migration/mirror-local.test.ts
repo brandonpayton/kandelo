@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { FramebufferRegistry } from "../../src/framebuffer/registry";
+import { ChunkedMessageChannel } from "../../src/migration/channel-chunked";
 import { LocalFramebufferMirror } from "../../src/migration/mirror-local";
+import { FakeDataChannel } from "../support/data-channel-pair";
 
 const WRITE_BASED = { pid: 7, addr: 0, len: 0, w: 2, h: 1, stride: 8, fmt: "BGRA32" as const };
 
@@ -108,6 +110,45 @@ describe("local framebuffer mirror", () => {
       stopWatch();
       publisher.close();
       watcher.close();
+    }
+  });
+
+  it("skips writes on a congested channel and resynchronises on drain", () => {
+    const [publisherWire, watcherWire] = FakeDataChannel.pair({ auto: false });
+    const publisherChannel = new ChunkedMessageChannel(publisherWire);
+    const watcherChannel = new ChunkedMessageChannel(watcherWire);
+    const publisher = new LocalFramebufferMirror(publisherChannel);
+    const watcher = new LocalFramebufferMirror(watcherChannel);
+    const source = publishedRegistry([1, 1, 1, 1, 1, 1, 1, 1]);
+    const sink = new FramebufferRegistry();
+    const receivedKinds: string[] = [];
+    watcherChannel.addEventListener("message", (event) => {
+      receivedKinds.push((event.data as { kind: string }).kind);
+    });
+    const stopPublish = publisher.publish(source, 7);
+    const stopWatch = watcher.watch(sink);
+    try {
+      publisherWire.flush();
+      expect([...sink.get(7)!.hostBuffer!]).toEqual([1, 1, 1, 1, 1, 1, 1, 1]);
+
+      publisherChannel.postMessage({
+        kind: "stuffing",
+        bytes: new Uint8Array(5 * 1024 * 1024),
+      });
+      expect(publisherChannel.congested()).toBe(true);
+      source.fbWrite(7, 0, new Uint8Array([2, 2, 2, 2, 2, 2, 2, 2]));
+
+      // The first flush frees the wire; the drain re-announce carries the
+      // written pixels as a fresh full frame, never as the skipped write.
+      publisherWire.flush();
+      publisherWire.flush();
+      expect([...sink.get(7)!.hostBuffer!]).toEqual([2, 2, 2, 2, 2, 2, 2, 2]);
+      expect(receivedKinds).not.toContain("write");
+    } finally {
+      stopPublish();
+      stopWatch();
+      publisherChannel.close();
+      watcherChannel.close();
     }
   });
 

@@ -162,7 +162,20 @@ export default defineConfig({
       // which the modeset KMS pane relies on; the legacy headless
       // shell silently returns null for getContext("webgl2") on the
       // worker side.
-      use: { browserName: "chromium", channel: "chromium" },
+      use: {
+        browserName: "chromium",
+        channel: "chromium",
+        // Chromium replaces host ICE candidates with mDNS names, which
+        // headless test contexts cannot resolve, so a loopback WebRTC
+        // link between two contexts never connects without this flag.
+        launchOptions: {
+          ...launchOptions,
+          args: [
+            ...(launchOptions.args ?? []),
+            "--disable-features=WebRtcHideLocalIpsWithMdns",
+          ],
+        },
+      },
     },
     {
       name: "firefox",

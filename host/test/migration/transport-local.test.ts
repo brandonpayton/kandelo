@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { ChunkedMessageChannel } from "../../src/migration/channel-chunked";
 import type { MachineCheckpoint } from "../../src/migration/checkpoint";
 import { LocalCheckpointHandover } from "../../src/migration/transport-local";
+import { FakeDataChannel } from "../support/data-channel-pair";
 
 function fakeCheckpoint(marker: number): MachineCheckpoint {
   return {
@@ -80,6 +82,34 @@ describe("local checkpoint handover", () => {
         "no keeper answered the handover within 200 ms",
       );
     } finally {
+      taker.close();
+    }
+  });
+
+  it("hands a checkpoint across a chunked wire", async () => {
+    const [keeperWire, takerWire] = FakeDataChannel.pair({ auto: true });
+    const keeper = new LocalCheckpointHandover(
+      new ChunkedMessageChannel(keeperWire),
+    );
+    const taker = new LocalCheckpointHandover(
+      new ChunkedMessageChannel(takerWire),
+    );
+    let sent = 0;
+    const stop = keeper.offer(
+      () => Promise.resolve(fakeCheckpoint(9)),
+      () => {
+        sent++;
+      },
+    );
+    try {
+      const taken = await taker.take(5_000);
+      expect(taken.kernelMemory).toEqual(new Uint8Array([9]));
+      expect(taken.filesystem).toEqual(new Uint8Array([9, 9]));
+      expect(taken.monotonicNs).toBe(5_000_000_000);
+      expect(sent).toBe(1);
+    } finally {
+      stop();
+      keeper.close();
       taker.close();
     }
   });

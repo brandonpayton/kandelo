@@ -13,7 +13,18 @@
  * forward, and publishing one fails loudly rather than showing a stale
  * frame as live. Node's `BroadcastChannel` implements the same contract, so
  * both hosts share this transport and its tests.
+ *
+ * The protocol is channel-agnostic: the default is a same-origin
+ * `BroadcastChannel`, and any injected `MessageChannelLike` — a chunked
+ * network channel — carries the same messages to a remote peer. On a
+ * congestible channel the publisher skips pixel writes while the channel is
+ * backed up and resynchronises watchers with a fresh announce on drain, so
+ * a slow wire shows a late frame, never an unbounded queue.
  */
+import {
+  channelCongestion,
+  type MessageChannelLike,
+} from "./channel.js";
 import type { FramebufferRegistry } from "../framebuffer/registry.js";
 
 const LOCAL_MIRROR_CHANNEL = "kandelo-framebuffer-mirror";
@@ -40,10 +51,11 @@ type LocalMirrorMessage =
     };
 
 export class LocalFramebufferMirror {
-  readonly #channel: BroadcastChannel;
+  readonly #channel: MessageChannelLike;
 
-  constructor(channelName = LOCAL_MIRROR_CHANNEL) {
-    this.#channel = new BroadcastChannel(channelName);
+  constructor(channel: string | MessageChannelLike = LOCAL_MIRROR_CHANNEL) {
+    this.#channel =
+      typeof channel === "string" ? new BroadcastChannel(channel) : channel;
   }
 
   /**
@@ -74,12 +86,23 @@ export class LocalFramebufferMirror {
     const stopChange = registry.onChange((boundPid, event) => {
       if (boundPid === pid && event === "bind") announce();
     });
+    const congestion = channelCongestion(this.#channel);
+    let starved = false;
     const stopWrite = registry.onWrite((writePid, offset, bytes) => {
       if (writePid !== pid) return;
+      if (congestion?.congested()) {
+        starved = true;
+        return;
+      }
       // slice() compacts the payload: a structured clone copies a view's
       // whole underlying buffer, which for forwarded worker messages can be
       // far larger than the written span.
       this.#post({ kind: "write", pid, offset, pixels: bytes.slice() });
+    });
+    const stopDrain = congestion?.onDrain(() => {
+      if (!starved) return;
+      starved = false;
+      announce();
     });
     const listener = (event: MessageEvent) => {
       const message = event.data as LocalMirrorMessage;
@@ -90,6 +113,7 @@ export class LocalFramebufferMirror {
     return () => {
       stopChange();
       stopWrite();
+      stopDrain?.();
       this.#channel.removeEventListener("message", listener);
     };
   }
