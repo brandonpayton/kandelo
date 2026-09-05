@@ -15,8 +15,10 @@ interface MachineCheckpointThreadsSummary {
 
 interface MigrationRestoreResult {
   captured: MachineCheckpointThreadsSummary;
-  signaled: boolean;
-  recaptured: MachineCheckpointThreadsSummary;
+  outputAtCapture: string;
+  signaled?: boolean;
+  recaptured?: MachineCheckpointThreadsSummary;
+  framebuffers?: { pid: number; w: number; h: number; hostBufferNonZero: boolean }[];
   output: string;
   hostDiagnostics: string[];
 }
@@ -37,6 +39,8 @@ async function runMigrationRestore(
     pty?: boolean;
     readyMarker: string;
     settleMs?: number;
+    rootfsMountSpec?: { path: string; source: "image"; readonly: boolean }[];
+    finishMarker?: string;
   },
 ): Promise<MigrationRestoreResult> {
   const programUrl = new URL(`/@fs/${programPath}`, baseURL).href;
@@ -73,7 +77,7 @@ test("restores a checkpointed process that keeps running", async ({
   );
 
   expect(result.signaled, result.output).toBe(true);
-  expect(result.recaptured.pids).toEqual(result.captured.pids);
+  expect(result.recaptured!.pids).toEqual(result.captured.pids);
 });
 
 test("restores a checkpointed process whose pthread keeps running", async ({
@@ -98,11 +102,40 @@ test("restores a checkpointed process whose pthread keeps running", async ({
   expect(capturedThreads.tids.length).toBe(capturedThreads.activeCount);
 
   expect(result.signaled, result.output).toBe(true);
-  expect(result.recaptured.pids).toEqual(result.captured.pids);
+  expect(result.recaptured!.pids).toEqual(result.captured.pids);
   // A capture completes only when every task of the process unwinds again,
   // so a recapture carrying the same TIDs proves the restored pthread
   // genuinely resumed alongside the main thread.
-  expect(result.recaptured.threads[0]!.tids).toEqual(capturedThreads.tids);
+  expect(result.recaptured!.threads[0]!.tids).toEqual(capturedThreads.tids);
+});
+
+test("restores a file mid-write, a directory mid-iteration, and a pending alarm", async ({
+  page,
+  baseURL,
+}) => {
+  test.setTimeout(180_000);
+  expect(baseURL).toBeTruthy();
+  await openTestRunner(page, baseURL!);
+
+  const result = await runMigrationRestore(
+    page,
+    baseURL!,
+    resolve(examplesDir, "checkpoint-handles.wasm"),
+    ["checkpoint-handles"],
+    {
+      readyMarker: "READY",
+      finishMarker: "ALARM OK",
+      // The fixture needs a writable root: a checkpoint carries the
+      // image-backed root filesystem, and scratch mounts do not travel.
+      rootfsMountSpec: [{ path: "/", source: "image", readonly: false }],
+    },
+  );
+
+  expect(result.outputAtCapture, result.output).not.toContain("OK");
+  expect(result.output).toContain("MONO OK");
+  expect(result.output).toContain("FILE OK");
+  expect(result.output).toContain("DIR OK");
+  expect(result.output).toContain("ALARM OK");
 });
 
 test("restores a running fbDOOM that keeps playing", async ({
@@ -142,5 +175,15 @@ test("restores a running fbDOOM that keeps playing", async ({
   // The game keeps playing only if it keeps crossing syscall boundaries
   // every tic; a capture completes only then, so a captured recapture is
   // the proof the demo loop resumed.
-  expect(result.recaptured.pids).toEqual(result.captured.pids);
+  expect(result.recaptured!.pids).toEqual(result.captured.pids);
+  // The receiver's main-thread framebuffer mirror — the seam the canvas
+  // renderer draws from — carries the rebound binding with real pixels.
+  expect(result.framebuffers).toEqual([
+    {
+      pid: result.captured.pids[0],
+      w: expect.any(Number),
+      h: expect.any(Number),
+      hostBufferNonZero: true,
+    },
+  ]);
 });

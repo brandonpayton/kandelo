@@ -305,6 +305,30 @@ const checkpointMachine: CheckpointMachine = {
     }
     return rootfsMemfs.sharedBuffer;
   },
+  monotonicNowNs: () => {
+    if (!vfsExecIO) {
+      throw new Error("this machine has no PlatformIO clock to checkpoint");
+    }
+    const now = vfsExecIO.clockGettime(1);
+    return now.sec * 1_000_000_000 + now.nsec;
+  },
+  framebuffers: () =>
+    kernelWorker.framebuffers.list().map((binding) => ({
+      pid: binding.pid,
+      addr: binding.addr,
+      len: binding.len,
+      w: binding.w,
+      h: binding.h,
+      stride: binding.stride,
+      fmt: binding.fmt,
+      hostBuffer: binding.hostBuffer === null
+        ? null
+        : new Uint8Array(
+          binding.hostBuffer.buffer,
+          binding.hostBuffer.byteOffset,
+          binding.hostBuffer.byteLength,
+        ),
+    })),
   kernelAbiVersion: () => kernelWorker.getKernelAbiVersion(),
   liveProcesses: () =>
     [...processes.entries()].map(([pid, info]) => ({
@@ -1175,6 +1199,17 @@ async function handleInit(msg: InitMessage) {
   if (msg.enableTcpNetwork) {
     io.network = new TcpNetworkBackend();
   }
+  if (msg.restoreCheckpoint) {
+    if (!io.advanceMonotonicFloor) {
+      throw new Error(
+        "restoring a checkpoint requires a PlatformIO with a monotonic floor",
+      );
+    }
+    // The adopted kernel memory carries monotonic deadlines measured on the
+    // captured machine's clock, and a guest's monotonic clock must never run
+    // backwards. Advance before anything reads this machine's clock.
+    io.advanceMonotonicFloor(msg.restoreCheckpoint.monotonicNs);
+  }
 
   kernelWorker = new CentralizedKernelWorker(
     {
@@ -1347,6 +1382,9 @@ async function handleInit(msg: InitMessage) {
   );
 
   if (msg.restoreCheckpoint && restoredProgramModules) {
+    kernelWorker.rebindRestoredHostHandles(
+      msg.restoreCheckpoint.processes.map((bucket) => ({ pid: bucket.pid })),
+    );
     for (const bucket of msg.restoreCheckpoint.processes) {
       const programModule = restoredProgramModules.get(bucket.pid);
       if (!programModule) {
@@ -1355,6 +1393,27 @@ async function handleInit(msg: InitMessage) {
         );
       }
       await restoreProcessFromBucket(bucket, programModule);
+    }
+    for (const framebuffer of msg.restoreCheckpoint.framebuffers) {
+      // Seeding through fbWrite replays the captured frame down the same
+      // path live pixels take, so a registry consumer sees the checkpoint's
+      // current frame before the restored guest writes its next one.
+      kernelWorker.framebuffers.bind({
+        pid: framebuffer.pid,
+        addr: framebuffer.addr,
+        len: framebuffer.len,
+        w: framebuffer.w,
+        h: framebuffer.h,
+        stride: framebuffer.stride,
+        fmt: framebuffer.fmt,
+      });
+      if (framebuffer.hostBuffer !== null) {
+        kernelWorker.framebuffers.fbWrite(
+          framebuffer.pid,
+          0,
+          framebuffer.hostBuffer,
+        );
+      }
     }
   }
 

@@ -8660,6 +8660,33 @@ pub fn sys_getitimer(
     }
 }
 
+/// Re-arm the host half of a restored process's ITIMER_REAL.
+///
+/// A machine checkpoint carries the kernel's timer state — the monotonic
+/// deadline and the interval — but the platform timer `host_set_alarm`
+/// scheduled dies with the captured machine. Re-arm the host with the
+/// remaining time and leave kernel state untouched: the deadline is already
+/// correct. A deadline that expired while the machine was frozen still owes
+/// its SIGALRM; the shortest host alarm is one second. Returns whether a
+/// timer was re-armed.
+pub fn rearm_host_interval_timer(
+    proc: &Process,
+    host: &mut dyn HostIO,
+) -> Result<bool, Errno> {
+    if proc.alarm_deadline_ns == 0 {
+        return Ok(false);
+    }
+    let (sec, nsec) = host.host_clock_gettime(wasm_posix_shared::clock::CLOCK_MONOTONIC)?;
+    let now_ns = (sec as u64)
+        .wrapping_mul(1_000_000_000)
+        .wrapping_add(nsec as u64);
+    let remaining_ns = proc.alarm_deadline_ns.saturating_sub(now_ns);
+    let alarm_secs = remaining_ns.div_ceil(1_000_000_000).max(1) as u32;
+    host.host_set_alarm(alarm_secs)?;
+    Ok(true)
+}
+
+
 /// rt_sigtimedwait -- wait for a signal from a specified set.
 ///
 /// Checks if any signal in `mask` is already pending and dequeues it.
@@ -17498,6 +17525,30 @@ mod tests {
     static SCM_RIGHTS_LIFETIME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn rearm_host_interval_timer_rearms_the_host_with_remaining_time() {
+        let mut host = MockHostIO::new();
+        let mut proc = Process::new(70);
+
+        // Disarmed: nothing to re-arm, no host call.
+        assert_eq!(rearm_host_interval_timer(&proc, &mut host), Ok(false));
+        assert_eq!(host.set_alarm_calls, Vec::<u32>::new());
+
+        // Armed 2.5 s past the mock clock: re-armed rounded up, deadline
+        // untouched.
+        let now_ns = 1234567890u64 * 1_000_000_000 + 123456789;
+        proc.alarm_deadline_ns = now_ns + 2_500_000_000;
+        assert_eq!(rearm_host_interval_timer(&proc, &mut host), Ok(true));
+        assert_eq!(host.set_alarm_calls, alloc::vec![3]);
+        assert_eq!(proc.alarm_deadline_ns, now_ns + 2_500_000_000);
+
+        // Expired while frozen: still owes its signal at the shortest host
+        // alarm.
+        proc.alarm_deadline_ns = now_ns - 1;
+        assert_eq!(rearm_host_interval_timer(&proc, &mut host), Ok(true));
+        assert_eq!(host.set_alarm_calls, alloc::vec![3, 1]);
+    }
+
+    #[test]
     fn process_borrow_paths_centralize_ambient_tid_fallback() {
         let direct_lookup = concat!("crate::process_table::", "current_tid()");
         let syscalls_source = include_str!("syscalls.rs");
@@ -17688,6 +17739,7 @@ mod tests {
         statfs_by_path: std::collections::HashMap<Vec<u8>, WasmStatfs>,
         handle_statfs: std::collections::HashMap<i64, WasmStatfs>,
         fsync_calls: Vec<i64>,
+        set_alarm_calls: Vec<u32>,
         /// Recorded `(pid, bo_id, addr, len)` for every `gbm_bo_bind` call so
         /// the DRI mmap path can be asserted against.
         gbm_bo_bind_calls: Vec<(i32, u32, usize, usize)>,
@@ -17778,6 +17830,7 @@ mod tests {
                 statfs_by_path: std::collections::HashMap::new(),
                 handle_statfs: std::collections::HashMap::new(),
                 fsync_calls: Vec::new(),
+                set_alarm_calls: Vec::new(),
                 gbm_bo_bind_calls: Vec::new(),
                 gbm_bo_unbind_calls: Vec::new(),
                 gl_unbind_calls: Vec::new(),
@@ -18388,7 +18441,8 @@ mod tests {
             Ok(())
         }
 
-        fn host_set_alarm(&mut self, _seconds: u32) -> Result<(), Errno> {
+        fn host_set_alarm(&mut self, seconds: u32) -> Result<(), Errno> {
+            self.set_alarm_calls.push(seconds);
             Ok(())
         }
 

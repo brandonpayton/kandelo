@@ -456,6 +456,40 @@ const ERANGE = 34;
 const ENAMETOOLONG = 36;
 const ENOENT = 2;
 const ENOSYS = 38;
+const ESPIPE = 29;
+const SEEK_SET = 0;
+const SEEK_CUR = 1;
+
+interface RestoredStreamPlanEntry {
+  oldHandle: number;
+  pid: number;
+  fd: number;
+  path: string;
+  flags: number;
+}
+
+interface RestoredDirPlanEntry {
+  oldHandle: number;
+  pid: number;
+  fd: number;
+  path: string;
+  position: bigint;
+}
+
+interface RestoredStreamRemap extends RestoredStreamPlanEntry {
+  newHandle: number;
+}
+
+interface RestoredDirRemap extends RestoredDirPlanEntry {
+  newHandle: number;
+}
+
+interface RestoredHostHandlePlan {
+  streams: RestoredStreamPlanEntry[];
+  dirs: RestoredDirPlanEntry[];
+  maxStream: number;
+  maxDir: number;
+}
 const ENOTSUP = 95;
 const ETIMEDOUT = 110;
 const EHOSTUNREACH = 113;
@@ -3391,10 +3425,10 @@ export class CentralizedKernelWorker {
             // WHY: the timer runs after the syscall import and its Rust entry
             // have both returned. Open a fresh lexical scope instead of
             // letting an asynchronous callback recover ambient Wasm authority.
-            this.#runOrDeferKernelEntry(
+            const deferredExpiry = this.#runOrDeferKernelEntry(
               `alarm expiry pid=${pid}`,
               (entry) => {
-                this.sendSignalToProcess(pid, SIGALRM, true, entry);
+                const sent = this.sendSignalToProcess(pid, SIGALRM, true, entry);
                 return undefined;
               },
             );
@@ -9670,6 +9704,306 @@ export class CentralizedKernelWorker {
     );
     if (deferred) {
       throw new KernelReentrantEntryError("restored thread channel attachment");
+    }
+  }
+
+  /**
+   * Rebind every host handle a restored kernel memory still names.
+   *
+   * The adopted kernel memory carries the captured machine's opaque host
+   * handles in its open file descriptions. Three phases keep kernel entries
+   * free of host effects: one kernel entry reads the handle map, the host
+   * reopens each named resource through this machine's `PlatformIO`, and a
+   * second kernel entry remaps the stale values machine-wide and heals
+   * positions through the kernel's own seek paths — all before any process
+   * worker starts. Interval timers re-arm with their remaining time through
+   * `kernel_rearm_host_timers`.
+   *
+   * Handles 0-2 are the machine-invariant pre-opened stdio and stay as they
+   * are. A non-stdio stream handle whose description has no path (a
+   * host-delegated pipe) cannot be reopened by name; it is left stale, which
+   * a later I/O attempt reports as the reset it is.
+   */
+  rebindRestoredHostHandles(restoredProcesses: readonly { pid: number }[]): void {
+    if (this.#kernelFatalError !== null) throw this.#kernelFatalError;
+    if (this.#kernelEntryGate.shouldDeferVoidIngress) {
+      throw new KernelReentrantEntryError("restored host handle rebinding");
+    }
+    let plan: RestoredHostHandlePlan | null = null;
+    const planDeferred = this.#runOrDeferKernelEntry(
+      "restored host handle enumeration",
+      (entry) => {
+        plan = this.#readRestoredHostHandlePlanWithinKernelEntry(entry);
+        return undefined;
+      },
+    );
+    if (planDeferred || plan === null) {
+      throw new KernelReentrantEntryError("restored host handle enumeration");
+    }
+    const { streams, dirs, maxStream, maxDir } = plan as RestoredHostHandlePlan;
+
+    if (maxStream >= 0 || maxDir >= 0) {
+      if (!this.io.reserveHandleFloors) {
+        throw new Error(
+          "restoring a checkpoint with live host handles requires a "
+            + "PlatformIO that reserves handle floors",
+        );
+      }
+      this.io.reserveHandleFloors(maxStream + 1, maxDir + 1);
+    }
+    const streamRemaps: RestoredStreamRemap[] = streams.map((stream) => ({
+      ...stream,
+      newHandle: this.io.open(
+        stream.path,
+        stream.flags
+          & ~(OPEN_FLAGS.O_CREAT | OPEN_FLAGS.O_EXCL | OPEN_FLAGS.O_TRUNC),
+        0,
+      ),
+    }));
+    const dirRemaps: RestoredDirRemap[] = dirs.map((dir) => ({
+      ...dir,
+      newHandle: this.io.opendir(dir.path),
+    }));
+
+    let completed = false;
+    const applyDeferred = this.#runOrDeferKernelEntry(
+      "restored host handle rebinding",
+      (entry) => {
+        this.#applyRestoredHostHandleRemapsWithinKernelEntry(
+          streamRemaps,
+          dirRemaps,
+          restoredProcesses,
+          entry,
+        );
+        completed = true;
+        return undefined;
+      },
+    );
+    if (applyDeferred || !completed) {
+      throw new KernelReentrantEntryError("restored host handle rebinding");
+    }
+  }
+
+  #readRestoredHostHandlePlanWithinKernelEntry(
+    entry: KernelWorkerEntryContext,
+  ): RestoredHostHandlePlan {
+    const records = this.#enumerateHostHandlesWithinKernelEntry(entry);
+    const streamExemplars = new Map<number, { pid: number; fd: number }>();
+    const dirExemplars = new Map<number, { pid: number; fd: number }>();
+    let maxStream = -1;
+    let maxDir = -1;
+    for (const record of records) {
+      if (record.kind === 0) {
+        maxStream = Math.max(maxStream, record.handle);
+        if (record.handle > 2 && !streamExemplars.has(record.handle)) {
+          streamExemplars.set(record.handle, { pid: record.pid, fd: record.fd });
+        }
+      } else {
+        maxDir = Math.max(maxDir, record.handle);
+        if (!dirExemplars.has(record.handle)) {
+          dirExemplars.set(record.handle, { pid: record.pid, fd: record.fd });
+        }
+      }
+    }
+
+    const fcntl = this.#kernelInstanceForEntry(entry).exports.kernel_fcntl as
+      ((fd: number, cmd: number, arg: number) => number) | undefined;
+    const lseek = this.#kernelInstanceForEntry(entry).exports.kernel_lseek as
+      | ((fd: number, offsetLo: number, offsetHi: number, whence: number) => bigint)
+      | undefined;
+    if (!fcntl || !lseek) {
+      throw new Error("Kernel missing host handle rebinding exports");
+    }
+
+    const F_GETFL = 3;
+    const streams: RestoredStreamPlanEntry[] = [];
+    for (const [oldHandle, exemplar] of streamExemplars) {
+      const path = this.#restoredHandlePath(exemplar.pid, exemplar.fd, entry);
+      if (path === null) continue;
+      this.#bindKernelTid(exemplar.pid, exemplar.pid, entry);
+      const flags = fcntl(exemplar.fd, F_GETFL, 0);
+      if (flags < 0) {
+        throw new Error(
+          `restored pid ${exemplar.pid} fd ${exemplar.fd}: F_GETFL failed: ${flags}`,
+        );
+      }
+      streams.push({ oldHandle, ...exemplar, path, flags });
+    }
+    const dirs: RestoredDirPlanEntry[] = [];
+    for (const [oldHandle, exemplar] of dirExemplars) {
+      const path = this.#restoredHandlePath(exemplar.pid, exemplar.fd, entry);
+      if (path === null) {
+        throw new Error(
+          `restored pid ${exemplar.pid} fd ${exemplar.fd}: directory iterator has no path`,
+        );
+      }
+      this.#bindKernelTid(exemplar.pid, exemplar.pid, entry);
+      const position = lseek(exemplar.fd, 0, 0, SEEK_CUR);
+      if (position < 0n) {
+        throw new Error(
+          `restored pid ${exemplar.pid} fd ${exemplar.fd}: directory position read failed: ${position}`,
+        );
+      }
+      dirs.push({ oldHandle, ...exemplar, path, position });
+    }
+    return { streams, dirs, maxStream, maxDir };
+  }
+
+  #restoredHandlePath(
+    pid: number,
+    fd: number,
+    entry: KernelWorkerEntryContext,
+  ): string | null {
+    const result = this.#readKernelOwnedPath(pid, fd, entry);
+    if (result.kind === "error") {
+      if (result.errno === ENOENT) return null;
+      throw new Error(
+        `restored pid ${pid} fd ${fd}: path read failed: ${result.errno}`,
+      );
+    }
+    return new TextDecoder().decode(result.value);
+  }
+
+  #applyRestoredHostHandleRemapsWithinKernelEntry(
+    streamRemaps: readonly RestoredStreamRemap[],
+    dirRemaps: readonly RestoredDirRemap[],
+    restoredProcesses: readonly { pid: number }[],
+    entry: KernelWorkerEntryContext,
+  ): void {
+    const remap = this.#kernelInstanceForEntry(entry).exports
+      .kernel_remap_host_handles as
+      ((kind: number, oldHandle: bigint, newHandle: bigint) => number) | undefined;
+    const lseek = this.#kernelInstanceForEntry(entry).exports.kernel_lseek as
+      | ((fd: number, offsetLo: number, offsetHi: number, whence: number) => bigint)
+      | undefined;
+    if (!remap || !lseek) {
+      throw new Error("Kernel missing host handle rebinding exports");
+    }
+    for (const stream of streamRemaps) {
+      const rewritten = remap(
+        0,
+        BigInt(stream.oldHandle),
+        BigInt(stream.newHandle),
+      );
+      if (rewritten <= 0) {
+        throw new Error(
+          `restored host handle remap kind=0 `
+            + `${stream.oldHandle} -> ${stream.newHandle} failed: ${rewritten}`,
+        );
+      }
+      this.#bindKernelTid(stream.pid, stream.pid, entry);
+      const sought = lseek(stream.fd, 0, 0, SEEK_CUR);
+      if (sought < 0n && sought !== BigInt(-ESPIPE)) {
+        throw new Error(
+          `restored pid ${stream.pid} fd ${stream.fd}: position sync failed: ${sought}`,
+        );
+      }
+    }
+    for (const dir of dirRemaps) {
+      const rewritten = remap(1, BigInt(dir.oldHandle), BigInt(dir.newHandle));
+      if (rewritten <= 0) {
+        throw new Error(
+          `restored host handle remap kind=1 `
+            + `${dir.oldHandle} -> ${dir.newHandle} failed: ${rewritten}`,
+        );
+      }
+      this.#bindKernelTid(dir.pid, dir.pid, entry);
+      // A directory's SEEK_CUR position is its guest-visible entry cookie;
+      // seeking back to it rebuilds the host iterator from the reopened
+      // directory and closes the placeholder the remap installed.
+      const low = Number(dir.position & 0xffff_ffffn);
+      const high = Number(dir.position >> 32n);
+      const sought = lseek(dir.fd, low, high, SEEK_SET);
+      if (sought !== dir.position) {
+        throw new Error(
+          `restored pid ${dir.pid} fd ${dir.fd}: directory seek to `
+            + `${dir.position} returned ${sought}`,
+        );
+      }
+    }
+    for (const { pid } of restoredProcesses) {
+      this.#rearmRestoredIntervalTimerWithinKernelEntry(pid, entry);
+    }
+  }
+
+  #enumerateHostHandlesWithinKernelEntry(
+    entry: KernelWorkerEntryContext,
+  ): { pid: number; fd: number; kind: number; handle: number }[] {
+    const scratch = this.#requireMainScratchRegion();
+    const bytes = scratch.withLease((lease) => {
+      const request = Math.min(SCRATCH_SIZE, scratch.capacity);
+      const written = this.#invokeEntryScratchExport(
+        entry,
+        lease,
+        "kernel_enumerate_host_handles",
+        [lease.exportPointer(0, request), request],
+      );
+      if (written < 0) {
+        throw new KernelScratchError(
+          `kernel host handle enumeration failed: ${written}`,
+          EIO,
+        );
+      }
+      if (!Number.isSafeInteger(written) || written > request) {
+        throw new KernelScratchError(
+          "kernel host handle enumeration exceeded scratch capacity",
+          EIO,
+        );
+      }
+      return lease.copyOut(0, written);
+    });
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const count = view.getUint32(0, true);
+    if (bytes.byteLength !== 4 + count * 20) {
+      throw new KernelScratchError(
+        "kernel host handle enumeration wire length mismatch",
+        EIO,
+      );
+    }
+    const records: { pid: number; fd: number; kind: number; handle: number }[] =
+      [];
+    for (let index = 0; index < count; index++) {
+      const offset = 4 + index * 20;
+      const handle = view.getBigInt64(offset + 12, true);
+      if (handle < 0n || handle > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new KernelScratchError(
+          `kernel host handle enumeration emitted unusable handle ${handle}`,
+          EIO,
+        );
+      }
+      records.push({
+        pid: view.getUint32(offset, true),
+        fd: view.getInt32(offset + 4, true),
+        kind: view.getUint32(offset + 8, true),
+        handle: Number(handle),
+      });
+    }
+    return records;
+  }
+
+  #rearmRestoredIntervalTimerWithinKernelEntry(
+    pid: number,
+    entry: KernelWorkerEntryContext,
+  ): void {
+    const rearm = this.#kernelInstanceForEntry(entry).exports
+      .kernel_rearm_host_timers as ((pid: number) => number) | undefined;
+    if (!rearm) {
+      throw new Error("Kernel missing kernel_rearm_host_timers export");
+    }
+    // onAlarm associates the platform timer with the syscall's process; give
+    // the re-arm the same association the original arming had.
+    const savedHandlePid = this.currentHandlePid;
+    this.currentHandlePid = pid;
+    let result: number;
+    try {
+      result = rearm(pid);
+    } finally {
+      this.currentHandlePid = savedHandlePid;
+    }
+    if (result < 0) {
+      throw new Error(
+        `restored pid ${pid}: interval timer re-arm failed: ${result}`,
+      );
     }
   }
 

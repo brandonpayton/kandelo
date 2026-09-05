@@ -632,6 +632,18 @@ const reviewedScalarKernelExportCalls: AuditAllowance[] = [
     "host/src/kernel-worker.ts::CentralizedKernelWorker.#installThreadChannelTransportWithinKernelEntry::kernel-export-direct-use::setMaxAddr(pid, this.toKernelPtr(tlsPageAddr))",
   ),
   reviewedScalarKernelExportCall(
+    "host/src/kernel-worker.ts::CentralizedKernelWorker.#readRestoredHostHandlePlanWithinKernelEntry::kernel-export-direct-use::fcntl(exemplar.fd, F_GETFL, 0)",
+  ),
+  reviewedScalarKernelExportCall(
+    "host/src/kernel-worker.ts::CentralizedKernelWorker.#readRestoredHostHandlePlanWithinKernelEntry::kernel-export-direct-use::lseek(exemplar.fd, 0, 0, SEEK_CUR)",
+  ),
+  reviewedScalarKernelExportCall(
+    "host/src/kernel-worker.ts::CentralizedKernelWorker.#applyRestoredHostHandleRemapsWithinKernelEntry::kernel-export-direct-use::lseek(stream.fd, 0, 0, SEEK_CUR)",
+  ),
+  reviewedScalarKernelExportCall(
+    "host/src/kernel-worker.ts::CentralizedKernelWorker.#applyRestoredHostHandleRemapsWithinKernelEntry::kernel-export-direct-use::lseek(dir.fd, low, high, SEEK_SET)",
+  ),
+  reviewedScalarKernelExportCall(
     "host/src/kernel-worker.ts::CentralizedKernelWorker.#bindKernelTid::kernel-export-direct-use::setTid(pid, tid)",
   ),
   reviewedScalarKernelExportCall(
@@ -1659,7 +1671,14 @@ describe("kernel scratch static contract", () => {
       sourceFiles: repositoryRuntimeSourceFiles(repoRoot),
       ownershipSeeds,
       allowances: auditAllowances,
-      kernelExportNames: [...abiKernelExportNames],
+      // M1/M2 defer every new kernel export to T2.5's single versioned ABI
+      // change (PLAN rule 7), so exports the scratch registry already names
+      // are absent from the committed snapshot until then. T2.5 removes this
+      // list by regenerating abi/snapshot.json.
+      kernelExportNames: [
+        ...abiKernelExportNames,
+        "kernel_enumerate_host_handles",
+      ],
       kernelDestinationFactoryDeclarations: [
         "host/src/kernel.ts::WasmPosixKernel.#rustLentKernelDestination",
       ],

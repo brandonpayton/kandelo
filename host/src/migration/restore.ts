@@ -66,6 +66,15 @@ export async function validateMachineCheckpoint(
   if (checkpoint.filesystem.byteLength === 0) {
     refuse("the filesystem buffer is empty");
   }
+  if (
+    !Number.isSafeInteger(checkpoint.monotonicNs)
+    || checkpoint.monotonicNs < 0
+  ) {
+    refuse(
+      `the captured monotonic clock ${String(checkpoint.monotonicNs)} `
+      + "is unusable",
+    );
+  }
 
   const modules = new Map<number, WebAssembly.Module>();
   for (const bucket of checkpoint.processes) {
@@ -74,7 +83,69 @@ export async function validateMachineCheckpoint(
     }
     modules.set(bucket.pid, await validateProcessBucket(bucket));
   }
+
+  if (!Array.isArray(checkpoint.framebuffers)) {
+    refuse("the checkpoint carries no framebuffer list");
+  }
+  const framebufferPids = new Set<number>();
+  for (const framebuffer of checkpoint.framebuffers) {
+    validateFramebuffer(
+      framebuffer,
+      checkpoint.processes.find((bucket) => bucket.pid === framebuffer.pid),
+    );
+    if (framebufferPids.has(framebuffer.pid)) {
+      refuse(`pid ${framebuffer.pid} carries two framebuffer bindings`);
+    }
+    framebufferPids.add(framebuffer.pid);
+  }
   return modules;
+}
+
+/**
+ * Refuse a framebuffer record the receiver cannot rebind faithfully.
+ *
+ * A write-based binding (the `addr === 0 && len === 0` sentinel) must carry
+ * exactly one frame of pixels; an mmap-based binding must name a range inside
+ * its process's memory and carries no host pixels — they ride in the memory
+ * copy.
+ */
+function validateFramebuffer(
+  framebuffer: MachineCheckpoint["framebuffers"][number],
+  bucket: CheckpointProcessBucket | undefined,
+): void {
+  const { pid, addr, len, w, h, stride, hostBuffer } = framebuffer;
+  if (bucket === undefined) {
+    refuse(`a framebuffer names pid ${pid}, which has no process bucket`);
+  }
+  const dimensionsUsable = [addr, len, w, h, stride].every(
+    (value) => Number.isSafeInteger(value) && value >= 0,
+  );
+  if (!dimensionsUsable || w === 0 || h === 0 || stride < w * 4) {
+    refuse(`pid ${pid}'s framebuffer geometry is unusable`);
+  }
+  const writeBased = addr === 0 && len === 0;
+  if (writeBased) {
+    if (hostBuffer === null || hostBuffer.byteLength !== h * stride) {
+      refuse(
+        `pid ${pid}'s write-based framebuffer carries `
+        + `${hostBuffer?.byteLength ?? 0} pixel bytes for a `
+        + `${h * stride}-byte frame`,
+      );
+    }
+    return;
+  }
+  if (hostBuffer !== null) {
+    refuse(
+      `pid ${pid}'s mmap-based framebuffer carries host pixels; `
+      + "its frame rides in the process memory copy",
+    );
+  }
+  if (len === 0 || addr + len > bucket.memory.byteLength) {
+    refuse(
+      `pid ${pid}'s framebuffer range does not fit inside its `
+      + `${bucket.memory.byteLength}-byte memory`,
+    );
+  }
 }
 
 async function validateProcessBucket(

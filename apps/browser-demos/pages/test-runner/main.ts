@@ -25,6 +25,7 @@ import {
 import { resolveBrowserCorsProxyConfig } from "../../lib/browser-cors-proxy";
 import kernelWasmUrl from "@kernel-wasm?url";
 import type { MachineCheckpoint } from "@host/migration/checkpoint";
+import type { MountSpec } from "@host/vfs/default-mounts";
 import type { ExecBinarySupport } from "./exec-binaries";
 
 interface DataFile {
@@ -44,6 +45,13 @@ interface MigrationRestoreOptions {
   pty?: boolean;
   readyMarker: string;
   settleMs?: number;
+  rootfsMountSpec?: MountSpec[];
+  /**
+   * When set, the restored guest is expected to finish its own program: the
+   * receiver waits for this marker instead of proving liveness by signal and
+   * recapture, which would race the guest's exit.
+   */
+  finishMarker?: string;
 }
 
 interface MachineCheckpointThreadsSummary {
@@ -51,10 +59,19 @@ interface MachineCheckpointThreadsSummary {
   threads: { pid: number; tids: number[]; activeCount: number }[];
 }
 
+interface MigrationFramebufferEvidence {
+  pid: number;
+  w: number;
+  h: number;
+  hostBufferNonZero: boolean;
+}
+
 interface MigrationRestoreResult {
   captured: MachineCheckpointThreadsSummary;
-  signaled: boolean;
-  recaptured: MachineCheckpointThreadsSummary;
+  outputAtCapture: string;
+  signaled?: boolean;
+  recaptured?: MachineCheckpointThreadsSummary;
+  framebuffers?: MigrationFramebufferEvidence[];
   output: string;
   hostDiagnostics: string[];
 }
@@ -589,6 +606,7 @@ async function init() {
     });
 
     let checkpoint: MachineCheckpoint | null = null;
+    let outputAtCapture = "";
     let pid = 0;
     const keeper = new BrowserKernel({
       kernelOwnedFs: true,
@@ -606,6 +624,7 @@ async function init() {
       await keeper.initFromOwnedImage({
         kernelWasm: kernelWasmBytes!,
         vfsImage: await buildImage(options.dataFiles),
+        rootfsMountSpec: options.rootfsMountSpec,
       });
       const exit = keeper.spawn(wasmBytes, argv, {
         env: options.env,
@@ -637,6 +656,7 @@ async function init() {
         throw new Error(`capture failed: ${JSON.stringify(capture)}`);
       }
       checkpoint = capture.checkpoint;
+      outputAtCapture = output;
     } finally {
       await keeper.destroy().catch(() => {});
       await settleWebKitReclaim();
@@ -646,6 +666,12 @@ async function init() {
 
     const receiver = new BrowserKernel({
       kernelOwnedFs: true,
+      onStdout: (data: Uint8Array) => {
+        output += decoder.decode(data);
+      },
+      onStderr: (data: Uint8Array) => {
+        output += decoder.decode(data);
+      },
       onHostDiagnostic: (diagnostic) => {
         hostDiagnostics.push(`${diagnostic.source}: ${diagnostic.message}`);
       },
@@ -654,17 +680,56 @@ async function init() {
       await receiver.initFromOwnedImage({
         kernelWasm: kernelWasmBytes!,
         vfsImage: await buildImage(),
+        rootfsMountSpec: options.rootfsMountSpec,
         restoreCheckpoint: checkpoint,
       });
+      if (options.finishMarker) {
+        const marker = options.finishMarker;
+        const deadline = performance.now() + 60_000;
+        while (!output.includes(marker)) {
+          if (performance.now() > deadline) {
+            throw new Error(
+              `restored guest never printed ${marker}: ${output.slice(-2_000)}`,
+            );
+          }
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        return {
+          captured: summarize(checkpoint),
+          outputAtCapture,
+          output,
+          hostDiagnostics,
+        };
+      }
       const signaled = await receiver.signalProcess(pid, 0);
       const recapture = await receiver.captureCheckpointBytes(timeouts);
       if (recapture.status !== "captured") {
         throw new Error(`recapture failed: ${JSON.stringify(recapture)}`);
       }
+      if (checkpoint.framebuffers.length > 0) {
+        // The rebind forwards the binding and the seeded frame to this
+        // main-thread mirror asynchronously; wait for it before reading.
+        const deadline = performance.now() + 10_000;
+        while (
+          receiver.framebuffers.list().length < checkpoint.framebuffers.length
+        ) {
+          if (performance.now() > deadline) break;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      }
+      const framebuffers = receiver.framebuffers.list().map((binding) => ({
+        pid: binding.pid,
+        w: binding.w,
+        h: binding.h,
+        hostBufferNonZero: binding.hostBuffer !== null
+          && binding.hostBuffer.some((byte) => byte !== 0),
+      }));
       return {
         captured: summarize(checkpoint),
+        outputAtCapture,
         signaled,
         recaptured: summarize(recapture.checkpoint),
+        framebuffers,
         output,
         hostDiagnostics,
       };

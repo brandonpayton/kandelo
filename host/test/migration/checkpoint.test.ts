@@ -109,6 +109,8 @@ function testMachine(sources: CheckpointProcessSource[]): TestMachine {
       },
       copyKernelMemory: () => new Uint8Array(KERNEL_MEMORY_BYTES).fill(7),
       filesystemBuffer: () => new SharedArrayBuffer(FILESYSTEM_BYTES),
+      framebuffers: () => [],
+      monotonicNowNs: () => 7_000_000_000,
       kernelAbiVersion: () => KERNEL_ABI,
       liveProcesses: () => sources,
     },

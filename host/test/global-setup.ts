@@ -127,6 +127,7 @@ const TEST_PROGRAMS = [
   "checkpoint-loop.c",
   "checkpoint-threads.c",
   "checkpoint-dlopen.c",
+  "checkpoint-handles.c",
 ];
 
 /** Extra compiler flags a test program needs beyond the shared invocation. */

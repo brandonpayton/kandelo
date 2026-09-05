@@ -263,6 +263,17 @@ describe("machine checkpoint of a running guest", () => {
         expect(captured!.memoryBytes).toBeGreaterThan(wad.byteLength);
         expect(captured!.argv).toEqual(["fbdoom", "-iwad", "/doom1.wad"]);
         expect(captured!.executionGeneration).toBeGreaterThan(0);
+        // fbDOOM renders write-based: the current frame lives in a
+        // host-owned buffer the checkpoint must carry.
+        expect(summary.framebuffers).toEqual([
+          {
+            pid,
+            w: expect.any(Number),
+            h: expect.any(Number),
+            hostBufferBytes: expect.any(Number),
+          },
+        ]);
+        expect(summary.framebuffers[0]!.hostBufferBytes).toBeGreaterThan(0);
 
         // The freeze reversed: the game still runs and can be read again.
         expect(await host.signalProcess(pid, 0)).toBe(true);

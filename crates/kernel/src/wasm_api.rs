@@ -2440,6 +2440,29 @@ pub extern "C" fn kernel_remap_host_handles(kind: u32, old_handle: i64, new_hand
     }
 }
 
+/// Re-arm this machine's host timers for one restored process.
+///
+/// A restored kernel memory carries armed ITIMER_REAL state — the monotonic
+/// deadline and the interval — but the platform timer the captured machine
+/// scheduled through `host_set_alarm` died with it. Returns 1 when the
+/// interval timer was re-armed with its remaining time, 0 when none was
+/// armed, and a negative errno on failure. POSIX timer slots store their
+/// original relative value rather than a deadline, so kernel state cannot
+/// reproduce their remaining time; that gap stays open until the state
+/// carries one.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_rearm_host_timers(pid: u32) -> i32 {
+    let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+    let Some(proc) = table.get_mut(pid) else {
+        return -(Errno::ESRCH as i32);
+    };
+    let mut host = WasmHostIO;
+    match syscalls::rearm_host_interval_timer(proc, &mut host) {
+        Ok(rearmed) => i32::from(rearmed),
+        Err(e) => -(e as i32),
+    }
+}
+
 /// Snapshot the process table for the host (Kandelo Inspector → Procs tab,
 /// and any host that wants a `ps`-equivalent view without spawning a user
 /// process). Walks every active pid and writes a compact, length-prefixed

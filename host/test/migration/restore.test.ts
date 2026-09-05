@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { NodeKernelHost } from "../../src/node-kernel-host";
+import type { MountSpec } from "../../src/vfs/default-mounts";
 import { findRepoRoot, resolveBinary } from "../../src/binary-resolver";
 import { doomSharewareWad } from "../support/doom-shareware";
 import { ABI_VERSION } from "../../src/generated/abi";
@@ -169,6 +170,39 @@ describe("checkpoint validation", () => {
           true,
         );
       }, /continuation root is unusable/);
+
+      await refusal((checkpoint) => {
+        (checkpoint as { monotonicNs: number }).monotonicNs = -1;
+      }, /captured monotonic clock -1 is unusable/);
+
+      await refusal((checkpoint) => {
+        (checkpoint as { framebuffers: unknown[] }).framebuffers = [
+          { pid: 424242, addr: 0, len: 0, w: 8, h: 8, stride: 32,
+            fmt: "BGRA32", hostBuffer: new Uint8Array(256) },
+        ];
+      }, /names pid 424242, which has no process bucket/);
+
+      await refusal((checkpoint) => {
+        (checkpoint as { framebuffers: unknown[] }).framebuffers = [
+          { pid: checkpoint.processes[0]!.pid, addr: 0, len: 0, w: 8, h: 8,
+            stride: 32, fmt: "BGRA32", hostBuffer: new Uint8Array(7) },
+        ];
+      }, /carries 7 pixel bytes for a 256-byte frame/);
+
+      await refusal((checkpoint) => {
+        (checkpoint as { framebuffers: unknown[] }).framebuffers = [
+          { pid: checkpoint.processes[0]!.pid, addr: 4096, len: 256, w: 8,
+            h: 8, stride: 32, fmt: "BGRA32", hostBuffer: new Uint8Array(256) },
+        ];
+      }, /carries host pixels/);
+
+      await refusal((checkpoint) => {
+        const bucket = checkpoint.processes[0]!;
+        (checkpoint as { framebuffers: unknown[] }).framebuffers = [
+          { pid: bucket.pid, addr: bucket.memory.byteLength, len: 256, w: 8,
+            h: 8, stride: 32, fmt: "BGRA32", hostBuffer: null },
+        ];
+      }, /framebuffer range does not fit inside/);
 
       // The corruptions above never touched the captured object itself.
       await expect(
@@ -379,6 +413,17 @@ describe("checkpoint validation", () => {
       }
       expect(checkpoint.processes.length).toBe(1);
       const pid = checkpoint.processes[0]!.pid;
+      // fbDOOM renders write-based, so the checkpoint carries the current
+      // frame in a host-owned pixel buffer.
+      expect(checkpoint.framebuffers.length).toBe(1);
+      const capturedFb = checkpoint.framebuffers[0]!;
+      expect(capturedFb.pid).toBe(pid);
+      expect(capturedFb.addr).toBe(0);
+      expect(capturedFb.hostBuffer).not.toBeNull();
+      expect(capturedFb.hostBuffer!.byteLength).toBe(
+        capturedFb.h * capturedFb.stride,
+      );
+      expect(capturedFb.hostBuffer!.some((byte) => byte !== 0)).toBe(true);
 
       const receiver = new NodeKernelHost({
         rootfsImage: "default",
@@ -398,6 +443,15 @@ describe("checkpoint validation", () => {
         expect(
           recapture.checkpoint.processes.map((bucket) => bucket.pid),
         ).toEqual([pid]);
+        // The receiver rebound the framebuffer: its own capture carries the
+        // same binding, seeded and still receiving the game's writes.
+        expect(recapture.checkpoint.framebuffers.length).toBe(1);
+        const reboundFb = recapture.checkpoint.framebuffers[0]!;
+        expect(reboundFb.pid).toBe(pid);
+        expect(reboundFb.w).toBe(capturedFb.w);
+        expect(reboundFb.h).toBe(capturedFb.h);
+        expect(reboundFb.stride).toBe(capturedFb.stride);
+        expect(reboundFb.hostBuffer!.some((byte) => byte !== 0)).toBe(true);
       } finally {
         await receiver.destroy();
       }
@@ -502,6 +556,78 @@ describe("checkpoint validation", () => {
         expect(recaptured!.threads.map((thread) => thread.tid)).toEqual(
           bucket.threads.map((thread) => thread.tid),
         );
+      } finally {
+        await receiver.destroy();
+      }
+    },
+  );
+
+  it(
+    "restores a file mid-write, a directory mid-iteration, and a pending alarm",
+    { timeout: 120_000 },
+    async () => {
+      // The fixture needs a writable root: a checkpoint carries the
+      // image-backed root filesystem, and scratch mounts do not travel.
+      const spec: MountSpec[] = [
+        { path: "/", source: "image", readonly: false },
+      ];
+      let keeperOut = "";
+      let ready = () => {};
+      const isReady = new Promise<void>((resolve) => { ready = resolve; });
+      const keeper = new NodeKernelHost({
+        rootfsImage: "default",
+        rootfsMountSpec: spec,
+        onStdout: (_pid, data) => {
+          keeperOut += new TextDecoder().decode(data);
+          if (keeperOut.includes("READY")) ready();
+        },
+        onStderr: (_pid, data) => {
+          keeperOut += new TextDecoder().decode(data);
+        },
+      });
+      await keeper.init();
+      let checkpoint: MachineCheckpoint;
+      try {
+        await new Promise<void>((resolve) => {
+          void keeper.spawn(
+            programBytes("checkpoint-handles.wasm"),
+            ["checkpoint-handles"],
+            { onStarted: () => resolve() },
+          );
+        });
+        await isReady;
+        const response = await keeper.captureCheckpointBytes(TIMEOUTS);
+        if (response.status !== "captured") {
+          throw new Error(`capture failed: ${JSON.stringify(response)}`);
+        }
+        checkpoint = response.checkpoint;
+        // The alarm is pending, the file half-written, the directory
+        // mid-iteration: none of the completion markers may exist yet.
+        expect(keeperOut).not.toContain("OK");
+      } finally {
+        await keeper.destroy();
+      }
+
+      let receiverOut = "";
+      const receiver = new NodeKernelHost({
+        rootfsImage: "default",
+        rootfsMountSpec: spec,
+        restoreCheckpoint: checkpoint,
+        onStdout: (_pid, data) => {
+          receiverOut += new TextDecoder().decode(data);
+        },
+        onStderr: (_pid, data) => {
+          receiverOut += new TextDecoder().decode(data);
+        },
+      });
+      await receiver.init();
+      try {
+        await expect
+          .poll(() => receiverOut.includes("ALARM OK"), { timeout: 30_000 })
+          .toBe(true);
+        expect(receiverOut).toContain("MONO OK");
+        expect(receiverOut).toContain("FILE OK");
+        expect(receiverOut).toContain("DIR OK");
       } finally {
         await receiver.destroy();
       }

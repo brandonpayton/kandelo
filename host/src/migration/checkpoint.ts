@@ -40,6 +40,25 @@ export interface CheckpointProcessThread {
   readonly tlsOffset: number;
 }
 
+/**
+ * One live framebuffer binding and, for a write-based binding, its pixels.
+ *
+ * A write-based binding's current frame lives in a host-allocated buffer —
+ * not in process or kernel memory — so the checkpoint must carry the bytes
+ * or the receiver's canvas starts black. An mmap-based binding's pixels ride
+ * inside the process memory copy; only the binding metadata travels.
+ */
+export interface CheckpointFramebuffer {
+  readonly pid: number;
+  readonly addr: number;
+  readonly len: number;
+  readonly w: number;
+  readonly h: number;
+  readonly stride: number;
+  readonly fmt: "BGRA32";
+  readonly hostBuffer: Uint8Array | null;
+}
+
 /** One live execution image the freeze can read. */
 export interface CheckpointProcessSource {
   readonly pid: number;
@@ -81,6 +100,10 @@ export interface CheckpointMachine {
   readonly disarmUnwindRequests: () => void;
   readonly copyKernelMemory: () => Uint8Array;
   readonly filesystemBuffer: () => SharedArrayBuffer;
+  /** Read under the freeze: bindings and write-based pixels are quiescent. */
+  readonly framebuffers: () => readonly CheckpointFramebuffer[];
+  /** This machine's CLOCK_MONOTONIC in nanoseconds. */
+  readonly monotonicNowNs: () => number;
   readonly kernelAbiVersion: () => number;
   readonly liveProcesses: () => readonly CheckpointProcessSource[];
 }
@@ -115,6 +138,16 @@ export interface MachineCheckpoint {
   readonly kernelAbiVersion: number;
   readonly kernelMemory: Uint8Array;
   readonly filesystem: Uint8Array;
+  readonly framebuffers: readonly CheckpointFramebuffer[];
+  /**
+   * The captured machine's CLOCK_MONOTONIC at the freeze, in nanoseconds.
+   *
+   * Kernel state carries monotonic deadlines (an armed interval timer), and
+   * POSIX forbids a guest's monotonic clock from running backwards. The
+   * receiver advances its own monotonic clock to at least this value before
+   * adopting the kernel memory.
+   */
+  readonly monotonicNs: number;
   readonly processes: readonly CheckpointProcessBucket[];
 }
 
@@ -128,6 +161,12 @@ export interface MachineCheckpoint {
 export interface MachineCheckpointSummary {
   readonly kernelMemoryBytes: number;
   readonly filesystemBytes: number;
+  readonly framebuffers: readonly {
+    readonly pid: number;
+    readonly w: number;
+    readonly h: number;
+    readonly hostBufferBytes: number;
+  }[];
   readonly processes: readonly {
     readonly pid: number;
     readonly executionGeneration: number;
@@ -152,6 +191,12 @@ function summarizeMachineCheckpoint(
   return {
     kernelMemoryBytes: checkpoint.kernelMemory.byteLength,
     filesystemBytes: checkpoint.filesystem.byteLength,
+    framebuffers: checkpoint.framebuffers.map((framebuffer) => ({
+      pid: framebuffer.pid,
+      w: framebuffer.w,
+      h: framebuffer.h,
+      hostBufferBytes: framebuffer.hostBuffer?.byteLength ?? 0,
+    })),
     processes: checkpoint.processes.map((bucket) => ({
       pid: bucket.pid,
       executionGeneration: bucket.executionGeneration,
@@ -186,6 +231,11 @@ export function machineCheckpointTransferList(
   return [
     checkpoint.kernelMemory.buffer as ArrayBuffer,
     checkpoint.filesystem.buffer as ArrayBuffer,
+    ...checkpoint.framebuffers.flatMap((framebuffer) =>
+      framebuffer.hostBuffer === null
+        ? []
+        : [framebuffer.hostBuffer.buffer as ArrayBuffer]
+    ),
     ...checkpoint.processes.map(
       (bucket) => bucket.memory.buffer as ArrayBuffer,
     ),
@@ -366,6 +416,13 @@ function readMachine(
     kernelAbiVersion: machine.kernelAbiVersion(),
     kernelMemory: machine.copyKernelMemory(),
     filesystem: new Uint8Array(machine.filesystemBuffer()).slice(),
+    monotonicNs: machine.monotonicNowNs(),
+    framebuffers: machine.framebuffers().map((framebuffer) => ({
+      ...framebuffer,
+      hostBuffer: framebuffer.hostBuffer === null
+        ? null
+        : framebuffer.hostBuffer.slice(),
+    })),
     processes: sources.map((source) => ({
       pid: source.pid,
       executionGeneration: source.executionGeneration,

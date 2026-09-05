@@ -91,6 +91,17 @@ export interface FileSystemBackend {
 
 export interface TimeProvider {
   clockGettime(clockId: number): { sec: number; nsec: number };
+  /**
+   * Keep every future CLOCK_MONOTONIC reading at or above `floorNs`.
+   *
+   * A restored machine adopts kernel state whose monotonic deadlines were
+   * measured on the captured machine's clock. POSIX also forbids a guest's
+   * monotonic clock from running backwards, and a fresh provider (a new
+   * worker's `performance.now()` origin) starts near zero. The restore
+   * advances this provider to the captured machine's reading, so deadlines
+   * keep their remaining time and guest-visible monotonic time continues.
+   */
+  advanceMonotonicFloor?(floorNs: number): void;
   nanosleep(sec: number, nsec: number): void;
 }
 
