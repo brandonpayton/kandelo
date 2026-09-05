@@ -175,6 +175,46 @@ export interface KernelLike {
     | { readonly status: "timed-out" | "failed"; readonly reason: string }
   >;
   /**
+   * Read this machine and start publishing its decisions from that state.
+   *
+   * One operation, not a read followed by a start: the recorder begins while
+   * the machine is still parked inside the freeze, so a replica that restores
+   * the checkpoint and replays from the log's first entry meets the machine at
+   * one instant. Mirrors
+   * `host/src/browser-kernel-host.ts: captureAndStreamReplicationLog`.
+   */
+  captureAndStreamReplicationLog?(
+    options: { unwindTimeoutMs: number; vforkTimeoutMs: number },
+    onEntries: (entries: readonly ReplicationLogEntryLike[]) => void,
+  ): Promise<{
+    readonly capture:
+      | { readonly status: "captured"; readonly checkpoint: MachineCheckpointLike }
+      | { readonly status: "timed-out" | "failed"; readonly reason: string };
+    readonly stop: () => Promise<void>;
+  }>;
+  /**
+   * Stop replaying a primary's log, and report how much of it this machine
+   * took.
+   *
+   * Two replicas given one log and left at different counts ran different
+   * machines, so a viewer that stops following says how far it got rather than
+   * stopping silently. Mirrors
+   * `host/src/browser-kernel-host.ts: stopReplicationReplay`.
+   */
+  stopReplicationReplay?(): Promise<{
+    readonly consumed: number;
+    readonly total: number;
+  }>;
+  /**
+   * Tell a replaying machine its log grew, so it applies what needs no guest.
+   *
+   * A keystroke or a resize the primary recorded has no guest request to
+   * answer, and a replica whose guest sits at a prompt would never pull it
+   * through on its own. Mirrors
+   * `host/src/browser-kernel-host.ts: drainReplicationReplay`.
+   */
+  drainReplicationReplay?(): void;
+  /**
    * Append bytes to a process's stdin buffer. Used by the framebuffer
    * input path so DOM key events on the canvas reach the fb-bound
    * process (fbDOOM reads scancodes from stdin).
@@ -361,6 +401,47 @@ export interface Capabilities {
  */
 export interface MachineCheckpointLike {
   readonly processes: ReadonlyArray<{ readonly pid: number }>;
+}
+
+/**
+ * One decision a machine's host made for it, as the wrapped kernel recorded it.
+ *
+ * Read no more here than the checkpoint above is: the session layer carries
+ * entries from the machine that recorded them to the replica that replays
+ * them, and the host runtime owns their schema
+ * (`host/src/replication/log.ts: ReplicationLogEntry`). Only the sequence
+ * number is named, because ordering is the one property this layer must not
+ * disturb.
+ */
+export interface ReplicationLogEntryLike {
+  readonly seq: number;
+}
+
+/**
+ * What a replica needs to run on the user's decisions instead of its own.
+ *
+ * `entries` is what the user had already recorded when the replica joined, and
+ * `queue` is where everything it records afterwards arrives. The queue is
+ * shared memory because the replica's kernel worker blocks on it: a guest
+ * clock read is synchronous, so a replica that has caught up with the user
+ * cannot await the next decision and cannot receive it as a message. The host
+ * runtime owns the ring's layout
+ * (`host/src/replication/log-queue.ts`).
+ */
+export interface MachineReplayLike {
+  readonly entries: readonly ReplicationLogEntryLike[];
+  readonly queue: SharedArrayBuffer;
+  /**
+   * Say that no further decision is coming, and let a waiting replica run on.
+   *
+   * A replica that has caught up with the user blocks its kernel worker on the
+   * queue, and a blocked worker answers nothing — not a stop, not a capture,
+   * not the graceful half of its own teardown. So every path that lets go of a
+   * replica's kernel calls this first: without it, closing a machine that is
+   * merely waiting costs the destroy timeout before the worker is terminated
+   * out from under it.
+   */
+  release(): void;
 }
 
 /**
@@ -784,6 +865,62 @@ export interface KernelHost {
    */
   prewarmBootDescriptor(desc: BootDescriptor): Promise<void>;
 
+  // machine replication — one machine runs on two computers. Handover moves a
+  // machine; these three copy one and keep the copy running the same way.
+  /**
+   * Read this machine for a viewer, and start publishing its decisions from
+   * that state.
+   *
+   * The same value {@link captureMachine} produces, so the viewer restores it
+   * exactly as a taker would. What differs is that this computer keeps the
+   * machine and keeps deciding for it: the returned `stop` ends the recording.
+   *
+   * Null when there is no machine here, or when the wrapped kernel cannot
+   * publish one. Rejects when a read was attempted and failed.
+   */
+  captureMachineForViewer(
+    onEntries: (entries: readonly ReplicationLogEntryLike[]) => void,
+  ): Promise<{
+    machine: CapturedMachine;
+    stop: () => Promise<void>;
+  } | null>;
+  /**
+   * Boot `desc`, restore `checkpoint` into it, and run it on the user's
+   * decisions rather than on this computer's.
+   *
+   * `replay` is installed before the restored processes resume, because they
+   * resume during the boot and read the clock as they do. A replica whose
+   * first reading came from its own host is a different machine from the one
+   * it claims to be showing.
+   *
+   * Everything here is another computer's input and is checked exactly as
+   * {@link adoptMachine} checks it.
+   */
+  replicateMachine(
+    desc: BootDescriptor,
+    checkpoint: MachineCheckpointLike,
+    terminals: readonly CapturedTerminal[],
+    replay: MachineReplayLike,
+  ): Promise<void>;
+  /**
+   * Stop following the user's machine, and report how much of its log this
+   * replica took.
+   *
+   * Null when this machine was not replaying. A replica left at a different
+   * count from the machine it followed ran a different machine, so the count
+   * is reported rather than dropped.
+   */
+  stopReplicatingMachine(): Promise<{ consumed: number; total: number } | null>;
+  /**
+   * Tell the replica this page runs that the user's log grew.
+   *
+   * Call it after pushing entries into the replay's queue. A keystroke or a
+   * resize the user recorded has no guest request to answer, so a replica
+   * whose guest sits at a prompt would never take it from the queue on its
+   * own. A no-op on a page that holds no replica.
+   */
+  drainReplicationReplay(): void;
+
   // dmesg ring
   subscribeDmesg(cb: (line: DmesgLine) => void): () => void;
   dmesgHistory(): DmesgLine[];
@@ -1081,11 +1218,17 @@ export interface LiveKernelHostOptions {
    * machine another computer froze. A page that receives one must skip the
    * programs it would otherwise start: the checkpoint already carries them,
    * and a second copy would fight the restored one over the same devices.
+   *
+   * `replay` is present when that machine is being copied rather than moved,
+   * and the copy is to run on the other computer's decisions. It must reach
+   * the kernel as part of the boot rather than after it: the restored
+   * processes resume inside the boot and read the clock as they do.
    */
   applyBootDescriptor?: (
     desc: BootDescriptor,
     host: LiveKernelHost,
     restore?: MachineCheckpointLike,
+    replay?: MachineReplayLike,
   ) => Promise<void>;
   /**
    * Load what booting a descriptor would need, without booting it.
@@ -1296,6 +1439,19 @@ export class LiveKernelHost implements KernelHost {
    */
   private arrivingTerminals: readonly CapturedTerminal[] = [];
   /**
+   * The gate a replica is waiting on, for the two moments around its boot.
+   *
+   * `arriving` is set while the replica is being booted and moves to `held` in
+   * `attachKernel`, for the same reason the terminals do: the boot detaches
+   * the previous kernel first, and a single slot would have that detach
+   * release the gate of the replica that is arriving.
+   *
+   * `held` is what every path that lets go of a kernel calls before it does.
+   * See {@link MachineReplayLike.release}.
+   */
+  private arrivingReplicaRelease: (() => void) | null = null;
+  private heldReplicaRelease: (() => void) | null = null;
+  /**
    * Terminals of the restored machine, keyed by path, each waiting for the
    * first emulator to attach to it. Consumed once, by `ensurePtySession`.
    */
@@ -1347,7 +1503,15 @@ export class LiveKernelHost implements KernelHost {
       this.arrivingTerminals.map((terminal) => [terminal.path, terminal]),
     );
     this.arrivingTerminals = [];
+    this.releaseReplica();
+    this.heldReplicaRelease = this.arrivingReplicaRelease;
+    this.arrivingReplicaRelease = null;
     this.kernel = kernel;
+    // Everything the user decided while this replica was booting is already
+    // in the replay's queue, and the nudges that announced it found no
+    // machine here to pass them on to. If the user then went quiet, no later
+    // entry will nudge again — so a replica's first drain happens now.
+    if (this.holdsReplica()) kernel.drainReplicationReplay?.();
     if (kernel.framebuffers) {
       this.offFramebufferAvailability = kernel.framebuffers.onChange(() => {
         this.refreshFramebufferAvailability();
@@ -1371,6 +1535,9 @@ export class LiveKernelHost implements KernelHost {
 
   /** Clear the wrapped kernel after a failed boot without changing status. */
   detachKernel(): void {
+    // Before anything reaches the kernel worker. A replica waiting for the
+    // user's next decision answers nothing until this runs.
+    this.releaseReplica();
     const detachedKernel = this.kernel;
     this.cancelLazyDownloads("kernel detached");
     this.clearLazyDownloadState();
@@ -1758,6 +1925,89 @@ export class LiveKernelHost implements KernelHost {
     checkpoint: MachineCheckpointLike,
     terminals: readonly CapturedTerminal[] = [],
   ): Promise<void> {
+    await this.bootAdopted(desc, checkpoint, terminals);
+  }
+
+  // ── KernelHost: machine replication ──────────────────────────────────────
+
+  async captureMachineForViewer(
+    onEntries: (entries: readonly ReplicationLogEntryLike[]) => void,
+  ): Promise<{ machine: CapturedMachine; stop: () => Promise<void> } | null> {
+    const kernel = this.kernel;
+    if (!kernel?.captureAndStreamReplicationLog) return null;
+    const { capture, stop } = await kernel.captureAndStreamReplicationLog(
+      HANDOVER_CAPTURE_TIMEOUTS,
+      onEntries,
+    );
+    if (capture.status !== "captured") {
+      throw new Error(`reading this machine ${capture.status}: ${capture.reason}`);
+    }
+    return {
+      machine: {
+        checkpoint: capture.checkpoint,
+        boot: this.getBootDescriptor(),
+        terminals: this.captureTerminals(),
+      },
+      stop,
+    };
+  }
+
+  async replicateMachine(
+    desc: BootDescriptor,
+    checkpoint: MachineCheckpointLike,
+    terminals: readonly CapturedTerminal[],
+    replay: MachineReplayLike,
+  ): Promise<void> {
+    await this.bootAdopted(desc, checkpoint, terminals, replay);
+  }
+
+  /**
+   * Stop following another computer's machine, and let go of the copy.
+   *
+   * The copy goes with the replay rather than outliving it. A replica taken off
+   * its log is a machine no computer is deciding for: its guests read a clock
+   * that answers `EIO`, they die, and `init` starts fresh ones — so what is left
+   * on the screen is a second machine wearing the first one's name, and this
+   * computer can type into it. Ending at `idle` says the true thing instead:
+   * the machine this page was watching is gone, and this page holds none.
+   *
+   * Returns how far the replay got, or null on a page holding no replica.
+   *
+   * Holding one is the condition, not merely having a kernel. A take-over is
+   * also a replica ending, and it ends by replacing the copy with the machine
+   * itself: the boot has already let go of the replica's gate by the time
+   * anything calls this, and dropping the machine arriving in its place would
+   * take away what the person just took.
+   */
+  async stopReplicatingMachine(): Promise<
+    { consumed: number; total: number } | null
+  > {
+    const kernel = this.kernel;
+    if (!this.holdsReplica() || !kernel?.stopReplicationReplay) return null;
+    const progress = await kernel.stopReplicationReplay();
+    await this.dropMachine("idle", "replication ended");
+    return progress;
+  }
+
+  drainReplicationReplay(): void {
+    if (!this.holdsReplica()) return;
+    this.kernel?.drainReplicationReplay?.();
+  }
+
+  /**
+   * Boot a machine that arrived from another computer, moved or copied.
+   *
+   * The two differ in one value and in nothing else: a copy carries the log it
+   * is to run on. Everything before that — checking the terminals, parking
+   * them for the kernel that is about to attach, and clearing them if no
+   * kernel ever does — is the same job and is done once here.
+   */
+  private async bootAdopted(
+    desc: BootDescriptor,
+    checkpoint: MachineCheckpointLike,
+    terminals: readonly CapturedTerminal[],
+    replay?: MachineReplayLike,
+  ): Promise<void> {
     if (!this.applyBootDescriptorImpl) {
       throw new Error(
         "this host cannot boot a descriptor, so it cannot adopt a machine",
@@ -1769,19 +2019,53 @@ export class LiveKernelHost implements KernelHost {
     // where someone is waiting for an answer, rather than surface later as a
     // terminal that misbehaves.
     this.arrivingTerminals = checkedTerminals(terminals);
+    this.arrivingReplicaRelease = replay?.release ?? null;
     try {
-      await this.applyBootDescriptorImpl(desc, this, checkpoint);
+      await this.applyBootDescriptorImpl(desc, this, checkpoint, replay);
     } finally {
       // `attachKernel` takes them. Anything still parked belongs to a boot
       // that never reached one, and must not be adopted by a later machine.
       this.arrivingTerminals = [];
+      this.arrivingReplicaRelease?.();
+      this.arrivingReplicaRelease = null;
     }
+  }
+
+  /**
+   * Whether the machine attached here is a copy of one another computer holds.
+   *
+   * A replica is kept the same as the machine it copies by that computer's
+   * decision log, and nothing this computer does is in that log. So a keystroke
+   * typed here, or a mouse moved here, is a decision the machine it copies
+   * never made: the two stop being one machine, and only this screen shows it.
+   * Input therefore follows the machine — take it over to type into it.
+   *
+   * Resizing a terminal is such a decision too. A window change delivers
+   * `SIGWINCH` and a new `TIOCGWINSZ`, so a program that redraws on it takes a
+   * turn the primary's program never took, and the copy is a different machine
+   * from the next reading onwards. The emulator keeps its own size; the
+   * machine's terminal keeps the primary's.
+   *
+   * The gate is the replay's own release hook, because that is what a replica
+   * has and a machine this computer holds does not: `attachKernel` sets it from
+   * the arriving replay, and every path that lets go of a kernel clears it.
+   */
+  private holdsReplica(): boolean {
+    return this.heldReplicaRelease !== null;
+  }
+
+  /** Let a replica waiting on this machine's gate run on, once. */
+  private releaseReplica(): void {
+    const release = this.heldReplicaRelease;
+    this.heldReplicaRelease = null;
+    release?.();
   }
 
   private async dropMachine(
     status: "halted" | "idle",
     reason: string,
   ): Promise<void> {
+    this.releaseReplica();
     this.setStatus(status);
     this.cancelLazyDownloads(reason);
     this.offFramebufferAvailability?.();
@@ -1863,10 +2147,16 @@ export class LiveKernelHost implements KernelHost {
       ),
     );
 
-    session.cols = opts.cols;
-    session.rows = opts.rows;
-    if (session.pid > 0 && !session.closed) {
-      kernel.ptyResize(session.pid, opts.rows, opts.cols);
+    // The emulator's own size, unless it is looking at a machine it only
+    // copies. A window here is not the machine's window: the primary's log
+    // carries no resize this one made, so the geometry belongs to the machine
+    // and the emulator renders what the machine's terminal holds.
+    if (!this.holdsReplica()) {
+      session.cols = opts.cols;
+      session.rows = opts.rows;
+      if (session.pid > 0 && !session.closed) {
+        kernel.ptyResize(session.pid, opts.rows, opts.cols);
+      }
     }
 
     const encoder = new TextEncoder();
@@ -1875,7 +2165,7 @@ export class LiveKernelHost implements KernelHost {
 
     return {
       write: (bytes) => {
-        if (closed) return;
+        if (closed || this.holdsReplica()) return;
         const buf = typeof bytes === "string" ? encoder.encode(bytes) : bytes;
         if (!this.isCurrentPtySession(sessionKey, session) || session.closed) return;
         kernel.ptyWrite(session.pid, buf);
@@ -1892,7 +2182,7 @@ export class LiveKernelHost implements KernelHost {
         return detach;
       },
       resize: (cols, rows) => {
-        if (closed) return;
+        if (closed || this.holdsReplica()) return;
         session.cols = cols;
         session.rows = rows;
         if (!this.isCurrentPtySession(sessionKey, session) || session.closed) return;
@@ -2847,6 +3137,7 @@ export class LiveKernelHost implements KernelHost {
 
     return {
       sendInput: (bytes) => {
+        if (this.holdsReplica()) return;
         const pid = ensureStillBound();
         if (pid === null) return;
         // Route input to the source the bound process actually reads from.
@@ -2860,6 +3151,7 @@ export class LiveKernelHost implements KernelHost {
         }
       },
       sendMouseEvent: (dx, dy, buttons) => {
+        if (this.holdsReplica()) return;
         if (ensureStillBound() === null) return;
         kernel.injectMouseEvent?.(dx, dy, buttons);
       },
@@ -2968,6 +3260,7 @@ export class LiveKernelHost implements KernelHost {
       crtcId,
       stats,
       sendMouseEvent: (dx, dy, buttons) => {
+        if (this.holdsReplica()) return;
         kernel.injectMouseEvent?.(dx, dy, buttons);
       },
       close: () => {

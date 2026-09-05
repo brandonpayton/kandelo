@@ -40,6 +40,28 @@ export interface ReplicationInputEvent {
 }
 
 /**
+ * The device path a PTY's index answers to, which is the name the guest sees.
+ *
+ * A host writes a keystroke by index because that is what its own tables hold,
+ * and the index is kernel state, so a restored machine's is the primary's.
+ * Recording the path rather than the index is what keeps the log readable and
+ * keeps this module free of any one host's tables — `syscalls.rs` builds the
+ * same name for `/proc` and for the slave a `ptsname` returns.
+ */
+export function ptsDevicePath(ptyIndex: number): string {
+  return `/dev/pts/${ptyIndex}`;
+}
+
+/** The PTY index `device` names, or undefined when it names something else. */
+export function ptsDeviceIndex(device: string): number | undefined {
+  const suffix = device.startsWith("/dev/pts/")
+    ? device.slice("/dev/pts/".length)
+    : "";
+  if (!/^\d+$/.test(suffix)) return undefined;
+  return Number(suffix);
+}
+
+/**
  * One pointer movement the host delivered, as the host delivered it.
  *
  * The host hands the kernel a delta and a button mask; the kernel builds the
@@ -60,6 +82,22 @@ export interface ReplicationPointerEvent {
 }
 
 /**
+ * One terminal size the host set, at the position it set it.
+ *
+ * A window change is a decision like a keystroke: it delivers `SIGWINCH` and
+ * a new `TIOCGWINSZ`, so a program that redraws on it takes a turn a machine
+ * that never heard of it does not take. Left out of the log, the primary's
+ * person resizing their window is enough to make every replica a different
+ * machine.
+ */
+export interface ReplicationResizeEvent {
+  readonly kind: "resize";
+  readonly device: string;
+  readonly rows: number;
+  readonly cols: number;
+}
+
+/**
  * A decision the host delivered without the guest asking for it.
  *
  * Nothing consumes one on its own, so a reader applies them as it passes
@@ -67,7 +105,8 @@ export interface ReplicationPointerEvent {
  */
 export type ReplicationPushedDecision =
   | ReplicationInputEvent
-  | ReplicationPointerEvent;
+  | ReplicationPointerEvent
+  | ReplicationResizeEvent;
 
 /**
  * A value the host produced that the guest could not have derived itself.
@@ -84,7 +123,11 @@ export type ReplicationDecision =
 function isPushedDecision(
   decision: ReplicationDecision,
 ): decision is ReplicationPushedDecision {
-  return decision.kind === "input" || decision.kind === "pointer";
+  return (
+    decision.kind === "input"
+    || decision.kind === "pointer"
+    || decision.kind === "resize"
+  );
 }
 
 /** One decision at its position in the machine's log. */
@@ -114,23 +157,31 @@ export class ReplicationDivergence extends Error {
  *
  * A recorder starts at the sequence number its checkpoint was taken at, so a
  * replica that joins from that checkpoint reads on from the same position.
+ *
+ * A recorder retains what it records, because a replica joins at boot and
+ * needs the log from sequence 0. That makes the log grow for as long as the
+ * machine runs, so exactly one holder should keep it: a recorder whose entries
+ * are being published as they are made is built with `retain: false`, and the
+ * publisher is then the only copy.
  */
 export class ReplicationLogRecorder {
   readonly #entries: ReplicationLogEntry[] = [];
   readonly #listeners = new Set<(entry: ReplicationLogEntry) => void>();
+  readonly #retain: boolean;
   #nextSeq: number;
 
-  constructor(firstSeq = 0) {
+  constructor(firstSeq = 0, options: { retain?: boolean } = {}) {
     if (!Number.isSafeInteger(firstSeq) || firstSeq < 0) {
       throw new Error("a replication log starts at a non-negative sequence");
     }
     this.#nextSeq = firstSeq;
+    this.#retain = options.retain ?? true;
   }
 
   record(decision: ReplicationDecision): ReplicationLogEntry {
     const entry: ReplicationLogEntry = { seq: this.#nextSeq, decision };
     this.#nextSeq += 1;
-    this.#entries.push(entry);
+    if (this.#retain) this.#entries.push(entry);
     for (const listener of [...this.#listeners]) listener(entry);
     return entry;
   }
@@ -151,10 +202,24 @@ export class ReplicationLogRecorder {
     return this.#nextSeq;
   }
 
+  /** What this recorder kept. Empty when it was built not to retain. */
   get entries(): readonly ReplicationLogEntry[] {
     return this.#entries;
   }
 }
+
+/**
+ * Wait for the primary to record more, and say whether it did.
+ *
+ * A replica that runs the machine faster than the primary reaches the end of
+ * the log it has been sent, and neither reading its own clock nor reusing the
+ * last one keeps it the same machine. A live replay installs this hook so the
+ * guest's clock read stops there until the next decision arrives.
+ *
+ * Returns `null` when the recording ended and nothing will follow, which is
+ * the end of the replay rather than a defect.
+ */
+export type ReplicationLogExtender = () => ReplicationLogEntry | null;
 
 /**
  * Serve recorded decisions back, in order, and refuse anything else.
@@ -165,16 +230,33 @@ export class ReplicationLogRecorder {
  * letting the two machines drift apart unnoticed.
  */
 export class ReplicationLogReader {
-  readonly #entries: readonly ReplicationLogEntry[];
+  readonly #entries: ReplicationLogEntry[];
   readonly #applyPushed?: (decision: ReplicationPushedDecision) => void;
+  readonly #extend?: ReplicationLogExtender;
+  readonly #extendReady?: ReplicationLogExtender;
   #index = 0;
+  #ended = false;
 
   constructor(
     entries: readonly ReplicationLogEntry[],
     applyPushed?: (decision: ReplicationPushedDecision) => void,
+    extend?: ReplicationLogExtender,
+    extendReady?: ReplicationLogExtender,
   ) {
-    this.#entries = entries;
+    this.#entries = [...entries];
     this.#applyPushed = applyPushed;
+    this.#extend = extend;
+    this.#extendReady = extendReady;
+  }
+
+  /**
+   * How many entries this reader holds.
+   *
+   * A live replay is given an empty log and grows it as the primary records,
+   * so this is what `consumed` is a position within.
+   */
+  get known(): number {
+    return this.#entries.length;
   }
 
   /**
@@ -200,22 +282,32 @@ export class ReplicationLogReader {
    * A pushed decision has no guest request to answer, so nothing would
    * consume it on its own. A driver that has just received new entries calls
    * this so input the primary delivered after its last clock read still
-   * reaches the replica.
+   * reaches the replica — a shell sitting at its prompt makes no clock read,
+   * and a keystroke that waited for one would never arrive.
+   *
+   * `extendReady` is what this pulls from: the entries that are already
+   * there, without waiting for more. The blocking `extend` belongs to the
+   * guest's own reads, where stopping until the primary decides is the point.
    */
   drainPushed(): void {
-    this.#drainPushed();
+    for (;;) {
+      this.#drainPushed();
+      if (this.#extendReady === undefined || this.#ended) return;
+      const arrived = this.#extendReady();
+      if (arrived === null) return;
+      this.#append(arrived);
+    }
   }
 
   takeClock(clockId: number): ReplicationClockReading {
-    // What the primary delivered before this reading must reach the guest
-    // before the reading does, or the replica applies it against a later
-    // state than the primary did.
-    this.#drainPushed();
-    const entry = this.#entries[this.#index];
+    const entry = this.#awaitEntry();
     if (entry === undefined) {
       throw new ReplicationDivergence(
         this.nextSeq,
-        `the replica read clock ${clockId} past the end of the log`,
+        this.#ended
+          ? `the replica read clock ${clockId} after the primary stopped `
+            + `recording`
+          : `the replica read clock ${clockId} past the end of the log`,
       );
     }
     if (entry.decision.kind !== "clock") {
@@ -234,6 +326,49 @@ export class ReplicationLogReader {
     }
     this.#index += 1;
     return entry.decision;
+  }
+
+  /**
+   * The entry the guest's next request must answer to, waiting for it if the
+   * replica has caught up with the primary.
+   *
+   * What the primary delivered before that entry reaches the guest first, on
+   * every pass, or the replica applies it against a later state than the
+   * primary did. Returns undefined when the log holds no more and none is
+   * coming.
+   */
+  #awaitEntry(): ReplicationLogEntry | undefined {
+    for (;;) {
+      this.#drainPushed();
+      const entry = this.#entries[this.#index];
+      if (entry !== undefined) return entry;
+      if (this.#extend === undefined || this.#ended) return undefined;
+      const arrived = this.#extend();
+      if (arrived === null) {
+        this.#ended = true;
+        return undefined;
+      }
+      this.#append(arrived);
+    }
+  }
+
+  /**
+   * Take one more entry the primary recorded.
+   *
+   * The wire that carried it already refuses a hole. Checking again here is
+   * what makes the reader's own position trustworthy: it consumes by index,
+   * so an entry appended out of sequence would be served as though the
+   * primary had made it in that order.
+   */
+  #append(entry: ReplicationLogEntry): void {
+    const last = this.#entries[this.#entries.length - 1];
+    if (last !== undefined && entry.seq !== last.seq + 1) {
+      throw new ReplicationDivergence(
+        entry.seq,
+        `the log jumped to ${entry.seq} where ${last.seq + 1} was next`,
+      );
+    }
+    this.#entries.push(entry);
   }
 
   /**
@@ -261,7 +396,7 @@ export class ReplicationLogReader {
 }
 
 function describePushed(decision: ReplicationPushedDecision): string {
-  return decision.kind === "input"
-    ? `input for ${decision.device}`
-    : "a pointer movement";
+  if (decision.kind === "input") return `input for ${decision.device}`;
+  if (decision.kind === "resize") return `a resize of ${decision.device}`;
+  return "a pointer movement";
 }

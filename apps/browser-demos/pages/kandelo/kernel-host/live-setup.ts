@@ -2,6 +2,8 @@
 
 import { BrowserKernel } from "@host/browser-kernel-host";
 import type { MachineCheckpoint } from "@host/migration/checkpoint";
+import type { ReplicationLogEntry } from "@host/replication/log";
+import type { ReplicationReplaySpec } from "@host/replication/worker";
 import { ensureServiceWorkerReady } from "../../../lib/init/service-worker-bridge";
 import { setupServiceWorkerFetchBridge } from "../../../lib/init/sw-bridge-fetch";
 import {
@@ -639,7 +641,7 @@ export async function createLiveHost(
     status: machineRequested ? "booting" : "idle",
     descriptor: initialDescriptor,
     galleryItems: localGalleryItems,
-    applyBootDescriptor: async (desc, h, restore) => {
+    applyBootDescriptor: async (desc, h, restore, replay) => {
       if (protectedProfile !== undefined) {
         assertProtectedCandidateDescriptor(desc, protectedProfile.descriptor);
         await activateProtectedProfile();
@@ -654,6 +656,15 @@ export async function createLiveHost(
         profileForDescriptor(desc, "none"),
         desc,
         restore as MachineCheckpoint | undefined,
+        // Only the two values the kernel worker runs on. `replay` also carries
+        // the session layer's own way of releasing this replica, which is a
+        // function and cannot be structured-cloned into a worker.
+        replay === undefined
+          ? undefined
+          : {
+            entries: replay.entries as readonly ReplicationLogEntry[],
+            queue: replay.queue,
+          },
       );
     },
     prewarmBootDescriptor: async (desc) => {
@@ -737,6 +748,7 @@ export async function createLiveHost(
     profile: LiveProfile,
     descriptor: BootDescriptor,
     restoreCheckpoint?: MachineCheckpoint,
+    replicationReplay?: ReplicationReplaySpec,
   ): Promise<void> {
     const seq = ++bootSeq;
     const previousKernel = currentKernel;
@@ -760,6 +772,7 @@ export async function createLiveHost(
         () => seq === bootSeq,
         requireServiceWorker,
         restoreCheckpoint,
+        replicationReplay,
       );
       if (seq !== bootSeq) {
         await kernel.destroy().catch(() => {});
@@ -1095,6 +1108,7 @@ async function bootProfile(
     tick?: (msg: string) => void,
   ) => Promise<ServiceWorker>,
   restoreCheckpoint?: MachineCheckpoint,
+  replicationReplay?: ReplicationReplaySpec,
 ): Promise<BrowserKernel> {
   const assertCurrent = () => {
     if (!isCurrent()) throw new BootSuperseded();
@@ -1366,6 +1380,7 @@ async function bootProfile(
     await kernel.initFromImage({
       ...kernelInitOptions,
       ...(restoreCheckpoint === undefined ? {} : { restoreCheckpoint }),
+      ...(replicationReplay === undefined ? {} : { replicationReplay }),
     });
     assertCurrent();
     host.attachKernel(kernel);
@@ -1473,8 +1488,11 @@ async function bootProfile(
 
     if (restoreCheckpoint !== undefined) {
       tick(
-        `restored ${restoreCheckpoint.processes.length} process(es) handed `
-        + `over by the other computer`,
+        replicationReplay === undefined
+          ? `restored ${restoreCheckpoint.processes.length} process(es) handed `
+            + `over by the other computer`
+          : `replicating ${restoreCheckpoint.processes.length} process(es) from `
+            + `the other computer's decisions`,
       );
     } else if (profile.framebufferTest) {
       const fbtestWasmUrl = await optionalBinaryUrl(

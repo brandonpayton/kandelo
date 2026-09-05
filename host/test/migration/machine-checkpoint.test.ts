@@ -45,6 +45,7 @@ async function startReadyGuest(
   options: {
     readonly args?: readonly string[];
     readonly prepare?: (host: NodeKernelHost) => Promise<void>;
+    readonly bytes?: ArrayBuffer;
   } = {},
 ): Promise<{ host: NodeKernelHost; pid: number }> {
   let ready = () => {};
@@ -61,9 +62,13 @@ async function startReadyGuest(
   await options.prepare?.(host);
   let pid = -1;
   const started = new Promise<void>((resolve) => {
-    void host.spawn(programBytes(program), [program, ...(options.args ?? [])], {
-      onStarted: (started) => { pid = started; resolve(); },
-    });
+    void host.spawn(
+      options.bytes ?? programBytes(program),
+      [program, ...(options.args ?? [])],
+      {
+        onStarted: (started) => { pid = started; resolve(); },
+      },
+    );
   });
   await started;
   await isReady;
@@ -109,6 +114,30 @@ function buildSideModule(): Uint8Array {
   // A fresh copy, because writeFileToVfs transfers the backing buffer and a
   // readFileSync Buffer sits in a pool it does not own.
   return new Uint8Array(readFileSync(soPath));
+}
+
+/**
+ * Build a checkpoint fixture without fork instrumentation.
+ *
+ * The committed `examples/*.wasm` fixtures are instrumented, so proving how
+ * a freeze meets a program whose frames cannot be unwound needs a build of
+ * the same source that skips `scripts/run-wasm-fork-instrument.sh`. The
+ * shipped `login.wasm` is such a program.
+ */
+function buildUninstrumentedFixture(name: string): ArrayBuffer {
+  const buildDir = join(tmpdir(), "wasm-checkpoint-uninstrumented");
+  mkdirSync(buildDir, { recursive: true });
+  const wasmPath = join(buildDir, `${name}-uninstrumented.wasm`);
+  execFileSync(
+    "wasm32posix-cc",
+    [
+      join(findRepoRoot(), `examples/${name}.c`),
+      "-o",
+      wasmPath,
+    ],
+    { stdio: "pipe" },
+  );
+  return fileArrayBuffer(wasmPath);
 }
 
 describe("machine checkpoint of a running guest", () => {
@@ -551,6 +580,60 @@ describe("machine checkpoint of a running guest", () => {
             "wait-lifecycle-test",
           ]),
         ).resolves.toBe(0);
+        expect(await host.signalProcess(pid, 0)).toBe(true);
+      } finally {
+        await host.destroy();
+      }
+    },
+  );
+
+  it(
+    "refuses to read a program built without checkpoint instrumentation",
+    { timeout: 60_000 },
+    async () => {
+      const bytes = buildUninstrumentedFixture("checkpoint-loop");
+      const { host, pid } = await startReadyGuest(
+        "checkpoint-loop-uninstrumented",
+        { bytes },
+      );
+      try {
+        const response = await host.captureCheckpoint(TIMEOUTS);
+
+        // The refusal is the whole outcome. The uninstrumented module has no
+        // capturing kernel_checkpoint, so the freeze is abandoned with the
+        // real reason instead of the process dying on the startup stub.
+        expect(response.status).toBe("failed");
+        if (response.status !== "failed") return;
+        expect(response.reason).toContain(
+          "without checkpoint instrumentation",
+        );
+        expect(await host.signalProcess(pid, 0)).toBe(true);
+      } finally {
+        await host.destroy();
+      }
+    },
+  );
+
+  it(
+    "refuses to read an uninstrumented program's threads the same way",
+    { timeout: 60_000 },
+    async () => {
+      const bytes = buildUninstrumentedFixture("checkpoint-threads");
+      const { host, pid } = await startReadyGuest(
+        "checkpoint-threads-uninstrumented",
+        { bytes },
+      );
+      try {
+        const response = await host.captureCheckpoint(TIMEOUTS);
+
+        // Thread workers read the freeze too, so the thread entry carries
+        // its own refusing stub. Either worker's refusal may arrive first;
+        // both name the same boundary and neither kills the guest.
+        expect(response.status).toBe("failed");
+        if (response.status !== "failed") return;
+        expect(response.reason).toContain(
+          "without checkpoint instrumentation",
+        );
         expect(await host.signalProcess(pid, 0)).toBe(true);
       } finally {
         await host.destroy();

@@ -44,15 +44,18 @@ import { resolveLazyUrl } from "./vfs/lazy-url";
 import { DeviceFileSystem } from "./vfs/device-fs";
 import { BrowserTimeProvider } from "./vfs/time";
 import {
-  ReplicationLogReader,
   ReplicationLogRecorder,
+  ptsDeviceIndex,
+  ptsDevicePath,
   type ReplicationLogEntry,
+  type ReplicationLogReader,
   type ReplicationPushedDecision,
 } from "./replication/log";
+import { RecordingTimeProvider } from "./replication/clock";
 import {
-  RecordingTimeProvider,
-  ReplayingTimeProvider,
-} from "./replication/clock";
+  beginReplicationReplay,
+  beginReplicationStream,
+} from "./replication/worker";
 import { restoreBrowserKernelInitMounts } from "./browser-kernel-vfs-init";
 import type { FileSystemBackend, MountConfig } from "./vfs/types";
 import { TlsNetworkBackend } from "./networking/tls-network-backend";
@@ -182,9 +185,7 @@ let baseTimeProvider: BrowserTimeProvider | null = null;
 /** The decision log this machine is taking, or null when it is taking none. */
 let replicationRecorder: ReplicationLogRecorder | null = null;
 /** The decision log this machine is following, or null when it leads. */
-let replicationReplay:
-  | { reader: ReplicationLogReader; entries: readonly ReplicationLogEntry[] }
-  | null = null;
+let replicationReplay: { reader: ReplicationLogReader } | null = null;
 let maxPages: number = DEFAULT_MAX_PAGES;
 let defaultThreadSlots: number = DEFAULT_PROCESS_THREAD_SLOTS;
 let processMemoryAllocator: ProcessMemoryAllocator;
@@ -866,6 +867,27 @@ function respond(requestId: number, result: unknown) {
   post({ type: "response", requestId, result });
 }
 
+function publishLog(entries: readonly ReplicationLogEntry[]): void {
+  post({ type: "replication_recorded", entries });
+}
+
+/**
+ * Start the decision log at the state a checkpoint just read.
+ *
+ * Runs inside the freeze, so it refuses rather than responding: a capture that
+ * cannot start the log must fail as a capture, not resume a machine whose
+ * replica would then be following a log that begins somewhere else.
+ */
+function beginStreamAtCapture(): void {
+  if (!io || !baseTimeProvider) {
+    throw new Error(
+      "replication needs an initialized machine: this one has no swappable "
+        + "guest clock yet",
+    );
+  }
+  replicationRecorder = beginReplicationStream(io, baseTimeProvider, publishLog);
+}
+
 /**
  * Swap the guest clock for replication, and name the boundary when there is
  * no clock to swap.
@@ -899,19 +921,31 @@ function respondToReplication(
  * Deliver a decision the primary made without the guest asking for it.
  *
  * A pointer movement replays as the delta the host handed the kernel, so the
- * kernel builds the same PS/2 frame it built on the primary. Nothing records
- * a device write yet, so one appearing here is a log this build cannot apply,
- * and saying so is better than dropping it.
+ * kernel builds the same PS/2 frame it built on the primary. A device write
+ * replays into the same PTY master the primary wrote to: the index is kernel
+ * state, so the checkpoint restored it, and the guest reads the bytes where
+ * the primary's guest read them.
+ *
+ * A device this host has no way to write to throws rather than being dropped.
+ * A dropped decision is a replica that silently stopped being the same machine.
  */
 function applyPushedDecision(decision: ReplicationPushedDecision): void {
   if (decision.kind === "pointer") {
     kernelWorker.injectMouseEvent(decision.dx, decision.dy, decision.buttons);
     return;
   }
-  throw new Error(
-    `the log carries input for ${decision.device}, which this host cannot `
-      + `replay`,
-  );
+  const ptyIdx = ptsDeviceIndex(decision.device);
+  if (ptyIdx === undefined) {
+    throw new Error(
+      `the log carries ${decision.kind} for ${decision.device}, which this `
+        + `host cannot replay`,
+    );
+  }
+  if (decision.kind === "resize") {
+    kernelWorker.ptySetWinsize(ptyIdx, decision.rows, decision.cols);
+    return;
+  }
+  kernelWorker.ptyMasterWrite(ptyIdx, decision.bytes);
 }
 
 function respondTransferredBytes(requestId: number, result: Uint8Array) {
@@ -1495,6 +1529,20 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
       ? undefined
       : { adoptKernelMemoryImage: msg.restoreCheckpoint.kernelMemory },
   );
+
+  // Before the first restored process, not after `init` answers. A restored
+  // process resumes below and reads the clock immediately; a replay installed
+  // once this function returns would have let it read this computer's.
+  if (msg.replicationReplay) {
+    replicationReplay = {
+      reader: beginReplicationReplay(
+        io,
+        baseTimeProvider,
+        msg.replicationReplay,
+        applyPushedDecision,
+      ),
+    };
+  }
 
   if (msg.restoreCheckpoint && restoredProgramModules) {
     kernelWorker.rebindRestoredHostHandles(
@@ -4916,12 +4964,30 @@ async function handleDestroy(
 function handlePtyWrite(msg: Extract<MainToKernelMessage, { type: "pty_write" }>) {
   const ptyIdx = ptyByPid.get(msg.pid);
   if (ptyIdx === undefined) return;
+  // Recorded before it is delivered, so the log holds it at the position the
+  // guest read it. A keystroke is a decision no replica can derive: without it
+  // the primary's shell runs a command the copy never sees, and the two are
+  // different machines from the next clock reading onwards.
+  replicationRecorder?.record({
+    kind: "input",
+    device: ptsDevicePath(ptyIdx),
+    bytes: msg.data,
+  });
   kernelWorker.ptyMasterWrite(ptyIdx, msg.data);
 }
 
 function handlePtyResize(msg: Extract<MainToKernelMessage, { type: "pty_resize" }>) {
   const ptyIdx = ptyByPid.get(msg.pid);
   if (ptyIdx === undefined) return;
+  // A resize is a decision like a keystroke: it delivers SIGWINCH and a new
+  // TIOCGWINSZ, so a program that redraws on it takes a turn a copy that
+  // never heard of it does not take.
+  replicationRecorder?.record({
+    kind: "resize",
+    device: ptsDevicePath(ptyIdx),
+    rows: msg.rows,
+    cols: msg.cols,
+  });
   kernelWorker.ptySetWinsize(ptyIdx, msg.rows, msg.cols);
 }
 
@@ -5196,10 +5262,14 @@ sw.onmessage = (e: MessageEvent) => {
     }
     case "capture_checkpoint": {
       const { requestId, unwindTimeoutMs, vforkTimeoutMs } = msg;
+      const onRead = msg.beginReplicationStream
+        ? beginStreamAtCapture
+        : undefined;
       if (msg.includeBytes) {
         void captureMachineCheckpoint(checkpointMachine, {
           unwindTimeoutMs,
           vforkTimeoutMs,
+          onRead,
         }).then(
           (result) => post(
             { type: "response", requestId, result },
@@ -5214,6 +5284,7 @@ sw.onmessage = (e: MessageEvent) => {
       void captureMachineCheckpointSummary(checkpointMachine, {
         unwindTimeoutMs,
         vforkTimeoutMs,
+        onRead,
       }).then(
         (result) => respond(requestId, result),
         (err) => respondError(requestId, (err as Error)?.message ?? String(err)),
@@ -5235,6 +5306,10 @@ sw.onmessage = (e: MessageEvent) => {
     }
     case "replication_record_start": {
       respondToReplication(msg.requestId, (target, clock) => {
+        if (msg.stream) {
+          replicationRecorder = beginReplicationStream(target, clock, publishLog);
+          return;
+        }
         replicationRecorder = new ReplicationLogRecorder();
         target.setTimeProvider(
           new RecordingTimeProvider(clock, replicationRecorder),
@@ -5251,12 +5326,14 @@ sw.onmessage = (e: MessageEvent) => {
     }
     case "replication_replay_start": {
       respondToReplication(msg.requestId, (target, clock) => {
-        const reader = new ReplicationLogReader(
-          msg.entries,
-          applyPushedDecision,
-        );
-        replicationReplay = { reader, entries: msg.entries };
-        target.setTimeProvider(new ReplayingTimeProvider(clock, reader));
+        replicationReplay = {
+          reader: beginReplicationReplay(
+            target,
+            clock,
+            msg,
+            applyPushedDecision,
+          ),
+        };
       });
       break;
     }
@@ -5266,8 +5343,17 @@ sw.onmessage = (e: MessageEvent) => {
       if (io && baseTimeProvider) io.setTimeProvider(baseTimeProvider);
       respond(msg.requestId, {
         consumed: replay?.reader.consumed ?? 0,
-        total: replay?.entries.length ?? 0,
+        total: replay?.reader.known ?? 0,
       });
+      break;
+    }
+    case "replication_replay_drain": {
+      // The primary delivered something between two guest requests — a
+      // keystroke, a resize — and a guest that is not reading the clock would
+      // never pull it through. The main thread says entries arrived; this
+      // takes what is ready and applies it, and never blocks: waiting for the
+      // primary belongs to the guest's own clock reads.
+      replicationReplay?.reader.drainPushed();
       break;
     }
     case "kms_attach_canvas":

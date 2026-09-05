@@ -681,12 +681,73 @@ describe("LiveKernelHost: machine handover", () => {
     const host = new LiveKernelHost({ applyBootDescriptor });
 
     await host.adoptMachine(DUMMY_DESCRIPTOR, FROZEN);
+    // No replay: a taker runs the machine, it does not follow one. A page that
+    // received a log here would boot a copy of a machine the other computer
+    // has already given up.
     expect(applyBootDescriptor).toHaveBeenCalledWith(
       DUMMY_DESCRIPTOR,
       host,
       FROZEN,
+      undefined,
     );
     expect(host.getStatus()).toBe("running");
+  });
+
+  // The other half of the same call. A replica boots the same descriptor from
+  // the same checkpoint and differs in one thing: it runs on the user's
+  // decisions rather than its own host's, and the boot has to be told so
+  // before it starts, because the restored processes resume inside it.
+  it("replicateMachine boots the peer's machine onto the peer's log", async () => {
+    const applyBootDescriptor = vi.fn(
+      async (desc: BootDescriptor, host: LiveKernelHost) => {
+        host.setDescriptor(desc);
+        // As a real boot does: the gate moves from arriving to held here, and
+        // a boot that never reaches a kernel releases it instead.
+        host.attachKernel({} as any);
+        host.setStatus("running");
+      },
+    );
+    const host = new LiveKernelHost({ applyBootDescriptor });
+    const replay = {
+      entries: [],
+      queue: new SharedArrayBuffer(1024),
+      release: vi.fn(),
+    };
+
+    await host.replicateMachine(DUMMY_DESCRIPTOR, FROZEN, [], replay);
+    expect(applyBootDescriptor).toHaveBeenCalledWith(
+      DUMMY_DESCRIPTOR,
+      host,
+      FROZEN,
+      replay,
+    );
+    expect(host.getStatus()).toBe("running");
+    // Still waiting on the user, not released: the replica is running.
+    expect(replay.release).not.toHaveBeenCalled();
+
+    // Every path that lets go of a replica's kernel releases its gate first. A
+    // kernel worker blocked waiting for the user's next decision answers
+    // nothing, including the graceful half of its own teardown.
+    await host.halt();
+    expect(replay.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("replicateMachine releases the gate when the boot reaches no kernel", async () => {
+    // A replica whose boot failed still has a queue somebody is feeding, and
+    // nothing left that will ever drain it.
+    const host = new LiveKernelHost({
+      applyBootDescriptor: async () => { throw new Error("no image"); },
+    });
+    const release = vi.fn();
+
+    await expect(
+      host.replicateMachine(DUMMY_DESCRIPTOR, FROZEN, [], {
+        entries: [],
+        queue: new SharedArrayBuffer(1024),
+        release,
+      }),
+    ).rejects.toThrow(/no image/);
+    expect(release).toHaveBeenCalledTimes(1);
   });
 
   it("adoptMachine refuses when the host cannot boot a descriptor", async () => {
@@ -799,6 +860,106 @@ describe("LiveKernelHost: machine handover", () => {
     // The keyboard reaches the process that arrived, not a new one beside it.
     pty.write("ls\n");
     expect(ptyWrite).toHaveBeenCalledWith(7, expect.anything());
+  });
+
+  // The same terminal, on a computer that is only copying the machine. A
+  // keystroke here reaches no log, so this copy would answer it and the machine
+  // it copies would not: two machines under one name, with only this screen
+  // showing the difference. The keyboard arrives with the take-over above.
+  it("refuses the keyboard on a machine it is only replicating", async () => {
+    const { host, ptyWrite } = taker([7]);
+    await host.replicateMachine(
+      DUMMY_DESCRIPTOR,
+      FROZEN,
+      [{
+        path: "/dev/pts/0",
+        pid: 7,
+        cols: 100,
+        rows: 30,
+        screen: new TextEncoder().encode("maker@kandelo:~$ "),
+      }],
+      { entries: [], queue: new SharedArrayBuffer(1024), release: vi.fn() },
+    );
+
+    const pty = await host.attachPty("/dev/pts/0", { cols: 100, rows: 30 });
+    pty.write("ls\n");
+    expect(ptyWrite).not.toHaveBeenCalled();
+  });
+
+  // A window change is a decision too: it delivers SIGWINCH and a new
+  // TIOCGWINSZ, so a program that redraws on it takes a turn the primary's
+  // program never took. The emulator here is a different size from the one the
+  // machine was read at, which is the ordinary case — two people do not share a
+  // window — and the machine's terminal must keep the primary's size.
+  it("refuses to resize a machine it is only replicating", async () => {
+    const { host, kernel } = taker([7]);
+    await host.replicateMachine(
+      DUMMY_DESCRIPTOR,
+      FROZEN,
+      [{
+        path: "/dev/pts/0",
+        pid: 7,
+        cols: 100,
+        rows: 30,
+        screen: new TextEncoder().encode("maker@kandelo:~$ "),
+      }],
+      { entries: [], queue: new SharedArrayBuffer(1024), release: vi.fn() },
+    );
+
+    const pty = await host.attachPty("/dev/pts/0", { cols: 158, rows: 39 });
+    pty.resize(80, 24);
+    expect(kernel.ptyResize).not.toHaveBeenCalled();
+    // And the terminal still reports the size the machine runs at, so a later
+    // take-over hands on the primary's geometry rather than this page's.
+    expect(pty.size()).toEqual({ cols: 100, rows: 30 });
+  });
+
+  // A keystroke or a resize the user records has no guest request to answer,
+  // so a replica whose guest sits at a prompt only sees it when told the log
+  // grew. The nudge goes to a machine this page copies, and to nothing else —
+  // a machine this page decides for has no replay to drain. The copy is also
+  // nudged once as it arrives: what the user decided while the replica was
+  // booting is already queued, and those nudges found no machine to take it.
+  it("nudges only a copy when the user's log grows", async () => {
+    const { host, kernel } = taker([7]);
+    const drainReplicationReplay = vi.fn();
+    (kernel as any).drainReplicationReplay = drainReplicationReplay;
+
+    host.drainReplicationReplay();
+    expect(drainReplicationReplay).not.toHaveBeenCalled();
+
+    await host.replicateMachine(DUMMY_DESCRIPTOR, FROZEN, [], {
+      entries: [],
+      queue: new SharedArrayBuffer(1024),
+      release: vi.fn(),
+    });
+    expect(drainReplicationReplay).toHaveBeenCalledTimes(1);
+    host.drainReplicationReplay();
+    expect(drainReplicationReplay).toHaveBeenCalledTimes(2);
+  });
+
+  // A replica taken off its log is a machine no computer decides for. Its
+  // guests read a clock that has no answer, they die, and `init` starts fresh
+  // ones — so a copy kept past its recording becomes a second machine wearing
+  // the first one's name, on a page that still calls itself the viewer.
+  it("lets go of the copy when it stops replicating", async () => {
+    const { host, kernel } = taker([7]);
+    const stopReplicationReplay = vi.fn(async () => ({ consumed: 4, total: 4 }));
+    (kernel as any).stopReplicationReplay = stopReplicationReplay;
+    const release = vi.fn();
+    await host.replicateMachine(DUMMY_DESCRIPTOR, FROZEN, [], {
+      entries: [],
+      queue: new SharedArrayBuffer(1024),
+      release,
+    });
+    expect(host.getStatus()).toBe("running");
+
+    expect(await host.stopReplicatingMachine())
+      .toEqual({ consumed: 4, total: 4 });
+    expect(host.getStatus()).toBe("idle");
+    // And the gate goes with it. A replica parked on a decision that will not
+    // come answers nothing, including the graceful half of its own teardown.
+    expect(release).toHaveBeenCalledTimes(1);
   });
 
   it("redraws the screen the other computer was showing", async () => {

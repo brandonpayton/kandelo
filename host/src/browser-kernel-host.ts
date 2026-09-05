@@ -26,6 +26,7 @@ import type {
   VfsFileSnapshot,
 } from "./browser-kernel-protocol";
 import type { ReplicationLogEntry } from "./replication/log";
+import type { ReplicationReplaySpec } from "./replication/worker";
 import type { HttpRequest, HttpResponse } from "./networking/in-kernel-http";
 import {
   type BrowserCorsProxyConfig,
@@ -204,6 +205,15 @@ export interface BrowserKernelOwnedImageInitOptions {
    * `NodeKernelHostOptions.restoreCheckpoint`.
    */
   restoreCheckpoint?: MachineCheckpoint;
+  /**
+   * Run this machine on a primary's decisions from its very first instruction.
+   *
+   * This is how a replica joins a machine that is already running: a restored
+   * process resumes inside `init`, so {@link startReplicationReplay} would
+   * install the replay after that process had read this computer's clock.
+   * Mirrors `NodeKernelHostOptions.replicationReplay`.
+   */
+  replicationReplay?: ReplicationReplaySpec;
 }
 
 async function fetchDefaultBrowserKernelArtifact(
@@ -270,6 +280,9 @@ export class BrowserKernel {
   private pendingPtyOutputChunks = 0;
   private pendingPtyOutputFailure: Error | undefined;
   private lazyDownloadListeners = new Set<(event: LazyDownloadEvent) => void>();
+  private replicationListeners = new Set<
+    (entries: readonly ReplicationLogEntry[]) => void
+  >();
   private pcmTransport: PcmTransportDescriptor | null = null;
   private pcmDriver: BrowserPcmDriver | null = null;
 
@@ -343,6 +356,7 @@ export class BrowserKernel {
     closedLazyAssets?: readonly ClosedLazyAsset[];
     rootfsMountSpec?: readonly MountSpec[];
     restoreCheckpoint?: MachineCheckpoint;
+    replicationReplay?: ReplicationReplaySpec;
   }): Promise<void> {
     const [wasmBytes, vfsImage] = await Promise.all([
       options.kernelWasm
@@ -361,6 +375,7 @@ export class BrowserKernel {
       closedLazyAssets: options.closedLazyAssets,
       rootfsMountSpec: options.rootfsMountSpec,
       restoreCheckpoint: options.restoreCheckpoint,
+      replicationReplay: options.replicationReplay,
       takeVfsImageOwnership: false,
     });
   }
@@ -390,6 +405,7 @@ export class BrowserKernel {
       closedLazyAssets: options.closedLazyAssets,
       rootfsMountSpec: options.rootfsMountSpec,
       restoreCheckpoint: options.restoreCheckpoint,
+      replicationReplay: options.replicationReplay,
       takeVfsImageOwnership: true,
     });
   }
@@ -405,6 +421,7 @@ export class BrowserKernel {
     closedLazyAssets?: readonly ClosedLazyAsset[];
     rootfsMountSpec?: readonly MountSpec[];
     restoreCheckpoint?: MachineCheckpoint;
+    replicationReplay?: ReplicationReplaySpec;
     takeVfsImageOwnership: boolean;
   }): Promise<void> {
     if (
@@ -502,6 +519,7 @@ export class BrowserKernel {
             ? undefined
             : opts.rootfsMountSpec.map((mount) => ({ ...mount })),
           restoreCheckpoint: opts.restoreCheckpoint,
+          replicationReplay: opts.replicationReplay,
           shmSab: this.shmSab,
           workerEntryUrl,
           config: {
@@ -875,21 +893,98 @@ export class BrowserKernel {
   }
 
   /**
+   * Publish this machine's decisions to `onEntries` as it makes them.
+   *
+   * This is what a machine being replicated live does instead of
+   * `startReplicationRecording`. The listener becomes the log's only holder:
+   * the kernel worker keeps nothing, because a replica joins at boot and needs
+   * every entry from sequence 0, and one growing copy of that is enough.
+   *
+   * Returns a function that stops the recording.
+   */
+  /**
+   * Read this machine and start publishing its decisions from that state.
+   *
+   * This is how a replica joins a machine that is already running: it restores
+   * the checkpoint and replays the log from its first entry. The two meet at
+   * one instant because the recorder starts inside the freeze, while every
+   * process is parked. A caller that captured and then called
+   * `streamReplicationLog` would lose the decisions the machine made as it
+   * resumed, and its replica would follow a log that begins somewhere its
+   * state does not.
+   *
+   * Returns the checkpoint result and a function that stops the recording.
+   * Nothing is being recorded when the capture did not succeed.
+   */
+  async captureAndStreamReplicationLog(
+    options: { unwindTimeoutMs: number; vforkTimeoutMs: number },
+    onEntries: (entries: readonly ReplicationLogEntry[]) => void,
+  ): Promise<{ capture: CheckpointFreezeResult; stop: () => Promise<void> }> {
+    this.replicationListeners.add(onEntries);
+    const requestId = this.nextRequestId++;
+    const capture = await this.request(requestId, {
+      type: "capture_checkpoint",
+      requestId,
+      unwindTimeoutMs: options.unwindTimeoutMs,
+      vforkTimeoutMs: options.vforkTimeoutMs,
+      includeBytes: true,
+      beginReplicationStream: true,
+    }) as CheckpointFreezeResult;
+    if (capture.status !== "captured") {
+      this.replicationListeners.delete(onEntries);
+      return { capture, stop: async () => {} };
+    }
+    return {
+      capture,
+      stop: async () => {
+        await this.stopReplicationRecording();
+        this.replicationListeners.delete(onEntries);
+      },
+    };
+  }
+
+  async streamReplicationLog(
+    onEntries: (entries: readonly ReplicationLogEntry[]) => void,
+  ): Promise<() => Promise<void>> {
+    const requestId = this.nextRequestId++;
+    await this.request(requestId, {
+      type: "replication_record_start",
+      requestId,
+      stream: true,
+    });
+    this.replicationListeners.add(onEntries);
+    return async () => {
+      // Dropped after the stop, not before it. The worker publishes every
+      // batch it recorded ahead of the stop response, and a listener removed
+      // first would miss the last of them.
+      await this.stopReplicationRecording();
+      this.replicationListeners.delete(onEntries);
+    };
+  }
+
+  /**
    * Serve this machine's decisions from `entries` instead of from this host.
    *
    * Call it after `init` and before the replayed guest runs. A replay that
-   * reaches past the end of the log, or reads a clock the recording does not
-   * hold there, throws `ReplicationDivergence` at the guest's clock read
-   * rather than inventing a value.
+   * reads a clock the recording does not hold at that position throws
+   * `ReplicationDivergence` at the guest's clock read rather than inventing a
+   * value.
+   *
+   * `queue` follows a primary that is still running: the replica blocks there
+   * when it catches up, instead of reaching past the end of the log. Without
+   * it the log is taken as complete, and reaching its end is the end of the
+   * replay.
    */
   async startReplicationReplay(
     entries: readonly ReplicationLogEntry[],
+    queue?: SharedArrayBuffer,
   ): Promise<void> {
     const requestId = this.nextRequestId++;
     await this.request(requestId, {
       type: "replication_replay_start",
       requestId,
       entries,
+      queue,
     });
   }
 
@@ -901,6 +996,18 @@ export class BrowserKernel {
       requestId,
     });
     return result as ReplicationReplayProgress;
+  }
+
+  /**
+   * Tell a replaying machine the log grew, so it applies what needs no guest.
+   *
+   * A keystroke or a resize the primary recorded has no guest request to
+   * answer, and the queue is shared memory the kernel worker only reads when
+   * asked — a replica whose guest sits at a prompt would otherwise never see
+   * it. Call it after pushing entries into the replay's queue.
+   */
+  drainReplicationReplay(): void {
+    this.sendToKernel({ type: "replication_replay_drain" });
   }
 
   /**
@@ -1754,6 +1861,11 @@ export class BrowserKernel {
         break;
       case "lazy_download":
         this.emitLazyDownload(msg.event);
+        break;
+      case "replication_recorded":
+        for (const listener of [...this.replicationListeners]) {
+          listener(msg.entries);
+        }
         break;
       default: {
         // Keep this dispatch coupled to KernelToMainMessage as the protocol

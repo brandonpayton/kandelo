@@ -27,193 +27,24 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
  * headless Chromium forms a loopback ICE pair.
  */
 
-const appUrl = (path: string): string => {
-  const baseUrl = process.env.KANDELO_TEST_BASE_URL;
-  return baseUrl ? new URL(path, baseUrl).href : path;
-};
-
-async function linkStatus(page: Page): Promise<string> {
-  return page.locator(".knetwork-status").innerText();
-}
-
-async function freshCode(page: Page, previous: string): Promise<string> {
-  await page.waitForFunction(
-    (before) => {
-      const field = document.getElementById(
-        "knetwork-local",
-      ) as HTMLTextAreaElement | null;
-      const value = field?.value ?? "";
-      return value.startsWith("kandelo1:") && value !== before;
-    },
-    previous,
-    { timeout: 30_000 },
-  );
-  return page.inputValue("#knetwork-local");
-}
-
-async function terminalText(page: Page, selector: string): Promise<string> {
-  return page
-    .locator(`${selector} .xterm-rows`)
-    .first()
-    .evaluate((node) => node.textContent ?? "");
-}
-
-async function terminalRows(page: Page, selector: string): Promise<number> {
-  return page.locator(`${selector} .xterm-rows > div`).count();
-}
+import { distinctColors } from "./support/canvas";
+import {
+  appUrl,
+  closeDockPopovers,
+  connectPeers,
+  networkButton,
+  openNetworkPopover,
+  terminalText,
+  typeIntoTerminal,
+} from "./support/peer-pair";
 
 /** How many shell prompts a terminal is showing. */
 async function prompts(page: Page, selector: string): Promise<number> {
   return (await terminalText(page, selector)).split("kandelo$").length - 1;
 }
 
-/** How many distinct colours a canvas is painting, capped so it stays cheap. */
-function distinctColors(canvas: Locator): Promise<number> {
-  return canvas.evaluate((el: HTMLCanvasElement) => {
-    const ctx = el.getContext("2d");
-    if (!ctx) return 0;
-    const { data } = ctx.getImageData(0, 0, el.width, el.height);
-    const seen = new Set<number>();
-    for (let i = 0; i < data.length; i += 4) {
-      seen.add((data[i] << 16) | (data[i + 1] << 8) | data[i + 2]);
-      if (seen.size > 8) break;
-    }
-    return seen.size;
-  });
-}
-
-/** The Network dock button, which reports the link whether or not it is open. */
-function networkButton(page: Page): Locator {
-  return page.getByRole("button", { name: "Network", exact: true });
-}
-
-/**
- * Carry the invite and the answer between the two pages, as the humans do.
- *
- * The sharer initiates, the viewer answers, the sharer completes. The retry
- * is the one a human makes when the page reports a failed attempt. Skips the
- * test at the ICE boundary — no direct route between two local contexts is a
- * network limit, not a transport defect — and fails on anything else.
- *
- * Both popups are gone by the time this returns: the popup exists to buy a
- * connection, and it closes itself once there is one. The link is therefore
- * read from the dock button, which stays whether or not anything is open, and
- * a test that wants the status text opens the popup again for it.
- */
-async function connectPeers(sharer: Page, viewer: Page): Promise<void> {
-  await openNetworkPopover(sharer);
-  await openNetworkPopover(viewer);
-
-  let invite = "";
-  let answer = "";
-  let linked = false;
-  for (let attempt = 0; attempt < 3 && !linked; attempt++) {
-    // The computer holding the machine invites; the empty one accepts, because
-    // only a computer with a machine has anything to invite someone to. Which
-    // of them can take the machine over is decided separately and keeps
-    // changing: it follows the machine, not the invite.
-    await openNetworkPopover(sharer);
-    await openNetworkPopover(viewer);
-    await sharer.getByRole("button", { name: "Create invite code" }).click();
-    invite = await freshCode(sharer, invite);
-    await viewer.fill("#knetwork-remote", invite);
-    await viewer.getByRole("button", { name: "Answer invite" }).click();
-    answer = await freshCode(viewer, answer);
-    await sharer.fill("#knetwork-remote", answer);
-    await sharer.getByRole("button", { name: "Complete connection" }).click();
-    const settled = await Promise.all(
-      [viewer, sharer].map((page) =>
-        expect(networkButton(page))
-          .toHaveClass(/is-connected/, { timeout: 30_000 })
-          .then(() => true, () => false),
-      ),
-    );
-    linked = settled.every(Boolean);
-  }
-  if (linked) return;
-
-  await openNetworkPopover(sharer);
-  await openNetworkPopover(viewer);
-  const states = await Promise.all([viewer, sharer].map(linkStatus));
-  // "No direct route" is the ICE boundary, not a transport defect: every
-  // signalling or codec bug fails earlier with its own message.
-  expect(
-    states.some((state) => state.includes("no direct route")),
-    `the link failed outside the ICE boundary: ${states.join(" | ")}`,
-  ).toBe(true);
-  test.skip(
-    true,
-    "no ICE route between two local contexts — on macOS, grant the "
-    + "Playwright browser Local Network permission to run this spec",
-  );
-}
-
-/**
- * Show the Network popover, whatever state it is in.
- *
- * Adopting a machine closes it — the page reacts to the boot descriptor it is
- * now running — so a test that reads the popup after a handover cannot assume
- * the popover it opened earlier is still there.
- */
-async function openNetworkPopover(page: Page): Promise<void> {
-  const button = networkButton(page);
-  if ((await button.getAttribute("aria-expanded")) !== "true") {
-    await button.click();
-  }
-  await expect(button).toHaveAttribute("aria-expanded", "true");
-}
-
-/**
- * Type into a terminal on a machine that has just arrived by handover.
- *
- * Focuses the emulator's input directly instead of clicking the terminal. A
- * taker settles its boot descriptor and then loads the arriving image's demo
- * guide, and `App.tsx` opens that guide once per descriptor and title, so it
- * can open after a test has already cleared the popovers. An open popover lays
- * a dismiss layer over the page (`Dock.tsx`, `kdock-popover-dismiss-layer`)
- * that takes the pointer-down: the click closes the guide and focuses nothing,
- * and every keystroke after it goes to the page instead of the shell. A person
- * sees the guide and clicks again; a test cannot win that race, and what these
- * tests are about is which computer may type, not what covers a terminal.
- */
-async function typeIntoTerminal(
-  page: Page,
-  selector: string,
-  line: string,
-): Promise<void> {
-  await page.locator(`${selector} .xterm-helper-textarea`).first().focus();
-  await page.keyboard.type(line);
-  await page.keyboard.press("Enter");
-}
-
-/**
- * Hide every dock popover that would swallow a click meant for a terminal.
- *
- * An open popover lays a dismiss layer across the page (`Dock.tsx`,
- * `kdock-popover-dismiss-layer`), and that layer takes the pointer-down: the
- * click closes the popover instead of focusing the terminal under it. A person
- * clicks again and gets on with it; a test clicks once, so it has to clear the
- * popovers first.
- *
- * The guide is here and not only the network popup because adopting a machine
- * opens it: the taker is running a demo it did not launch, so the page shows
- * that demo's guide over the terminal the machine arrived with.
- *
- * Neither popover is tied to the link, so closing them changes nothing about
- * what is shared.
- */
-async function closeDockPopovers(pages: Page[]): Promise<void> {
-  for (const page of pages) {
-    for (const name of ["Network", "Guide"]) {
-      const button = page.getByRole("button", { name, exact: true });
-      // The guide button is absent on a machine with no guide at all.
-      if ((await button.count()) === 0) continue;
-      if ((await button.getAttribute("aria-expanded")) === "true") {
-        await button.click();
-      }
-      await expect(button).toHaveAttribute("aria-expanded", "false");
-    }
-  }
+async function terminalRows(page: Page, selector: string): Promise<number> {
+  return page.locator(`${selector} .xterm-rows > div`).count();
 }
 
 test("shares a running machine's terminal with a computer that has none", async ({
@@ -248,7 +79,7 @@ test("shares a running machine's terminal with a computer that has none", async 
     await expect(sharer.locator(".kshell-host .xterm-rows").first())
       .toBeVisible({ timeout: 120_000 });
 
-    await connectPeers(sharer, viewer);
+    await connectPeers(sharer, viewer, (reason) => test.skip(true, reason));
 
     // The popup exists to buy a connection, and there is one, so it is no
     // longer covering the machine it was opened to share.
@@ -407,7 +238,7 @@ test("says it is waiting only until the other computer shares something", async 
     // and opens nothing, which is the state this test is about.
     await sharer.goto(appUrl("/?demo=nginx"), { waitUntil: "domcontentloaded" });
     await viewer.goto(appUrl("/"), { waitUntil: "domcontentloaded" });
-    await connectPeers(sharer, viewer);
+    await connectPeers(sharer, viewer, (reason) => test.skip(true, reason));
 
     await expect(viewer.locator(".kempty-peer-note"))
       .toContainText("Waiting for the other computer to share a screen", {
@@ -463,7 +294,7 @@ test("shares a running fbDOOM screen with a computer that has none", async ({
       intervals: [1_000, 2_000, 3_000],
     }).toBeGreaterThan(4);
 
-    await connectPeers(sharer, viewer);
+    await connectPeers(sharer, viewer, (reason) => test.skip(true, reason));
 
     // fbDOOM writes to /dev/fb0 rather than mapping it, so the mirror has a
     // stream to forward and the sharer says it is forwarding it.
@@ -541,7 +372,7 @@ test("moves a running fbDOOM to the computer that was watching it", async ({
       intervals: [1_000, 2_000, 3_000],
     }).toBeGreaterThan(4);
 
-    await connectPeers(keeper, taker);
+    await connectPeers(keeper, taker, (reason) => test.skip(true, reason));
     await expect(taker.locator(".kshared-framebuffer"))
       .toBeVisible({ timeout: 90_000 });
 
@@ -666,7 +497,7 @@ test("carries the machine's files to the computer that takes it", async ({
       .poll(() => terminalText(keeper, ".kshell-host"), { timeout: 60_000 })
       .not.toContain(written);
 
-    await connectPeers(keeper, taker);
+    await connectPeers(keeper, taker, (reason) => test.skip(true, reason));
     await expect(taker.locator(".kshared-terminal"))
       .toBeVisible({ timeout: 90_000 });
 
@@ -747,7 +578,7 @@ test("moves the keyboard with the machine, in both directions", async ({
       .poll(() => terminalText(first, ".kshell-host"), { timeout: 60_000 })
       .toContain(kept);
 
-    await connectPeers(first, second);
+    await connectPeers(first, second, (reason) => test.skip(true, reason));
     await expect(second.locator(".kshared-terminal"))
       .toBeVisible({ timeout: 90_000 });
 

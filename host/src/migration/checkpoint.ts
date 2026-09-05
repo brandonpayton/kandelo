@@ -460,6 +460,16 @@ export interface CheckpointFreezeOptions {
    * holds its parent for as long as it likes. T0.6 question 3.
    */
   readonly vforkTimeoutMs: number;
+  /**
+   * Run once the machine's bytes have been read, while it is still parked.
+   *
+   * A replica restores this checkpoint and replays the decision log from its
+   * first entry, so the recorder has to start at exactly the state that was
+   * read. Starting it after the capture returned would leave every decision
+   * the machine made between the read and the resume in neither the state nor
+   * the log. Throwing here fails the capture, and the machine still resumes.
+   */
+  readonly onRead?: () => void;
 }
 
 class CheckpointTimeout extends Error {}
@@ -611,6 +621,7 @@ async function freezeAndRead(
     machine.holdProcessDispatch();
     held = true;
     checkpoint = readMachine(machine, armed);
+    options.onRead?.();
   } finally {
     machine.disarmUnwindRequests();
     if (held) unreleased = await machine.releaseProcessDispatch();

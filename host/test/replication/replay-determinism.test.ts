@@ -23,72 +23,14 @@ import type { ReplicationLogEntry } from "../../src/replication/log";
 import {
   compareMachineStateHashes,
   hashMachineCheckpoint,
-} from "../../src/replication/state-hash";
-
-const TIMEOUTS = { unwindTimeoutMs: 10_000, vforkTimeoutMs: 5_000 };
-
-/** Five `date` runs: five guest clock reads, no randomness, no external bytes. */
-const READS = 5;
-const GUEST = [
-  "sh",
-  "-c",
-  `i=0; while [ $i -lt ${READS} ]; do date +%s; i=$((i+1)); done`,
-];
-
-const pause = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
-
-/**
- * Take the machine once its last guest is gone.
- *
- * A guest's exit promise resolves before the kernel has finished reaping it,
- * and a freeze that arms a process which then leaves reports that rather than
- * capturing. Both waits below are for that same departure: `enumProcs` stops
- * naming the guest first, and the freeze stops finding it a moment later. The
- * refusal is transient by definition — it names a process that has just ended —
- * so it is retried, and every other refusal is reported.
- *
- * Hashing an idle machine is also what makes the comparison measure the
- * replay: a live process rewrites its own memory while it is being read.
- */
-async function captureWhenIdle(
-  host: NodeKernelHost,
-): Promise<MachineCheckpoint> {
-  for (let attempt = 0; attempt < 200; attempt++) {
-    // pid 1 is the machine's init, which is always listed and never leaves.
-    if ((await host.enumProcs()).every((proc) => proc.pid <= 1)) break;
-    await pause(25);
-  }
-  for (let attempt = 0; ; attempt++) {
-    const response = await host.captureCheckpointBytes(TIMEOUTS);
-    if (response.status === "captured") return response.checkpoint;
-    const ending = response.status === "failed"
-      && /ended during the checkpoint freeze/.test(response.reason);
-    if (!ending || attempt >= 40) {
-      throw new Error(`capture failed: ${JSON.stringify(response)}`);
-    }
-    await pause(25);
-  }
-}
-
-function collectStdout(): {
-  onStdout: (pid: number, data: Uint8Array) => void;
-  read: () => string;
-} {
-  let text = "";
-  const decoder = new TextDecoder();
-  return {
-    onStdout: (_pid, data) => {
-      text += decoder.decode(data);
-    },
-    read: () => text,
-  };
-}
-
-/** The seconds a `date +%s` transcript printed, in order. */
-function printedSeconds(stdout: string): number[] {
-  return stdout.trim().split("\n").map((line) => Number(line.trim()));
-}
+} from "../support/state-hash";
+import {
+  GUEST,
+  READS,
+  captureWhenIdle,
+  collectStdout,
+  printedSeconds,
+} from "../support/replication-machine";
 
 /** The seconds a log holds, in the order a replica takes them. */
 function loggedSeconds(log: readonly ReplicationLogEntry[]): number[] {

@@ -6,6 +6,7 @@
 
 import * as React from "react";
 import type { MachineHandover } from "./machine-handover";
+import type { MachineReplication } from "./machine-replication";
 import type { PeerSession } from "./peer-session";
 import type { FramebufferSharing } from "./shared-framebuffer";
 import type { PrimarySurface } from "../../../../../web-libs/kandelo-session/src/kernel-host";
@@ -64,6 +65,11 @@ function surfaceSummary(
  * Then the surface, and last a sentence that is not a surface: the whole
  * machine can leave this computer. Someone sharing a screen should not learn
  * only afterwards that the peer could take the machine drawing it.
+ *
+ * A computer running a replica holds a machine and is still the watcher, so
+ * it is named as one. Its machine is a copy of the other computer's, kept the
+ * same by the decisions crossing the wire, and it may no more be typed into
+ * than a mirrored screen may.
  */
 function sharedSummary(
   hasMachine: boolean,
@@ -72,7 +78,14 @@ function sharedSummary(
   terminal: boolean,
   screen: FramebufferSharing,
   machine: boolean,
+  replication: MachineReplication,
 ): string {
+  if (replication.replicating) {
+    return "The other computer holds the machine, so it is the one that "
+      + "types. This computer is running a copy of it, following the "
+      + "decisions it makes rather than the pixels it draws. Take it over to "
+      + "run it here and type into it.";
+  }
   if (!hasMachine || presenting === null) {
     return peerHasMachine
       ? "The other computer holds the machine, so it is the one that types. "
@@ -83,7 +96,10 @@ function sharedSummary(
   const lines = [
     "You hold the machine, so you are the one that types; the other computer "
     + "is watching.",
-    surfaceSummary(presenting, terminal, screen),
+    replication.publishing
+      ? "The other computer is running a copy of this machine, following "
+        + "every decision this one makes."
+      : surfaceSummary(presenting, terminal, screen),
   ];
   if (machine) {
     lines.push(
@@ -140,6 +156,15 @@ export const NetworkPopup: React.FC<{
    * other computer is shown, so it also decides what this popup reports.
    */
   presenting: PrimarySurface | null;
+  /**
+   * Whether one machine is running on both computers, and which side this is.
+   *
+   * It changes who this computer is more than what it is showing: a viewer
+   * running a replica holds a machine and still cannot type into it, and a
+   * summary derived from "does this computer hold a machine" alone would tell
+   * that person the opposite.
+   */
+  replication: MachineReplication;
 }> = ({
   session,
   sharingTerminal,
@@ -148,6 +173,7 @@ export const NetworkPopup: React.FC<{
   canTakeMachine,
   hasMachine,
   presenting,
+  replication,
 }) => {
   const connected = session.link !== null;
   const note = takeNote(handover);
@@ -199,14 +225,21 @@ export const NetworkPopup: React.FC<{
             sharingTerminal,
             sharingScreen,
             handover.offering,
+            replication,
           )}
         </div>
+        {replication.failure !== null && (
+          <div className="knetwork-replication-note" role="status">
+            {`Running a copy of this machine has not worked yet, and this `
+              + `computer keeps asking: ${replication.failure}`}
+          </div>
+        )}
 
         <section className="knetwork-section">
           <div className="knetwork-link-controls">
             <button
               type="button"
-              className="knetwork-button knetwork-disconnect"
+              className="knetwork-button"
               onClick={session.disconnect}
             >
               Disconnect

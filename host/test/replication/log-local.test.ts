@@ -171,6 +171,55 @@ describe("local replication log", () => {
     }
   });
 
+  it("ends one machine's recording, and serves the next one to the same peer", async () => {
+    const channel = `replication-test-${crypto.randomUUID()}`;
+    const computer = new LocalReplicationLog<string>(channel);
+    const replica = new LocalReplicationLog<string>(channel);
+    const first = new ReplicationLogRecorder();
+    const second = new ReplicationLogRecorder();
+    const serveFrom = (recorder: ReplicationLogRecorder, name: string) =>
+      computer.serve(async (publish) => {
+        const stopRecord = recorder.onRecord((entry) => publish([entry]));
+        return { machine: name, stop: async () => stopRecord() };
+      });
+
+    const stale = fakeSink();
+    const stopStale = replica.watch(stale.sink);
+    let stopServing = serveFrom(first, "the machine that was running");
+    try {
+      await expect(replica.join(5_000)).resolves
+        .toBe("the machine that was running");
+      recordClocks(first, 2);
+      await vi.waitFor(() => expect(stale.taken()).toHaveLength(2));
+
+      // Launching a demo destroys the machine a replica is a copy of and boots
+      // a different one. The replica has to be told, because its own computer
+      // shows nothing: it holds a machine before and after.
+      stopServing();
+      await vi.waitFor(() => expect(stale.ended()).toBe(1));
+
+      // And it has to join the replacement rather than follow along on the
+      // subscription it already has. A machine numbers its decisions from
+      // zero, so the watcher that counted the first one's discards every one
+      // of the second's as already seen.
+      stopServing = serveFrom(second, "the machine that replaced it");
+      const fresh = fakeSink();
+      const stopFresh = replica.watch(fresh.sink);
+      await expect(replica.join(5_000)).resolves
+        .toBe("the machine that replaced it");
+      recordClocks(second, 2);
+      await vi.waitFor(() => expect(fresh.taken()).toHaveLength(2));
+      expect(fresh.taken().map((entry) => entry.seq)).toEqual([0, 1]);
+      expect(stale.taken()).toHaveLength(2);
+      stopFresh();
+    } finally {
+      stopStale();
+      stopServing();
+      computer.close();
+      replica.close();
+    }
+  });
+
   it("loses no entry to a wire that holds its bytes", async () => {
     const [near, far] = FakeDataChannel.pair({ auto: false });
     const publisher = new LocalReplicationLog(new ChunkedMessageChannel(near));

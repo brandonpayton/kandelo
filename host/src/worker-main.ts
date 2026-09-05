@@ -3471,6 +3471,23 @@ export async function centralizedWorkerMain(
       kernelImports.kernel_clone = () => -STARTUP_EAGAIN;
     }
 
+    if (!hasForkInstrumentation) {
+      // The capturing kernel_checkpoint below is only installed for
+      // instrumented modules, so a freeze request would otherwise reach the
+      // startup stub, whose throw takes the process down. A program that
+      // cannot unwind is a boundary the capture reports; asking to read the
+      // machine must never be what kills a process on it.
+      kernelImports.kernel_checkpoint = (): void => {
+        port.postMessage({
+          type: "checkpoint_refused",
+          pid,
+          reason:
+            "this program was built without checkpoint instrumentation "
+            + "(wasm-fork-instrument), so its frames cannot be unwound",
+        } satisfies WorkerToHostMessage);
+      };
+    }
+
     if (hasForkInstrumentation) {
       const linkedFrameFormat = readLinkedFrameFormat(module);
       const moduleStateFormat = readForkModuleStateDescriptor(module);
@@ -5956,6 +5973,18 @@ export async function centralizedThreadWorkerMain(
             "wasm-fork-instrument exports. Rebuild the program with " +
             "scripts/run-wasm-fork-instrument.sh.",
         );
+      };
+      // Mirrors the process worker: a freeze request to a program that
+      // cannot unwind is refused, and the guest keeps running.
+      kernelImports.kernel_checkpoint = (): void => {
+        port.postMessage({
+          type: "checkpoint_refused",
+          pid,
+          tid,
+          reason:
+            "this program was built without checkpoint instrumentation "
+            + "(wasm-fork-instrument), so its frames cannot be unwound",
+        } satisfies WorkerToHostMessage);
       };
     }
     const threadLongjmpTag = createLongjmpTag(ptrWidth);

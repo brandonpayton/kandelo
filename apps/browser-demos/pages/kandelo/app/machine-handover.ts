@@ -70,6 +70,15 @@ export interface MachineHandover {
 export function useMachineHandover(
   host: KernelHost,
   link: PeerLink | null,
+  /**
+   * Whether this computer's machine is a replica of the peer's.
+   *
+   * A replica is a copy of one machine, not a second machine, so the computer
+   * holding one announces that it holds none. Offering it would let the peer
+   * take a copy of its own machine and leave two of them, each deciding for
+   * itself and neither following the other.
+   */
+  replicating: boolean,
 ): MachineHandover {
   const status = useStatus();
   const [taking, setTaking] = React.useState(false);
@@ -136,7 +145,7 @@ export function useMachineHandover(
   }, [handover]);
 
   React.useEffect(() => {
-    if (!handover || status !== "running") return;
+    if (!handover || status !== "running" || replicating) return;
     return handover.offer(
       () => host.captureMachine(),
       () => {
@@ -152,7 +161,7 @@ export function useMachineHandover(
       // something it could have fetched anyway.
       () => host.getBootDescriptor(),
     );
-  }, [handover, host, status]);
+  }, [handover, host, replicating, status]);
 
   const take = React.useCallback(() => {
     if (!handover) return;
@@ -184,7 +193,7 @@ export function useMachineHandover(
   }, [handover, host]);
 
   return {
-    offering: handover !== null && status === "running",
+    offering: handover !== null && status === "running" && !replicating,
     peerHasMachine,
     handedOver,
     taking,

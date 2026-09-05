@@ -15,6 +15,7 @@ import type { PcmTransportDescriptor } from "./audio/pcm-transport";
 import type { MountSpec } from "./vfs/default-mounts";
 import type { MachineCheckpoint } from "./migration/checkpoint";
 import type { ReplicationLogEntry } from "./replication/log";
+import type { ReplicationReplaySpec } from "./replication/worker";
 import {
   type BrowserCorsProxyConfig,
   validateBrowserCorsProxyConfig,
@@ -85,6 +86,17 @@ export interface InitMessage {
    * with.
    */
   restoreCheckpoint?: MachineCheckpoint;
+  /**
+   * Run this machine on a primary's decisions from its very first instruction.
+   *
+   * A replica joining a machine that is already running restores that
+   * machine's processes, and those processes resume inside this `init`. A
+   * `replication_replay_start` sent afterwards therefore arrives after they
+   * have read this computer's clock. Passing the replay here installs it
+   * between the machine's own setup and the first restored process, so the
+   * replica's first reading is the primary's.
+   */
+  replicationReplay?: ReplicationReplaySpec;
   /** Base URL for relative lazy file/archive URLs stored in vfsImage. */
   lazyUrlBase?: string;
   /** Exhaustive exact-byte lazy transport for this image; no network fallback. */
@@ -392,6 +404,15 @@ export interface CaptureCheckpointRequestMessage {
   unwindTimeoutMs: number;
   vforkTimeoutMs: number;
   includeBytes?: true;
+  /**
+   * Begin streaming the decision log from the state this capture reads.
+   *
+   * This is how a replica joins a running machine: it restores the checkpoint
+   * and replays from the log's first entry, so the two have to meet at one
+   * instant. The recorder starts while the machine is still parked, which no
+   * caller on the main thread can arrange for itself.
+   */
+  beginReplicationStream?: true;
 }
 
 /** Enable / disable the syscall trace ring buffer. Off by default — flip
@@ -418,25 +439,45 @@ export interface DrainSyscallTraceMessage {
 export interface ReplicationRecordStartMessage {
   type: "replication_record_start";
   requestId: number;
+  /**
+   * Publish each decision as it is made, and keep none.
+   *
+   * A live replica joins at boot and needs the log from sequence 0, so
+   * somebody must hold all of it. Streaming moves that holder to the main
+   * thread, where the wire is, rather than keeping a second copy here.
+   */
+  stream?: boolean;
 }
 
-/** Stop recording and take the log. Response carries ReplicationLogEntry[]. */
+/**
+ * Stop recording and take the log.
+ *
+ * Response carries the entries this recorder retained, which is none of them
+ * when it was started with `stream`.
+ */
 export interface ReplicationRecordStopMessage {
   type: "replication_record_stop";
   requestId: number;
 }
 
+/** Decisions a streaming recorder made, in the order it made them. */
+export interface ReplicationRecordedMessage {
+  type: "replication_recorded";
+  entries: readonly ReplicationLogEntry[];
+}
+
 /**
- * Serve the machine's decisions from `entries` instead of from this host.
+ * Serve the machine's decisions from a primary's log instead of from this host.
  *
- * Sent after `init` and before the replayed guest runs. A restore has already
- * happened by then, so one message covers both a fresh machine and a replica
- * that adopted a checkpoint.
+ * Sent after `init` and before the replayed guest runs, which covers a machine
+ * this host booted fresh. A replica that adopted a checkpoint cannot use it:
+ * its restored processes resume inside `init` and read the clock before this
+ * message could arrive, so it passes `replicationReplay` on {@link InitMessage}
+ * instead.
  */
-export interface ReplicationReplayStartMessage {
+export interface ReplicationReplayStartMessage extends ReplicationReplaySpec {
   type: "replication_replay_start";
   requestId: number;
-  entries: readonly ReplicationLogEntry[];
 }
 
 /**
@@ -451,7 +492,25 @@ export interface ReplicationReplayStopMessage {
   requestId: number;
 }
 
-/** What a replica took from the log it was replaying. */
+/**
+ * Say the primary's log grew, so the replica applies what needs no guest.
+ *
+ * A keystroke or a resize has no guest request to answer: a guest that is not
+ * reading the clock would never pull it out of the queue, and the queue is
+ * shared memory the kernel worker only looks at when asked. Fire-and-forget —
+ * the entries themselves travel on the queue, not here.
+ */
+export interface ReplicationReplayDrainMessage {
+  type: "replication_replay_drain";
+}
+
+/**
+ * What a replica took from the log it was replaying.
+ *
+ * `total` is what the replica had been given, which for a live replay is what
+ * the primary had recorded by the time it stopped rather than the whole of a
+ * finished recording.
+ */
 export interface ReplicationReplayProgress {
   readonly consumed: number;
   readonly total: number;
@@ -545,6 +604,7 @@ export type MainToKernelMessage =
   | ReplicationRecordStopMessage
   | ReplicationReplayStartMessage
   | ReplicationReplayStopMessage
+  | ReplicationReplayDrainMessage
   | HttpRequestMessage
   | KmsAttachCanvasMessage
   | KmsAttachStatsMessage
@@ -737,4 +797,5 @@ export type KernelToMainMessage =
   | FbForgetGenerationMessage
   | ProcEventMessage
   | HttpBridgePendingMessage
-  | LazyDownloadMessage;
+  | LazyDownloadMessage
+  | ReplicationRecordedMessage;

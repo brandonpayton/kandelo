@@ -253,6 +253,50 @@ describe("machine checkpoint freeze", () => {
     expect(Atomics.load(new Int32Array(freeze.gate), 0)).toBe(1);
   });
 
+  it("starts a decision log while the machine is still parked", async () => {
+    const state = testMachine([processSource(4, 1)]);
+    const freeze = state.sources[0]!.checkpointFreeze;
+    const seen: { gate: number; held: number[][]; released: number[][] }[] = [];
+    const capture = captureMachineCheckpoint(state.machine, {
+      ...options,
+      onRead: () => {
+        seen.push({
+          gate: Atomics.load(new Int32Array(freeze.gate), 0),
+          held: [...state.held],
+          released: [...state.released],
+        });
+      },
+    });
+    await flush();
+    freeze.unwound();
+    await capture;
+
+    // A replica adopts the state this read and replays the log from its first
+    // entry, so a decision the machine made between the two would belong to
+    // neither. Zero is the pending gate: the machine had not resumed.
+    expect(seen).toEqual([{ gate: 0, held: [[4]], released: [] }]);
+  });
+
+  it("fails the capture when the decision log cannot be started", async () => {
+    const state = testMachine([processSource(4, 1)]);
+    const capture = captureMachineCheckpoint(state.machine, {
+      ...options,
+      onRead: () => {
+        throw new Error("no swappable guest clock");
+      },
+    });
+    await flush();
+    state.sources[0]!.checkpointFreeze.unwound();
+
+    // Handing back a checkpoint whose log never started would give a replica
+    // a state to adopt and no decisions to follow it with.
+    await expect(capture).resolves.toMatchObject({
+      status: "failed",
+      reason: expect.stringContaining("no swappable guest clock"),
+    });
+    expect(state.released).toEqual([[4]]);
+  });
+
   it("admits no worker creation and no rootfs mutation while it runs", async () => {
     const state = testMachine([processSource(4, 1)]);
     const capture = captureMachineCheckpoint(state.machine, options);
