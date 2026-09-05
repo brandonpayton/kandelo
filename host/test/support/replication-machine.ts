@@ -2,9 +2,10 @@
  * One Kandelo machine, shaped for a replication test.
  *
  * The guest below reads the clock and nothing else, which is what makes it a
- * fair subject: randomness and external bytes are not routed through the log
- * yet, so a guest that read either would produce a log complete for its clock
- * and silent about the rest.
+ * fair subject: randomness is not routed through the log yet, so a guest that
+ * read it would produce a log complete for its clock and silent about the
+ * rest. External bytes travel only as injected HTTP exchanges —
+ * `http-exchange.test.ts` — not yet as arbitrary socket reads.
  */
 import { expect } from "vitest";
 import type { NodeKernelHost } from "../../src/node-kernel-host";

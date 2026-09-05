@@ -119,6 +119,25 @@ export interface ReplicationResizeEvent {
 }
 
 /**
+ * One HTTP request the host injected into the machine, as it injected it.
+ *
+ * A server guest observes an injected connection three ways: the accept that
+ * hands it a peer, the peer's port, and the request bytes it reads. All three
+ * are host-produced — the primary's bridge even draws the peer port at
+ * random — so all three travel. The response is not here: it is the machine's
+ * own output, and a replica that runs the same machine computes it again.
+ */
+export interface ReplicationHttpExchange {
+  readonly kind: "http";
+  /** The in-kernel listener port the request was dispatched to. */
+  readonly port: number;
+  /** The synthetic peer port the primary drew for the injected connection. */
+  readonly remotePort: number;
+  /** The raw HTTP/1.1 request bytes, exactly as written into the pipe. */
+  readonly request: Uint8Array;
+}
+
+/**
  * A decision the host delivered without the guest asking for it.
  *
  * Nothing consumes one on its own, so a reader applies them as it passes
@@ -127,7 +146,8 @@ export interface ReplicationResizeEvent {
 export type ReplicationPushedDecision =
   | ReplicationInputEvent
   | ReplicationPointerEvent
-  | ReplicationResizeEvent;
+  | ReplicationResizeEvent
+  | ReplicationHttpExchange;
 
 /**
  * A value the host produced that the guest could not have derived itself.
@@ -149,6 +169,7 @@ function isPushedDecision(
     decision.kind === "input"
     || decision.kind === "pointer"
     || decision.kind === "resize"
+    || decision.kind === "http"
   );
 }
 
@@ -476,5 +497,8 @@ export class ReplicationLogReader {
 function describePushed(decision: ReplicationPushedDecision): string {
   if (decision.kind === "input") return `input for ${decision.device}`;
   if (decision.kind === "resize") return `a resize of ${decision.device}`;
+  if (decision.kind === "http") {
+    return `an HTTP request for port ${decision.port}`;
+  }
   return "a pointer movement";
 }

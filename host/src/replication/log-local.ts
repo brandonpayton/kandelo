@@ -65,11 +65,22 @@ export interface ReplicationLogSink {
    * on.
    */
   diverged(error: ReplicationDivergence): void;
+  /**
+   * The publisher's page walked its web preview to `path`.
+   *
+   * Presentation, not a decision: the machine's inputs already travel as
+   * `http` entries, and this names the page the publisher is looking at so a
+   * viewer walks its own preview to the same place. A sink without the
+   * callback ignores it — a viewer that cannot follow is stale, not
+   * diverged.
+   */
+  navigated?(path: string): void;
 }
 
 type LocalReplicationMessage<TMachine> =
   | { readonly kind: "hello" }
   | { readonly kind: "entries"; readonly entries: readonly ReplicationLogEntry[] }
+  | { readonly kind: "navigated"; readonly path: string }
   | { readonly kind: "ended" }
   | { readonly kind: "join"; readonly joinId: string }
   | { readonly kind: "withdrawn"; readonly joinId: string }
@@ -328,6 +339,17 @@ export class LocalReplicationLog<TMachine = never> {
   }
 
   /**
+   * Tell every watcher which page this machine's web preview is on.
+   *
+   * Sent by the publisher whenever its preview navigates, and once when the
+   * recording starts, so a viewer that joined mid-session still learns where
+   * the user is.
+   */
+  publishNavigation(path: string): void {
+    this.#post({ kind: "navigated", path });
+  }
+
+  /**
    * Deliver the published log into `sink`, in order and without a hole.
    *
    * Says hello so a running publisher answers with what it has. A watcher that
@@ -342,6 +364,10 @@ export class LocalReplicationLog<TMachine = never> {
       const message = event.data as LocalReplicationMessage<TMachine>;
       if (message.kind === "ended") {
         sink.ended();
+        return;
+      }
+      if (message.kind === "navigated") {
+        sink.navigated?.(message.path);
         return;
       }
       if (message.kind !== "entries") return;

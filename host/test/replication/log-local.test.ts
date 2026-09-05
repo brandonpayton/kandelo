@@ -280,4 +280,36 @@ describe("local replication log", () => {
       stopWatch();
     }
   });
+  it("tells a watcher which page the publisher's preview is on", async () => {
+    const channel = `replication-test-${crypto.randomUUID()}`;
+    const publisher = new LocalReplicationLog(channel);
+    const following = new LocalReplicationLog(channel);
+    const plain = new LocalReplicationLog(channel);
+    const recorder = new ReplicationLogRecorder();
+    const stopPublish = publisher.publish(recorder);
+    const followingSink = fakeSink();
+    const plainSink = fakeSink();
+    const paths: string[] = [];
+    const stopFollowing = following.watch({
+      ...followingSink.sink,
+      navigated: (path) => void paths.push(path),
+    });
+    const stopPlain = plain.watch(plainSink.sink);
+    try {
+      publisher.publishNavigation("/wp-admin/");
+      await vi.waitFor(() => expect(paths).toEqual(["/wp-admin/"]));
+      // A navigation is presentation, not a log entry, and a sink without
+      // the callback keeps receiving entries.
+      recordClocks(recorder, 2);
+      await vi.waitFor(() => expect(plainSink.taken()).toHaveLength(2));
+      expect(followingSink.taken()).toHaveLength(2);
+    } finally {
+      stopFollowing();
+      stopPlain();
+      stopPublish();
+      publisher.close();
+      following.close();
+      plain.close();
+    }
+  });
 });

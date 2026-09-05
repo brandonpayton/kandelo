@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { GlQueryTap } from "../../src/kernel";
+import type { HttpExchangeTap } from "../../src/networking/in-kernel-http";
 import type { ReplicationLogEntry } from "../../src/replication/log";
 import {
+  ReplayedHttpExchanges,
   beginReplicationReplay,
   beginReplicationStream,
 } from "../../src/replication/worker";
@@ -12,10 +14,12 @@ function machineSurface() {
     provider: TimeProvider | null;
     tap: GlQueryTap | null;
     behindProbe: (() => boolean) | null;
+    httpTap: HttpExchangeTap | null;
   } = {
     provider: null,
     tap: null,
     behindProbe: null,
+    httpTap: null,
   };
   return {
     installed,
@@ -24,12 +28,15 @@ function machineSurface() {
         installed.provider = provider;
       },
     },
-    glQueries: {
+    taps: {
       setGlQueryTap: (tap: GlQueryTap | null) => {
         installed.tap = tap;
       },
       setReplicationBehindProbe: (probe: (() => boolean) | null) => {
         installed.behindProbe = probe;
+      },
+      setHttpExchangeTap: (tap: HttpExchangeTap | null) => {
+        installed.httpTap = tap;
       },
     },
     clock: {
@@ -47,18 +54,26 @@ describe("beginReplicationStream", () => {
       surface.io,
       surface.clock,
       (entries) => published.push(...entries),
-      surface.glQueries,
+      surface.taps,
     );
 
     surface.installed.provider!.clockGettime(1);
     expect(surface.installed.tap?.mode).toBe("record");
     if (surface.installed.tap?.mode !== "record") return;
     surface.installed.tap.record(5, 4, new Uint8Array([1, 0, 0, 0]));
+    expect(surface.installed.httpTap?.mode).toBe("record");
+    if (surface.installed.httpTap?.mode !== "record") return;
+    surface.installed.httpTap.record({
+      port: 80,
+      remotePort: 4242,
+      request: new Uint8Array([71]),
+    });
     await Promise.resolve();
 
     expect(published.map((entry) => entry.decision.kind)).toEqual([
       "clock",
       "gl",
+      "http",
     ]);
   });
 });
@@ -77,7 +92,7 @@ describe("beginReplicationReplay", () => {
       surface.io,
       surface.clock,
       { entries },
-      surface.glQueries,
+      surface.taps,
     );
 
     expect(surface.installed.behindProbe?.()).toBe(true);
@@ -91,5 +106,34 @@ describe("beginReplicationReplay", () => {
     expect(answer.rc).toBe(4);
     expect(answer.bytes).toEqual(new Uint8Array([1, 0, 0, 0]));
     expect(surface.installed.behindProbe?.()).toBe(false);
+    expect(surface.installed.httpTap?.mode).toBe("replay");
+  });
+});
+
+describe("ReplayedHttpExchanges", () => {
+  it("hands a parked fetch the response its replay later computes", async () => {
+    const store = new ReplayedHttpExchanges<string>();
+    const parked = store.take("GET /");
+    store.deliver("GET /", "hello");
+    await expect(parked).resolves.toBe("hello");
+  });
+
+  it("serves the latest response for a request line delivered twice", async () => {
+    const store = new ReplayedHttpExchanges<string>();
+    store.deliver("GET /", "first");
+    store.deliver("GET /", "second");
+    await expect(store.take("GET /")).resolves.toBe("second");
+  });
+
+  it("resolves null for a request the primary never made", async () => {
+    const store = new ReplayedHttpExchanges<string>(20);
+    await expect(store.take("GET /missing")).resolves.toBeNull();
+  });
+
+  it("releases every parked fetch with null on drop", async () => {
+    const store = new ReplayedHttpExchanges<string>();
+    const parked = store.take("GET /");
+    store.drop();
+    await expect(parked).resolves.toBeNull();
   });
 });

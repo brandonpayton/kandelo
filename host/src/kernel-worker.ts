@@ -84,6 +84,8 @@ import {
 import {
   buildRawHttpRequest,
   parseRawHttpResponse,
+  parseRawRequestLine,
+  type HttpExchangeTap,
   type HttpRequest,
   type HttpResponse,
   type SendHttpRequestOptions,
@@ -3348,6 +3350,8 @@ export class CentralizedKernelWorker {
   private networkListenObserver:
     | ((pid: number, fd: number, port: number) => void)
     | undefined;
+  private httpExchangeTap: HttpExchangeTap | null = null;
+  private replayedInjectionChain: Promise<void> = Promise.resolve();
   /** KMS presenter: OffscreenCanvas per CRTC for the vblank pump to blit
    *  the bound framebuffer into. Populated via `attachKmsCanvas`. */
   private kmsCanvases = new Map<number, OffscreenCanvas>();
@@ -31746,6 +31750,76 @@ export class CentralizedKernelWorker {
   // ---------------------------------------------------------------------------
 
   /**
+   * Watch or replace the injections `sendHttpRequest` makes, for replication.
+   *
+   * An injected request is a machine input exactly like a keystroke: the
+   * guest observes the connection, the peer port this host drew, and the
+   * request bytes. A recording machine hands all three to the tap before the
+   * guest can observe them; a replaying machine refuses live injections
+   * outright, because an injection the primary never made is a machine that
+   * is silently no longer the same machine.
+   */
+  setHttpExchangeTap(tap: HttpExchangeTap | null): void {
+    this.httpExchangeTap = tap;
+  }
+
+  /**
+   * Deliver one recorded HTTP injection to a replaying machine.
+   *
+   * The primary's listener existed at the log position it recorded the
+   * injection; a replica applying the log can reach that position before its
+   * own guest has reached `listen()`, so the injection waits for the
+   * listener rather than refusing. Injections chain in log order — the
+   * guest must observe the primary's connections in the primary's order —
+   * while the response pumps overlap, exactly as the primary's did. The
+   * returned promise carries the response this machine computes: its own
+   * output, not the primary's.
+   */
+  replayHttpExchange(
+    exchange: { port: number; remotePort: number; request: Uint8Array },
+    opts: SendHttpRequestOptions = {},
+  ): Promise<HttpResponse> {
+    const method = parseRawRequestLine(exchange.request).method;
+    const label = opts.debugLabel
+      ?? `replayed ${method} on port ${exchange.port}`;
+    const timeoutMs = opts.timeoutMs ?? 60_000;
+    const injected = this.replayedInjectionChain.then(async () => {
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const target = this.pickListenerTarget(exchange.port);
+        if (target) {
+          return this.openInjectedHttpExchange(
+            target,
+            exchange.remotePort,
+            exchange.request,
+            label,
+          );
+        }
+        if (Date.now() > deadline) {
+          throw new Error(`No in-kernel listener for port ${exchange.port}`);
+        }
+        await new this.#promiseReceiver<void>((resolve) => {
+          this.#registerTimeout(resolve, 25);
+        });
+      }
+    });
+    this.replayedInjectionChain = injected.then(
+      () => undefined,
+      () => undefined,
+    );
+    return injected.then(({ sendPipeIdx, recvPipeIdx }) =>
+      this.pumpHttpResponse(
+        0,
+        sendPipeIdx,
+        recvPipeIdx,
+        timeoutMs,
+        opts.maxResponseBytes ?? Number.MAX_SAFE_INTEGER,
+        method,
+        label,
+      ));
+  }
+
+  /**
    * Send an HTTP/1.1 request to a server running inside the kernel and
    * resolve with the parsed response. Bypasses real TCP — uses
    * `kernel_inject_connection` + `kernel_pipe_*` directly.
@@ -31765,6 +31839,13 @@ export class CentralizedKernelWorker {
       throw new Error("in-kernel HTTP response bound must be a positive safe integer");
     }
     const label = opts.debugLabel ?? `${request.method} ${request.url}`;
+    const tap = this.httpExchangeTap;
+    if (tap?.mode === "replay") {
+      throw new Error(
+        `[in-kernel-http ${label}] a replica cannot take a live HTTP `
+          + `request: an injection the primary never made diverges the machine`,
+      );
+    }
 
     const target = this.pickListenerTarget(port);
     if (!target) {
@@ -31774,41 +31855,20 @@ export class CentralizedKernelWorker {
     // Synthetic remote — picked from the ephemeral range so the kernel
     // doesn't think two simultaneous external calls share a 4-tuple.
     const remotePort = 1024 + Math.floor(Math.random() * 60_000);
-    const recvPipeIdx = this.injectConnection(
-      target.pid,
-      target.fd,
-      [127, 0, 0, 1],
-      remotePort,
-    );
-    if (recvPipeIdx < 0) {
-      throw new Error(
-        `[in-kernel-http ${label}] kernel_inject_connection failed (${recvPipeIdx})`,
-      );
-    }
-    const sendPipeIdx = recvPipeIdx + 1;
-    const globalPipePid = 0;
-
-    // Write the request bytes through the TCP scratch buffer.
     const rawRequest = buildRawHttpRequest(request);
-    const written = this.writePipeData(
-      globalPipePid,
-      recvPipeIdx,
+    // Recorded before it is delivered, so the log holds the injection at the
+    // position the guest observes it.
+    tap?.record({ port, remotePort, request: rawRequest });
+    const { sendPipeIdx, recvPipeIdx } = this.openInjectedHttpExchange(
+      target,
+      remotePort,
       rawRequest,
+      label,
     );
-    if (written < rawRequest.length) {
-      // Partial write here would mean the recv pipe filled up before the
-      // server even started reading. Treat as a hard error for the prototype.
-      this.closePipeWrite(globalPipePid, recvPipeIdx);
-      this.closePipeRead(globalPipePid, sendPipeIdx);
-      throw new Error(
-        `[in-kernel-http ${label}] partial write ${written}/${rawRequest.length}`,
-      );
-    }
-    this.notifyPipeReadable(recvPipeIdx);
 
     // Pump the response.
     const response = await this.pumpHttpResponse(
-      globalPipePid,
+      0,
       sendPipeIdx,
       recvPipeIdx,
       timeoutMs,
@@ -31830,6 +31890,52 @@ export class CentralizedKernelWorker {
       });
     }
     return response;
+  }
+
+  /**
+   * Open one injected connection and deliver the request bytes into it.
+   *
+   * Synchronous on purpose: this is the part of an HTTP exchange the guest
+   * observes, so a replaying machine applies it at the exact log position the
+   * recording machine made it. The response pump stays with the caller.
+   */
+  private openInjectedHttpExchange(
+    target: { pid: number; fd: number },
+    remotePort: number,
+    rawRequest: Uint8Array,
+    label: string,
+  ): { sendPipeIdx: number; recvPipeIdx: number } {
+    const recvPipeIdx = this.injectConnection(
+      target.pid,
+      target.fd,
+      [127, 0, 0, 1],
+      remotePort,
+    );
+    if (recvPipeIdx < 0) {
+      throw new Error(
+        `[in-kernel-http ${label}] kernel_inject_connection failed (${recvPipeIdx})`,
+      );
+    }
+    const sendPipeIdx = recvPipeIdx + 1;
+    const globalPipePid = 0;
+
+    // Write the request bytes through the TCP scratch buffer.
+    const written = this.writePipeData(
+      globalPipePid,
+      recvPipeIdx,
+      rawRequest,
+    );
+    if (written < rawRequest.length) {
+      // Partial write here would mean the recv pipe filled up before the
+      // server even started reading. Treat as a hard error for the prototype.
+      this.closePipeWrite(globalPipePid, recvPipeIdx);
+      this.closePipeRead(globalPipePid, sendPipeIdx);
+      throw new Error(
+        `[in-kernel-http ${label}] partial write ${written}/${rawRequest.length}`,
+      );
+    }
+    this.notifyPipeReadable(recvPipeIdx);
+    return { sendPipeIdx, recvPipeIdx };
   }
 
   /**

@@ -56,7 +56,13 @@ import {
   beginReplicationReplay,
   beginReplicationStream,
   glQueryRecordTap,
+  httpExchangeRecordTap,
+  ReplayedHttpExchanges,
 } from "./replication/worker";
+import {
+  parseRawRequestLine,
+  type HttpResponse,
+} from "./networking/in-kernel-http";
 import { restoreBrowserKernelInitMounts } from "./browser-kernel-vfs-init";
 import type { FileSystemBackend, MountConfig } from "./vfs/types";
 import { TlsNetworkBackend } from "./networking/tls-network-backend";
@@ -944,6 +950,24 @@ function respondToReplication(
 function applyPushedDecision(decision: ReplicationPushedDecision): void {
   if (decision.kind === "pointer") {
     kernelWorker.injectMouseEvent(decision.dx, decision.dy, decision.buttons);
+    return;
+  }
+  if (decision.kind === "http") {
+    // The injection lands synchronously, at this log position. The response
+    // is this machine's own output; it settles later, into the store the
+    // viewer's bridge serves from.
+    const line = parseRawRequestLine(decision.request);
+    void kernelWorker
+      .replayHttpExchange(decision)
+      .then((response) => {
+        replayedHttpExchanges.deliver(`${line.method} ${line.target}`, response);
+      })
+      .catch((err) => {
+        console.warn(
+          `[replication] replayed ${line.method} ${line.target} failed:`,
+          err,
+        );
+      });
     return;
   }
   const ptyIdx = ptsDeviceIndex(decision.device);
@@ -5072,10 +5096,37 @@ function handleRegisterPtyOutput(msg: Extract<MainToKernelMessage, { type: "regi
 //      programmatic access without going through a service worker.
 //
 // Both end up calling kernelWorker.sendHttpRequest() with the same shape.
+//
+// A replaying machine is the exception: its injections come from the
+// primary's log, and its own page is served from the responses those
+// replayed injections produce. A live injection on a replica is refused —
+// see `HttpExchangeTap`.
+
+const replayedHttpExchanges = new ReplayedHttpExchanges<HttpResponse>();
 
 async function handleHttpRequest(requestId: number, request: any) {
   if (!kernelWorker.isKernelInitialized() || !bridgePort) return;
   const portRef = bridgePort;
+  if (replicationReplay !== null) {
+    const key = `${request.method} ${request.url || "?"}`;
+    const replayed = await replayedHttpExchanges.take(key);
+    if (replayed === null) {
+      portRef.postMessage({
+        type: "http-error",
+        requestId,
+        error: `the machine being viewed never served ${key}`,
+      });
+      return;
+    }
+    portRef.postMessage({
+      type: "http-response",
+      requestId,
+      status: replayed.status,
+      headers: replayed.headers,
+      body: replayed.body,
+    });
+    return;
+  }
   const activityId = beginBridgeRequest();
   const url = request.url || "?";
 
@@ -5142,6 +5193,22 @@ async function handleHttpRequestMessage(msg: {
 }) {
   if (!kernelWorker.isKernelInitialized()) {
     respondError(msg.requestId, "Kernel not initialized");
+    return;
+  }
+  if (replicationReplay !== null) {
+    // A replaying machine takes its injections from the primary's log; a
+    // fetch here reads the response the replayed injection produced instead
+    // of making an injection of its own.
+    const key = `${msg.request.method} ${msg.request.url}`;
+    const replayed = await replayedHttpExchanges.take(key);
+    if (replayed === null) {
+      respondError(
+        msg.requestId,
+        `the machine being viewed never served ${key}`,
+      );
+      return;
+    }
+    respond(msg.requestId, replayed);
     return;
   }
   try {
@@ -5354,6 +5421,9 @@ sw.onmessage = (e: MessageEvent) => {
           new RecordingTimeProvider(clock, replicationRecorder),
         );
         kernelWorker.setGlQueryTap(glQueryRecordTap(replicationRecorder));
+        kernelWorker.setHttpExchangeTap(
+          httpExchangeRecordTap(replicationRecorder),
+        );
       });
       break;
     }
@@ -5362,6 +5432,7 @@ sw.onmessage = (e: MessageEvent) => {
       replicationRecorder = null;
       if (io && baseTimeProvider) io.setTimeProvider(baseTimeProvider);
       kernelWorker?.setGlQueryTap(null);
+      kernelWorker?.setHttpExchangeTap(null);
       respond(msg.requestId, recorder?.entries ?? []);
       break;
     }
@@ -5385,6 +5456,8 @@ sw.onmessage = (e: MessageEvent) => {
       if (io && baseTimeProvider) io.setTimeProvider(baseTimeProvider);
       kernelWorker?.setGlQueryTap(null);
       kernelWorker?.setReplicationBehindProbe(null);
+      kernelWorker?.setHttpExchangeTap(null);
+      replayedHttpExchanges.drop();
       respond(msg.requestId, {
         consumed: replay?.reader.consumed ?? 0,
         total: replay?.reader.known ?? 0,
