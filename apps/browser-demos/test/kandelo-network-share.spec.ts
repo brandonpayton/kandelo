@@ -46,6 +46,10 @@ async function terminalText(page: Page, selector: string): Promise<string> {
     .evaluate((node) => node.textContent ?? "");
 }
 
+async function terminalRows(page: Page, selector: string): Promise<number> {
+  return page.locator(`${selector} .xterm-rows > div`).count();
+}
+
 test("shares a running machine's terminal with a computer that has none", async ({
   browser,
   baseURL,
@@ -127,6 +131,29 @@ test("shares a running machine's terminal with a computer that has none", async 
     await expect(viewer.locator(".kshared-terminal")).toBeVisible();
     await expect(viewer.locator(".kshared-terminal-head"))
       .toContainText("Terminal on the other computer", { timeout: 60_000 });
+
+    // The viewer renders the sharer's machine, so it must render it at the
+    // sharer's size. A session reports its geometry only once an emulator has
+    // attached, and the viewer skips a zero, so a viewer left at xterm's
+    // default would replay the sharer's byte log at the wrong width and split
+    // that shell's in-place prompt redraws into separate visible prompts.
+    const sharerRows = await terminalRows(sharer, ".kshell-host");
+    expect(sharerRows).toBeGreaterThan(0);
+    await expect
+      .poll(() => terminalRows(viewer, ".kshared-terminal"), { timeout: 60_000 })
+      .toBe(sharerRows);
+
+    // An open popover lays a dismiss layer across the page, which swallows
+    // the pointer-down that would focus a terminal. Close both with the
+    // toggle that opened them; the link is not tied to the popover.
+    for (const page of [sharer, viewer]) {
+      const networkButton = page.getByRole("button", {
+        name: "Network",
+        exact: true,
+      });
+      await networkButton.click();
+      await expect(networkButton).toHaveAttribute("aria-expanded", "false");
+    }
 
     // Text the sharer's machine printed reaches the viewer.
     const fromSharer = `kandelo-share-${Date.now().toString(36)}`;

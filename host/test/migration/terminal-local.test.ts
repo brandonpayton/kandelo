@@ -106,6 +106,53 @@ describe("local terminal mirror", () => {
     }
   });
 
+  it("gives a watcher that joins mid-stream each byte exactly once", async () => {
+    const channel = `terminal-test-${crypto.randomUUID()}`;
+    const publisher = new LocalTerminalMirror(channel);
+    const watcher = new LocalTerminalMirror(channel);
+    const terminal = fakeTerminal();
+    const stopPublish = publisher.publish(PTY, terminal.source);
+    terminal.emit("kandelo$ ");
+    const sink = fakeSink();
+    // The seeding reset and this output cross on the wire: the machine keeps
+    // printing while the watcher's hello is still travelling. Output the seed
+    // already carries must not land on screen a second time.
+    const stopWatch = watcher.watch(sink.sink);
+    terminal.emit("echo hi\r\n");
+    try {
+      await vi.waitFor(() =>
+        expect(sink.text(PTY)).toBe("kandelo$ echo hi\r\n"),
+      );
+    } finally {
+      stopPublish();
+      stopWatch();
+      publisher.close();
+      watcher.close();
+    }
+  });
+
+  it("does not double a terminal that is published again", async () => {
+    const channel = `terminal-test-${crypto.randomUUID()}`;
+    const publisher = new LocalTerminalMirror(channel);
+    const watcher = new LocalTerminalMirror(channel);
+    const terminal = fakeTerminal();
+    const sink = fakeSink();
+    const stopWatch = watcher.watch(sink.sink);
+    // A dropped link republishes the same PTY. The watcher renders one
+    // machine, so it must see one copy of what that machine printed.
+    publisher.publish(PTY, terminal.source)();
+    const stopPublish = publisher.publish(PTY, terminal.source);
+    terminal.emit("kandelo$ ");
+    try {
+      await vi.waitFor(() => expect(sink.text(PTY)).toBe("kandelo$ "));
+    } finally {
+      stopPublish();
+      stopWatch();
+      publisher.close();
+      watcher.close();
+    }
+  });
+
   it("writes a watcher's keystrokes into the terminal", async () => {
     const channel = `terminal-test-${crypto.randomUUID()}`;
     const publisher = new LocalTerminalMirror(channel);

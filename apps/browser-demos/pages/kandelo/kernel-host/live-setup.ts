@@ -615,6 +615,13 @@ export async function createLiveHost(
 
   const initialDescriptor = protectedProfile?.descriptor ??
     await descriptorForBootQuery(opts.vfsUrl, opts.demo);
+  // A page holds a machine at load only once the boot query or an ABI staging
+  // profile asks for one. Booting a default shell for a bare URL spends a
+  // whole image download on a choice the visitor never made, and leaves a page
+  // that came to watch another computer's machine contending with one of its
+  // own. A gallery launch arrives later, through applyBootDescriptor.
+  const machineRequested = protectedProfile !== undefined ||
+    Boolean(opts.demo?.trim()) || Boolean(opts.vfsUrl?.trim());
   let host: LiveKernelHost;
   let protectedBoot: Promise<void> | undefined;
   const activateProtectedProfile = (): Promise<void> => {
@@ -628,7 +635,7 @@ export async function createLiveHost(
     return protectedBoot;
   };
   host = new LiveKernelHost({
-    status: "booting",
+    status: machineRequested ? "booting" : "idle",
     descriptor: initialDescriptor,
     galleryItems: localGalleryItems,
     applyBootDescriptor: async (desc, h) => {
@@ -691,11 +698,13 @@ export async function createLiveHost(
   };
 
   if (protectedProfile === undefined) {
-    void startBoot(
-      host,
-      profileForDescriptor(initialDescriptor, opts.fb),
-      initialDescriptor,
-    );
+    if (machineRequested) {
+      void startBoot(
+        host,
+        profileForDescriptor(initialDescriptor, opts.fb),
+        initialDescriptor,
+      );
+    }
   } else if (candidateVfsPlacement!.pagesLoad === null) {
     void activateProtectedProfile();
   } else {

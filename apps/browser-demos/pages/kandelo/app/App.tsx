@@ -389,7 +389,7 @@ export const App: React.FC = () => {
         networkConnected={peer.link !== null}
         themeOpen={themeOpen}
         status={surface.status}
-        machineTitle={desc.title}
+        machineTitle={isEmpty ? "Kandelo" : desc.title}
         viewDisabled={{
           demo: !surface.canOpenDemo,
           terminal: !surface.canUseTerminal,
