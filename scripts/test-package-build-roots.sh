@@ -106,6 +106,68 @@ if [ "${KANDELO_PACKAGE_BUILD_ROOTS_TEST_FOCUS:-}" = "fbdoom-git-input" ]; then
     exit 0
 fi
 
+run_spidermonkey_to_sysroot_gate() (
+    set -euo pipefail
+
+    local test_root="$1" stdout_file="$2"
+    shift 2
+
+    # The sysroot gate is the first check below the host SDK selection, so an
+    # empty sysroot stops the build there without running a compiler. The
+    # SourceOnly staging gate sits above the SDK selection and would exit
+    # first, so this contract is only observable outside that policy.
+    if env -u WASM_POSIX_RESOLUTION_POLICY "$@" \
+        WASM_POSIX_SYSROOT="$test_root/no-sysroot" \
+        WASM_POSIX_DEP_WORK_DIR="$test_root/work" \
+        WASM_POSIX_DEP_OUT_DIR="$test_root/out" \
+        WASM_POSIX_DEP_TARGET_ARCH=wasm32 \
+        bash "$REPO_ROOT/packages/registry/spidermonkey/build-spidermonkey.sh" \
+        >"$stdout_file" 2>"$test_root/stderr"; then
+        fail "SpiderMonkey ran past its missing sysroot"
+    fi
+    grep -F "sysroot not found" "$test_root/stderr" >/dev/null ||
+        fail "SpiderMonkey stopped before selecting its host macOS SDK"
+)
+
+test_spidermonkey_host_macos_sdk() (
+    set -euo pipefail
+    [ "$(uname -s)" = "Darwin" ] || return 0
+
+    local test_root selected override
+    test_root="$(mktemp -d)"
+    test_root="$(cd "$test_root" && pwd -P)"
+    trap 'rm -rf "$test_root"' EXIT
+    mkdir -p "$test_root/no-sysroot"
+
+    run_spidermonkey_to_sysroot_gate "$test_root" "$test_root/selected.stdout" \
+        -u WASM_POSIX_MACOS_SDK_DIR
+    selected="$(sed -n 's/^==> Using macOS SDK //p' "$test_root/selected.stdout")"
+    [ -n "$selected" ] ||
+        fail "SpiderMonkey did not report the host macOS SDK it selected"
+    case "$selected" in
+    /nix/store/*)
+        fail "SpiderMonkey selected the dev shell's nix macOS SDK: $selected"
+        ;;
+    esac
+    # mozbuild links host build scripts through Apple's cc with -nodefaultlibs,
+    # so NIX_LDFLAGS never applies and -liconv has to come from the SDK itself.
+    [ -e "$selected/usr/lib/libiconv.tbd" ] ||
+        fail "SpiderMonkey's host macOS SDK carries no libiconv: $selected"
+
+    override="$test_root/override-sdk"
+    mkdir -p "$override"
+    run_spidermonkey_to_sysroot_gate "$test_root" "$test_root/override.stdout" \
+        WASM_POSIX_MACOS_SDK_DIR="$override"
+    [ "$(sed -n 's/^==> Using macOS SDK //p' "$test_root/override.stdout")" = "$override" ] ||
+        fail "SpiderMonkey ignored the caller's WASM_POSIX_MACOS_SDK_DIR"
+)
+
+test_spidermonkey_host_macos_sdk
+if [ "${KANDELO_PACKAGE_BUILD_ROOTS_TEST_FOCUS:-}" = "spidermonkey-host-sdk" ]; then
+    echo "test-package-build-roots.sh: SpiderMonkey host macOS SDK contract ok"
+    exit 0
+fi
+
 netcat_script="$REPO_ROOT/packages/registry/netcat/build-netcat.sh"
 if grep -F 'automake --print-libdir' "$netcat_script" >/dev/null; then
     fail "netcat executes the relocated Automake wrapper to locate support data"

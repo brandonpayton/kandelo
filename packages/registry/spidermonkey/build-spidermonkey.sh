@@ -67,22 +67,51 @@ fi
 HOST_OS="$(uname -s)"
 MACOS_SDK_DIR="${WASM_POSIX_MACOS_SDK_DIR:-}"
 
-if [ "$HOST_OS" = "Darwin" ] && [ -z "$MACOS_SDK_DIR" ] && command -v xcrun >/dev/null 2>&1; then
-    SYSTEM_DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
-    if [ -d "$SYSTEM_DEVELOPER_DIR" ]; then
-        MACOS_SDK_DIR="$(DEVELOPER_DIR="$SYSTEM_DEVELOPER_DIR" xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)"
-        if [ -n "$MACOS_SDK_DIR" ]; then
+# The dev shell exports a nixpkgs apple-sdk as SDKROOT, and nixpkgs strips
+# libiconv from it because it ships libiconv as its own package. mozbuild
+# links host build scripts with `$HOST_CC -isysroot $SDKROOT -nodefaultlibs`
+# through Apple's /usr/bin/cc, which is not the nix cc-wrapper and so never
+# applies the -L that NIX_LDFLAGS carries. Rust's mozglue-static build script
+# links -liconv, so a host SDK without it fails with
+# `ld64.lld: error: library not found for -liconv`. Select a complete system
+# SDK for the host toolchain instead.
+if [ "$HOST_OS" = "Darwin" ] && [ -z "$MACOS_SDK_DIR" ]; then
+    for SYSTEM_DEVELOPER_DIR in \
+        "/Applications/Xcode.app/Contents/Developer" \
+        "/Library/Developer/CommandLineTools"; do
+        [ -d "$SYSTEM_DEVELOPER_DIR" ] || continue
+
+        # xcrun reports "unable to find sdk" on stdout, not stderr, so an
+        # unchecked capture turns the failure text into the SDK path.
+        SDK_CANDIDATE=""
+        if command -v xcrun >/dev/null 2>&1; then
+            SDK_CANDIDATE="$(DEVELOPER_DIR="$SYSTEM_DEVELOPER_DIR" xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)"
+        fi
+        if [ -d "$SDK_CANDIDATE" ]; then
+            MACOS_SDK_DIR="$SDK_CANDIDATE"
             export DEVELOPER_DIR="$SYSTEM_DEVELOPER_DIR"
             export SDKROOT="$MACOS_SDK_DIR"
+            break
         fi
-    else
-        MACOS_SDK_DIR="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)"
-    fi
+
+        # A Command Line Tools install carries the SDK but xcrun cannot select
+        # it from this developer directory. Leave DEVELOPER_DIR alone, so tools
+        # that already resolve through the dev shell keep working.
+        SDK_CANDIDATE="$SYSTEM_DEVELOPER_DIR/SDKs/MacOSX.sdk"
+        [ -d "$SDK_CANDIDATE" ] || continue
+        MACOS_SDK_DIR="$SDK_CANDIDATE"
+        export SDKROOT="$MACOS_SDK_DIR"
+        break
+    done
 fi
 
 if [ -n "$MACOS_SDK_DIR" ] && [ ! -d "$MACOS_SDK_DIR" ]; then
     echo "ERROR: macOS SDK not found at $MACOS_SDK_DIR." >&2
     exit 1
+fi
+
+if [ -n "$MACOS_SDK_DIR" ]; then
+    echo "==> Using macOS SDK $MACOS_SDK_DIR"
 fi
 
 if [ ! -f "$SYSROOT/lib/libc.a" ]; then

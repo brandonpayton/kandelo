@@ -230,6 +230,18 @@
         devShells.default = pkgs.mkShell {
           packages = devShellPackages;
 
+          # SpiderMonkey's configure rejects any macOS SDK below 15.5
+          # ("SDK version 14.4 is too old"), and nixpkgs' default apple-sdk
+          # is 14.4. A versioned SDK overrides that default from
+          # buildInputs; from `packages` it lands in nativeBuildInputs,
+          # where its setup hook never sets SDKROOT. This is the SDK the
+          # host-side build tools compile against. It does not reach the
+          # wasm32/wasm64 cross-compile, and it is not a tool on PATH, so
+          # it stays out of KANDELO_DEV_SHELL_TOOL_PATH.
+          buildInputs = pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.apple-sdk_15
+          ];
+
           shellHook = ''
             # On Darwin, nix develop can leave user profile and ambient
             # host prefix entries ahead of mkShell package bins. Reassert
