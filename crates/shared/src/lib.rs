@@ -116,7 +116,12 @@ pub mod process_layout;
 ///     no-result `kernel.kernel_checkpoint` unwind hook from the post-syscall
 ///     trampoline, and machine restore uses the host-handle enumerate and
 ///     remap, host-timer re-arm, and PTY-index kernel exports.
-pub const ABI_VERSION: u32 = 44;
+/// 45: the checkpoint request word is a bit set rather than a single value.
+///     The freeze completes a parked blocking syscall with `EINTR` so the
+///     process reaches the post-syscall trampoline at all, and publishes
+///     `CHECKPOINT_REQUEST_RESTART` alongside `CHECKPOINT_REQUEST_UNWIND` to
+///     tell the guest to resubmit that syscall once the rewind returns.
+pub const ABI_VERSION: u32 = 45;
 
 /// Byte width of Kandelo's Linux-compatible kernel CPU-affinity mask.
 ///
@@ -1347,13 +1352,23 @@ pub mod channel {
         * CHECKPOINT_AREA_ALIGNMENT;
     /// Base offset of the checkpoint request area.
     pub const CHECKPOINT_BASE: usize = SIG_BASE - CHECKPOINT_AREA_SIZE;
-    /// The checkpoint request word (u32). 0 = no request.
+    /// The checkpoint request word (u32), a bit set. 0 = no request.
     ///
     /// The host publishes it; the guest clears it once it has taken the
     /// request, so a later syscall on the same channel does not unwind again.
     pub const CHECKPOINT_REQUEST: usize = CHECKPOINT_BASE;
-    /// Request value: unwind this process's call stack into its linear memory.
+    /// Request bit: unwind this process's call stack into its linear memory.
     pub const CHECKPOINT_REQUEST_UNWIND: u32 = 1;
+    /// Request bit: resubmit the syscall this request rode in on.
+    ///
+    /// The freeze completes a parked syscall with `EINTR` to reach a boundary
+    /// the process would otherwise never reach. No signal was caught, so the
+    /// process is owed the call it was making rather than an interruption.
+    /// This bit is what tells the guest to make that call again.
+    pub const CHECKPOINT_REQUEST_RESTART: u32 = 2;
+    /// Every request bit the host may publish.
+    pub const CHECKPOINT_REQUEST_KNOWN_MASK: u32 =
+        CHECKPOINT_REQUEST_UNWIND | CHECKPOINT_REQUEST_RESTART;
 }
 
 #[cfg(test)]
@@ -1418,6 +1433,15 @@ mod channel_abi_tests {
         assert_eq!(channel::CHECKPOINT_BASE % channel::CHECKPOINT_AREA_ALIGNMENT, 0);
         assert!(channel::CHECKPOINT_BASE >= channel::DATA_OFFSET);
         assert_ne!(channel::CHECKPOINT_REQUEST_UNWIND, 0);
+        assert_ne!(channel::CHECKPOINT_REQUEST_RESTART, 0);
+        assert_eq!(
+            channel::CHECKPOINT_REQUEST_UNWIND & channel::CHECKPOINT_REQUEST_RESTART,
+            0,
+        );
+        assert_eq!(
+            channel::CHECKPOINT_REQUEST_KNOWN_MASK,
+            channel::CHECKPOINT_REQUEST_UNWIND | channel::CHECKPOINT_REQUEST_RESTART,
+        );
     }
 }
 

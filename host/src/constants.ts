@@ -2606,7 +2606,10 @@ export function describeWasmArtifactPolicyFailures(
     );
   }
   if (options.forbidForkInstrumentation && hasForkArtifactSurface) {
-    failures.push("contains ABI 43 wasm-fork-instrument metadata, imports, or exports");
+    failures.push(
+      `contains ABI ${options.expectedAbi} wasm-fork-instrument metadata, ` +
+        "imports, or exports",
+    );
   }
 
   const requireForkInstrumentation =

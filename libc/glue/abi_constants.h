@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 /* Mirrors wasm_posix_shared::ABI_VERSION. */
-#define WASM_POSIX_ABI_VERSION 44u
+#define WASM_POSIX_ABI_VERSION 45u
 
 /* Non-forking spawn syscall number. */
 #define WASM_POSIX_SYS_SPAWN 500u
@@ -79,6 +79,8 @@
 #define WASM_POSIX_CHANNEL_CHECKPOINT_BASE_OFFSET 65544u
 #define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_OFFSET 65544u
 #define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_UNWIND 1u
+#define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_RESTART 2u
+#define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_KNOWN_MASK 3u
 
 /* A known request without a lossless layout for this caller. */
 #define WASM_POSIX_IOCTL_UNSUPPORTED_SIZE UINT32_MAX

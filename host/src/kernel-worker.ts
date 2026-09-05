@@ -15015,18 +15015,26 @@ export class CentralizedKernelWorker {
         entry,
       )
     ) return false;
-    try {
-      const result = this.runSyntheticMemorySyscall(
-        channel,
-        SYS_THREAD_CANCEL,
-        [this.guestTidForChannel(channel)],
-        entry,
+    // WHY: this names the target task rather than re-entering its channel.
+    // `kernel_handle_channel` activates a blocking retry for the calling task
+    // and refuses one that already holds a binding with EBUSY, which is every
+    // task whose wait this method exists to retire.
+    const cancelHostOwnedWait = this.#kernelInstanceForEntry(entry).exports
+      .kernel_cancel_host_owned_wait as
+        ((pid: number, tid: number) => number) | undefined;
+    if (typeof cancelHostOwnedWait !== "function") {
+      this.#failBlockingRetryProtocol(
+        "kernel host-owned wait cancellation export is unavailable",
       );
-      // WHY: THREAD_CANCEL's cleanup proof is the exact pair (0, 0).
-      // Treating errno alone as success would let a malformed (-1, 0) or
-      // positive return retire host state and publish EINTR even though the
+    }
+    try {
+      // WHY: the cleanup proof is an exact 0. Treating a negative errno as
+      // success would retire host state and publish EINTR even though the
       // kernel never confirmed exact-task cleanup.
-      return result.retVal === 0 && result.errVal === 0;
+      return cancelHostOwnedWait(
+        channel.pid,
+        this.guestTidForChannel(channel),
+      ) === 0;
     } catch (error) {
       this.#rethrowKernelEntryFatal(error);
       // Process/thread teardown also owns idempotent kernel-side cleanup.

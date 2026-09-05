@@ -738,6 +738,9 @@ fn render_c_channel_contract() -> String {
          #define WASM_POSIX_CHANNEL_CHECKPOINT_BASE_OFFSET {checkpoint_base}u\n\
          #define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_OFFSET {checkpoint_request}u\n\
          #define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_UNWIND {checkpoint_request_unwind}u\n\
+         #define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_RESTART {checkpoint_request_restart}u\n\
+         #define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_KNOWN_MASK \
+         {checkpoint_request_known_mask}u\n\
          \n",
         status_idle = shared::ChannelStatus::Idle as u32,
         status_pending = shared::ChannelStatus::Pending as u32,
@@ -787,6 +790,8 @@ fn render_c_channel_contract() -> String {
         checkpoint_base = channel::CHECKPOINT_BASE,
         checkpoint_request = channel::CHECKPOINT_REQUEST,
         checkpoint_request_unwind = channel::CHECKPOINT_REQUEST_UNWIND,
+        checkpoint_request_restart = channel::CHECKPOINT_REQUEST_RESTART,
+        checkpoint_request_known_mask = channel::CHECKPOINT_REQUEST_KNOWN_MASK,
     )
 }
 
@@ -3077,8 +3082,16 @@ fn render_ts_module() -> String {
         channel::CHECKPOINT_REQUEST
     ));
     out.push_str(&format!(
-        "export const CH_CHECKPOINT_REQUEST_UNWIND = {} as const;\n\n",
+        "export const CH_CHECKPOINT_REQUEST_UNWIND = {} as const;\n",
         channel::CHECKPOINT_REQUEST_UNWIND
+    ));
+    out.push_str(&format!(
+        "export const CH_CHECKPOINT_REQUEST_RESTART = {} as const;\n",
+        channel::CHECKPOINT_REQUEST_RESTART
+    ));
+    out.push_str(&format!(
+        "export const CH_CHECKPOINT_REQUEST_KNOWN_MASK = {} as const;\n\n",
+        channel::CHECKPOINT_REQUEST_KNOWN_MASK
     ));
     out.push_str(&format!(
         "export const SIGNAL_ACTION_RESTART = {} as const;\n\n",
@@ -4794,7 +4807,7 @@ fn channel_checkpoint_area() -> Value {
     request.insert("size".into(), json!(CHECKPOINT_WIRE_SIZE));
     request.insert(
         "meaning".into(),
-        json!("u32 request word, host-published, guest-cleared (0=none)"),
+        json!("u32 request bit set, host-published, guest-cleared (0=none)"),
     );
     let mut m: JsonMap = BTreeMap::new();
     m.insert("area_size".into(), json!(CHECKPOINT_AREA_SIZE));
@@ -4807,6 +4820,14 @@ fn channel_checkpoint_area() -> Value {
     m.insert(
         "request_unwind".into(),
         json!(CHECKPOINT_REQUEST_UNWIND),
+    );
+    m.insert(
+        "request_restart".into(),
+        json!(CHECKPOINT_REQUEST_RESTART),
+    );
+    m.insert(
+        "request_known_mask".into(),
+        json!(CHECKPOINT_REQUEST_KNOWN_MASK),
     );
     m.insert(
         "slots".into(),
@@ -7675,6 +7696,8 @@ mod tests {
             "#define WASM_POSIX_CHANNEL_CHECKPOINT_BASE_OFFSET 65544u",
             "#define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_OFFSET 65544u",
             "#define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_UNWIND 1u",
+            "#define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_RESTART 2u",
+            "#define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_KNOWN_MASK 3u",
         ] {
             assert!(header.contains(expected), "missing generated C: {expected}");
         }
@@ -7699,6 +7722,8 @@ mod tests {
             "export const CH_CHECKPOINT_WIRE_SIZE = 4 as const;",
             "export const CH_CHECKPOINT_REQUEST = 65544 as const;",
             "export const CH_CHECKPOINT_REQUEST_UNWIND = 1 as const;",
+            "export const CH_CHECKPOINT_REQUEST_RESTART = 2 as const;",
+            "export const CH_CHECKPOINT_REQUEST_KNOWN_MASK = 3 as const;",
         ] {
             assert!(
                 typescript.contains(expected),

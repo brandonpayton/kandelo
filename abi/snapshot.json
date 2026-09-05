@@ -1,5 +1,5 @@
 {
-  "abi_version": 44,
+  "abi_version": 45,
   "channel_buffers": {
     "data_offset": 72,
     "data_size": 65536,
@@ -8,11 +8,13 @@
   "channel_checkpoint_area": {
     "area_size": 8,
     "base": 65544,
+    "request_known_mask": 3,
+    "request_restart": 2,
     "request_unwind": 1,
     "reserved_tail_size": 4,
     "slots": [
       {
-        "meaning": "u32 request word, host-published, guest-cleared (0=none)",
+        "meaning": "u32 request bit set, host-published, guest-cleared (0=none)",
         "name": "CHECKPOINT_REQUEST",
         "offset": 65544,
         "size": 4
@@ -991,7 +993,7 @@
   },
   "host_adapter": {
     "manifest": {
-      "abi_version": 44,
+      "abi_version": 45,
       "channel_data_offset": 72,
       "channel_data_size": 65536,
       "channel_header_size": 72,
@@ -1844,6 +1846,11 @@
       "kind": "func",
       "name": "kernel_brk",
       "signature": "(i32) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_cancel_host_owned_wait",
+      "signature": "(i32,i32) -> (i32)"
     },
     {
       "kind": "func",

@@ -2267,6 +2267,34 @@ pub extern "C" fn kernel_generate_host_signal(pid: u32, signum: u32) -> i32 {
     0
 }
 
+/// Retire the kernel wait state one task holds, naming that task explicitly.
+///
+/// WHY: a checkpoint freeze has to move a process parked in a blocking syscall
+/// to its post-syscall hook, and the only way to do that is to complete the
+/// parked request. Completing it while the kernel still believes the task is
+/// waiting would leave the capture reading an incoherent machine, so the wait
+/// is retired first.
+///
+/// Routing that through the target's own channel as a synthetic
+/// `SYS_THREAD_CANCEL` cannot work. `kernel_handle_channel` activates a
+/// blocking retry for the calling task, and a task that already holds a
+/// binding is refused with `EBUSY` — which is every task this boundary exists
+/// to release. Like `kernel_generate_host_signal`, this export names the
+/// target explicitly and creates no caller task authority, so it reaches the
+/// parked task without competing with the retry it is retiring.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_cancel_host_owned_wait(pid: u32, tid: u32) -> i32 {
+    let _gkl = GklGuard::acquire();
+    let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+    let Some(proc) = table.get_mut(pid) else {
+        return -(Errno::ESRCH as i32);
+    };
+    match syscalls::cancel_host_owned_wait_for_live_tid(proc, tid) {
+        Ok(()) => 0,
+        Err(error) => -(error as i32),
+    }
+}
+
 /// Get fork exec path for a specific process.
 /// Writes path to buf, returns bytes written, 0 if no exec path, -ESRCH if not found.
 #[unsafe(no_mangle)]
