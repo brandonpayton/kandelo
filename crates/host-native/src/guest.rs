@@ -454,6 +454,14 @@ pub struct ForkProofOfUse {
     pub externrefs_resolved: i64,
     pub exnrefs_reconstructed: i64,
     pub gc_nodes_reconstructed: i64,
+    /// N1-I5 Task 3: static roots the `DRIVE_OP_STATIC_ROOT` step published
+    /// into the anyref transit. Stays `0` unless the fork's graph actually
+    /// contains a static-root recipe.
+    pub static_roots_published: i64,
+    /// N1-I5 Task 3: plan steps `fm_drive_execute`'s injected loop drove
+    /// (ALLOC/FILL/EXN/STATIC_ROOT/EXTERNREF_TRANSIT). Stays `0` for a
+    /// funcref/externref-only fork, which builds a zero-step plan.
+    pub drive_steps_executed: i64,
 }
 
 // --- Raw shared-memory access helpers ---------------------------------------
@@ -572,6 +580,121 @@ fn grow_to_cover(mem: &SharedMemory, end_addr: usize) -> anyhow::Result<()> {
         mem.grow(required_pages - current_pages)
             .map_err(|e| anyhow::anyhow!("guest memory.grow to {required_pages} pages failed: {e}"))?;
     }
+    Ok(())
+}
+
+/// N1-I5 Task 3: write a genuinely-valid module-state (KFMS) arena at
+/// `scratch_addr` (which the caller has already reserved as a page-aligned,
+/// otherwise-unused slice of the co-resident fork-module's own region — see
+/// [`instantiate_fork_module`]'s `reference_scratch_base` computation) — the
+/// `module_state_root` [`drive_reference_replay`]'s `fm_begin_reference_
+/// replay` call needs.
+///
+/// Native has no module-state CAPTURE mechanism yet (the whole
+/// `__wpk_fork_module_state_*` guest-import family stays inert — see this
+/// file's N1-I4 doc comments on `define_unknown_imports_as_traps`), so no
+/// fork today produces a REAL arena. This is not a fabricated success: the
+/// arena this writes is a genuinely valid, SEALED KFMS chunk carrying exactly
+/// ONE reference-transaction record pair (a `NODES` segment + its `KFRV`
+/// manifest) encoding the CANONICAL NULL-ONLY graph
+/// (`fork_codec::ReferenceGraphBuilder::begin()`, never mutated) — the same
+/// minimal graph `reference_segments_writer`'s own
+/// `round_trips_minimal_null_only_graph` test proves round-trips through the
+/// module's decoder. A literally record-less chunk was tried first and
+/// rejected the manifest's own admissibility rule: `parse()`
+/// (`fork-codec/src/reference_segments.rs`) requires `node_count >= 1` (every
+/// real transaction — including a frames-only, no-live-reference fork on
+/// Node/browser — always carries at least the canonical Null sentinel node),
+/// so a zero-record chunk is not a valid empty transaction, it is simply
+/// malformed (`fm_last_errno` `EINVAL`, confirmed empirically). Encoding the
+/// canonical null-only graph is the true byte-for-byte floor of "this fork
+/// captured no reference": `fm_begin_reference_replay`'s own admissibility
+/// gate (`driver.all_nodes_module_admissible()`) trivially admits a
+/// null-only graph, and its bookkeeping counters stay at `0` (there is no
+/// externref/exnref/GC node to count) — proof-of-use is unaffected. Uses the
+/// module's OWN encoder (`fork_codec::ReferenceSegmentsWriter`, the exact
+/// inverse of the decoder `fm_begin_reference_replay` calls), not a
+/// hand-rolled wire format, so a future decoder/encoder wire change cannot
+/// silently drift this out of sync. `fm_begin_reference_replay` fails loudly
+/// (`EINVAL`) on any malformed header, so a mistake here would be a visible
+/// bug, not a silent illusion. A future task that adds real native
+/// module-state capture (out of this task's scope — see the N1-I5 grounding
+/// doc's capture-side gap) replaces this with the guest's own captured
+/// arena.
+fn write_empty_module_state_arena(guest_mem: &SharedMemory, scratch_addr: u32) -> anyhow::Result<()> {
+    use wasm_posix_shared::abi;
+
+    let header_size = abi::wpk_fork_module_state_chunk_header_size(4)
+        .ok_or_else(|| anyhow::anyhow!("no KFMS chunk header size for wasm32 pointer width"))?
+        as usize;
+
+    // Encode the canonical null-only reference transaction via the module's
+    // own (de)serializer — see this function's doc comment for why a
+    // literally record-less chunk is rejected as malformed, not accepted as
+    // empty.
+    let builder = fork_codec::ReferenceGraphBuilder::begin();
+    let writer = fork_codec::ReferenceSegmentsWriter::new(
+        abi::WPK_FORK_REFERENCE_TRANSACTION_OWNER,
+        1 << 16, // one segment per section; the null-only graph is tiny
+    )
+    .map_err(|e| anyhow::anyhow!("ReferenceSegmentsWriter::new failed: {e:?}"))?;
+    let mut kfms_records: Vec<(u16, u32, u32, Vec<u8>)> = Vec::new();
+    {
+        let mut sink = |kind: u16, activation_id: u32, owner_id: u32, payload: &[u8]| {
+            kfms_records.push((kind, activation_id, owner_id, payload.to_vec()));
+            Ok(())
+        };
+        writer
+            .write(&mut sink, &builder)
+            .map_err(|e| anyhow::anyhow!("ReferenceSegmentsWriter::write failed: {e:?}"))?;
+    }
+
+    // Frame each KFMS record with its 24-byte KFMR TLV header, zero-padded to
+    // the arena's record alignment — mirrors `module_state::decode_records`'
+    // read side field-for-field.
+    let record_header_size = abi::WPK_FORK_MODULE_STATE_RECORD_HEADER_SIZE as usize;
+    let record_alignment = abi::WPK_FORK_MODULE_STATE_RECORD_ALIGNMENT as usize;
+    let mut records_bytes: Vec<u8> = Vec::new();
+    for (kind, activation_id, owner_id, payload) in &kfms_records {
+        let unaligned = record_header_size + payload.len();
+        let aligned = unaligned.div_ceil(record_alignment) * record_alignment;
+        let mut record = vec![0u8; aligned];
+        record[0..4].copy_from_slice(b"KFMR");
+        record[4..6].copy_from_slice(&abi::WPK_FORK_MODULE_STATE_RECORD_VERSION.to_le_bytes());
+        record[6..8].copy_from_slice(&kind.to_le_bytes());
+        record[8..12].copy_from_slice(&(aligned as u32).to_le_bytes());
+        record[12..16].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        record[16..20].copy_from_slice(&activation_id.to_le_bytes());
+        record[20..24].copy_from_slice(&owner_id.to_le_bytes());
+        record[record_header_size..record_header_size + payload.len()].copy_from_slice(payload);
+        // record[record_header_size + payload.len()..aligned] stays zero
+        // padding (the vec's own zero-init) — the decoder requires it.
+        records_bytes.extend_from_slice(&record);
+    }
+
+    let used = header_size + records_bytes.len();
+    anyhow::ensure!(
+        used <= WASM_PAGE_SIZE,
+        "synthesized reference transaction ({used} bytes) does not fit the reserved scratch page"
+    );
+
+    let mut header = vec![0u8; header_size];
+    header[0..4].copy_from_slice(b"KFMC"); // chunk magic
+    header[4..6].copy_from_slice(&abi::WPK_FORK_MODULE_STATE_ARENA_VERSION.to_le_bytes());
+    let flags = abi::WPK_FORK_MODULE_STATE_CHUNK_FLAG_ROOT | abi::WPK_FORK_MODULE_STATE_CHUNK_FLAG_SEALED;
+    header[6..8].copy_from_slice(&flags.to_le_bytes());
+    header[8..12].copy_from_slice(&scratch_addr.to_le_bytes()); // root ptr (self)
+    header[12..16].copy_from_slice(&0u32.to_le_bytes()); // previous ptr
+    header[16..20].copy_from_slice(&0u32.to_le_bytes()); // next ptr
+    header[20..24].copy_from_slice(&(WASM_PAGE_SIZE as u32).to_le_bytes()); // capacity
+    header[24..28].copy_from_slice(&(used as u32).to_le_bytes()); // used
+    header[28..32].copy_from_slice(&(kfms_records.len() as u32).to_le_bytes()); // record_count
+    header[32..36].copy_from_slice(&0u32.to_le_bytes()); // reserved
+    // header[36..header_size] stays zero padding (the vec's own zero-init).
+
+    let mut arena = header;
+    arena.extend_from_slice(&records_bytes);
+    unsafe { write_bytes(guest_mem, scratch_addr as usize, &arena) };
     Ok(())
 }
 
@@ -2716,6 +2839,15 @@ pub struct ForkModule {
     /// catalog` — see [`compute_guest_fork_format`] and its caller in
     /// `spawn_guest_thread`.
     pub catalog_scratch_base: usize,
+    /// N1-I5 Task 3: the page-aligned guest address of the synthesized,
+    /// genuinely-valid but EMPTY (zero-record) KFMS module-state arena this
+    /// `instantiate_fork_module` call wrote via
+    /// [`write_empty_module_state_arena`] — the `module_state_root`
+    /// [`drive_reference_replay`]'s `fm_begin_reference_replay` call passes.
+    /// See that function's doc comment for why an empty arena is the correct
+    /// (not fabricated) value for every native fork today: native has no
+    /// module-state CAPTURE mechanism yet, so no fork produces a REAL one.
+    pub empty_module_state_root: u32,
 
     // -- Coordinator (`fm_*`) exports, bound once here so callers never
     // re-look-up a name (a typo would only surface at the FIRST call site,
@@ -2942,7 +3074,34 @@ pub(crate) fn instantiate_fork_module(
          the module's shadow-stack padding"
     );
 
+    // N1-I5 Task 3: reserve ONE page, page-aligned, immediately after the
+    // resume-catalog scratch above, still inside the module's own
+    // shadow-stack padding (which the `grow_to_cover` call just below already
+    // covers, and which `kernel_set_max_addr` already protects from the
+    // guest kernel's own brk/mmap allocator — see this region's own doc
+    // comment). Growing the guest's WASM MEMORY past `memory_base +
+    // region_bytes` is not an option: that address is `ProcessLayout::
+    // max_addr`, the SAME value `new_shared` used as this memory's hard
+    // `maximum` (`DEFAULT_MAX_PAGES`), so the memory is already at its
+    // absolute ceiling once this region is covered — `SharedMemory::grow`
+    // past it fails outright (confirmed empirically: this task's first
+    // attempt tried exactly that and every fork test failed with "failed to
+    // grow memory by 1"). `write_empty_module_state_arena` writes its
+    // `module_state_root` header here; see that function's doc comment for
+    // why an empty (zero-record) arena is a truthful, not fabricated, value
+    // for every native fork today.
+    let reference_scratch_base = (catalog_scratch_base + FORK_MODULE_CATALOG_SCRATCH_BYTES)
+        .div_ceil(WASM_PAGE_SIZE)
+        * WASM_PAGE_SIZE;
+    anyhow::ensure!(
+        reference_scratch_base + WASM_PAGE_SIZE <= memory_base + region_bytes,
+        "fork-module reference-replay scratch page does not fit in the module's shadow-stack padding"
+    );
+    let reference_scratch_base = u32::try_from(reference_scratch_base)
+        .map_err(|_| anyhow::anyhow!("reference-replay scratch address {reference_scratch_base:#x} does not fit in wasm32"))?;
+
     grow_to_cover(guest_mem, memory_base + region_bytes)?;
+    write_empty_module_state_arena(guest_mem, reference_scratch_base)?;
 
     let mut linker: Linker<()> = Linker::new(engine);
     linker.define(&mut *store, "env", "memory", guest_mem.clone())?;
@@ -3094,6 +3253,7 @@ pub(crate) fn instantiate_fork_module(
         function_catalog_table,
         drive_table,
         static_root_catalog_table,
+        empty_module_state_root: reference_scratch_base,
     })
 }
 
@@ -4167,6 +4327,12 @@ fn spawn_guest_thread(
             if let Ok(v) = fm.fm_gc_nodes_reconstructed.call(&mut store, ()) {
                 acc.gc_nodes_reconstructed += v;
             }
+            if let Ok(v) = fm.fm_static_roots_published.call(&mut store, ()) {
+                acc.static_roots_published += v;
+            }
+            if let Ok(v) = fm.fm_drive_steps_executed.call(&mut store, ()) {
+                acc.drive_steps_executed += v;
+            }
         }
     })
 }
@@ -4262,6 +4428,131 @@ fn is_thrown_exception_escape(e: &wasmtime::Error) -> bool {
 /// the ONLY case the loop continues on, by driving the seal/serialize/
 /// channel-post/parent-replay-begin sequence before looping back to call
 /// `wpk_fork_resume_start`.
+/// N1-I5 Task 3: drive the co-resident module's reference-replay
+/// sub-sequence, in the exact order `host/src/fork-process-continuation.ts:
+/// 1081-1100`'s Node/browser `attachModuleChild` uses (grounding doc §1 "How
+/// the guest feeds references"/§4), for ONE replay (either the child's
+/// `fm_begin_child_replay`-seeded rewind, or the parent's own `fm_begin_
+/// replay`-seeded rewind — both callers below drive this identically):
+///
+///  1. Seed `fm_set_activation_gc_codec`/`fm_set_host_exception_owner` from
+///     whatever this host has captured for the child, if anything. Native has
+///     no GC-codec-byte capture and no host-exception-owner tracking yet
+///     (module-state (KFMS) capture/restore stays fully inert on native — see
+///     this file's N1-I4 doc comments), so both seed calls are skipped here:
+///     there is no data to seed them with, and calling either with a
+///     fabricated value would be dishonest, not merely incomplete. A future
+///     task that adds native module-state/GC-codec capture adds these calls
+///     here, guarded on that new data actually existing.
+///  2. `fm_begin_reference_replay(module_state_root, pid)` — seeds the
+///     whole-arena reference graph, BEFORE any module-state restore or rewind
+///     touches a reference. `module_state_root` here is NOT the continuation
+///     root `fm_begin_child_replay`/`fm_begin_replay` use — an earlier
+///     version of this function tried reusing that root and empirically
+///     failed (`fm_last_errno` `EINVAL`: `decode_module_state` rejects it,
+///     since the continuation root points at the KFRE frame journal, a
+///     different wire format). Native has no module-state CAPTURE mechanism
+///     yet, so [`write_empty_module_state_arena`] synthesizes a genuinely
+///     valid KFMS arena carrying the canonical null-only reference
+///     transaction instead — see its doc comment for why that (not a
+///     literally record-less chunk) is the true floor of "this fork captured
+///     no reference," and not a fabricated success. `pid`
+///     is retained in both this export's and `fm_build_gc_plan`'s signatures
+///     for the host call site but unused since M2 (see `fm_begin_reference_
+///     replay`'s own Rust doc comment); any constant value is correct.
+///  3. `fm_build_gc_plan(pid)` + `fm_gc_plan_count()` — builds (and sizes) the
+///     topological GC drive plan for whatever the fork's graph contains
+///     (possibly zero steps: a funcref/externref-only fork has no typed-GC
+///     node to drive).
+///  4. `fm_drive_execute(plan_ptr, count)` — drives ALLOC/FILL/EXN via the
+///     `env.__wpk_fork_drive_table` funcref table (T1-populated) and
+///     STATIC_ROOT/EXTERNREF_TRANSIT via `fm_static_root_slot`/`fm_externref_
+///     handle` + `resolve_externref` (T2), for however many steps step 3
+///     found.
+///
+/// `fm_last_errno` is checked after every `fm_*` call in this sequence; any
+/// nonzero errno is a truthful failure — this returns `false` (having
+/// already logged which stage failed) rather than silently continuing into a
+/// rewind whose reference state was never actually seeded.
+fn drive_reference_replay(store: &mut Store<()>, fm: &ForkModule, _guest_mem: &SharedMemory) -> bool {
+    // Retained in `fm_begin_reference_replay`/`fm_build_gc_plan`'s signatures
+    // for the host call site but unused since M2 — see this function's doc
+    // comment.
+    const PID: u32 = 0;
+
+    // `instantiate_fork_module` already wrote a genuinely-valid KFMS arena
+    // (the canonical null-only reference transaction) at this address once,
+    // at instantiation time (see `write_empty_module_state_arena` and
+    // `ForkModule::empty_module_state_root`'s doc comments) — reuse it
+    // rather than re-synthesizing it here.
+    let module_state_root = fm.empty_module_state_root;
+
+    if let Err(e) = fm.fm_begin_reference_replay.call(&mut *store, (module_state_root, PID)) {
+        eprintln!("fm_begin_reference_replay failed: {e:#}");
+        return false;
+    }
+    match fm.fm_last_errno.call(&mut *store, ()) {
+        Ok(0) => {}
+        Ok(errno) => {
+            eprintln!("fm_begin_reference_replay failed: errno {errno}");
+            return false;
+        }
+        Err(e) => {
+            eprintln!("fm_last_errno after fm_begin_reference_replay failed: {e:#}");
+            return false;
+        }
+    }
+
+    let plan_ptr = match fm.fm_build_gc_plan.call(&mut *store, PID) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("fm_build_gc_plan failed: {e:#}");
+            return false;
+        }
+    };
+    match fm.fm_last_errno.call(&mut *store, ()) {
+        Ok(0) => {}
+        Ok(errno) => {
+            eprintln!("fm_build_gc_plan failed: errno {errno}");
+            return false;
+        }
+        Err(e) => {
+            eprintln!("fm_last_errno after fm_build_gc_plan failed: {e:#}");
+            return false;
+        }
+    }
+
+    let count = match fm.fm_gc_plan_count.call(&mut *store, ()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("fm_gc_plan_count failed: {e:#}");
+            return false;
+        }
+    };
+    let Ok(count) = u32::try_from(count) else {
+        eprintln!("fm_gc_plan_count returned a negative count {count}");
+        return false;
+    };
+
+    if let Err(e) = fm.fm_drive_execute.call(&mut *store, (plan_ptr, count)) {
+        eprintln!("fm_drive_execute failed: {e:#}");
+        return false;
+    }
+    match fm.fm_last_errno.call(&mut *store, ()) {
+        Ok(0) => {}
+        Ok(errno) => {
+            eprintln!("fm_drive_execute failed: errno {errno}");
+            return false;
+        }
+        Err(e) => {
+            eprintln!("fm_last_errno after fm_drive_execute failed: {e:#}");
+            return false;
+        }
+    }
+
+    true
+}
+
 fn run_fork_capable_entry(
     store: &mut Store<()>,
     instance: &wasmtime::Instance,
@@ -4355,6 +4646,13 @@ fn run_fork_capable_entry(
                 eprintln!("fm_last_errno after fm_begin_child_replay failed: {e:#}");
                 return;
             }
+        }
+        // N1-I5 Task 3: drive the co-resident module's reference-replay
+        // sub-sequence BEFORE the rewind touches any reference — see
+        // `drive_reference_replay`'s doc comment for the exact order and why
+        // `root` doubles as this call's `module_state_root`.
+        if !drive_reference_replay(&mut *store, fm, guest_mem) {
+            return;
         }
         let Some(rewind_begin) = get_guest_export_typed::<u32, ()>(
             &mut *store,
@@ -4592,6 +4890,12 @@ fn drive_fork_capture_seal_and_launch_child(
             eprintln!("fm_last_errno after fm_begin_replay failed: {e:#}");
             return false;
         }
+    }
+    // N1-I5 Task 3: drive the same reference-replay sub-sequence for the
+    // PARENT's own rewind (its captured frames may hold reference-typed
+    // locals too — see `drive_reference_replay`'s doc comment).
+    if !drive_reference_replay(&mut *store, fm, guest_mem) {
+        return false;
     }
     let Some(rewind_begin) = get_guest_export_typed::<u32, ()>(
         &mut *store,
