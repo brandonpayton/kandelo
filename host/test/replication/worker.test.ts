@@ -137,25 +137,113 @@ describe("ReplayedHttpExchanges", () => {
     const store = new ReplayedHttpExchanges<string>();
     const parked = store.take("GET /");
     store.deliver("GET /", "hello");
-    await expect(parked).resolves.toBe("hello");
+    await expect(parked).resolves.toEqual({ kind: "served", response: "hello" });
   });
 
   it("serves the latest response for a request line delivered twice", async () => {
     const store = new ReplayedHttpExchanges<string>();
     store.deliver("GET /", "first");
     store.deliver("GET /", "second");
-    await expect(store.take("GET /")).resolves.toBe("second");
+    await expect(store.take("GET /")).resolves.toEqual({
+      kind: "served",
+      response: "second",
+    });
   });
 
-  it("resolves null for a request the primary never made", async () => {
+  it("calls a request the log never carried unrecorded", async () => {
     const store = new ReplayedHttpExchanges<string>(20);
-    await expect(store.take("GET /missing")).resolves.toBeNull();
+    await expect(store.take("GET /missing")).resolves.toEqual({
+      kind: "unrecorded",
+    });
   });
 
-  it("releases every parked fetch with null on drop", async () => {
+  // The park is for a request the replay has not reached. A replay that is
+  // running owns the answer, and a WordPress page behind php-fpm takes as long
+  // as it takes — giving up on it would report a request the log plainly
+  // carries as one the machine never saw.
+  it("waits past the park while a replay of the request is running", async () => {
+    const store = new ReplayedHttpExchanges<string>(10);
+    store.expect("GET /");
+    const parked = store.take("GET /");
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    store.deliver("GET /", "slow");
+    await expect(parked).resolves.toEqual({ kind: "served", response: "slow" });
+  });
+
+  it("reports why a replay of the request ended without a response", async () => {
+    const store = new ReplayedHttpExchanges<string>(10);
+    store.expect("GET /");
+    const parked = store.take("GET /");
+    store.fail("GET /", "No in-kernel listener for port 8080");
+    await expect(parked).resolves.toEqual({
+      kind: "failed",
+      reason: "No in-kernel listener for port 8080",
+    });
+  });
+
+  it("keeps waiting while another replay of the same request runs", async () => {
+    const store = new ReplayedHttpExchanges<string>(10);
+    store.expect("GET /");
+    store.expect("GET /");
+    const parked = store.take("GET /");
+    store.fail("GET /", "first attempt failed");
+    store.deliver("GET /", "second attempt");
+    await expect(parked).resolves.toEqual({
+      kind: "served",
+      response: "second attempt",
+    });
+  });
+
+  it("tells every parked fetch that the replica is gone on drop", async () => {
     const store = new ReplayedHttpExchanges<string>();
     const parked = store.take("GET /");
     store.drop();
-    await expect(parked).resolves.toBeNull();
+    await expect(parked).resolves.toEqual({
+      kind: "failed",
+      reason: "the replica that was serving GET / is gone",
+    });
+  });
+
+  it("reports a miss once, before the deadline, while nothing replays", async () => {
+    const missed: string[] = [];
+    const store = new ReplayedHttpExchanges<string>(60, {
+      report: (key) => missed.push(key),
+      afterMs: 10,
+    });
+    const first = store.take("GET /style.css");
+    const second = store.take("GET /style.css");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(missed).toEqual(["GET /style.css"]);
+    store.expect("GET /style.css");
+    store.deliver("GET /style.css", "css");
+    await expect(first).resolves.toEqual({ kind: "served", response: "css" });
+    await expect(second).resolves.toEqual({ kind: "served", response: "css" });
+  });
+
+  it("does not report a miss while a replay of the request runs", async () => {
+    const missed: string[] = [];
+    const store = new ReplayedHttpExchanges<string>(60, {
+      report: (key) => missed.push(key),
+      afterMs: 10,
+    });
+    store.expect("GET /");
+    const parked = store.take("GET /");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(missed).toEqual([]);
+    store.deliver("GET /", "own");
+    await expect(parked).resolves.toEqual({ kind: "served", response: "own" });
+  });
+
+  it("reports a request line again once its earlier ask went unrecorded", async () => {
+    const missed: string[] = [];
+    const store = new ReplayedHttpExchanges<string>(20, {
+      report: (key) => missed.push(key),
+      afterMs: 5,
+    });
+    await expect(store.take("GET /")).resolves.toEqual({ kind: "unrecorded" });
+    const again = store.take("GET /");
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(missed).toEqual(["GET /", "GET /"]);
+    await expect(again).resolves.toEqual({ kind: "unrecorded" });
   });
 });

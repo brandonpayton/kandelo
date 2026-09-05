@@ -292,6 +292,7 @@ export class BrowserKernel {
   private replicationListeners = new Set<
     (entries: readonly ReplicationLogEntry[]) => void
   >();
+  private replicationHttpMissListeners = new Set<(key: string) => void>();
   private pcmTransport: PcmTransportDescriptor | null = null;
   private pcmDriver: BrowserPcmDriver | null = null;
 
@@ -981,6 +982,20 @@ export class BrowserKernel {
       // first would miss the last of them.
       await this.stopReplicationRecording();
       this.replicationListeners.delete(onEntries);
+    };
+  }
+
+  /**
+   * Subscribe to request lines a replaying machine has no replay of.
+   *
+   * Fired on a replica whose page asked for a resource the primary's log does
+   * not carry. The primary can still make that request, and whoever holds the
+   * wire to it is the one that can ask.
+   */
+  subscribeReplicationHttpMisses(cb: (key: string) => void): () => void {
+    this.replicationHttpMissListeners.add(cb);
+    return () => {
+      this.replicationHttpMissListeners.delete(cb);
     };
   }
 
@@ -1887,6 +1902,11 @@ export class BrowserKernel {
       case "replication_recorded":
         for (const listener of [...this.replicationListeners]) {
           listener(msg.entries);
+        }
+        break;
+      case "replication_http_miss":
+        for (const listener of [...this.replicationHttpMissListeners]) {
+          listener(msg.key);
         }
         break;
       default: {

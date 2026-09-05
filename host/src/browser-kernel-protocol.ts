@@ -505,6 +505,21 @@ export interface ReplicationReplayDrainMessage {
 }
 
 /**
+ * A request line this replaying machine was asked for and has no replay of.
+ *
+ * The page asked its replica for a resource the primary's log does not carry
+ * — the primary's browser served it from cache, or served it before this
+ * replica joined. The primary can still make that request, so the miss is
+ * reported to the main thread, where the wire to the primary is, instead of
+ * waiting out the deadline into a 502.
+ */
+export interface ReplicationHttpMissMessage {
+  type: "replication_http_miss";
+  /** The request line, `"METHOD target"`, as the replay store keys it. */
+  key: string;
+}
+
+/**
  * What a replica took from the log it was replaying.
  *
  * `total` is what the replica had been given, which for a live replay is what
@@ -809,4 +824,5 @@ export type KernelToMainMessage =
   | ProcEventMessage
   | HttpBridgePendingMessage
   | LazyDownloadMessage
-  | ReplicationRecordedMessage;
+  | ReplicationRecordedMessage
+  | ReplicationHttpMissMessage;

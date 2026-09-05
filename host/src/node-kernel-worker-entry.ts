@@ -63,6 +63,7 @@ import {
   glQueryRecordTap,
   httpExchangeRecordTap,
   ReplayedHttpExchanges,
+  describeReplayedHttp,
 } from "./replication/worker";
 import {
   parseRawRequestLine,
@@ -4407,16 +4408,22 @@ function applyPushedDecision(decision: ReplicationPushedDecision): void {
     // The injection lands synchronously, at this log position. The response
     // is this machine's own output; it settles later, into the store a
     // viewer's fetch is served from.
+    //
+    // The store is told to expect it here, before anything is awaited, so a
+    // viewer that asks first waits for this machine's answer instead of for a
+    // deadline. A replay that ends without one says why, in the same place.
     const line = parseRawRequestLine(decision.request);
+    const key = `${line.method} ${line.target}`;
+    replayedHttpExchanges.expect(key);
     void kernelWorker
       .replayHttpExchange(decision)
       .then((response) => {
-        replayedHttpExchanges.deliver(`${line.method} ${line.target}`, response);
+        replayedHttpExchanges.deliver(key, response);
       })
       .catch((err) => {
-        console.warn(
-          `[replication] replayed ${line.method} ${line.target} failed:`,
-          err,
+        replayedHttpExchanges.fail(
+          key,
+          (err as Error)?.message ?? String(err),
         );
       });
     return;
@@ -4503,14 +4510,11 @@ async function handleHttpRequest(msg: HttpRequestMessage) {
     // of making an injection of its own.
     const key = `${msg.request.method} ${msg.request.url}`;
     const replayed = await replayedHttpExchanges.take(key);
-    if (replayed === null) {
-      respondError(
-        msg.requestId,
-        `the machine being viewed never served ${key}`,
-      );
+    if (replayed.kind !== "served") {
+      respondError(msg.requestId, describeReplayedHttp(key, replayed));
       return;
     }
-    respond(msg.requestId, replayed);
+    respond(msg.requestId, replayed.response);
     return;
   }
   try {

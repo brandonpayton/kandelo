@@ -2958,12 +2958,31 @@
 /* ── Web preview pane ───────────────────────────────────────────────────── */
 
 .kdisplay-surface {
+  position: relative;
   flex: 1;
   min-width: 0;
   min-height: 0;
   display: flex;
   background: #fff;
   overflow: hidden;
+}
+
+.kweb-remote-cursor {
+  position: absolute;
+  pointer-events: none;
+  transform: translate(-2px, -1px);
+  transition: left 90ms linear, top 90ms linear;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.35));
+}
+
+/* Each shape points at the position from a different place: the arrow from
+   its tip, the hand from its fingertip, the I-beam from its middle. */
+.kweb-remote-cursor[data-shape="pointer"] {
+  transform: translate(-6px, -2px);
+}
+
+.kweb-remote-cursor[data-shape="text"] {
+  transform: translate(-5px, -10px);
 }
 
 .kweb-frame {

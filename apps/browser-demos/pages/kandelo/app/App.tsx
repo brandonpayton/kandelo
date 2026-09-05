@@ -434,6 +434,18 @@ export const App: React.FC = () => {
                 ? replication.navigation.viewerPath
                 : undefined
             }
+            onPreviewCursorChange={
+              replication.publishing ? replication.cursor.publish : undefined
+            }
+            previewViewerCursor={
+              replication.replicating ? replication.cursor.viewerCursor : null
+            }
+            onPreviewScrollChange={
+              replication.publishing ? replication.scroll.publish : undefined
+            }
+            previewViewerScroll={
+              replication.replicating ? replication.scroll.viewerScroll : null
+            }
             previewReloadToken={previewReloadToken}
           />
         )}

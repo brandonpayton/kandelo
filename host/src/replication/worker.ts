@@ -66,7 +66,7 @@ export function glQueryRecordTap(recorder: ReplicationLogRecorder): GlQueryTap {
 }
 
 /** Serve the recorded GL answers back, and refuse to invent one. */
-export function glQueryReplayTap(reader: ReplicationLogReader): GlQueryTap {
+function glQueryReplayTap(reader: ReplicationLogReader): GlQueryTap {
   return {
     mode: "replay",
     take: (op) => reader.takeGlQuery(op),
@@ -86,7 +86,7 @@ export function acceptSelectionRecordTap(
 }
 
 /** Hold each connection for the worker the primary gave it to. */
-export function acceptSelectionReplayTap(
+function acceptSelectionReplayTap(
   reader: ReplicationLogReader,
 ): AcceptSelectionTap {
   return {
@@ -107,6 +107,15 @@ export function httpExchangeRecordTap(
   };
 }
 
+/** What a replica has for one request line the viewer asked for. */
+export type ReplayedHttpOutcome<Response> =
+  /** This machine computed a response for the request. */
+  | { readonly kind: "served"; readonly response: Response }
+  /** The replay of the request ended without one, and this is why. */
+  | { readonly kind: "failed"; readonly reason: string }
+  /** The log carries no such request, so this machine never saw it. */
+  | { readonly kind: "unrecorded" };
+
 /**
  * The responses a replica's replayed injections produced, by request line.
  *
@@ -120,58 +129,176 @@ export function httpExchangeRecordTap(
  */
 export class ReplayedHttpExchanges<Response> {
   readonly #responses = new Map<string, Response>();
+  /** Why the last replay of a request line ended without a response. */
+  readonly #failures = new Map<string, string>();
+  /** How many replays of a request line are running. */
+  readonly #inFlight = new Map<string, number>();
   readonly #waiters = new Map<
     string,
-    Array<(response: Response | null) => void>
+    Array<(outcome: ReplayedHttpOutcome<Response>) => void>
   >();
+  /** Request lines already reported missing, until something settles them. */
+  readonly #missed = new Set<string>();
   readonly #waitMs: number;
+  readonly #missAfterMs: number;
+  readonly #reportMiss: ((key: string) => void) | null;
 
-  constructor(waitMs = 30_000) {
+  constructor(
+    waitMs = 30_000,
+    miss?: { report: (key: string) => void; afterMs?: number },
+  ) {
     this.#waitMs = waitMs;
-  }
-
-  deliver(key: string, response: Response): void {
-    this.#responses.set(key, response);
-    const waiters = this.#waiters.get(key);
-    if (!waiters) return;
-    this.#waiters.delete(key);
-    for (const waiter of waiters) waiter(response);
+    this.#reportMiss = miss?.report ?? null;
+    this.#missAfterMs = miss?.afterMs ?? 2_000;
   }
 
   /**
-   * The response the primary's browsing produced for this request, waiting
-   * for the replay to compute it when the viewer's page asks first.
+   * A replay of this request line has started.
    *
-   * Resolves null for a request the primary never made — a cache asymmetry
-   * between the two browsers, not a divergence: the machine never saw either
-   * copy of it.
+   * Said before the machine is asked to serve it, and it is what turns the
+   * wait below from a deadline into a wait for this machine's own answer. The
+   * replay takes as long as the machine takes — a WordPress page behind
+   * php-fpm is not a 30 s request — and a viewer that gave up first would
+   * report a request the log plainly carries as one that was never made.
    */
-  take(key: string): Promise<Response | null> {
-    const ready = this.#responses.get(key);
-    if (ready !== undefined) return Promise.resolve(ready);
+  expect(key: string): void {
+    this.#inFlight.set(key, (this.#inFlight.get(key) ?? 0) + 1);
+  }
+
+  deliver(key: string, response: Response): void {
+    this.#leave(key);
+    this.#missed.delete(key);
+    this.#responses.set(key, response);
+    this.#failures.delete(key);
+    this.#settle(key, { kind: "served", response });
+  }
+
+  /**
+   * The replay of this request line ended without a response.
+   *
+   * The reason is the machine's, so it belongs to whoever asked for the page
+   * rather than to a console line no viewer reads.
+   */
+  fail(key: string, reason: string): void {
+    this.#leave(key);
+    this.#missed.delete(key);
+    this.#failures.set(key, reason);
+    if (this.#running(key) || this.#responses.has(key)) return;
+    this.#settle(key, { kind: "failed", reason });
+  }
+
+  /**
+   * What this machine produced for the request, waiting for a replay that is
+   * still running and parking briefly for one that has not started.
+   *
+   * The short park is for the request the log has not reached yet. Once the
+   * park expires with nothing in flight, `unrecorded` is the true answer:
+   * neither browser's copy of that request reached this machine, which is a
+   * cache asymmetry between the two and not a divergence.
+   */
+  take(key: string): Promise<ReplayedHttpOutcome<Response>> {
+    const ready = this.#ready(key);
+    if (ready !== null) return Promise.resolve(ready);
     return new Promise((resolve) => {
       const waiters = this.#waiters.get(key) ?? [];
       waiters.push(resolve);
       this.#waiters.set(key, waiters);
+      if (this.#running(key)) return;
+      // Report the miss well before the deadline. The primary can still make
+      // the request this machine has no replay of — that is what a report is
+      // for — and a report held until the deadline arrives with the 502.
+      if (this.#reportMiss !== null) {
+        setTimeout(() => {
+          if (this.#running(key) || this.#missed.has(key)) return;
+          if (!this.#waiters.has(key)) return;
+          this.#missed.add(key);
+          this.#reportMiss?.(key);
+        }, this.#missAfterMs);
+      }
       setTimeout(() => {
-        const parked = this.#waiters.get(key);
-        if (!parked) return;
-        const index = parked.indexOf(resolve);
-        if (index < 0) return;
-        parked.splice(index, 1);
-        if (parked.length === 0) this.#waiters.delete(key);
-        resolve(null);
+        // A replay may have started while this fetch waited. Its answer is
+        // this machine's, and it is worth more than a deadline.
+        if (this.#running(key)) return;
+        this.#missed.delete(key);
+        this.#release(key, resolve, { kind: "unrecorded" });
       }, this.#waitMs);
     });
   }
 
   drop(): void {
     this.#responses.clear();
-    for (const waiters of this.#waiters.values()) {
-      for (const waiter of waiters) waiter(null);
+    this.#failures.clear();
+    this.#inFlight.clear();
+    this.#missed.clear();
+    for (const [key, waiters] of this.#waiters) {
+      for (const waiter of waiters) {
+        waiter({
+          kind: "failed",
+          reason: `the replica that was serving ${key} is gone`,
+        });
+      }
     }
     this.#waiters.clear();
   }
+
+  #ready(key: string): ReplayedHttpOutcome<Response> | null {
+    const response = this.#responses.get(key);
+    if (response !== undefined) return { kind: "served", response };
+    const reason = this.#failures.get(key);
+    if (reason !== undefined && !this.#running(key)) {
+      return { kind: "failed", reason };
+    }
+    return null;
+  }
+
+  #running(key: string): boolean {
+    return (this.#inFlight.get(key) ?? 0) > 0;
+  }
+
+  #leave(key: string): void {
+    const running = this.#inFlight.get(key) ?? 0;
+    if (running <= 1) this.#inFlight.delete(key);
+    else this.#inFlight.set(key, running - 1);
+  }
+
+  #settle(key: string, outcome: ReplayedHttpOutcome<Response>): void {
+    const waiters = this.#waiters.get(key);
+    if (!waiters) return;
+    this.#waiters.delete(key);
+    for (const waiter of waiters) waiter(outcome);
+  }
+
+  #release(
+    key: string,
+    waiter: (outcome: ReplayedHttpOutcome<Response>) => void,
+    outcome: ReplayedHttpOutcome<Response>,
+  ): void {
+    const parked = this.#waiters.get(key);
+    if (!parked) return;
+    const index = parked.indexOf(waiter);
+    if (index < 0) return;
+    parked.splice(index, 1);
+    if (parked.length === 0) this.#waiters.delete(key);
+    waiter(outcome);
+  }
+}
+
+/**
+ * What to tell a viewer whose fetch this machine did not answer.
+ *
+ * "Never served" is a claim about the log, so it is only made when the log
+ * really carries no such request. A replay that ran and failed reports its own
+ * reason instead, because that reason is the machine's state and the person
+ * looking at a blank page is owed it. Both hosts say it here so a viewer reads
+ * the same sentence whichever one is running its replica.
+ */
+export function describeReplayedHttp(
+  key: string,
+  outcome: { kind: "failed"; reason: string } | { kind: "unrecorded" },
+): string {
+  return outcome.kind === "failed"
+    ? `the machine being viewed failed to serve ${key}: ${outcome.reason}`
+    : `the machine being viewed never served ${key}`;
 }
 
 /**

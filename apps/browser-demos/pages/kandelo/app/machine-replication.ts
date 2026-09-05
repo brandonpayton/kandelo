@@ -39,7 +39,11 @@
 // replica's own draws repaint its screen — so the modeset demo is no longer
 // mirror-bound.
 import * as React from "react";
-import { LocalReplicationLog } from "@host/replication/log-local";
+import {
+  LocalReplicationLog,
+  type PreviewCursor,
+  type PreviewScroll,
+} from "@host/replication/log-local";
 import {
   ReplicationLogQueueWriter,
   createReplicationLogQueue,
@@ -99,6 +103,29 @@ export interface MachineReplication {
     readonly viewerPath: string | null;
   };
   /**
+   * The publisher's hand over the shared preview.
+   *
+   * A publishing page calls `publish` as its pointer moves over the preview,
+   * and with null when it leaves; a replicating page draws `viewerCursor`
+   * over its own preview, which is null until the pointer first arrives and
+   * again once it left.
+   */
+  readonly cursor: {
+    readonly publish: (position: PreviewCursor | null) => void;
+    readonly viewerCursor: PreviewCursor | null;
+  };
+  /**
+   * How far the publisher scrolled the shared preview.
+   *
+   * A publishing page calls `publish` as its preview scrolls; a replicating
+   * page walks its own preview to `viewerScroll`, which is null until the
+   * publisher first scrolls.
+   */
+  readonly scroll: {
+    readonly publish: (position: PreviewScroll) => void;
+    readonly viewerScroll: PreviewScroll | null;
+  };
+  /**
    * True from asking the user for its machine until this one is running it.
    *
    * A replica arriving and a machine being taken over are two boots of the
@@ -119,6 +146,8 @@ const IDLE: MachineReplication = {
   replicating: false,
   failure: null,
   navigation: { publish: () => {}, viewerPath: null },
+  cursor: { publish: () => {}, viewerCursor: null },
+  scroll: { publish: () => {}, viewerScroll: null },
 };
 
 export function useMachineReplication(
@@ -130,6 +159,12 @@ export function useMachineReplication(
   const [replicating, setReplicating] = React.useState(false);
   const [failure, setFailure] = React.useState<string | null>(null);
   const [viewerPath, setViewerPath] = React.useState<string | null>(null);
+  const [viewerCursor, setViewerCursor] = React.useState<PreviewCursor | null>(
+    null,
+  );
+  const [viewerScroll, setViewerScroll] = React.useState<PreviewScroll | null>(
+    null,
+  );
   // The wire outlives renders; a publish callback that closed over one
   // render's wire would post into a link that was already replaced.
   const wireRef = React.useRef<LocalReplicationLog<CapturedMachine> | null>(
@@ -138,6 +173,12 @@ export function useMachineReplication(
   const publishNavigation = React.useCallback((path: string) => {
     wireRef.current?.publishNavigation(path);
   }, []);
+  const publishCursor = React.useCallback((position: PreviewCursor | null) => {
+    wireRef.current?.publishCursor(position);
+  }, []);
+  const publishScroll = React.useCallback((position: PreviewScroll) => {
+    wireRef.current?.publishScroll(position);
+  }, []);
 
   React.useEffect(() => {
     setPublishing(false);
@@ -145,6 +186,8 @@ export function useMachineReplication(
     setReplicating(false);
     setFailure(null);
     setViewerPath(null);
+    setViewerCursor(null);
+    setViewerScroll(null);
     if (!link) return;
     // The transport wraps the link's channel; the link owns and closes it, so
     // dropping a transport here must not close the channel underneath it.
@@ -174,8 +217,12 @@ export function useMachineReplication(
           },
         };
       });
+      const stopServingMisses = wire.onMiss((key) => {
+        serveMissedRequest(host, key);
+      });
       leaveRole = () => {
         stopServing();
+        stopServingMisses();
         setPublishing(false);
       };
     };
@@ -214,11 +261,15 @@ export function useMachineReplication(
        * again, and the loop below asks the other computer for whatever it is
        * running now.
        */
+      let stopMisses: (() => void) | null = null;
       const dropReplica = () => {
         if (!replica) return;
         replica = false;
+        stopMisses?.();
+        stopMisses = null;
         setReplicating(false);
         setViewerPath(null);
+        setViewerCursor(null);
         void host.stopReplicatingMachine();
       };
       leaveRole = () => {
@@ -248,6 +299,12 @@ export function useMachineReplication(
             },
             navigated: (path) => {
               setViewerPath(path);
+            },
+            cursor: (position) => {
+              setViewerCursor(position);
+            },
+            scrolled: (position) => {
+              setViewerScroll(position);
             },
             ended: () => {
               writer.end();
@@ -300,6 +357,9 @@ export function useMachineReplication(
             }
             if (gone || left) return;
             replica = true;
+            stopMisses = host.subscribeReplicationHttpMisses((key) => {
+              wire.reportMiss(key);
+            });
             setJoining(false);
             setFailure(null);
             setReplicating(true);
@@ -354,5 +414,32 @@ export function useMachineReplication(
     replicating,
     failure,
     navigation: { publish: publishNavigation, viewerPath },
+    cursor: { publish: publishCursor, viewerCursor },
+    scroll: { publish: publishScroll, viewerScroll },
   };
+}
+
+/**
+ * Make the request a viewer's replica has no replay of.
+ *
+ * The fetch travels this page's own service-worker bridge into the machine,
+ * and skips this browser's HTTP cache — the cache is why the log misses it.
+ * The response is discarded here: the injection is what was asked for, and
+ * the viewer serves the copy its own replica computes from the log.
+ */
+function serveMissedRequest(host: KernelHost, key: string): void {
+  const space = key.indexOf(" ");
+  if (space < 0) return;
+  const method = key.slice(0, space);
+  if (method !== "GET" && method !== "HEAD") return;
+  const base = host.getWebPreview()?.url;
+  if (!base || base === "about:blank") return;
+  const root = new URL(
+    base.endsWith("/") ? base : `${base}/`,
+    window.location.href,
+  );
+  const target = new URL(key.slice(space + 1).replace(/^\//, ""), root);
+  void fetch(target, { method, cache: "no-store" })
+    .then((response) => response.arrayBuffer())
+    .catch(() => {});
 }

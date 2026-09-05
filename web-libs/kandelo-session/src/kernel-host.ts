@@ -215,6 +215,11 @@ export interface KernelLike {
    */
   drainReplicationReplay?(): void;
   /**
+   * Subscribe to request lines a replaying machine has no replay of. Mirrors
+   * `host/src/browser-kernel-host.ts: subscribeReplicationHttpMisses`.
+   */
+  subscribeReplicationHttpMisses?(cb: (key: string) => void): () => void;
+  /**
    * Append bytes to a process's stdin buffer. Used by the framebuffer
    * input path so DOM key events on the canvas reach the fb-bound
    * process (fbDOOM reads scancodes from stdin).
@@ -920,6 +925,17 @@ export interface KernelHost {
    * own. A no-op on a page that holds no replica.
    */
   drainReplicationReplay(): void;
+  /**
+   * Subscribe to request lines this page's replica was asked for and has no
+   * replay of.
+   *
+   * The primary's log does not carry them — its browser served them from
+   * cache, or served them before this replica joined — but the primary can
+   * still make the request. A viewer forwards each one over its wire so the
+   * primary injects it, the log carries it back, and the replica serves its
+   * own recomputed response. Fires only while this page holds a replica.
+   */
+  subscribeReplicationHttpMisses(cb: (key: string) => void): () => void;
 
   // dmesg ring
   subscribeDmesg(cb: (line: DmesgLine) => void): () => void;
@@ -1389,6 +1405,7 @@ export class LiveKernelHost implements KernelHost {
   private lazyDownloadRing: LazyDownloadEvent[] = [];
   private lazyDownloadSummariesById = new Map<string, LazyDownloadSummary>();
   private lazyDownloadListeners = new ListenerSet<LazyDownloadEvent>();
+  private replicationHttpMissListeners = new ListenerSet<string>();
   private lazyDownloadSummaryListeners = new ListenerSet<void>();
   private lazyDownloadCapacity = 512;
   private processListeners = new ListenerSet<ProcessEvent>();
@@ -1413,6 +1430,7 @@ export class LiveKernelHost implements KernelHost {
   private surfaceAvailability: SurfaceAvailability = { ...DEFAULT_SURFACE_AVAILABILITY };
   private offFramebufferAvailability: (() => void) | null = null;
   private offLazyDownloads: (() => void) | null = null;
+  private offReplicationHttpMisses: (() => void) | null = null;
   private offAudioState: (() => void) | null = null;
 
   private kernel?: KernelLike;
@@ -1494,6 +1512,8 @@ export class LiveKernelHost implements KernelHost {
     this.offFramebufferAvailability = null;
     this.offLazyDownloads?.();
     this.offLazyDownloads = null;
+    this.offReplicationHttpMisses?.();
+    this.offReplicationHttpMisses = null;
     this.offAudioState?.();
     this.offAudioState = null;
     this.invalidatePtySessions(previousKernel);
@@ -1522,6 +1542,14 @@ export class LiveKernelHost implements KernelHost {
         this.emitLazyDownloadEvent(event);
       });
     }
+    if (kernel.subscribeReplicationHttpMisses) {
+      this.offReplicationHttpMisses = kernel.subscribeReplicationHttpMisses(
+        (key) => {
+          if (!this.holdsReplica()) return;
+          this.replicationHttpMissListeners.emit(key);
+        },
+      );
+    }
     if (kernel.onAudioStateChange) {
       this.offAudioState = kernel.onAudioStateChange((state) => {
         this.audioStateListeners.emit(state);
@@ -1545,6 +1573,8 @@ export class LiveKernelHost implements KernelHost {
     this.offFramebufferAvailability = null;
     this.offLazyDownloads?.();
     this.offLazyDownloads = null;
+    this.offReplicationHttpMisses?.();
+    this.offReplicationHttpMisses = null;
     this.offAudioState?.();
     this.offAudioState = null;
     this.invalidatePtySessions(detachedKernel);
@@ -2072,6 +2102,8 @@ export class LiveKernelHost implements KernelHost {
     this.offFramebufferAvailability = null;
     this.offLazyDownloads?.();
     this.offLazyDownloads = null;
+    this.offReplicationHttpMisses?.();
+    this.offReplicationHttpMisses = null;
     this.offAudioState?.();
     this.offAudioState = null;
     this.setSurfaceAvailability({ terminal: false, framebuffer: false, web: false, kms: false });
@@ -2095,6 +2127,10 @@ export class LiveKernelHost implements KernelHost {
 
   subscribeLazyDownloads(cb: (event: LazyDownloadEvent) => void): () => void {
     return this.lazyDownloadListeners.add(cb);
+  }
+
+  subscribeReplicationHttpMisses(cb: (key: string) => void): () => void {
+    return this.replicationHttpMissListeners.add(cb);
   }
 
   lazyDownloadHistory(): LazyDownloadEvent[] {

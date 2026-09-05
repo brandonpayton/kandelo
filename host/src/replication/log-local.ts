@@ -75,12 +75,49 @@ export interface ReplicationLogSink {
    * diverged.
    */
   navigated?(path: string): void;
+  /**
+   * Where the publisher's pointer is over its web preview, or null once it
+   * left.
+   *
+   * Presentation like `navigated`: the clicks already travel as `http`
+   * entries, and this is the hand a viewer watches move between them. The
+   * position is a fraction of the preview surface, because the two pages
+   * size their previews differently and a pixel on one names nothing on the
+   * other.
+   */
+  cursor?(position: PreviewCursor | null): void;
+  /**
+   * How far the publisher scrolled its web preview.
+   *
+   * Presentation like `cursor`: scrolling asks the machine for nothing, so it
+   * appears in no log entry, and a viewer left at the top of a page the
+   * publisher already scrolled is watching a different part of it. The
+   * position is a fraction of each axis's scrollable distance, because the
+   * two pages size their previews differently and the same page is not as
+   * tall in both.
+   */
+  scrolled?(position: PreviewScroll): void;
+}
+
+/** A pointer position as fractions of the web preview surface, 0..1. */
+export interface PreviewCursor {
+  readonly x: number;
+  readonly y: number;
+}
+
+/** A scroll position as fractions of the scrollable distance, 0..1. */
+export interface PreviewScroll {
+  readonly x: number;
+  readonly y: number;
 }
 
 type LocalReplicationMessage<TMachine> =
   | { readonly kind: "hello" }
   | { readonly kind: "entries"; readonly entries: readonly ReplicationLogEntry[] }
   | { readonly kind: "navigated"; readonly path: string }
+  | { readonly kind: "cursor"; readonly position: PreviewCursor | null }
+  | { readonly kind: "scrolled"; readonly position: PreviewScroll }
+  | { readonly kind: "miss"; readonly key: string }
   | { readonly kind: "ended" }
   | { readonly kind: "join"; readonly joinId: string }
   | { readonly kind: "withdrawn"; readonly joinId: string }
@@ -350,6 +387,50 @@ export class LocalReplicationLog<TMachine = never> {
   }
 
   /**
+   * Tell every watcher where this machine's pointer is over its web preview.
+   *
+   * Sent by the publisher as its pointer moves, and with null when it leaves
+   * the preview, so a viewer stops drawing a hand that is no longer there.
+   */
+  publishCursor(position: PreviewCursor | null): void {
+    this.#post({ kind: "cursor", position });
+  }
+
+  /**
+   * Tell every watcher how far this machine's web preview is scrolled.
+   *
+   * Sent by the publisher as it scrolls, and once when a page settles, so a
+   * viewer that joined mid-page is looking at the part the publisher is.
+   */
+  publishScroll(position: PreviewScroll): void {
+    this.#post({ kind: "scrolled", position });
+  }
+
+  /**
+   * Tell the publisher its log has no replay of `key`, a request line this
+   * watcher's page asked its replica for.
+   *
+   * The publisher's browser served it from cache, or served it before this
+   * replica joined; either way the publisher can still make the request, and
+   * once it does, the log carries it to every replica.
+   */
+  reportMiss(key: string): void {
+    this.#post({ kind: "miss", key });
+  }
+
+  /**
+   * Serve the request lines watchers report missing. Returns an unsubscribe.
+   */
+  onMiss(handler: (key: string) => void): () => void {
+    const listener = (event: MessageEvent) => {
+      const message = event.data as LocalReplicationMessage<TMachine>;
+      if (message.kind === "miss") handler(message.key);
+    };
+    this.#channel.addEventListener("message", listener);
+    return () => this.#channel.removeEventListener("message", listener);
+  }
+
+  /**
    * Deliver the published log into `sink`, in order and without a hole.
    *
    * Says hello so a running publisher answers with what it has. A watcher that
@@ -368,6 +449,14 @@ export class LocalReplicationLog<TMachine = never> {
       }
       if (message.kind === "navigated") {
         sink.navigated?.(message.path);
+        return;
+      }
+      if (message.kind === "cursor") {
+        sink.cursor?.(message.position);
+        return;
+      }
+      if (message.kind === "scrolled") {
+        sink.scrolled?.(message.position);
         return;
       }
       if (message.kind !== "entries") return;

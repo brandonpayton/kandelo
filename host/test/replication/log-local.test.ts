@@ -312,4 +312,92 @@ describe("local replication log", () => {
       plain.close();
     }
   });
+  it("carries a watcher's missing request line to the publisher", async () => {
+    const channel = `replication-test-${crypto.randomUUID()}`;
+    const publisher = new LocalReplicationLog(channel);
+    const watcher = new LocalReplicationLog(channel);
+    const misses: string[] = [];
+    const stopMisses = publisher.onMiss((key) => void misses.push(key));
+    try {
+      watcher.reportMiss("GET /wp-content/style.css");
+      await vi.waitFor(() =>
+        expect(misses).toEqual(["GET /wp-content/style.css"]),
+      );
+    } finally {
+      stopMisses();
+      publisher.close();
+      watcher.close();
+    }
+  });
+  it("tells a watcher where the publisher's pointer is, and when it left", async () => {
+    const channel = `replication-test-${crypto.randomUUID()}`;
+    const publisher = new LocalReplicationLog(channel);
+    const following = new LocalReplicationLog(channel);
+    const plain = new LocalReplicationLog(channel);
+    const recorder = new ReplicationLogRecorder();
+    const stopPublish = publisher.publish(recorder);
+    const followingSink = fakeSink();
+    const plainSink = fakeSink();
+    const positions: Array<{ x: number; y: number } | null> = [];
+    const stopFollowing = following.watch({
+      ...followingSink.sink,
+      cursor: (position) => void positions.push(position),
+    });
+    const stopPlain = plain.watch(plainSink.sink);
+    try {
+      publisher.publishCursor({ x: 0.25, y: 0.5 });
+      publisher.publishCursor(null);
+      await vi.waitFor(() =>
+        expect(positions).toEqual([{ x: 0.25, y: 0.5 }, null]),
+      );
+      // A cursor is presentation, not a log entry, and a sink without the
+      // callback keeps receiving entries.
+      recordClocks(recorder, 2);
+      await vi.waitFor(() => expect(plainSink.taken()).toHaveLength(2));
+      expect(followingSink.taken()).toHaveLength(2);
+    } finally {
+      stopFollowing();
+      stopPlain();
+      stopPublish();
+      publisher.close();
+      following.close();
+      plain.close();
+    }
+  });
+
+  it("tells a watcher how far the publisher scrolled", async () => {
+    const channel = `replication-test-${crypto.randomUUID()}`;
+    const publisher = new LocalReplicationLog(channel);
+    const following = new LocalReplicationLog(channel);
+    const plain = new LocalReplicationLog(channel);
+    const recorder = new ReplicationLogRecorder();
+    const stopPublish = publisher.publish(recorder);
+    const followingSink = fakeSink();
+    const plainSink = fakeSink();
+    const positions: Array<{ x: number; y: number }> = [];
+    const stopFollowing = following.watch({
+      ...followingSink.sink,
+      scrolled: (position) => void positions.push(position),
+    });
+    const stopPlain = plain.watch(plainSink.sink);
+    try {
+      publisher.publishScroll({ x: 0, y: 0.4 });
+      publisher.publishScroll({ x: 0, y: 1 });
+      await vi.waitFor(() =>
+        expect(positions).toEqual([{ x: 0, y: 0.4 }, { x: 0, y: 1 }]),
+      );
+      // A scroll is presentation, not a log entry, and a sink without the
+      // callback keeps receiving entries.
+      recordClocks(recorder, 2);
+      await vi.waitFor(() => expect(plainSink.taken()).toHaveLength(2));
+      expect(followingSink.taken()).toHaveLength(2);
+    } finally {
+      stopFollowing();
+      stopPlain();
+      stopPublish();
+      publisher.close();
+      following.close();
+      plain.close();
+    }
+  });
 });
