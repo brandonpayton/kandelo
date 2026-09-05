@@ -94,14 +94,18 @@ export const Modeset: React.FC<ModesetProps> = ({ crtcId = 1, onDockControlsChan
   // Pointer events cover mouse, touch, and pen with one listener set; a
   // touch acts as a left-button mouse. The wasm side has no
   // absolute-cursor input — it integrates int8 deltas from PS/2 packets
-  // — so we mirror the wasm cursor estimate here (centered at the FB
-  // midpoint, matching modeset.c's initial `cursor_x/y = CANVAS_W/H / 2`)
-  // and snap it to the OS pointer on pointerenter (or a touch press)
-  // with a synthetic teleport delta. Browser Y grows down, PS/2 dy is
-  // positive-up, so flip once in `sendDelta`. Large jumps get chunked
-  // into legal i8 packets — without that, a fast drag wraps
-  // `(int8_t)pkt[1]` and `drain_mouse()` interprets it as the opposite
-  // direction.
+  // — so we mirror the wasm cursor here and snap it to the OS pointer on
+  // pointerenter (or a touch press). The snap cannot trust modeset.c's
+  // initial midpoint: a machine adopted through a take-over restores its
+  // cursor wherever the previous owner left it, and a teleport measured
+  // from the wrong origin offsets every splat for the rest of the
+  // session. So each snap first drives the cursor to the origin with a
+  // full-frame negative sweep — `drain_mouse()` clamps every packet, so
+  // the corner is reached from anywhere — and teleports from there.
+  // Browser Y grows down, PS/2 dy is positive-up, so flip once in
+  // `sendDelta`. Large jumps get chunked into legal i8 packets — without
+  // that, a fast drag wraps `(int8_t)pkt[1]` and `drain_mouse()`
+  // interprets it as the opposite direction.
   React.useEffect(() => {
     if (status !== "running") return;
     const canvas = canvasRef.current;
@@ -109,8 +113,8 @@ export const Modeset: React.FC<ModesetProps> = ({ crtcId = 1, onDockControlsChan
 
     let prevCanvasX: number | null = null;
     let prevCanvasY: number | null = null;
-    let wasmCursorX = MODESET_FB_W / 2;
-    let wasmCursorY = MODESET_FB_H / 2;
+    let wasmCursorX = 0;
+    let wasmCursorY = 0;
     let buttons = 0;
     let activeTouchId: number | null = null;
     const buttonBit = (button: number) =>
@@ -135,11 +139,12 @@ export const Modeset: React.FC<ModesetProps> = ({ crtcId = 1, onDockControlsChan
     const sendDelta = (dx: number, dy: number) => {
       if (dx === 0 && dy === 0) return;
       injectChunkedMouseMotion(sink, dx, -dy, buttons);
-      wasmCursorX += dx;
-      wasmCursorY += dy;
+      wasmCursorX = Math.min(canvas.width - 1, Math.max(0, wasmCursorX + dx));
+      wasmCursorY = Math.min(canvas.height - 1, Math.max(0, wasmCursorY + dy));
     };
     const handlePointerAt = (canvasX: number, canvasY: number) => {
       if (prevCanvasX === null || prevCanvasY === null) {
+        sendDelta(-canvas.width, -canvas.height);
         sendDelta(Math.round(canvasX - wasmCursorX), Math.round(canvasY - wasmCursorY));
       } else {
         sendDelta(Math.round(canvasX - prevCanvasX), Math.round(canvasY - prevCanvasY));

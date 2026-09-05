@@ -7,6 +7,36 @@
  */
 import type { Locator } from "@playwright/test";
 
+/**
+ * Mean brightness of one region of the canvas, 0..255.
+ *
+ * The region is given as fractions of the surface, so a spec asserts on
+ * where paint landed without knowing the framebuffer's pixel size.
+ */
+export function regionBrightness(
+  canvas: Locator,
+  region: { x: number; y: number; w: number; h: number },
+): Promise<number> {
+  return canvas.evaluate((el: HTMLCanvasElement, r) => {
+    const scratch = document.createElement("canvas");
+    scratch.width = el.width;
+    scratch.height = el.height;
+    const ctx = scratch.getContext("2d");
+    if (!ctx) return 0;
+    ctx.drawImage(el, 0, 0);
+    const x = Math.floor(r.x * scratch.width);
+    const y = Math.floor(r.y * scratch.height);
+    const w = Math.max(1, Math.floor(r.w * scratch.width));
+    const h = Math.max(1, Math.floor(r.h * scratch.height));
+    const { data } = ctx.getImageData(x, y, w, h);
+    let sum = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      sum += Math.max(data[i]!, data[i + 1]!, data[i + 2]!);
+    }
+    return sum / (data.length / 4);
+  }, region);
+}
+
 /** How many distinct colours a canvas is painting, capped so it stays cheap. */
 export function distinctColors(canvas: Locator): Promise<number> {
   return canvas.evaluate((el: HTMLCanvasElement) => {

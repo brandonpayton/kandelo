@@ -26,7 +26,7 @@ import { expect, test, type Page } from "@playwright/test";
  * headless Chromium forms a loopback ICE pair.
  */
 
-import { distinctColors } from "./support/canvas";
+import { distinctColors, regionBrightness } from "./support/canvas";
 import {
   appUrl,
   closeDockPopovers,
@@ -322,6 +322,92 @@ test("replicates a machine whose screen only a GL context painted", async ({
     }).toBeGreaterThan(4);
     await expect.poll(() => distinctColors(userCanvas), { timeout: 60_000 })
       .toBeGreaterThan(4);
+  } finally {
+    await viewerContext.close();
+    await userContext.close();
+  }
+});
+
+test("puts the taker's splats where the taker points after a take-over", async ({
+  browser,
+  baseURL,
+  browserName,
+}) => {
+  test.skip(
+    browserName !== "chromium",
+    "only headless Chromium can form a loopback ICE pair",
+  );
+  test.setTimeout(600_000);
+  expect(baseURL).toBeTruthy();
+
+  // modeset.c has no absolute cursor — it integrates PS/2 deltas — so the
+  // page mirrors the guest cursor and teleports it with a synthetic delta.
+  // A taken-over machine restores its cursor wherever the giver left it,
+  // which is the case that broke: a mirror that assumed the boot-time
+  // midpoint offset every splat by the giver's parking distance.
+  const userContext = await browser.newContext();
+  const viewerContext = await browser.newContext();
+  const user = await userContext.newPage();
+  const viewer = await viewerContext.newPage();
+  try {
+    await user.goto(appUrl("/?demo=modeset"), { waitUntil: "domcontentloaded" });
+    await viewer.goto(appUrl("/"), { waitUntil: "domcontentloaded" });
+    await expect(user.locator(".kdock-status-text"))
+      .toHaveAttribute("data-status", "running", { timeout: 300_000 });
+    const userCanvas = user.locator("canvas.kmodeset-canvas").first();
+    await expect(userCanvas).toBeVisible({ timeout: 180_000 });
+
+    await connectPeers(user, viewer, (reason) => test.skip(true, reason));
+    await expectReplica(viewer);
+    await closeDockPopovers([user, viewer]);
+
+    // Park the giver's cursor deep in the bottom-right, so the checkpoint
+    // carries a cursor far from the midpoint the old mirror assumed.
+    const userBox = await userCanvas.boundingBox();
+    expect(userBox).toBeTruthy();
+    await user.mouse.move(
+      userBox!.x + userBox!.width * 0.95,
+      userBox!.y + userBox!.height * 0.95,
+      { steps: 8 },
+    );
+
+    await openNetworkPopover(viewer);
+    await takeButton(viewer).click();
+    await closeDockPopovers([user, viewer]);
+    await expect(viewer.locator(".kdock-status"))
+      .toHaveAttribute("data-role", "user", { timeout: 300_000 });
+    await expect(viewer.locator(".kdock-status-text"))
+      .toHaveAttribute("data-status", "running", { timeout: 300_000 });
+    const viewerCanvas = viewer.locator("canvas.kmodeset-canvas").first();
+    await expect(viewerCanvas).toBeVisible({ timeout: 180_000 });
+
+    // Stir only inside the top-left of the taker's canvas. The dye must
+    // land there — brighter than the far corner — not at the click plus
+    // the giver's parking offset. The pointer leaves the canvas before
+    // every stir because that is the discriminating motion: each re-entry
+    // teleports the guest cursor again, so a teleport measured from the
+    // wrong origin re-offsets every stir, while relative tracking alone
+    // lets edge clamping slowly absorb the offset and hide the bug.
+    const topLeft = { x: 0.05, y: 0.05, w: 0.35, h: 0.35 };
+    const bottomRight = { x: 0.6, y: 0.6, w: 0.35, h: 0.35 };
+    await expect.poll(async () => {
+      const box = await viewerCanvas.boundingBox();
+      if (!box) return -255;
+      const px = (fx: number) => box.x + box.width * fx;
+      const py = (fy: number) => box.y + box.height * fy;
+      await viewer.mouse.move(px(0.5), box.y - 40, { steps: 4 });
+      await viewer.mouse.move(px(0.12), py(0.12), { steps: 5 });
+      await viewer.mouse.down();
+      await viewer.mouse.move(px(0.3), py(0.3), { steps: 12 });
+      await viewer.mouse.move(px(0.12), py(0.28), { steps: 12 });
+      await viewer.mouse.up();
+      const near = await regionBrightness(viewerCanvas, topLeft);
+      const far = await regionBrightness(viewerCanvas, bottomRight);
+      return near - far;
+    }, {
+      timeout: 240_000,
+      intervals: [2_000, 3_000, 5_000],
+    }).toBeGreaterThan(5);
   } finally {
     await viewerContext.close();
     await userContext.close();
