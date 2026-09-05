@@ -31,34 +31,13 @@ import {
   appUrl,
   closeDockPopovers,
   connectPeers,
+  expectReplica,
   networkButton,
   openNetworkPopover,
+  takeOverButton as takeButton,
   terminalText,
   typeIntoTerminal,
 } from "./support/peer-pair";
-
-/** The take-over control, offered only to a computer that may use it. */
-function takeButton(page: Page) {
-  return page.getByRole("button", { name: "Take over this machine" });
-}
-
-/**
- * Wait until this page is running a replica of the other computer's machine.
- *
- * Read from the dock rather than from a terminal on the page: the mirrored
- * terminal a viewer watches and the terminal of a machine it holds are the
- * same emulator in the same `.kshell-host`, so their presence says nothing
- * about which of the two this is. The dock says both halves — a machine is
- * running here, and this computer is still the viewer — and no shared surface
- * is left to watch.
- */
-async function expectReplica(page: Page): Promise<void> {
-  await expect(page.locator(".kdock-status-text"))
-    .toHaveAttribute("data-status", "running", { timeout: 300_000 });
-  await expect(page.locator(".kdock-status"))
-    .toHaveAttribute("data-role", "viewer");
-  await expect(page.locator(".kshared-machine")).toHaveCount(0);
-}
 
 /**
  * Open a terminal on a fresh machine and wait for its shell.
@@ -268,6 +247,78 @@ test("follows the user to the demo they launch next", async ({
       timeout: 180_000,
       intervals: [1_000, 2_000, 3_000],
     }).toBeGreaterThan(4);
+  } finally {
+    await viewerContext.close();
+    await userContext.close();
+  }
+});
+
+/**
+ * Stir the fluid with the pointer, so the dye the replica must show exists.
+ *
+ * Pavel's sim splats dye on pointer motion and the dye fades, so a machine
+ * left alone converges to a black screen that says nothing. The motion
+ * crosses the wire as pointer decisions, never as pixels.
+ */
+async function stirFluid(page: Page): Promise<void> {
+  const box = await page.locator(".kmodeset-stage").first().boundingBox();
+  if (!box) return;
+  const centerX = box.x + box.width / 2;
+  const centerY = box.y + box.height / 2;
+  await page.mouse.move(centerX - 80, centerY - 40, { steps: 5 });
+  await page.mouse.move(centerX + 80, centerY + 40, { steps: 10 });
+  await page.mouse.move(centerX, centerY - 60, { steps: 10 });
+}
+
+test("replicates a machine whose screen only a GL context painted", async ({
+  browser,
+  baseURL,
+  browserName,
+}) => {
+  test.skip(
+    browserName !== "chromium",
+    "only headless Chromium can form a loopback ICE pair",
+  );
+  test.setTimeout(600_000);
+  expect(baseURL).toBeTruthy();
+
+  const userContext = await browser.newContext();
+  const viewerContext = await browser.newContext();
+  const user = await userContext.newPage();
+  const viewer = await viewerContext.newPage();
+  try {
+    await user.goto(appUrl("/?demo=modeset"), { waitUntil: "domcontentloaded" });
+    await viewer.goto(appUrl("/"), { waitUntil: "domcontentloaded" });
+
+    // The fluid sim paints through the EGL to WebGL2 bridge: no frame of it
+    // ever reaches a host buffer, which is exactly the machine a checkpoint
+    // used to refuse.
+    await expect(user.locator(".kdock-status-text"))
+      .toHaveAttribute("data-status", "running", { timeout: 300_000 });
+    const userCanvas = user.locator("canvas.kmodeset-canvas").first();
+    await expect(userCanvas).toBeVisible({ timeout: 180_000 });
+
+    await connectPeers(user, viewer, (reason) => test.skip(true, reason));
+    await expectReplica(viewer);
+
+    // The replica shows the same demo's GL surface, painted by this
+    // computer's own context from the restored machine's state.
+    const viewerCanvas = viewer.locator("canvas.kmodeset-canvas").first();
+    await expect(viewerCanvas).toBeVisible({ timeout: 180_000 });
+
+    // Stirring on the user reaches the viewer as decisions: the splats are
+    // pointer deltas in the log, and the color on the viewer's canvas was
+    // rendered here, from them.
+    await closeDockPopovers([user, viewer]);
+    await expect.poll(async () => {
+      await stirFluid(user);
+      return distinctColors(viewerCanvas);
+    }, {
+      timeout: 240_000,
+      intervals: [2_000, 3_000, 5_000],
+    }).toBeGreaterThan(4);
+    await expect.poll(() => distinctColors(userCanvas), { timeout: 60_000 })
+      .toBeGreaterThan(4);
   } finally {
     await viewerContext.close();
     await userContext.close();

@@ -8,11 +8,11 @@ import { installKernelWorkerTestScratch } from "./kernel-worker-test-scratch";
 /**
  * A KMS canvas is GL-owned once a WebGL2 context paints it, and not before.
  *
- * The distinction decides whether a machine can be checkpointed. A GL guest
- * paints the canvas directly and writes nothing back, so a checkpoint has no
- * pixels to read and must refuse. A guest that paints its GBM buffer object by
- * CPU leaves its pixels where the checkpoint does read them, so refusing it
- * would name a boundary that machine has not reached.
+ * The distinction decides what a capture carries and what the vblank pump
+ * does. A GL guest paints the canvas directly and writes nothing back, so a
+ * checkpoint reads its context state rather than pixels and the pump must
+ * not blit over what GL paints. A guest that paints its GBM buffer object
+ * by CPU leaves its pixels where the checkpoint reads them.
  */
 
 const CRTC = 1;

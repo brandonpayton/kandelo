@@ -149,6 +149,29 @@ export async function closeDockPopovers(pages: Page[]): Promise<void> {
   }
 }
 
+/** The take-over control, offered only to a computer that may use it. */
+export function takeOverButton(page: Page): Locator {
+  return page.getByRole("button", { name: "Take over this machine" });
+}
+
+/**
+ * Wait until this page is running a replica of the other computer's machine.
+ *
+ * Read from the dock rather than from a terminal on the page: the mirrored
+ * terminal a viewer watches and the terminal of a machine it holds are the
+ * same emulator in the same `.kshell-host`, so their presence says nothing
+ * about which of the two this is. The dock says both halves — a machine is
+ * running here, and this computer is still the viewer — and no shared surface
+ * is left to watch.
+ */
+export async function expectReplica(page: Page): Promise<void> {
+  await expect(page.locator(".kdock-status-text"))
+    .toHaveAttribute("data-status", "running", { timeout: 300_000 });
+  await expect(page.locator(".kdock-status"))
+    .toHaveAttribute("data-role", "viewer");
+  await expect(page.locator(".kshared-machine")).toHaveCount(0);
+}
+
 export async function terminalText(
   page: Page,
   selector: string,

@@ -20,6 +20,7 @@ function fakeCheckpoint(marker: number): MachineCheckpoint {
     monotonicNs: 5_000_000_000,
     framebuffers: [],
     kms: { fbs: [], crtcs: [], masterPid: null, buffers: [] },
+    gl: [],
     processes: [],
   };
 }

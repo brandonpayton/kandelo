@@ -7,6 +7,7 @@
  * is what stops one host from batching, waiting, or ending differently from
  * the other.
  */
+import type { GlQueryTap } from "../kernel.js";
 import type { TimeProvider } from "../vfs/types.js";
 import {
   ReplicationLogReader,
@@ -17,6 +18,37 @@ import {
 } from "./log.js";
 import { RecordingTimeProvider, ReplayingTimeProvider } from "./clock.js";
 import { ReplicationLogQueueReader } from "./log-queue.js";
+
+/**
+ * The machine surface replication swaps, beyond the clock.
+ *
+ * GL query answers are host-produced values exactly like clock readings —
+ * two GPUs answer differently — so a recording or replaying machine puts
+ * its hand on `host_gl_query` at the same moment it swaps the guest clock,
+ * and takes it off at the same moment too. One installer type keeps Node
+ * and the browser doing both identically.
+ */
+export interface ReplicationGlQueries {
+  setGlQueryTap(tap: GlQueryTap | null): void;
+}
+
+/** Record every GL query answer the guest is handed, on the shared log. */
+export function glQueryRecordTap(recorder: ReplicationLogRecorder): GlQueryTap {
+  return {
+    mode: "record",
+    record: (op, rc, bytes) => {
+      recorder.record({ kind: "gl", op, rc, bytes });
+    },
+  };
+}
+
+/** Serve the recorded GL answers back, and refuse to invent one. */
+export function glQueryReplayTap(reader: ReplicationLogReader): GlQueryTap {
+  return {
+    mode: "replay",
+    take: (op) => reader.takeGlQuery(op),
+  };
+}
 
 /**
  * Record the machine's decisions and hand each one to the main thread.
@@ -58,9 +90,11 @@ export function beginReplicationStream(
   io: { setTimeProvider(provider: TimeProvider): void },
   clock: TimeProvider,
   publish: (entries: readonly ReplicationLogEntry[]) => void,
+  glQueries: ReplicationGlQueries,
 ): ReplicationLogRecorder {
   const recorder = createStreamingRecorder(publish);
   io.setTimeProvider(new RecordingTimeProvider(clock, recorder));
+  glQueries.setGlQueryTap(glQueryRecordTap(recorder));
   return recorder;
 }
 
@@ -124,6 +158,7 @@ export function beginReplicationReplay(
   io: { setTimeProvider(provider: TimeProvider): void },
   clock: TimeProvider,
   spec: ReplicationReplaySpec,
+  glQueries: ReplicationGlQueries,
   applyPushed?: (decision: ReplicationPushedDecision) => void,
 ): ReplicationLogReader {
   const { extend, extendReady } = createQueueExtenders(spec.queue);
@@ -134,5 +169,6 @@ export function beginReplicationReplay(
     extendReady,
   );
   io.setTimeProvider(new ReplayingTimeProvider(clock, reader));
+  glQueries.setGlQueryTap(glQueryReplayTap(reader));
   return reader;
 }

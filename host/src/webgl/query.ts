@@ -79,6 +79,13 @@ export function runGlQuery(
       if (loc) {
         const idx = ++b.nextUniformLoc;
         b.uniformLocations.set(idx, loc);
+        // The pair behind the index, kept because the location object dies
+        // with the context and a checkpoint restore has to re-ask a fresh
+        // one; see `GlBinding.uniformLocationNames`.
+        b.uniformLocationNames.set(idx, {
+          program: programName,
+          uniform: uniformName,
+        });
         outDv.setInt32(0, idx, true);
       } else {
         outDv.setInt32(0, -1, true);

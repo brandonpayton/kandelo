@@ -11,6 +11,12 @@ import {
   type CheckpointProcessBucket,
   type MachineCheckpoint,
 } from "./checkpoint";
+import {
+  GL_FLOAT,
+  GL_UNSIGNED_BYTE,
+  glChannelCount,
+  type CheckpointGlContext,
+} from "../webgl/snapshot";
 
 /**
  * Refuse an untrusted checkpoint, on either host.
@@ -170,7 +176,306 @@ export async function validateMachineCheckpoint(
     framebufferPids.add(framebuffer.pid);
   }
   validateKmsState(checkpoint.kms, checkpoint.processes);
+  if (!Array.isArray(checkpoint.gl)) {
+    refuse("the checkpoint carries no GL context list");
+  }
+  const glPids = new Set<number>();
+  for (const context of checkpoint.gl) {
+    validateGlContext(
+      context,
+      checkpoint.processes.find((bucket) => bucket.pid === context.pid),
+    );
+    if (glPids.has(context.pid)) {
+      refuse(`pid ${context.pid} carries two GL contexts`);
+    }
+    glPids.add(context.pid);
+  }
   return modules;
+}
+
+/** Caps on a GL context a peer sent, far above anything a real guest makes. */
+const MAX_GL_OBJECTS = 65_536;
+const MAX_GL_TEXTURE_DIMENSION = 16_384;
+const MAX_GL_SOURCE_LENGTH = 1_048_576;
+const MAX_GL_UNIFORM_VALUES = 65_536;
+const MAX_GL_BOUNDARY_LINES = 10_000;
+
+function glBytesPerChannel(pixelsType: number): number | null {
+  if (pixelsType === GL_UNSIGNED_BYTE) return 1;
+  if (pixelsType === GL_FLOAT) return 4;
+  return null;
+}
+
+/**
+ * Refuse a GL context the receiver cannot rebuild faithfully.
+ *
+ * A GL context arrives inside a checkpoint from a peer, so every count,
+ * range, and cross-reference is checked before anything touches a real
+ * WebGL2 context. References must close within the context: a framebuffer
+ * naming a texture the checkpoint does not carry cannot be rebuilt, and
+ * accepting it would restore a machine whose render targets are silently
+ * gone.
+ */
+function validateGlContext(
+  context: CheckpointGlContext,
+  bucket: CheckpointProcessBucket | undefined,
+): void {
+  const pid = context.pid;
+  if (bucket === undefined) {
+    refuse(`a GL context names pid ${String(pid)}, which has no process bucket`);
+  }
+  const rangeUsable = [context.cmdbufAddr, context.cmdbufLen].every(
+    (value) => Number.isSafeInteger(value) && value >= 0,
+  );
+  if (
+    !rangeUsable
+    || context.cmdbufAddr + context.cmdbufLen > bucket.memory.byteLength
+  ) {
+    refuse(
+      `pid ${pid}'s GL cmdbuf does not fit inside its `
+        + `${bucket.memory.byteLength}-byte memory`,
+    );
+  }
+  for (const list of [
+    context.buffers,
+    context.textures,
+    context.shaders,
+    context.programs,
+    context.vaos,
+    context.fbos,
+    context.rbos,
+    context.uniformLocationNames,
+  ]) {
+    if (!Array.isArray(list) || list.length > MAX_GL_OBJECTS) {
+      refuse(`pid ${pid}'s GL context carries an unusable object list`);
+    }
+  }
+  if (
+    !Array.isArray(context.boundaries)
+    || context.boundaries.length > MAX_GL_BOUNDARY_LINES
+    || context.boundaries.some(
+      (line) => typeof line !== "string" || line.length > 500,
+    )
+  ) {
+    refuse(`pid ${pid}'s GL context carries an unusable boundary list`);
+  }
+  if (
+    !Number.isSafeInteger(context.nextUniformLoc)
+    || context.nextUniformLoc < 0
+  ) {
+    refuse(`pid ${pid}'s GL uniform-location counter is unusable`);
+  }
+
+  const bufferNames = new Set<number>();
+  for (const buffer of context.buffers) {
+    if (!Number.isSafeInteger(buffer.name) || bufferNames.has(buffer.name)) {
+      refuse(`pid ${pid} carries GL buffer ${String(buffer.name)} twice`);
+    }
+    bufferNames.add(buffer.name);
+    if (!(buffer.bytes instanceof Uint8Array)) {
+      refuse(`pid ${pid}'s GL buffer ${buffer.name} carries no bytes`);
+    }
+  }
+  const textureNames = new Set<number>();
+  for (const texture of context.textures) {
+    if (!Number.isSafeInteger(texture.name) || textureNames.has(texture.name)) {
+      refuse(`pid ${pid} carries GL texture ${String(texture.name)} twice`);
+    }
+    textureNames.add(texture.name);
+    if (!Array.isArray(texture.levels) || texture.levels.length > 32) {
+      refuse(`pid ${pid}'s GL texture ${texture.name} carries an unusable level list`);
+    }
+    for (const level of texture.levels) {
+      const geometryUsable = [level.level, level.width, level.height].every(
+        (value) => Number.isSafeInteger(value) && value >= 0,
+      );
+      if (
+        !geometryUsable
+        || level.width > MAX_GL_TEXTURE_DIMENSION
+        || level.height > MAX_GL_TEXTURE_DIMENSION
+      ) {
+        refuse(
+          `pid ${pid}'s GL texture ${texture.name} level `
+            + `${String(level.level)} has unusable geometry`,
+        );
+      }
+      if (level.pixels === null) continue;
+      const channels = glChannelCount(level.format);
+      const bytesPerChannel = glBytesPerChannel(level.pixelsType);
+      if (channels === null || bytesPerChannel === null) {
+        refuse(
+          `pid ${pid}'s GL texture ${texture.name} level ${level.level} `
+            + "carries pixels in a shape this host does not read",
+        );
+      }
+      const expected = level.width * level.height * channels * bytesPerChannel;
+      if (
+        !(level.pixels instanceof Uint8Array)
+        || level.pixels.byteLength !== expected
+      ) {
+        refuse(
+          `pid ${pid}'s GL texture ${texture.name} level ${level.level} `
+            + `carries ${level.pixels?.byteLength ?? 0} pixel bytes for a `
+            + `${expected}-byte level`,
+        );
+      }
+    }
+  }
+  const shaderNames = new Set<number>();
+  for (const shader of context.shaders) {
+    if (!Number.isSafeInteger(shader.name) || shaderNames.has(shader.name)) {
+      refuse(`pid ${pid} carries GL shader ${String(shader.name)} twice`);
+    }
+    shaderNames.add(shader.name);
+    if (typeof shader.source !== "string" || shader.source.length > MAX_GL_SOURCE_LENGTH) {
+      refuse(`pid ${pid}'s GL shader ${shader.name} carries an unusable source`);
+    }
+  }
+  const programNames = new Set<number>();
+  for (const program of context.programs) {
+    if (!Number.isSafeInteger(program.name) || programNames.has(program.name)) {
+      refuse(`pid ${pid} carries GL program ${String(program.name)} twice`);
+    }
+    programNames.add(program.name);
+    if (!Array.isArray(program.shaders) || program.shaders.length > 16) {
+      refuse(`pid ${pid}'s GL program ${program.name} carries an unusable shader list`);
+    }
+    for (const attached of program.shaders) {
+      if (
+        typeof attached.source !== "string"
+        || attached.source.length > MAX_GL_SOURCE_LENGTH
+      ) {
+        refuse(
+          `pid ${pid}'s GL program ${program.name} attaches an unusable source`,
+        );
+      }
+      if (attached.shaderName !== null && !shaderNames.has(attached.shaderName)) {
+        refuse(
+          `pid ${pid}'s GL program ${program.name} attaches shader `
+            + `${String(attached.shaderName)}, which the checkpoint does not carry`,
+        );
+      }
+    }
+    if (!Array.isArray(program.uniforms) || program.uniforms.length > MAX_GL_OBJECTS) {
+      refuse(`pid ${pid}'s GL program ${program.name} carries an unusable uniform list`);
+    }
+    for (const uniform of program.uniforms) {
+      if (
+        typeof uniform.name !== "string"
+        || uniform.name.length > 1024
+        || !Array.isArray(uniform.values)
+        || uniform.values.length > MAX_GL_UNIFORM_VALUES
+        || uniform.values.some((value) => typeof value !== "number")
+      ) {
+        refuse(`pid ${pid}'s GL program ${program.name} carries an unusable uniform`);
+      }
+    }
+    if (!Array.isArray(program.attribBindings) || program.attribBindings.length > 256) {
+      refuse(`pid ${pid}'s GL program ${program.name} carries an unusable attribute list`);
+    }
+  }
+  const rboNames = new Set<number>();
+  for (const rbo of context.rbos) {
+    if (!Number.isSafeInteger(rbo.name) || rboNames.has(rbo.name)) {
+      refuse(`pid ${pid} carries GL renderbuffer ${String(rbo.name)} twice`);
+    }
+    rboNames.add(rbo.name);
+  }
+  const vaoNames = new Set<number>([0]);
+  for (const vao of context.vaos) {
+    if (!Number.isSafeInteger(vao.name) || (vao.name !== 0 && vaoNames.has(vao.name))) {
+      refuse(`pid ${pid} carries GL vertex array ${String(vao.name)} twice`);
+    }
+    vaoNames.add(vao.name);
+    if (
+      vao.elementArrayBufferName !== null
+      && !bufferNames.has(vao.elementArrayBufferName)
+    ) {
+      refuse(
+        `pid ${pid}'s GL vertex array ${vao.name} indexes buffer `
+          + `${String(vao.elementArrayBufferName)}, which the checkpoint does not carry`,
+      );
+    }
+    if (!Array.isArray(vao.attribs) || vao.attribs.length > 256) {
+      refuse(`pid ${pid}'s GL vertex array ${vao.name} carries an unusable attribute list`);
+    }
+    for (const attrib of vao.attribs) {
+      if (attrib.bufferName !== null && !bufferNames.has(attrib.bufferName)) {
+        refuse(
+          `pid ${pid}'s GL vertex array ${vao.name} reads buffer `
+            + `${String(attrib.bufferName)}, which the checkpoint does not carry`,
+        );
+      }
+    }
+  }
+  const fboNames = new Set<number>();
+  for (const fbo of context.fbos) {
+    if (!Number.isSafeInteger(fbo.name) || fboNames.has(fbo.name)) {
+      refuse(`pid ${pid} carries GL framebuffer ${String(fbo.name)} twice`);
+    }
+    fboNames.add(fbo.name);
+    if (!Array.isArray(fbo.attachments) || fbo.attachments.length > 8) {
+      refuse(`pid ${pid}'s GL framebuffer ${fbo.name} carries an unusable attachment list`);
+    }
+    for (const attachment of fbo.attachments) {
+      const carried = attachment.kind === "texture"
+        ? textureNames.has(attachment.objectName)
+        : attachment.kind === "renderbuffer"
+          ? rboNames.has(attachment.objectName)
+          : false;
+      if (!carried) {
+        refuse(
+          `pid ${pid}'s GL framebuffer ${fbo.name} attaches `
+            + `${String(attachment.kind)} ${String(attachment.objectName)}, `
+            + "which the checkpoint does not carry",
+        );
+      }
+    }
+  }
+  for (const entry of context.uniformLocationNames) {
+    if (
+      !Number.isSafeInteger(entry.index)
+      || entry.index <= 0
+      || entry.index > context.nextUniformLoc
+      || typeof entry.uniform !== "string"
+      || entry.uniform.length > 1024
+    ) {
+      refuse(`pid ${pid} carries an unusable GL uniform-location entry`);
+    }
+  }
+  if (context.state === null) return;
+  const state = context.state;
+  if (
+    state.currentProgramName !== null
+    && !programNames.has(state.currentProgramName)
+  ) {
+    refuse(
+      `pid ${pid}'s GL pipeline uses program `
+        + `${String(state.currentProgramName)}, which the checkpoint does not carry`,
+    );
+  }
+  if (state.vaoName !== 0 && !vaoNames.has(state.vaoName)) {
+    refuse(
+      `pid ${pid}'s GL pipeline binds vertex array `
+        + `${String(state.vaoName)}, which the checkpoint does not carry`,
+    );
+  }
+  for (const bound of [state.fboName, state.readFboName]) {
+    if (bound !== 0 && !fboNames.has(bound)) {
+      refuse(
+        `pid ${pid}'s GL pipeline binds framebuffer `
+          + `${String(bound)}, which the checkpoint does not carry`,
+      );
+    }
+  }
+  for (const unit of state.textureUnits) {
+    if (!textureNames.has(unit.name)) {
+      refuse(
+        `pid ${pid}'s GL pipeline binds texture ${String(unit.name)}, `
+          + "which the checkpoint does not carry",
+      );
+    }
+  }
 }
 
 /**

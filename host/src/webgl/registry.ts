@@ -25,6 +25,30 @@ import { defaultShadow, type GlShadowState } from "./shadow.js";
 export type GlContextHandle = number;
 export type GlSurfaceHandle = number;
 
+/**
+ * One texture level's geometry and format, as the guest uploaded it.
+ *
+ * WebGL2 has no `getTexLevelParameter`, so a checkpoint that wants to read a
+ * texture back has to already know what shape to read. The bridge records the
+ * shape at `OP_TEX_IMAGE_2D` time — the one moment it crosses the cmdbuf —
+ * because nothing can recover it from the context later.
+ */
+export type GlTextureLevelShape = {
+  internalFormat: number;
+  width: number;
+  height: number;
+  format: number;
+  type: number;
+};
+
+/** Everything about a texture that WebGL2 refuses to answer afterwards. */
+export type GlTextureShape = {
+  levels: Map<number, GlTextureLevelShape>;
+  /** True once `OP_GENERATE_MIPMAP` ran, so a rebuild regenerates the
+   *  derived levels instead of expecting them in `levels`. */
+  mipmapped: boolean;
+};
+
 export type GlBindingInput = {
   pid: number;
   /** Wasm-process address where the cmdbuf was mmap'd (set by the
@@ -75,6 +99,21 @@ export type GlBinding = GlBindingInput & {
   uniformLocations: Map<number, WebGLUniformLocation>;
   /** Monotonic counter for `uniformLocations`; never decremented. */
   nextUniformLoc: number;
+  /** Which `(program, uniform)` each location index stands for.
+   *
+   *  A `WebGLUniformLocation` is opaque and dies with its context, so a
+   *  checkpoint can carry only the index. This map is what lets a restore
+   *  re-ask a fresh context for the location and file it under the index
+   *  the guest still holds. */
+  uniformLocationNames: Map<number, { program: number; uniform: string }>;
+
+  /** Texture shapes by cmdbuf name; see {@link GlTextureShape}. */
+  textureShapes: Map<number, GlTextureShape>;
+  /** Which texture name each unit holds, mirroring `shadow.textureUnits`,
+   *  which holds the objects. `OP_TEX_IMAGE_2D` names no texture — it
+   *  uploads into whatever the active unit holds — so shape recording
+   *  needs the name back. */
+  textureUnitNames: Map<number, number>;
 
   /** Last `glUseProgram` target, kept for handlers that need the
    *  current program (e.g. uniform setters). */
@@ -122,6 +161,9 @@ export class GlContextRegistry {
       rbos: new Map(),
       uniformLocations: new Map(),
       nextUniformLoc: 0,
+      uniformLocationNames: new Map(),
+      textureShapes: new Map(),
+      textureUnitNames: new Map(),
       currentProgram: null,
       shadow: defaultShadow(),
       forward,

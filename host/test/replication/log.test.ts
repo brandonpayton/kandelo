@@ -21,6 +21,9 @@ const pointer = (dx: number, dy: number, buttons: number) =>
 const resize = (device: string, rows: number, cols: number) =>
   ({ kind: "resize", device, rows, cols }) as const;
 
+const glAnswer = (op: number, rc: number, ...bytes: number[]) =>
+  ({ kind: "gl", op, rc, bytes: new Uint8Array(bytes) }) as const;
+
 describe("replication log recorder", () => {
   it("numbers decisions from the position it was given", () => {
     const recorder = new ReplicationLogRecorder(41);
@@ -141,6 +144,75 @@ describe("replication log reader", () => {
     // the recovery that follows it would name different positions.
     expect(reader.nextSeq).toBe(0);
     expect(reader.takeClock(1)).toEqual(reading(1, 7, 0));
+  });
+});
+
+describe("replication log GL query answers", () => {
+  it("serves the recorded answers in order, interleaved with the clock", () => {
+    const recorder = new ReplicationLogRecorder();
+    recorder.record(glAnswer(5, 4, 1, 0, 0, 0));
+    recorder.record(reading(1, 7, 0));
+    recorder.record(glAnswer(1, 4, 0, 0, 0, 0));
+    const reader = new ReplicationLogReader(recorder.entries);
+
+    expect(reader.takeGlQuery(5)).toEqual(glAnswer(5, 4, 1, 0, 0, 0));
+    expect(reader.takeClock(1)).toEqual(reading(1, 7, 0));
+    expect(reader.takeGlQuery(1)).toEqual(glAnswer(1, 4, 0, 0, 0, 0));
+  });
+
+  it("reports the position when the replica runs a different query", () => {
+    const recorder = new ReplicationLogRecorder(4);
+    recorder.record(glAnswer(5, 4, 1, 0, 0, 0));
+    const reader = new ReplicationLogReader(recorder.entries);
+
+    expect(() => reader.takeGlQuery(1)).toThrow(ReplicationDivergence);
+    expect(() => reader.takeGlQuery(1)).toThrow(
+      "replication log diverged at 4: the replica ran GL query 1 where the "
+        + "primary ran 5",
+    );
+    expect(reader.nextSeq).toBe(4);
+  });
+
+  it("reports the position when the replica runs a query at a clock", () => {
+    const recorder = new ReplicationLogRecorder();
+    recorder.record(reading(1, 7, 0));
+    const reader = new ReplicationLogReader(recorder.entries);
+
+    expect(() => reader.takeGlQuery(5)).toThrow(
+      "the replica ran a GL query where the primary recorded clock",
+    );
+    expect(() => reader.takeClock(1)).not.toThrow();
+  });
+
+  it("reports the position when the replica runs a query past the end", () => {
+    const reader = new ReplicationLogReader([]);
+    expect(() => reader.takeGlQuery(5)).toThrow(
+      "replication log diverged at 0: the replica ran GL query 5 past the "
+        + "end of the log",
+    );
+  });
+
+  it("refuses an answer whose bytes fall short of its claim", () => {
+    const reader = new ReplicationLogReader([
+      { seq: 0, decision: { kind: "gl", op: 5, rc: 8, bytes: new Uint8Array(4) } },
+    ]);
+    expect(() => reader.takeGlQuery(5)).toThrow(
+      "the log's GL answer claims 8 bytes and carries 4",
+    );
+  });
+
+  it("delivers what the primary pushed before an answer, before it", () => {
+    const recorder = new ReplicationLogRecorder();
+    recorder.record(input("/dev/pts/0", 13));
+    recorder.record(glAnswer(5, 4, 1, 0, 0, 0));
+    const delivered: ReplicationPushedDecision[] = [];
+    const reader = new ReplicationLogReader(
+      recorder.entries,
+      (decision) => delivered.push(decision),
+    );
+
+    expect(reader.takeGlQuery(5)).toEqual(glAnswer(5, 4, 1, 0, 0, 0));
+    expect(delivered).toEqual([input("/dev/pts/0", 13)]);
   });
 });
 

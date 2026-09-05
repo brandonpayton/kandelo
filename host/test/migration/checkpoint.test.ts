@@ -6,11 +6,13 @@ import { ThreadPageAllocator } from "../../src/thread-allocator";
 import {
   captureMachineCheckpoint,
   captureMachineCheckpointSummary,
+  machineCheckpointTransferList,
   type CheckpointKmsState,
   type CheckpointMachine,
   type CheckpointProcessSource,
 } from "../../src/migration/checkpoint";
 import type { ProcessMemoryLayout } from "../../src/process-memory";
+import type { CheckpointGlContext } from "../../src/webgl/snapshot";
 
 const KERNEL_MEMORY_BYTES = 64;
 const FILESYSTEM_BYTES = 128;
@@ -71,7 +73,7 @@ interface TestMachine {
   settleVforks: () => Promise<void>;
   unreleasable: number[];
   kms: CheckpointKmsState;
-  glOwnedCrtcs: number[];
+  glContexts: CheckpointGlContext[];
 }
 
 function testMachine(sources: CheckpointProcessSource[]): TestMachine {
@@ -92,7 +94,7 @@ function testMachine(sources: CheckpointProcessSource[]): TestMachine {
     settleVforks: () => Promise.resolve(),
     unreleasable: [],
     kms: { fbs: [], crtcs: [], masterPid: null, buffers: [] },
-    glOwnedCrtcs: [],
+    glContexts: [],
     machine: {
       runWithoutWorkerCreation: (operation, exclusive) =>
         creators.runExclusive(operation, exclusive),
@@ -135,7 +137,7 @@ function testMachine(sources: CheckpointProcessSource[]): TestMachine {
       ],
       framebuffers: () => [],
       kmsState: () => state.kms,
-      glOwnedCrtcs: () => state.glOwnedCrtcs,
+      glContexts: () => state.glContexts,
       monotonicNowNs: () => 7_000_000_000,
       kernelAbiVersion: () => KERNEL_ABI,
       liveProcesses: () => sources,
@@ -206,7 +208,7 @@ describe("machine checkpoint freeze", () => {
     expect(result.checkpoint.processes[0]!.memory.byteLength)
       .toBe(PROCESS_MEMORY_BYTES);
     expect(result.checkpoint.processes[0]!.argv).toEqual(["/bin/program-4"]);
-    expect(result.checkpoint.format).toBe(4);
+    expect(result.checkpoint.format).toBe(5);
     expect(result.checkpoint.kernelAbiVersion).toBe(KERNEL_ABI);
     expect(
       new Uint8Array(result.checkpoint.processes[0]!.programBytes),
@@ -401,20 +403,58 @@ describe("machine checkpoint freeze", () => {
     expect(state.held).toEqual([]);
   });
 
-  it("refuses a GL-owned CRTC without freezing the machine", async () => {
+  it("carries the GL contexts and transfers their bytes", async () => {
     const state = testMachine([processSource(4, 1)]);
-    state.glOwnedCrtcs = [31];
+    const bufferBytes = new Uint8Array([1, 2, 3]);
+    const pixelBytes = new Uint8Array([9, 9, 9, 9]);
+    state.glContexts = [{
+      pid: 4,
+      cmdbufAddr: 0,
+      cmdbufLen: 0,
+      contextId: 1,
+      surfaceId: 1,
+      crtcId: 31,
+      buffers: [{ name: 10, usage: 0x88e4, bytes: bufferBytes }],
+      textures: [{
+        name: 11,
+        levels: [{
+          level: 0,
+          internalFormat: 0x1908,
+          width: 1,
+          height: 1,
+          format: 0x1908,
+          type: 0x1401,
+          pixels: pixelBytes,
+          pixelsType: 0x1401,
+        }],
+        mipmapped: false,
+        minFilter: 0,
+        magFilter: 0,
+        wrapS: 0,
+        wrapT: 0,
+      }],
+      shaders: [],
+      programs: [],
+      vaos: [],
+      fbos: [],
+      rbos: [],
+      uniformLocationNames: [],
+      nextUniformLoc: 0,
+      state: null,
+      boundaries: ["renderbuffer contents cannot be read out of WebGL2"],
+    }];
 
-    await expect(captureMachineCheckpoint(state.machine, options)).resolves.toEqual({
-      status: "failed",
-      reason:
-        "CRTC 31 paints through a GL-owned canvas, whose pixels never reach "
-        + "a host buffer a checkpoint can read",
-    });
-    expect(state.held).toEqual([]);
-    expect(state.armed).toEqual([]);
-    expect(Atomics.load(new Int32Array(state.sources[0]!.checkpointFreeze.gate), 0))
-      .toBe(0);
+    const capture = captureMachineCheckpoint(state.machine, options);
+    await flush();
+    for (const source of state.sources) source.checkpointFreeze.unwound();
+
+    const result = await capture;
+    expect(result.status).toBe("captured");
+    if (result.status !== "captured") return;
+    expect(result.checkpoint.gl).toBe(state.glContexts);
+    const transfers = machineCheckpointTransferList(result.checkpoint);
+    expect(transfers).toContain(bufferBytes.buffer);
+    expect(transfers).toContain(pixelBytes.buffer);
   });
 
   it("captures a CPU-scanout modeset machine", async () => {

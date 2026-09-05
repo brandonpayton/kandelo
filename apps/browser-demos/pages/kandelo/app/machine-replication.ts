@@ -31,13 +31,13 @@
 // is the viewer again — which is what sends it to ask for whatever the other
 // computer is running now.
 //
-// Two boundaries are reported rather than worked around. A machine whose guest
-// owns the GL context cannot be read at all — `captureMachineCheckpoint`
-// refuses it — so a modeset demo cannot be replicated, and the viewer is told
-// that instead of being shown pixels pretending to be a machine. And a replica
-// that reaches the end of the user's log stops there: it does not read its own
-// clock, so a user who walks away leaves a viewer parked mid-instruction
-// rather than drifting into a different machine.
+// One boundary is reported rather than worked around: a replica that reaches
+// the end of the user's log stops there. It does not read its own clock, so a
+// user who walks away leaves a viewer parked mid-instruction rather than
+// drifting into a different machine. A GL machine replicates like any other —
+// the checkpoint carries the guest's context state, not its pixels, and the
+// replica's own draws repaint its screen — so the modeset demo is no longer
+// mirror-bound.
 import * as React from "react";
 import { LocalReplicationLog } from "@host/replication/log-local";
 import {

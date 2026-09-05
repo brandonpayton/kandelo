@@ -29,8 +29,14 @@ import {
   getWasmPosixKernelRuntimeAccess,
   negErrno,
   WasmPosixKernel,
+  type GlQueryTap,
   type KernelPointer,
 } from "./kernel";
+import {
+  captureGlContext,
+  type CheckpointGlContext,
+} from "./webgl/snapshot";
+import { rebuildGlContext } from "./webgl/rebuild";
 import {
   createKernelEntryScopedInstance,
   invokeKernelEntrySerializedHostOperation,
@@ -3366,6 +3372,17 @@ export class CentralizedKernelWorker {
    *  pixels still reach the GBM buffer object a checkpoint reads. Keeping the
    *  two apart is what lets a CPU-painting modeset guest be captured. */
   private kmsGlOwned = new Set<number>();
+  /** GL contexts a checkpoint restore has not rebuilt yet, by pid.
+   *
+   *  A context needs a canvas, and the canvas arrives whenever the
+   *  embedder attaches one — after `init` on both hosts, never on Node.
+   *  Until then the captured context is held here, and a capture of this
+   *  machine hands it back verbatim: a machine whose screen has not
+   *  reappeared yet still carries its GL state forward. */
+  private pendingGlRestores = new Map<
+    number,
+    { context: CheckpointGlContext; onBoundary: (line: string) => void }
+  >();
   /** KMS stats SAB per CRTC. Slots [0..4] populated by the pump (frame
    *  count, timestamp, width, height, blit µs); slots [5,6] populated
    *  from kernel-side `kernel_kms_commit_count` / `kernel_kms_last_frame_us`. */
@@ -34252,6 +34269,11 @@ export class CentralizedKernelWorker {
     return this.#kernel.kms;
   }
 
+  /** Replication's hand on `host_gl_query`; see `WasmPosixKernel.setGlQueryTap`. */
+  setGlQueryTap(tap: GlQueryTap | null): void {
+    this.#kernel.setGlQueryTap(tap);
+  }
+
   /** CRTCs whose canvas a GL context owns.
    *
    *  These are exactly the CRTCs whose frames never pass through a host
@@ -34265,6 +34287,114 @@ export class CentralizedKernelWorker {
    *  the machine has not reached. */
   glOwnedCrtcs(): number[] {
     return [...this.kmsGlOwned];
+  }
+
+  /** Every GL binding's context state, for a checkpoint to carry.
+   *
+   *  Read under the freeze, like `kmsState`. The registry does not know
+   *  which CRTC a canvas scans out, so the CRTC is matched here by canvas
+   *  identity — the same association `host_gl_create_context` used when it
+   *  marked the canvas GL-owned. */
+  captureGlContextsForCheckpoint(): CheckpointGlContext[] {
+    return this.gl.list().map((binding) => {
+      const pending = this.pendingGlRestores.get(binding.pid);
+      if (pending) return pending.context;
+      let crtcId: number | null = null;
+      for (const [crtc, canvas] of this.kmsCanvases) {
+        if (canvas === binding.canvas) {
+          crtcId = crtc;
+          break;
+        }
+      }
+      return captureGlContext(binding, crtcId);
+    });
+  }
+
+  /** Adopt a checkpoint's GL contexts, rebuilding each when its canvas is
+   *  there.
+   *
+   *  The binding is rebuilt at once — a restored guest's next
+   *  `host_gl_submit` must find one, or it fails with EIO on a machine
+   *  that was healthy when captured. The context itself waits for
+   *  `attachKmsCanvas`, and the carried boundary lines are reported now:
+   *  they describe what the capture already lost, not what this host has
+   *  yet to do. */
+  restoreGlContextsFromCheckpoint(
+    contexts: readonly CheckpointGlContext[],
+    onBoundary: (line: string) => void,
+  ): void {
+    for (const context of contexts) {
+      this.gl.bind({
+        pid: context.pid,
+        cmdbufAddr: context.cmdbufAddr,
+        cmdbufLen: context.cmdbufLen,
+      });
+      const binding = this.gl.get(context.pid)!;
+      binding.contextId = context.contextId;
+      binding.surfaceId = context.surfaceId;
+      binding.nextUniformLoc = context.nextUniformLoc;
+      for (const entry of context.uniformLocationNames) {
+        binding.uniformLocationNames.set(entry.index, {
+          program: entry.program,
+          uniform: entry.uniform,
+        });
+      }
+      for (const line of context.boundaries) {
+        onBoundary(`GL pid ${context.pid}: ${line}`);
+      }
+      if (context.contextId === null) continue;
+      this.pendingGlRestores.set(context.pid, { context, onBoundary });
+      if (context.crtcId !== null) {
+        const canvas = this.kmsCanvases.get(context.crtcId);
+        if (canvas) this.rebuildPendingGlContext(context.crtcId, canvas);
+      }
+    }
+  }
+
+  /** Build the WebGL2 context a pending restore waits for, and rebuild
+   *  the captured state into it. Mirrors `host_gl_create_context`: the
+   *  same context attributes, the same float extensions, the same canvas
+   *  sizing from the CRTC's framebuffer, the same ownership mark. */
+  private rebuildPendingGlContext(
+    crtcId: number,
+    canvas: OffscreenCanvas,
+  ): void {
+    for (const [pid, pending] of this.pendingGlRestores) {
+      if (pending.context.crtcId !== crtcId) continue;
+      const binding = this.gl.get(pid);
+      if (!binding) {
+        this.pendingGlRestores.delete(pid);
+        continue;
+      }
+      const fb = this.kms.currentFb(crtcId);
+      if (fb && (canvas.width !== fb.width || canvas.height !== fb.height)) {
+        canvas.width = fb.width;
+        canvas.height = fb.height;
+      }
+      const gl = canvas.getContext("webgl2", {
+        antialias: false,
+        premultipliedAlpha: false,
+        preserveDrawingBuffer: true,
+      }) as WebGL2RenderingContext | null;
+      if (!gl) {
+        pending.onBoundary(
+          `GL pid ${pid}: the CRTC ${crtcId} canvas refuses a WebGL2 `
+            + "context; the machine runs, its GL screen stays dark",
+        );
+        continue;
+      }
+      gl.getExtension("EXT_color_buffer_float");
+      gl.getExtension("OES_texture_float_linear");
+      gl.getExtension("EXT_float_blend");
+      this.gl.attachCanvas(pid, canvas);
+      binding.canvas = canvas;
+      binding.gl = gl;
+      this.markKmsCanvasGlOwned(crtcId);
+      for (const line of rebuildGlContext(gl, binding, pending.context)) {
+        pending.onBoundary(`GL pid ${pid}: ${line}`);
+      }
+      this.pendingGlRestores.delete(pid);
+    }
   }
 
   /** Record that a live WebGL2 context now paints the CRTC's canvas.
@@ -34321,6 +34451,7 @@ export class CentralizedKernelWorker {
     } else if (mode === "webgl2") {
       this.kmsContextMode.set(crtc_id, "webgl2");
     }
+    if (mode !== "2d") this.rebuildPendingGlContext(crtc_id, canvas);
     this.startVblankPump();
   }
 

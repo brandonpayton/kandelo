@@ -221,7 +221,7 @@ describe("machine checkpoint of a running guest", () => {
         expect(response.status).toBe("captured");
         if (response.status !== "captured") return;
         const { checkpoint } = response;
-        expect(checkpoint.format).toBe(4);
+        expect(checkpoint.format).toBe(5);
         expect(checkpoint.kernelAbiVersion).toBe(ABI_VERSION);
         expect(checkpoint.kernelMemory.byteLength).toBeGreaterThan(0);
         // `/` alone, because `resolveForNodeKernelSession` gives every scratch

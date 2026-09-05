@@ -1263,6 +1263,113 @@ describe("Rust-owned host import ranges", () => {
     ).toBe(0x1234);
   });
 
+  it("records the GL query answer the guest was handed", () => {
+    const { kernel, memory } = fullKernelHarness();
+    kernel.gl.bind({ pid: 7, cmdbufAddr: 4096, cmdbufLen: 4096 });
+    kernel.gl.get(7)!.gl = {
+      getError: () => 0x1234,
+    } as unknown as WebGL2RenderingContext;
+    const recorded: { op: number; rc: number; bytes: Uint8Array }[] = [];
+    kernel.setGlQueryTap({
+      mode: "record",
+      record: (op, rc, bytes) => recorded.push({ op, rc, bytes }),
+    });
+    const imports = kernel.testAuthority.buildImportObject(memory) as {
+      env: Record<string, (...args: any[]) => any>;
+    };
+
+    const out = memory.buffer.byteLength - 4;
+    expect(imports.env.host_gl_query(7, QOP_GET_ERROR, 0, 0, out, 4)).toBe(4);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]!.op).toBe(QOP_GET_ERROR);
+    expect(recorded[0]!.rc).toBe(4);
+    expect(new DataView(
+      recorded[0]!.bytes.buffer,
+      recorded[0]!.bytes.byteOffset,
+    ).getUint32(0, true)).toBe(0x1234);
+  });
+
+  it("records the -1 a context-less machine answers", () => {
+    const { kernel, memory } = fullKernelHarness();
+    kernel.gl.bind({ pid: 7, cmdbufAddr: 4096, cmdbufLen: 4096 });
+    const recorded: { rc: number }[] = [];
+    kernel.setGlQueryTap({
+      mode: "record",
+      record: (_op, rc) => recorded.push({ rc }),
+    });
+    const imports = kernel.testAuthority.buildImportObject(memory) as {
+      env: Record<string, (...args: any[]) => any>;
+    };
+
+    const out = memory.buffer.byteLength - 4;
+    expect(imports.env.host_gl_query(7, QOP_GET_ERROR, 0, 0, out, 4)).toBe(-1);
+    expect(recorded).toEqual([{ rc: -1 }]);
+  });
+
+  it("serves the logged GL answer over the local GPU's on replay", () => {
+    const { kernel, memory } = fullKernelHarness();
+    kernel.gl.bind({ pid: 7, cmdbufAddr: 4096, cmdbufLen: 4096 });
+    const getError = vi.fn(() => 0x9999);
+    kernel.gl.get(7)!.gl = {
+      getError,
+    } as unknown as WebGL2RenderingContext;
+    const logged = new Uint8Array(4);
+    new DataView(logged.buffer).setUint32(0, 0x1234, true);
+    kernel.setGlQueryTap({
+      mode: "replay",
+      take: (op) => {
+        expect(op).toBe(QOP_GET_ERROR);
+        return { rc: 4, bytes: logged };
+      },
+    });
+    const imports = kernel.testAuthority.buildImportObject(memory) as {
+      env: Record<string, (...args: any[]) => any>;
+    };
+
+    const out = memory.buffer.byteLength - 4;
+    expect(imports.env.host_gl_query(7, QOP_GET_ERROR, 0, 0, out, 4)).toBe(4);
+    // The local query still ran, for its side effects; the guest never saw
+    // its answer.
+    expect(getError).toHaveBeenCalledTimes(1);
+    expect(new DataView(memory.buffer).getUint32(out, true)).toBe(0x1234);
+  });
+
+  it("serves the logged GL answer on a replica with no context yet", () => {
+    const { kernel, memory } = fullKernelHarness();
+    kernel.gl.bind({ pid: 7, cmdbufAddr: 4096, cmdbufLen: 4096 });
+    const logged = new Uint8Array(4);
+    new DataView(logged.buffer).setUint32(0, 0x1234, true);
+    kernel.setGlQueryTap({
+      mode: "replay",
+      take: () => ({ rc: 4, bytes: logged }),
+    });
+    const imports = kernel.testAuthority.buildImportObject(memory) as {
+      env: Record<string, (...args: any[]) => any>;
+    };
+
+    const out = memory.buffer.byteLength - 4;
+    expect(imports.env.host_gl_query(7, QOP_GET_ERROR, 0, 0, out, 4)).toBe(4);
+    expect(new DataView(memory.buffer).getUint32(out, true)).toBe(0x1234);
+  });
+
+  it("lets a replay divergence out of host_gl_query", () => {
+    const { kernel, memory } = fullKernelHarness();
+    kernel.gl.bind({ pid: 7, cmdbufAddr: 4096, cmdbufLen: 4096 });
+    kernel.setGlQueryTap({
+      mode: "replay",
+      take: () => {
+        throw new Error("replication log diverged at 3");
+      },
+    });
+    const imports = kernel.testAuthority.buildImportObject(memory) as {
+      env: Record<string, (...args: any[]) => any>;
+    };
+
+    const out = memory.buffer.byteLength - 4;
+    expect(() => imports.env.host_gl_query(7, QOP_GET_ERROR, 0, 0, out, 4))
+      .toThrow("replication log diverged at 3");
+  });
+
   it.each([4, 8] as const)(
     "writes the generated KMS mode size at the exact wasm%d memory boundary",
     (pointerWidth) => {

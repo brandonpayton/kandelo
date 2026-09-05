@@ -55,6 +55,7 @@ import { RecordingTimeProvider } from "./replication/clock";
 import {
   beginReplicationReplay,
   beginReplicationStream,
+  glQueryRecordTap,
 } from "./replication/worker";
 import { restoreBrowserKernelInitMounts } from "./browser-kernel-vfs-init";
 import type { FileSystemBackend, MountConfig } from "./vfs/types";
@@ -235,7 +236,7 @@ const checkpointMachine: CheckpointMachine = {
     ...kernelWorker.kms.snapshot(),
     buffers: kernelWorker.bos.snapshot(),
   }),
-  glOwnedCrtcs: () => kernelWorker.glOwnedCrtcs(),
+  glContexts: () => kernelWorker.captureGlContextsForCheckpoint(),
   framebuffers: () =>
     kernelWorker.framebuffers.list().map((binding) => ({
       pid: binding.pid,
@@ -885,7 +886,12 @@ function beginStreamAtCapture(): void {
         + "guest clock yet",
     );
   }
-  replicationRecorder = beginReplicationStream(io, baseTimeProvider, publishLog);
+  replicationRecorder = beginReplicationStream(
+    io,
+    baseTimeProvider,
+    publishLog,
+    kernelWorker,
+  );
 }
 
 /**
@@ -1539,6 +1545,7 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
         io,
         baseTimeProvider,
         msg.replicationReplay,
+        kernelWorker,
         applyPushedDecision,
       ),
     };
@@ -1547,6 +1554,18 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
   if (msg.restoreCheckpoint && restoredProgramModules) {
     kernelWorker.rebindRestoredHostHandles(
       msg.restoreCheckpoint.processes.map((bucket) => ({ pid: bucket.pid })),
+    );
+    // Before the first restored process resumes: its next GL submit must
+    // find a binding, or a machine that was healthy when captured fails
+    // with EIO. The context itself waits for the embedder's canvas.
+    kernelWorker.restoreGlContextsFromCheckpoint(
+      msg.restoreCheckpoint.gl,
+      (line) => {
+        reportHostDiagnostic(
+          { pid: 0, source: "checkpoint restore", message: line },
+          "warn",
+        );
+      },
     );
     for (const bucket of msg.restoreCheckpoint.processes) {
       const programModule = restoredProgramModules.get(bucket.pid);
@@ -5307,13 +5326,19 @@ sw.onmessage = (e: MessageEvent) => {
     case "replication_record_start": {
       respondToReplication(msg.requestId, (target, clock) => {
         if (msg.stream) {
-          replicationRecorder = beginReplicationStream(target, clock, publishLog);
+          replicationRecorder = beginReplicationStream(
+            target,
+            clock,
+            publishLog,
+            kernelWorker,
+          );
           return;
         }
         replicationRecorder = new ReplicationLogRecorder();
         target.setTimeProvider(
           new RecordingTimeProvider(clock, replicationRecorder),
         );
+        kernelWorker.setGlQueryTap(glQueryRecordTap(replicationRecorder));
       });
       break;
     }
@@ -5321,6 +5346,7 @@ sw.onmessage = (e: MessageEvent) => {
       const recorder = replicationRecorder;
       replicationRecorder = null;
       if (io && baseTimeProvider) io.setTimeProvider(baseTimeProvider);
+      kernelWorker?.setGlQueryTap(null);
       respond(msg.requestId, recorder?.entries ?? []);
       break;
     }
@@ -5331,6 +5357,7 @@ sw.onmessage = (e: MessageEvent) => {
             target,
             clock,
             msg,
+            kernelWorker,
             applyPushedDecision,
           ),
         };
@@ -5341,6 +5368,7 @@ sw.onmessage = (e: MessageEvent) => {
       const replay = replicationReplay;
       replicationReplay = null;
       if (io && baseTimeProvider) io.setTimeProvider(baseTimeProvider);
+      kernelWorker?.setGlQueryTap(null);
       respond(msg.requestId, {
         consumed: replay?.reader.consumed ?? 0,
         total: replay?.reader.known ?? 0,

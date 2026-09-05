@@ -26,6 +26,27 @@ export interface ReplicationClockReading {
 }
 
 /**
+ * One GL query result the host produced for a guest.
+ *
+ * A GL guest asks its GPU questions — `glGetError`, a uniform location, a
+ * driver limit, pixels read back — and the answers are host-produced values
+ * exactly like a clock reading: two GPUs answer differently, and a guest
+ * that branches on its own GPU's answer stops being the same machine. The
+ * primary records the bytes its guest was handed; a replica hands its guest
+ * those bytes and runs its own query only for the side effects that keep
+ * its context following along.
+ *
+ * `rc` is the raw `host_gl_query` return: bytes written when non-negative,
+ * a negative errno otherwise. `bytes` carries exactly the written bytes.
+ */
+export interface ReplicationGlQueryAnswer {
+  readonly kind: "gl";
+  readonly op: number;
+  readonly rc: number;
+  readonly bytes: Uint8Array;
+}
+
+/**
  * Bytes the host delivered to a device, at the position it delivered them.
  *
  * `device` is the path the bytes were appended to, so the log stays
@@ -117,6 +138,7 @@ export type ReplicationPushedDecision =
  */
 export type ReplicationDecision =
   | ReplicationClockReading
+  | ReplicationGlQueryAnswer
   | ReplicationPushedDecision;
 
 /** Whether `decision` is one the host delivered rather than the guest asked for. */
@@ -297,6 +319,44 @@ export class ReplicationLogReader {
       if (arrived === null) return;
       this.#append(arrived);
     }
+  }
+
+  takeGlQuery(op: number): ReplicationGlQueryAnswer {
+    const entry = this.#awaitEntry();
+    if (entry === undefined) {
+      throw new ReplicationDivergence(
+        this.nextSeq,
+        this.#ended
+          ? `the replica ran GL query ${op} after the primary stopped recording`
+          : `the replica ran GL query ${op} past the end of the log`,
+      );
+    }
+    if (entry.decision.kind !== "gl") {
+      throw new ReplicationDivergence(
+        entry.seq,
+        `the replica ran a GL query where the primary recorded `
+          + `${entry.decision.kind}`,
+      );
+    }
+    if (entry.decision.op !== op) {
+      throw new ReplicationDivergence(
+        entry.seq,
+        `the replica ran GL query ${op} where the primary ran `
+          + `${entry.decision.op}`,
+      );
+    }
+    if (
+      entry.decision.rc > 0
+      && entry.decision.bytes.byteLength < entry.decision.rc
+    ) {
+      throw new ReplicationDivergence(
+        entry.seq,
+        `the log's GL answer claims ${entry.decision.rc} bytes and carries `
+          + `${entry.decision.bytes.byteLength}`,
+      );
+    }
+    this.#index += 1;
+    return entry.decision;
   }
 
   takeClock(clockId: number): ReplicationClockReading {

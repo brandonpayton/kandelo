@@ -1,6 +1,7 @@
 import type { CheckpointFreezeGateCoordinator } from "../checkpoint-freeze-gate";
 import type { ProcessMemoryLayout } from "../process-memory";
 import type { ThreadPageAllocatorState } from "../thread-allocator";
+import type { CheckpointGlContext } from "../webgl/snapshot";
 
 /**
  * Freeze a running machine and read it, on either host.
@@ -175,13 +176,13 @@ export interface CheckpointMachine {
   readonly framebuffers: () => readonly CheckpointFramebuffer[];
   /** Read under the freeze: the display is quiescent. */
   readonly kmsState: () => CheckpointKmsState;
-  /** CRTCs whose canvas a GL context owns.
+  /** Read under the freeze: every GL binding's context state, read back out
+   *  of WebGL2 plus what the bridge retained; see `webgl/snapshot.ts`.
    *
-   *  A GL guest paints its OffscreenCanvas through the EGL to WebGL2 bridge,
-   *  so no CPU ever assembles a frame and no host buffer holds one. Those
-   *  pixels are outside what a checkpoint can read, and the capture refuses
-   *  rather than restoring a machine whose screen is silently gone. */
-  readonly glOwnedCrtcs: () => readonly number[];
+   *  A GL guest's pixels never reach a host buffer, but the checkpoint does
+   *  not need them: the guest's context state travels here, a restore
+   *  rebuilds it, and the restored guest's own draws repaint the screen. */
+  readonly glContexts: () => readonly CheckpointGlContext[];
   /** This machine's CLOCK_MONOTONIC in nanoseconds. */
   readonly monotonicNowNs: () => number;
   readonly kernelAbiVersion: () => number;
@@ -267,7 +268,7 @@ export interface CheckpointProcessBucket {
  * refuses a checkpoint whose format it does not know rather than guessing at
  * the missing or extra fields.
  */
-export const MACHINE_CHECKPOINT_FORMAT = 4;
+export const MACHINE_CHECKPOINT_FORMAT = 5;
 
 export interface MachineCheckpoint {
   readonly format: typeof MACHINE_CHECKPOINT_FORMAT;
@@ -303,6 +304,17 @@ export interface MachineCheckpoint {
   readonly framebuffers: readonly CheckpointFramebuffer[];
   /** The modeset display, empty for a machine that never drove `/dev/dri`. */
   readonly kms: CheckpointKmsState;
+  /**
+   * Every GL binding's context state, empty for a machine that never drove
+   * the EGL to WebGL2 bridge.
+   *
+   * A GL guest's pixels stay behind — a replica re-executes the guest and
+   * renders its own — but the objects the guest created and the values it
+   * set are machine state, and a restored guest resumes believing they
+   * exist. Each context also carries `boundaries`: what its read could not
+   * take, which a restore reports rather than absorbs.
+   */
+  readonly gl: readonly CheckpointGlContext[];
   /**
    * The captured machine's CLOCK_MONOTONIC at the freeze, in nanoseconds.
    *
@@ -348,6 +360,14 @@ export interface MachineCheckpointSummary {
       readonly pixelBytes: number;
     }[];
   };
+  readonly gl: readonly {
+    readonly pid: number;
+    readonly buffers: number;
+    readonly textures: number;
+    readonly programs: number;
+    readonly pixelBytes: number;
+    readonly boundaries: readonly string[];
+  }[];
   readonly processes: readonly {
     readonly pid: number;
     readonly executionGeneration: number;
@@ -396,6 +416,23 @@ function summarizeMachineCheckpoint(
         pixelBytes: buffer.pixels.byteLength,
       })),
     },
+    gl: checkpoint.gl.map((context) => ({
+      pid: context.pid,
+      buffers: context.buffers.length,
+      textures: context.textures.length,
+      programs: context.programs.length,
+      pixelBytes: context.textures.reduce(
+        (total, texture) => total + texture.levels.reduce(
+          (levelTotal, level) => levelTotal + (level.pixels?.byteLength ?? 0),
+          0,
+        ),
+        0,
+      ) + context.buffers.reduce(
+        (total, buffer) => total + buffer.bytes.byteLength,
+        0,
+      ),
+      boundaries: context.boundaries,
+    })),
     processes: checkpoint.processes.map((bucket) => ({
       pid: bucket.pid,
       executionGeneration: bucket.executionGeneration,
@@ -438,6 +475,14 @@ export function machineCheckpointTransferList(
     ...checkpoint.kms.buffers.map(
       (buffer) => buffer.pixels.buffer as ArrayBuffer,
     ),
+    ...checkpoint.gl.flatMap((context) => [
+      ...context.buffers.map((buffer) => buffer.bytes.buffer as ArrayBuffer),
+      ...context.textures.flatMap((texture) =>
+        texture.levels.flatMap((level) =>
+          level.pixels === null ? [] : [level.pixels.buffer as ArrayBuffer]
+        )
+      ),
+    ]),
     ...checkpoint.processes.map(
       (bucket) => bucket.memory.buffer as ArrayBuffer,
     ),
@@ -542,15 +587,6 @@ export async function captureMachineCheckpoint(
   machine: CheckpointMachine,
   options: CheckpointFreezeOptions,
 ): Promise<CheckpointFreezeResult> {
-  const glOwned = machine.glOwnedCrtcs();
-  if (glOwned.length > 0) {
-    return {
-      status: "failed",
-      reason:
-        `CRTC ${glOwned.join(", ")} paints through a GL-owned canvas, whose ` +
-        `pixels never reach a host buffer a checkpoint can read`,
-    };
-  }
   try {
     return await machine.runWithoutWorkerCreation(
       "checkpoint freeze",
@@ -698,6 +734,7 @@ function readMachine(
         : framebuffer.hostBuffer.slice(),
     })),
     kms: machine.kmsState(),
+    gl: machine.glContexts(),
     processes: sources.map((source) => ({
       pid: source.pid,
       executionGeneration: source.executionGeneration,
