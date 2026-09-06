@@ -34,6 +34,19 @@
 ;;      F5/F6"), so the probe result is NOT asserted against the original
 ;;      handle — only that calling it does not trap.
 ;;
+;; N1-F5 Task 2 status note: this fixture continues to prove the GATE, not
+;; reconstruction. F5 investigation found the real capture-time entry point
+;; for a plain externref local is `gc_lookup` (not `encode_externref` — see
+;; `guest.rs`'s doc comment above its `gc_lookup` binding), and a sound,
+;; additive capture-side fix is possible there — but lifting it requires a
+;; companion REPLAY-side fix in frozen/shared code
+;; (`crates/fork_codec::drive_plan::build_drive_plan` does not schedule a
+;; transit-publish for an externref reachable only from a frame vector,
+;; outside this native-only task's scope), so `gc_lookup` deliberately stays
+;; the original unconditional gate below. See `native_fork_externref_
+;; reconstruct.wat` for the (currently `#[ignore]`d) success-shaped fixture
+;; this gap blocks.
+;;
 ;; Exit codes (parent-observed; there is never a child to reap):
 ;;   0  = success (fork cleanly EOPNOTSUPP'd, no child spawned, parent
 ;;        resumed and ran to completion)

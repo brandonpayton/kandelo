@@ -4911,6 +4911,43 @@ fn spawn_guest_thread(
                 }
             }
 
+            // N1-F5 Task 2 investigation note (see task-2-report.md for the
+            // full writeup): `gc_lookup`, NOT `__wpk_fork_ref_encode_externref`
+            // (the host import wired above), is the ACTUAL capture-time entry
+            // point a plain externref-typed local reaches in the "linked"
+            // co-resident-module architecture `wasm-fork-instrument` always
+            // builds (`crates/fork-instrument/src/module_gc_codec.rs`'s
+            // `emit_externref_bridge` gives the encode_externref/
+            // decode_externref NAMES to LOCAL wasm functions that
+            // unconditionally `any.convert_extern`/delegate through
+            // `encode_anyref`/`decode_anyref`; the raw host imports of those
+            // names are consequently never declared at all — confirmed by
+            // disassembling an instrumented fixture's import section and call
+            // graph). A sound, ADDITIVE fix is possible here in principle
+            // (peek the anyref-transit slot via `fm.gc_transit_table`,
+            // recover a host externref via `ExternRef::convert_any`, and
+            // check `externref_provenance` by identity before falling back to
+            // the existing gate) and was prototyped and verified to make
+            // CAPTURE succeed — but the REPLAY side's drive-plan builder
+            // (`crates/fork_codec::drive_plan::build_drive_plan`, frozen/
+            // shared, consumed by `crates/fork-module`) only schedules a
+            // `DRIVE_OP_EXTERNREF_TRANSIT` publish for an externref reachable
+            // from a GC struct/array field or exception payload — NOT one
+            // reachable only from an ordinary frame reference vector (the
+            // "directly held" case `crates/fork-module/src/lib.rs`'s own doc
+            // comment says should decode "lazily via the guest import
+            // `__wpk_fork_ref_decode_externref`" — an import that, per the
+            // paragraph above, is never actually declared in this
+            // architecture). Enabling the encode-side short-circuit without
+            // a working decode companion makes the FORK PROCEED (capture
+            // succeeds, a child is launched) only for BOTH the parent's own
+            // resume and the child's rewind to TRAP reading an unpopulated
+            // transit slot — a regression from today's clean, parent-
+            // survives `EOPNOTSUPP` gate. That decode-side fix lives in
+            // `crates/fork-codec`/`crates/fork-module`/`crates/fork-instrument`,
+            // outside this native-only task's scope, so `gc_lookup` stays the
+            // ORIGINAL, safe, unconditional gate below pending that
+            // companion change.
             let gc_lookup_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_LOOKUP;
             if guest_declares(gc_lookup_name) {
                 let capture_for_gc = Arc::clone(&capture);

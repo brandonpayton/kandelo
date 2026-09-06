@@ -1943,6 +1943,83 @@ mod tests {
         Ok(())
     }
 
+    /// N1-F5 Task 2: a REAL native `fork()` that carries a genuine WASM
+    /// `externref` LIVE across the boundary, captured via mint-time
+    /// PROVENANCE recording (`guest.rs`'s
+    /// `__wpk_fork_ref_provenance_externref` host body +
+    /// `ExternrefProvenance`) and reconstructed, identity-preserved, through
+    /// the replay side — the externref analogue of
+    /// `smoke_fork_reconstructs_references`.
+    ///
+    /// STATUS: `#[ignore]`d — BLOCKED on a decode-side gap outside
+    /// `crates/host-native`'s scope. Investigation (see `guest.rs`'s doc
+    /// comment on its `gc_lookup` binding, and
+    /// `.superpowers/sdd/2026-09-05-n1-f5-externref-capture/task-2-report.md`)
+    /// found the capture-time entry point a plain externref local actually
+    /// reaches is `gc_lookup`, not `__wpk_fork_ref_encode_externref`, and a
+    /// sound capture-side fix there was prototyped and verified to work. But
+    /// the frozen/shared replay drive-plan builder
+    /// (`crates/fork_codec::drive_plan::build_drive_plan`) only schedules a
+    /// transit-publish for an externref reachable from a GC struct/array
+    /// field or exception payload — not one reachable only from an ordinary
+    /// frame reference vector (this fixture's case) — so lifting the
+    /// encode-side gate alone makes BOTH the parent's resume and the
+    /// child's rewind trap instead of reconstructing. Mirrors
+    /// `smoke_fork_reconstructs_references`'s own HISTORY note precedent
+    /// (that test was itself `#[ignore]`d through N1-I5 Task 3 until its
+    /// capture path existed). Un-ignore this once the drive-plan gap closes.
+    ///
+    /// Fixture: `native_fork_externref_reconstruct.instrumented.wasm`
+    /// (`fixtures/native_fork_externref_reconstruct.wat`) — a NEW fixture
+    /// (the ORIGINAL `native_fork_externref_gate.wat` still proves today's
+    /// real, working behavior: a plain externref fork cleanly `EOPNOTSUPP`s
+    /// with the parent surviving). See the new fixture's own doc comment for
+    /// the full exit-code table.
+    ///
+    /// Asserts correctness (`exit_code == 0`, both processes observe the
+    /// SAME externref handle, 42) AND proof of use
+    /// (`fork_proof_of_use.references_reconstructed > 0`, so a silent
+    /// fallback that merely happened to leave the local unread cannot pass).
+    #[test]
+    #[ignore = "N1-F5 T2 BLOCKED: replay drive-plan gap outside host-native, see doc comment"]
+    fn smoke_fork_externref_reconstructs() -> anyhow::Result<()> {
+        let Some(path) = kernel_path_or_skip() else {
+            return Ok(());
+        };
+        let Some(_fork_module_path) = fork_module_path_or_skip() else {
+            return Ok(());
+        };
+        let guest_wasm =
+            include_bytes!("../fixtures/native_fork_externref_reconstruct.instrumented.wasm");
+
+        let options = guest::GuestOptions { enable_fork_module: true, ..Default::default() };
+        let outcome = guest::run_guest(&path, guest_wasm, &options)?;
+
+        assert_eq!(
+            outcome.exit_code, 0,
+            "expected both the reconstructed CHILD externref and the \
+             PARENT's own post-fork externref to check out at handle 42 \
+             (stdout: {:?}, stderr: {:?}, trace: {:?}, proof: {:?})",
+            String::from_utf8_lossy(&outcome.stdout),
+            String::from_utf8_lossy(&outcome.stderr),
+            outcome.syscall_trace,
+            outcome.fork_proof_of_use,
+        );
+        assert!(
+            outcome.syscall_trace.contains(&wasm_posix_shared::abi::host_intercepted::SYS_FORK),
+            "expected the SYS_FORK sentinel in the syscall trace: {:?}",
+            outcome.syscall_trace
+        );
+
+        let proof = outcome.fork_proof_of_use;
+        assert!(
+            proof.references_reconstructed > 0,
+            "the module must have driven a real externref reconstruction \
+             (not a silent fallback): {proof:?}"
+        );
+        Ok(())
+    }
+
     /// Wasmtime 35 -> 48 upgrade acceptance test (the reason for the
     /// upgrade): a *fork-instrumented* guest module — the exact artifact
     /// shape `scripts/run-wasm-fork-instrument.sh` produces for every
