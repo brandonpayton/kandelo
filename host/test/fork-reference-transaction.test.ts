@@ -65,6 +65,12 @@ function makeExternrefs(): {
       if (!values.has(handle)) throw new Error(`missing handle ${handle}`);
       return values.get(handle);
     },
+    tryEncode(value) {
+      if ((typeof value !== "object" || value === null) && typeof value !== "function") {
+        return undefined;
+      }
+      return handles.get(value as object);
+    },
   };
   return { provider, values };
 }

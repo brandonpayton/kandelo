@@ -142,6 +142,9 @@ function externrefs(values: ReadonlyMap<number, unknown>): {
         if (!values.has(handle)) throw new Error(`unknown externref handle ${handle}`);
         return values.get(handle);
       },
+      tryEncode(): number | undefined {
+        return undefined;
+      },
     },
     materializations,
   };

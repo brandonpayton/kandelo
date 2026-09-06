@@ -343,6 +343,7 @@ export const WPK_FORK_REFERENCE_IMPORT_GC_PROVENANCE_END = "__wpk_fork_ref_gc_pr
 export const WPK_FORK_REFERENCE_IMPORT_GC_PROVENANCE_REF = "__wpk_fork_ref_gc_provenance_ref" as const;
 export const WPK_FORK_REFERENCE_IMPORT_GC_ROUTE = "__wpk_fork_ref_gc_route" as const;
 export const WPK_FORK_REFERENCE_IMPORT_GC_TRANSIT = "__wpk_fork_ref_gc_transit" as const;
+export const WPK_FORK_REFERENCE_IMPORT_PROVENANCE_EXTERNREF = "__wpk_fork_ref_provenance_externref" as const;
 export const WPK_FORK_REFERENCE_EXPORT_GC_ALLOCATE = "__wpk_fork_ref_gc_allocate" as const;
 export const WPK_FORK_REFERENCE_EXPORT_GC_ENCODE_SLOT = "__wpk_fork_ref_gc_encode_slot" as const;
 export const WPK_FORK_REFERENCE_EXPORT_GC_FILL = "__wpk_fork_ref_gc_fill" as const;

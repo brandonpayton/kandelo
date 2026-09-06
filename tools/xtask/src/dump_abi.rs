@@ -2507,6 +2507,10 @@ fn render_ts_module() -> String {
             shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_TRANSIT,
         ),
         (
+            "WPK_FORK_REFERENCE_IMPORT_PROVENANCE_EXTERNREF",
+            shared::abi::WPK_FORK_REFERENCE_IMPORT_PROVENANCE_EXTERNREF,
+        ),
+        (
             "WPK_FORK_REFERENCE_EXPORT_GC_ALLOCATE",
             shared::abi::WPK_FORK_REFERENCE_EXPORT_GC_ALLOCATE,
         ),

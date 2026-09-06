@@ -9,6 +9,7 @@ import {
   appendSegmentedForkReferenceTransaction,
   decodeSegmentedForkReferenceTransaction,
   findForkReferenceVectorOrdinal,
+  forkReferenceVectorFrom,
   ForkReferenceDirectoryOverlay,
   ForkReferenceVectorBuilder,
   indexForkReferenceVector,
@@ -25,12 +26,15 @@ import {
   FORK_GC_FIELD_MUTABLE,
   FORK_GC_FIELD_REFERENCE,
   FORK_GC_LAYOUT_DEFAULTABLE_SHELL,
+  FORK_GC_LAYOUT_REQUIRES_PROVENANCE,
   ForkGcConstructorKind,
   type ForkGcCodecDescriptor,
   type ForkGcCodecProvider,
+  type ForkGcConstructorProvenance,
   type ForkGcLayoutDescriptor,
 } from "./fork-gc-codec";
 import { ForkStaticRootCatalog } from "./fork-static-root-catalog";
+import type { ForkExternrefProvenanceTable } from "./fork-externref-provenance";
 import {
   WPK_FORK_REFERENCE_TRANSACTION_OWNER,
 } from "./generated/abi";
@@ -60,6 +64,17 @@ export interface ForkExternrefRecipeProvider {
    * The real host value remains with the provider's owner.
    */
   materialize(handle: number): unknown;
+
+  /**
+   * Lookup-only handle extraction: read a handle back from a value that is
+   * ALREADY self-describing (e.g. a canonical worker-local token), never
+   * minting a new handle for a value with none. Used by
+   * `ForkActivationRegistry.recordExternrefProvenance` (the
+   * `__wpk_fork_ref_provenance_externref` host-import body) so a sound,
+   * never-mint provenance recording never risks `capture()`'s unclaimed-value
+   * fallback.
+   */
+  tryEncode(value: unknown): number | undefined;
 }
 
 export interface ForkExceptionSlotProvider {
@@ -120,6 +135,11 @@ export interface ForkReferenceChildReplayAdoption {
   readonly allocatedTypedRecipes: ReadonlySet<number>;
   readonly filledTypedRecipes: ReadonlySet<number>;
   readonly materializedExceptionRecipes: ReadonlySet<number>;
+}
+
+export interface ForkGcDefinitionProvenance {
+  readonly record: ForkGcConstructorProvenance;
+  readonly recipeIds: readonly number[];
 }
 
 interface ScratchChunk {
@@ -196,6 +216,8 @@ export class ForkReferenceTransaction {
     new PagedForkReferenceDirectory();
   private readonly materializedValues = new Map<number, unknown>();
   private readonly pendingExceptions = new Set<number>();
+  private readonly pendingGc = new Set<number>();
+  private readonly i31Ids = new Map<number, number>();
   private readonly exceptionCacheIndexes = new Map<number, number>();
   private exceptionSlots: ForkExceptionSlotProvider | undefined;
   private readonly scratchChunks: ScratchChunk[] = [];
@@ -215,6 +237,9 @@ export class ForkReferenceTransaction {
     MutableForkReferenceVectorInternIndex = new Map();
   private readonly decodedReferenceVectors =
     new ForkReferenceDirectoryOverlay<ForkReferenceVector>();
+  private readonly decodedReferenceVectorIntern:
+    MutableForkReferenceVectorInternIndex = new Map();
+  private readonly replayGcVectors = new Map<number, number>();
   private typedMaterialized = false;
   private childTransaction: DecodedSegmentedForkReferenceTransaction | null = null;
   private childReplayAdopted = false;
@@ -231,6 +256,12 @@ export class ForkReferenceTransaction {
     private readonly label = "fork reference transaction",
     private readonly staticRoots?: ForkStaticRootCatalog,
     private readonly typedReplay?: ForkTypedReferenceReplayOwner,
+    /**
+     * Local, same-realm provenance lookup for a plain host externref reached
+     * through the anyref-transit `GC_LOOKUP` seam (N1 Node/browser parity).
+     * Lookup-only: `lookupGcSlot` never mints through this table.
+     */
+    private readonly externrefProvenance?: ForkExternrefProvenanceTable,
   ) {}
 
   setExceptionSlotProvider(provider: ForkExceptionSlotProvider): void {
@@ -299,6 +330,399 @@ export class ForkReferenceTransaction {
     return id;
   }
 
+  /**
+   * Dedup/static-root/externref-provenance lookup for an anyref-lineage value
+   * held in the module's Wasm-GC transit table.
+   *
+   * Mirrors native's `gc_lookup` layering
+   * (`crates/host-native/src/guest.rs`): (1) has this exact live value already
+   * been assigned a recipe id this capture (cycle/alias back onto an
+   * already-claimed node)? (2) is it a registered static root (a harvest-time
+   * reverse index, `ForkStaticRootCatalog.encode`)? (3) is it a plain host
+   * externref with mint-time-recorded provenance (`externrefProvenance`,
+   * lookup-only, never mint here)? A miss on all three returns `0` ("unknown"
+   * — not a gate by itself), letting the guest's own dispatch recurse into
+   * `claimGcSlot` (real struct/array/i31 construction) next.
+   */
+  lookupGcSlot(table: WebAssembly.Table, slot: number): number {
+    this.requirePhase("capture", "look up a Wasm-GC identity");
+    const value = this.gcSlotValue(table, slot);
+    const known = this.lookupId(value);
+    if (known !== undefined) return known;
+    const staticRoot = this.staticRoots?.encode(value);
+    if (staticRoot) {
+      const id = this.nodes.length;
+      if (id > 0xffff_ffff) {
+        throw new RangeError("fork reference recipe id space exhausted");
+      }
+      this.nodes.push({
+        id,
+        node: {
+          kind: "static-root",
+          moduleActivation: staticRoot.moduleActivation,
+          staticRootOrdinal: staticRoot.ordinal,
+        },
+      });
+      this.capturedValues.push(value);
+      this.rememberId(value, id);
+      // Publish the static root into the transit at `id + 1` so PARENT replay's
+      // `decode_anyref` (a pure `table.get(transit, recipe + 1)`) reads it. A
+      // captured i31 / struct is grown+published for the parent by
+      // `encodeI31` / `claimGcSlot`; the static-root lookup path did neither, so a
+      // static root held as a bare operand-stack / local value across fork left the
+      // parent's transit slot unsized and the resume trapped out of bounds. (The
+      // CHILD re-publishes every static root via `materializeAllTyped` PHASE A.)
+      if (id + 2 > table.length) {
+        table.grow(id + 2 - table.length, null);
+      }
+      table.set(id + 1, value);
+      return id;
+    }
+    // N1 Node/browser parity: the externref-provenance branch. A hit here
+    // means `value` crossed a genuine host-import production site (recorded
+    // by `__wpk_fork_ref_provenance_externref`'s import body at mint time),
+    // not merely a GC-internalized anyref that happens to reach this seam.
+    const externrefHandle = this.externrefProvenance?.lookup(value);
+    if (externrefHandle !== undefined) {
+      const id = this.intern(value, () => ({
+        kind: "externref",
+        handle: externrefHandle,
+      }));
+      // Publish into the transit at `id + 1`, exactly like the static-root
+      // branch above: the guest's generated `decode_externref` bridge (a
+      // LOCAL Wasm function, not this file's JS `decodeExternref`) restores a
+      // plain host externref by reading the SAME transit table
+      // (`decode_anyref`'s `table.get(transit, recipe + 1)`), not by calling
+      // back into JS. Skipping this publish leaves the PARENT's transit slot
+      // unsized/unset and its resumed continuation traps out of bounds.
+      if (id + 2 > table.length) {
+        table.grow(id + 2 - table.length, null);
+      }
+      table.set(id + 1, value);
+      return id;
+    }
+    return 0;
+  }
+
+  claimGcSlot(table: WebAssembly.Table, slot: number): number {
+    this.requirePhase("capture", "claim a Wasm-GC identity");
+    const value = this.gcSlotValue(table, slot);
+    const known = this.lookupId(value);
+    if (known !== undefined) return known;
+    const id = this.nodes.length;
+    if (id > 0xffff_ffff) {
+      throw new RangeError("fork reference recipe id space exhausted");
+    }
+    // WHY: publish graph identity before recursively encoding fields. The
+    // placeholder is never serializable; `sealInto` rejects it via pendingGc
+    // unless the generated codec completes `defineGc`.
+    this.nodes.push({
+      id,
+      node: {
+        kind: "struct",
+        moduleActivation: 0,
+        typeOrdinal: 0,
+        layoutId: 0,
+        scalars: new Uint8Array(),
+        fields: [],
+      },
+    });
+    this.capturedValues.push(value);
+    this.rememberId(value, id);
+    this.pendingGc.add(id);
+    return id;
+  }
+
+  encodeI31(value: number): number {
+    this.requirePhase("capture", "encode an i31ref");
+    if (
+      !Number.isInteger(value)
+      || value < -0x4000_0000
+      || value > 0x3fff_ffff
+    ) {
+      throw new RangeError(`invalid signed i31 payload ${value}`);
+    }
+    const known = this.i31Ids.get(value);
+    if (known !== undefined) return known;
+    const id = this.nodes.length;
+    if (id > 0xffff_ffff) {
+      throw new RangeError("fork reference recipe id space exhausted");
+    }
+    this.nodes.push({ id, node: { kind: "i31", value } });
+    // i31 identity is defined by its 31-bit payload. Keep a scalar here so
+    // parent replay and graph aliases use the same canonical recipe id.
+    this.capturedValues.push(value);
+    this.i31Ids.set(value, id);
+    return id;
+  }
+
+  capturedGcValue(recipeId: number): unknown {
+    this.requirePhase("capture", "read a captured Wasm-GC identity");
+    assertRecipeId(recipeId);
+    if (recipeId === 0 || recipeId >= this.capturedValues.length) {
+      throw new Error(`fork Wasm-GC recipe ${recipeId} is out of bounds`);
+    }
+    return this.capturedValues.get(recipeId);
+  }
+
+  defineGc(
+    recipeId: number,
+    moduleActivation: number,
+    typeOrdinal: number,
+    layoutId: number,
+    kind: number,
+    scalarPointer: number | bigint,
+    scalarByteLength: number,
+    referenceVectorOrdinal: number,
+    descriptor: ForkGcCodecDescriptor,
+    provenance: ForkGcDefinitionProvenance | null,
+  ): void {
+    this.requirePhase("capture", "define a Wasm-GC recipe");
+    assertRecipeId(recipeId);
+    this.assertU32(moduleActivation, "GC module activation");
+    this.assertU32(typeOrdinal, "GC type ordinal");
+    this.assertU31(layoutId, "GC layout id", false);
+    this.assertU32(referenceVectorOrdinal, "GC reference vector ordinal");
+    if (!this.pendingGc.has(recipeId)) {
+      throw new Error(`fork Wasm-GC recipe ${recipeId} is not pending definition`);
+    }
+    const layout = descriptor.require(layoutId);
+    if (
+      layout.typeOrdinal !== typeOrdinal
+      || layout.kind !== kind
+    ) {
+      throw new Error(
+        `fork Wasm-GC recipe ${recipeId} coordinate does not match `
+        + `${moduleActivation}:${typeOrdinal}:${layoutId}:${kind}`,
+      );
+    }
+    const snapshotScalars = this.readBytes(
+      scalarPointer,
+      scalarByteLength,
+      "fork Wasm-GC scalar payload",
+    );
+    const vector = this.referenceVectors.get(referenceVectorOrdinal);
+    if (!vector) {
+      throw new Error(
+        `fork Wasm-GC recipe ${recipeId} names an unavailable reference vector`,
+      );
+    }
+    this.validateGcSnapshot(
+      layout,
+      snapshotScalars,
+      vector,
+      `fork Wasm-GC recipe ${recipeId}`,
+    );
+
+    const requiresProvenance =
+      (layout.flags & FORK_GC_LAYOUT_REQUIRES_PROVENANCE) !== 0;
+    if (requiresProvenance !== (provenance !== null)) {
+      throw new Error(
+        `fork Wasm-GC recipe ${recipeId} has `
+        + `${provenance ? "unexpected" : "missing"} constructor provenance`,
+      );
+    }
+    let provenanceScalars: Uint8Array = new Uint8Array();
+    let provenanceIds: readonly number[] = [];
+    if (provenance) {
+      const selected = descriptor.requireCaptureLayout(
+        layout.baseLayoutId,
+        provenance.record.layoutId,
+      );
+      if (
+        selected.id !== layout.id
+        || provenance.record.activationId !== moduleActivation
+        || provenance.record.baseLayoutId !== layout.baseLayoutId
+        || provenance.record.scalars.byteLength
+          !== layout.provenanceScalarLength
+        || provenance.record.references.length
+          !== layout.provenanceReferenceCount
+        || provenance.recipeIds.length
+          !== layout.provenanceReferenceCount
+      ) {
+        throw new Error(
+          `fork Wasm-GC recipe ${recipeId} provenance does not match `
+          + `layout ${layout.id}`,
+        );
+      }
+      provenance.recipeIds.forEach((id, index) => {
+        assertRecipeId(id);
+        if (id >= this.nodes.length) {
+          throw new Error(
+            `fork Wasm-GC provenance ${index} names missing recipe ${id}`,
+          );
+        }
+      });
+      provenanceScalars = provenance.record.scalars;
+      provenanceIds = provenance.recipeIds;
+    }
+
+    const scalars = new Uint8Array(
+      provenanceScalars.byteLength + snapshotScalars.byteLength,
+    );
+    scalars.set(provenanceScalars);
+    scalars.set(snapshotScalars, provenanceScalars.byteLength);
+    const references = [...provenanceIds, ...vector];
+    const node: ForkReferenceRecipeNode =
+      layout.kind === 1
+        ? {
+            kind: "struct",
+            moduleActivation,
+            typeOrdinal,
+            layoutId,
+            scalars,
+            fields: references,
+          }
+        : {
+            kind: "array",
+            moduleActivation,
+            typeOrdinal,
+            layoutId,
+            scalars,
+            elements: references,
+          };
+    this.nodes.set(recipeId, { id: recipeId, node });
+    this.pendingGc.delete(recipeId);
+  }
+
+  routeGc(recipeId: number, expectedActivation: number): number {
+    assertRecipeId(recipeId);
+    this.assertU32(expectedActivation, "GC route activation");
+    const node = this.recipeNode(recipeId);
+    if (node?.kind === "i31") return 0;
+    if (
+      (node?.kind !== "struct" && node?.kind !== "array")
+      || node.moduleActivation !== expectedActivation
+    ) {
+      return -1;
+    }
+    const layoutId = node.layoutId ?? 0;
+    this.assertU31(layoutId, `fork Wasm-GC recipe ${recipeId} layout`, false);
+    return layoutId;
+  }
+
+  gcPayloadLength(
+    recipeId: number,
+    expectedActivation: number,
+    expectedLayoutId: number,
+  ): number {
+    assertRecipeId(recipeId);
+    this.assertU32(expectedActivation, "GC payload activation");
+    this.assertU31(expectedLayoutId, "GC payload layout");
+    const node = this.recipeNode(recipeId);
+    if (node?.kind === "i31") {
+      if (expectedLayoutId !== 0) {
+        throw new Error(`fork i31 recipe ${recipeId} has a nonzero layout`);
+      }
+      return 4;
+    }
+    if (
+      (node?.kind !== "struct" && node?.kind !== "array")
+      || node.moduleActivation !== expectedActivation
+      || (node.layoutId ?? 0) !== expectedLayoutId
+    ) {
+      throw new Error(
+        `fork Wasm-GC recipe ${recipeId} does not match payload route `
+        + `${expectedActivation}:${expectedLayoutId}`,
+      );
+    }
+    return (node.scalars ?? new Uint8Array()).byteLength;
+  }
+
+  loadGc(
+    recipeId: number,
+    moduleActivation: number,
+    typeOrdinal: number,
+    layoutId: number,
+    kind: number,
+    scalarDestination: number | bigint,
+    scalarByteLength: number,
+  ): number {
+    this.requirePhase("child-replay", "load a Wasm-GC recipe");
+    assertRecipeId(recipeId);
+    this.assertU32(moduleActivation, "GC load activation");
+    // WHY the coercion: an i31 recipe carries the type ordinal `0xffff_ffff` (the
+    // "no struct/array type" sentinel). A wasm caller that passes it as a signed
+    // i32 delivers `-1` at the wasm->JS boundary, which `assertU32` (value < 0)
+    // would reject BEFORE the i31 branch below could accept the sentinel — so an
+    // i31 load through the module drive would spuriously fail. Coerce to unsigned
+    // first; this is a no-op for the genuine u32 type ordinals struct/array carry.
+    typeOrdinal = typeOrdinal >>> 0;
+    this.assertU32(typeOrdinal, "GC load type ordinal");
+    this.assertU31(layoutId, "GC load layout id");
+    this.assertU32(kind, "GC load kind");
+    const node = this.recipeNode(recipeId);
+    if (node?.kind === "i31") {
+      if (
+        layoutId !== 0
+        || typeOrdinal !== 0xffff_ffff
+        || kind !== 0
+        || scalarByteLength !== 4
+      ) {
+        throw new Error(`fork i31 recipe ${recipeId} has an invalid load coordinate`);
+      }
+      const bytes = new Uint8Array(4);
+      new DataView(bytes.buffer).setInt32(0, node.value, true);
+      this.writeBytes(
+        scalarDestination,
+        bytes,
+        "fork i31 scalar destination",
+      );
+      return 0;
+    }
+    if (node?.kind !== "struct" && node?.kind !== "array") {
+      throw new Error(`fork recipe ${recipeId} is not a Wasm-GC aggregate`);
+    }
+    const nodeKind = node.kind === "struct" ? 1 : 2;
+    const scalars = node.scalars ?? new Uint8Array();
+    if (
+      node.moduleActivation !== moduleActivation
+      || node.typeOrdinal !== typeOrdinal
+      || (node.layoutId ?? 0) !== layoutId
+      || nodeKind !== kind
+      || scalars.byteLength !== scalarByteLength
+    ) {
+      throw new Error(
+        `fork Wasm-GC recipe ${recipeId} payload does not match `
+        + `the generated codec`,
+      );
+    }
+    this.writeBytes(
+      scalarDestination,
+      scalars,
+      "fork Wasm-GC scalar destination",
+    );
+    const edges = node.kind === "struct" ? node.fields : node.elements;
+    if (edges.length === 0) return 0;
+    const known = this.replayGcVectors.get(recipeId);
+    if (known !== undefined) return known;
+    const existing = findForkReferenceVectorOrdinal(
+      [
+        this.childTransaction!.vectorIntern,
+        this.decodedReferenceVectorIntern,
+      ],
+      this.decodedReferenceVectors,
+      forkReferenceVectorFrom(edges, edges.length),
+    );
+    if (existing !== undefined) {
+      this.replayGcVectors.set(recipeId, existing);
+      return existing;
+    }
+    const ordinal = this.decodedReferenceVectors.length;
+    if (ordinal > MAX_REFERENCE_VECTOR_ORDINAL) {
+      throw new RangeError("fork reference vector ordinal space exhausted");
+    }
+    const canonical = forkReferenceVectorFrom(edges, edges.length);
+    this.decodedReferenceVectors.push(canonical);
+    indexForkReferenceVector(
+      this.decodedReferenceVectorIntern,
+      canonical,
+      ordinal,
+    );
+    this.replayGcVectors.set(recipeId, ordinal);
+    return ordinal;
+  }
+
   sealInto(arena: ForkModuleStateArena): Uint8Array {
     this.requirePhase("capture", "seal reference capture");
     if (this.scratchReservations.length !== 0) {
@@ -309,6 +733,11 @@ export class ForkReferenceTransaction {
     if (this.pendingExceptions.size !== 0) {
       throw new Error(
         `cannot seal ${this.pendingExceptions.size} incomplete exception recipe(s)`,
+      );
+    }
+    if (this.pendingGc.size !== 0) {
+      throw new Error(
+        `cannot seal ${this.pendingGc.size} incomplete Wasm-GC recipe(s)`,
       );
     }
     if (this.pendingReferenceVectors.size !== 0) {
@@ -364,6 +793,7 @@ export class ForkReferenceTransaction {
     // transaction-wide index. The immutable decoded directory remains the
     // shared base used by both early and ordinary replay.
     this.decodedReferenceVectors.reset(decoded.vectors);
+    this.decodedReferenceVectorIntern.clear();
     for (const entry of graph.nodes) {
       if (entry.node.kind === "exnref") {
         this.exceptionCacheIndexes.set(
@@ -1585,6 +2015,35 @@ export class ForkReferenceTransaction {
     }
   }
 
+  private assertU31(
+    value: number,
+    context: string,
+    allowZero = true,
+  ): void {
+    if (
+      !Number.isInteger(value)
+      || value < (allowZero ? 0 : 1)
+      || value > 0x7fff_ffff
+    ) {
+      throw new RangeError(`${context} is not ${allowZero ? "a" : "a nonzero"} u31`);
+    }
+  }
+
+  private gcSlotValue(table: WebAssembly.Table, slot: number): unknown {
+    this.assertU32(slot, "Wasm-GC transit slot");
+    if (slot >= table.length) {
+      throw new RangeError(`Wasm-GC transit slot ${slot} is out of bounds`);
+    }
+    const value = table.get(slot);
+    if (
+      (typeof value !== "object" || value === null)
+      && typeof value !== "function"
+    ) {
+      throw new TypeError("Wasm-GC transit slot is not a non-null reference");
+    }
+    return value;
+  }
+
   private requireActivePhase(operation: string): void {
     if (
       this.phase !== "capture"
@@ -1750,6 +2209,8 @@ export class ForkReferenceTransaction {
       }
     }
     this.pendingExceptions.clear();
+    this.pendingGc.clear();
+    this.i31Ids.clear();
     this.exceptionCacheIndexes.clear();
     this.nodes.clear();
     this.capturedValues.clear();
@@ -1762,6 +2223,8 @@ export class ForkReferenceTransaction {
     this.nextReferenceVectorHandle = 1;
     this.referenceVectorIntern.clear();
     this.decodedReferenceVectors.clear();
+    this.decodedReferenceVectorIntern.clear();
+    this.replayGcVectors.clear();
     this.typedMaterialized = false;
     this.childTransaction = null;
     this.childReplayAdopted = false;

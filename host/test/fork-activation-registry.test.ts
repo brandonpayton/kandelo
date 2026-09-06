@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   buildForkActivationStateImports,
   ForkActivationRegistry,
@@ -136,26 +136,27 @@ function registry(memory: WebAssembly.Memory, label: string): ForkActivationRegi
       materialize: () => {
         throw new Error("fixture has no externrefs");
       },
+      tryEncode: () => undefined,
     },
     label,
   );
 }
 
 describe("ForkActivationRegistry", () => {
-  it("gates GC layout capture with a survivable placeholder and records the kind", () => {
-    // The real capture-side layout encoder (`ForkActivationRegistry.captureGcLayout`)
-    // was deleted once Task 4 gutted this import to a survivable placeholder (no
-    // reconstruction runs on the capture side for gated struct/array kinds); this
-    // now exercises the current gated import body instead.
+  it("binds GC layout capture in the generated slot/activation/layout order", () => {
+    // N1 Node/browser parity: `captureGcLayout` is un-gated again (real
+    // struct/array/i31 capture, not a survivable placeholder), so this goes
+    // back to exercising the real dispatch order via a spy.
     const memory = new WebAssembly.Memory({ initial: 2 });
     const owner = registry(memory, "GC capture import");
+    const capture = vi.spyOn(owner, "captureGcLayout").mockReturnValue(23);
     const imports = buildForkActivationStateImports(7, owner);
     const captureLayout = imports[
       WPK_FORK_REFERENCE_IMPORT_GC_CAPTURE_LAYOUT
     ] as CallableFunction;
 
-    expect(captureLayout(5, 7, 11)).toBe(11);
-    expect(owner.takeUnsupportedReferenceKind()).toBe("struct/array");
+    expect(captureLayout(5, 7, 11)).toBe(23);
+    expect(capture).toHaveBeenCalledWith(7, 5, 11);
     expect(() => captureLayout(7, 5, 11)).toThrow(
       "activation 7 cannot select GC layout for activation 5",
     );
