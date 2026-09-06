@@ -2274,6 +2274,68 @@ mod tests {
         Ok(())
     }
 
+    /// N1 refcomplete (last gated native kind): a STATIC ROOT — an IMMUTABLE
+    /// `(ref $node)` global whose init is `struct.new`, reached through a
+    /// mutable HOLDER edge — held live across a native `kernel_fork` and
+    /// RE-IDENTIFIED (never reconstructed) by `(activation, ordinal)`
+    /// coordinate in the child. See `fixtures/native_fork_gc_static_root.wat`'s
+    /// own doc comment for the fixture shape and exit-code contract, and
+    /// `docs/plans/2026-09-05-n1-static-root-capture-grounding.md` for the
+    /// design this test proves end-to-end: `StaticRootProvenance`'s
+    /// capture-side reverse index (`guest.rs`) feeding the already-built
+    /// replay-side `DRIVE_OP_STATIC_ROOT`/`fm_static_root_slot` machinery.
+    ///
+    /// This is the genuinely RED-before-GREEN case: before
+    /// `StaticRootProvenance` existed, `gc_lookup`'s miss let the guest's own
+    /// dispatch fall through to `gc_claim`/`gc_define`, capturing the value
+    /// as an ORDINARY dynamic `Struct` recipe — which reconstructs the
+    /// child's holder field as a FRESH, non-identical struct object, so the
+    /// fixture's own `ref.eq`-against-the-child's-own-`$static_root`-global
+    /// check would fail (exit 91), not merely reconstruct the wrong scalar.
+    #[test]
+    fn smoke_fork_static_root_reconstructs() -> anyhow::Result<()> {
+        let Some(path) = kernel_path_or_skip() else {
+            return Ok(());
+        };
+        let Some(_fork_module_path) = fork_module_path_or_skip() else {
+            return Ok(());
+        };
+        let guest_wasm = include_bytes!("../fixtures/native_fork_gc_static_root.instrumented.wasm");
+
+        let options = guest::GuestOptions { enable_fork_module: true, ..Default::default() };
+        let outcome = guest::run_guest(&path, guest_wasm, &options)?;
+
+        assert_eq!(
+            outcome.exit_code, 0,
+            "expected the CHILD's reconstructed static root (identity-equal \
+             to the child's OWN fresh global) and the PARENT's own \
+             unaffected static root to verify (stdout: {:?}, stderr: {:?}, \
+             trace: {:?}, proof: {:?})",
+            String::from_utf8_lossy(&outcome.stdout),
+            String::from_utf8_lossy(&outcome.stderr),
+            outcome.syscall_trace,
+            outcome.fork_proof_of_use,
+        );
+        assert!(
+            outcome.syscall_trace.contains(&wasm_posix_shared::abi::host_intercepted::SYS_FORK),
+            "expected the SYS_FORK sentinel in the syscall trace: {:?}",
+            outcome.syscall_trace
+        );
+
+        // `static_roots_published` (`fm_static_roots_published`) is the
+        // proof-of-use counter for `DRIVE_OP_STATIC_ROOT` — it only advances
+        // when the child's drive plan actually re-identified a static root
+        // by coordinate, not when a value was (mis-)captured and
+        // reconstructed as an ordinary dynamic GC node.
+        let proof = outcome.fork_proof_of_use;
+        assert!(
+            proof.static_roots_published > 0,
+            "the module must have driven a real static-root re-identification \
+             (not a silent dynamic-Struct fallback): {proof:?}"
+        );
+        Ok(())
+    }
+
     /// Wasmtime 35 -> 48 upgrade acceptance test (the reason for the
     /// upgrade): a *fork-instrumented* guest module — the exact artifact
     /// shape `scripts/run-wasm-fork-instrument.sh` produces for every
