@@ -70,6 +70,20 @@ export interface PlatformIO {
    * backing may omit this hook.
    */
   preparePath?(path: string): Promise<boolean>;
+  /**
+   * Keep every future file handle at or above `fileFloor` and every future
+   * directory handle at or above `dirFloor`. A restored kernel memory still
+   * names the captured machine's handles; a fresh allocation overlapping a
+   * stale value would make old and new indistinguishable before the remap
+   * rewrites them. Only hosts that restore checkpoints need this hook.
+   */
+  reserveHandleFloors?(fileFloor: number, dirFloor: number): void;
+  /**
+   * Keep every future CLOCK_MONOTONIC reading at or above `floorNs`. See
+   * `TimeProvider.advanceMonotonicFloor`; hosts that restore checkpoints
+   * need this hook.
+   */
+  advanceMonotonicFloor?(floorNs: number): void;
   open(path: string, flags: number, mode: number): number;
   close(handle: number): number;
   read(

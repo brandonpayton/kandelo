@@ -110,6 +110,11 @@ int *__errno_location(void);
 #define CH_SIGINFO_WORD_2 WASM_POSIX_CHANNEL_SIGINFO_WORD_2_OFFSET
 #define CH_SIG_ALT_SP  WASM_POSIX_CHANNEL_SIG_ALT_SP_OFFSET
 #define CH_SIG_ALT_SIZE WASM_POSIX_CHANNEL_SIG_ALT_SIZE_OFFSET
+#define CH_CHECKPOINT_REQUEST WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_OFFSET
+#define CH_CHECKPOINT_REQUEST_UNWIND \
+    WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_UNWIND
+#define CH_CHECKPOINT_REQUEST_RESTART \
+    WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_RESTART
 
 _Static_assert(WASM_POSIX_CHANNEL_ARGS_COUNT == 6u,
                "channel syscall glue requires six argument slots");
@@ -135,6 +140,22 @@ _Static_assert(sizeof(uint64_t) == WASM_POSIX_CHANNEL_SIG_ALT_SP_BYTES,
                "signal delivery alt-stack pointer width must match generated ABI");
 _Static_assert(sizeof(uint64_t) == WASM_POSIX_CHANNEL_SIG_ALT_SIZE_BYTES,
                "signal delivery alt-stack size width must match generated ABI");
+_Static_assert(WASM_POSIX_CHANNEL_CHECKPOINT_BASE_OFFSET
+                       + WASM_POSIX_CHANNEL_CHECKPOINT_AREA_SIZE
+                   == WASM_POSIX_CHANNEL_SIG_BASE_OFFSET,
+               "checkpoint request area must sit directly below the signal area");
+_Static_assert(WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_OFFSET
+                       + WASM_POSIX_CHANNEL_CHECKPOINT_WIRE_SIZE
+                   <= WASM_POSIX_CHANNEL_SIG_BASE_OFFSET,
+               "checkpoint request word must not reach into the signal area");
+_Static_assert(sizeof(uint32_t) == WASM_POSIX_CHANNEL_CHECKPOINT_WIRE_SIZE,
+               "checkpoint request word width must match generated ABI");
+_Static_assert(
+    WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_KNOWN_MASK
+        == (WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_UNWIND
+            | WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_RESTART),
+    "checkpoint request bit mask drift"
+);
 
 #define EFAULT 14
 #define EINTR 4
@@ -481,6 +502,19 @@ int32_t kernel_fork(int32_t mode);
 __attribute__((import_module("kernel"), import_name("kernel_exit")))
 _Noreturn void kernel_exit(int32_t status);
 
+/* Checkpoint — the migration unwind boundary, seeded exactly like kernel_fork.
+ *
+ * Unlike kernel_fork this IS reached from the syscall dispatcher, deliberately.
+ * A checkpoint must unwind the whole call stack, so seeding the instrumenter
+ * from here is what gives it every function that can be live at a syscall
+ * return. Programs that never fork, such as fbDOOM, have no other seed.
+ *
+ * The capture pass does not return: the frames unwind into linear memory. A
+ * rewind returns here and the guest continues after the syscall that carried
+ * the request, so the import has nothing to report. */
+__attribute__((import_module("kernel"), import_name("kernel_checkpoint")))
+void kernel_checkpoint(void);
+
 /*
  * Complete one ordinary guest-owned channel request after a host import that
  * performed channel work in JavaScript. Those host-owned completions leave
@@ -749,6 +783,26 @@ static uint32_t __deliver_pending_signal(uintptr_t base, int *delivered)
     return flags;
 }
 
+/* Take a pending checkpoint request and report the bits it carried.
+ *
+ * The return value survives the capture because the rewind restores this
+ * frame's locals, which is the same property every value read before the
+ * call already depends on. */
+static uint32_t __take_pending_checkpoint(uintptr_t base)
+{
+    uint32_t *request_ptr = (uint32_t *)(uintptr_t)(base + CH_CHECKPOINT_REQUEST);
+    uint32_t request = *request_ptr;
+
+    if (request == 0) return 0;
+
+    /* Clear before the call, never after. The capture pass unwinds instead of
+     * returning, so a clear placed after it never runs, and the restored
+     * process would read the request again and checkpoint itself forever. */
+    *request_ptr = 0;
+    if ((request & CH_CHECKPOINT_REQUEST_UNWIND) != 0) kernel_checkpoint();
+    return request;
+}
+
 /* ------------------------------------------------------------------ */
 /* Central dispatch — writes to channel and blocks for result          */
 /* ------------------------------------------------------------------ */
@@ -839,6 +893,7 @@ static long __do_syscall_impl(long n, long long a1, long long a2, long long a3,
     int32_t err;
     uint32_t delivered_flags;
     int delivered_signal;
+    uint32_t checkpoint_request;
 
 restart_wait_syscall:
     base = get_channel_base();
@@ -950,6 +1005,51 @@ restart_wait_syscall:
         get_channel_base(),
         &delivered_signal
     );
+
+    /* Take a pending checkpoint before the restart block below. A frozen
+     * process must unwind here rather than resubmit a blocking syscall it
+     * would then park on, leaving the keeper waiting for an unwind that
+     * cannot arrive. */
+    checkpoint_request = __take_pending_checkpoint(get_channel_base());
+
+    /* A checkpoint interrupt is not a signal. The freeze completes a parked
+     * blocking syscall with EINTR only so this hook is reached at all: a login
+     * shell in wait4 or an idle daemon in poll has no other boundary at which
+     * it can unwind. Nothing was caught, so the caller is owed the call it was
+     * making rather than an interruption, and the RESTART bit is what says so.
+     *
+     * A caught signal on the same completion keeps its own POSIX semantics.
+     * The handler has already run, and the block below decides whether the
+     * call resumes, so a non-restarting handler still returns EINTR.
+     *
+     * A syscall that reported anything other than EINTR completed for real and
+     * is never resubmitted, because the freeze can publish this bit onto a
+     * mailbox whose result raced it.
+     *
+     * Only ppoll carries a deadline this file can recompute, so every other
+     * finite wait resumes with its original timeout. Across a restore that
+     * lengthens the wait by the time the machine spent frozen. */
+    if ((checkpoint_request & CH_CHECKPOINT_REQUEST_RESTART) != 0 &&
+        err == EINTR && !delivered_signal) {
+        /* An enabled cancellation may have been published while this thread
+         * was parked. Honor it before submitting another indefinite wait, the
+         * same preflight the signal restart runs for the same reason. */
+        if (cancellation_point) {
+            long checked = __syscall_cp_check(-(long)EINTR);
+            if (checked != -(long)EINTR) {
+                kandelo_finish_interrupted_mask_wait(n, a4, a6);
+                return checked;
+            }
+        }
+        if (kandelo_ppoll_has_deadline) {
+            kandelo_ppoll_remaining(
+                &kandelo_ppoll_deadline,
+                &kandelo_ppoll_remaining_timeout
+            );
+            a3 = (long long)(uintptr_t)&kandelo_ppoll_remaining_timeout;
+        }
+        goto restart_wait_syscall;
+    }
 
     /* A host-deferred blocking operation or slow PCM drain completes the
      * channel with EINTR so the caught handler runs at the real interruption

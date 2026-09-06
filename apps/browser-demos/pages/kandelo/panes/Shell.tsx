@@ -137,6 +137,15 @@ const ShellTerminalHost: React.FC<{
     fit.fit();
     let unsubData = () => {};
     let disposed = false;
+    // The terminal is visible and focusable as soon as xterm opens, but the
+    // PTY handle arrives asynchronously — on a take-over, adopting the moved
+    // machine's terminal keeps attachPty pending while the person is already
+    // typing at the restored prompt. Hold those keystrokes and hand them to
+    // the PTY the moment it attaches.
+    const pendingInput: string[] = [];
+    const preAttachInput = term.onData((data) => {
+      pendingInput.push(data);
+    });
     const focusTerminal = () => {
       term.focus();
       window.requestAnimationFrame(() => {
@@ -184,6 +193,8 @@ const ShellTerminalHost: React.FC<{
         }
         ptyRef.current = pty;
         unsubData = pty.onData((bytes) => term.write(bytes));
+        preAttachInput.dispose();
+        for (const data of pendingInput.splice(0)) pty.write(data);
         const onInput = term.onData((data) => pty.write(data));
         const onResize = term.onResize(({ cols, rows }) => pty.resize(cols, rows));
         const ro = new ResizeObserver(() => {
@@ -262,7 +273,8 @@ const PreBoot: React.FC<{ status: string }> = ({ status }) => (
   </div>
 );
 
-function readShellTheme(element: HTMLElement | null) {
+/** The xterm palette the current Kandelo theme resolves to. */
+export function readShellTheme(element: HTMLElement | null) {
   const styles = getComputedStyle(element ?? document.documentElement);
   const background = cssToken(styles, "--k-shell-bg", "#1e2327");
   return {

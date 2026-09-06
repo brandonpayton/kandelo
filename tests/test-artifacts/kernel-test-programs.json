@@ -16,7 +16,8 @@
       "resolver_path": "programs/exec-caller.wasm",
       "consumers": [
         "host/test/exec.test.ts",
-        "host/test/abi-version.test.ts"
+        "host/test/abi-version.test.ts",
+        "host/test/checkpoint-hook.test.ts"
       ]
     },
     {

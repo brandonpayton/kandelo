@@ -135,6 +135,11 @@ describe.skipIf(!hasDash || !hasCoreutils)("dash + coreutils exec", () => {
       programPath: dashBinary!,
       argv: ["dash", "-c", cmd],
       env: ["PATH=/bin:/usr/bin", "HOME=/tmp"],
+      // `execPrograms` materializes coreutils.wasm at every mapped guest
+      // path, so dash's PATH lookup stat()s a real file and execve() reads
+      // real Wasm. Passing a custom `io` would route the run to main-thread
+      // mode, which never builds that rootfs, and execve() would then read
+      // whatever native binary the host keeps at /bin/echo.
       execPrograms,
       timeout,
     });

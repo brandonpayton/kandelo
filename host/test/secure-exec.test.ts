@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,6 +7,7 @@ import { MemoryFileSystem } from "../src/vfs/memory-fs";
 import { NodeTimeProvider } from "../src/vfs/time";
 import { VirtualPlatformIO } from "../src/vfs/vfs";
 import { runCentralizedProgram } from "./centralized-test-helper";
+import { readEntryCallSequence } from "./support/wasm-entry-call-scan";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const probeBinary = join(
@@ -90,25 +90,36 @@ async function launch(
 
 describe.skipIf(!hasProbe)("secure exec startup", () => {
   it("keeps constructor dispatch out of the linker-synthesized entry prefix", () => {
-    const disassembly = execFileSync(
-      "wasm-objdump",
-      ["-d", probeBinary!],
-      { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 },
+    const bytes = readFileSync(probeBinary!);
+    const calls = readEntryCallSequence(
+      bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+      "_start",
     );
-    const startOffset = disassembly.search(/func\[\d+\] <_start>:/);
-    const nextFunctionOffset = disassembly.indexOf(" func[", startOffset + 1);
-    const startBody = disassembly.slice(
-      startOffset,
-      nextFunctionOffset < 0 ? undefined : nextFunctionOffset,
+    const argcCall = calls.findIndex(
+      (call) => call.kind === "call" && call.target === "kernel.kernel_get_argc",
     );
-    const argcCall = startBody.indexOf("<kernel.kernel_get_argc>");
-    const secureCall = startBody.indexOf("<kernel.kernel_get_secure_exec>");
-    const constructorDispatch = startBody.indexOf("call_indirect");
+    const secureCall = calls.findIndex(
+      (call) => call.kind === "call" && call.target === "kernel.kernel_get_secure_exec",
+    );
+    const constructorDispatch = calls.findIndex((call) => call.kind === "call_indirect");
 
-    expect(startOffset).toBeGreaterThanOrEqual(0);
     expect(argcCall).toBeGreaterThanOrEqual(0);
     expect(secureCall).toBeGreaterThan(argcCall);
     expect(constructorDispatch).toBeGreaterThan(secureCall);
+  });
+
+  // The check above is only worth its assertions if a module it cannot read
+  // fails loudly. `wasm-objdump` answered this question by printing a shifted
+  // disassembly of a module it had given up on, which reads as an ordered
+  // entry prefix that simply lacks the calls.
+  it("refuses to report an order it could not read", () => {
+    const bytes = readFileSync(probeBinary!);
+    const truncated = bytes.buffer.slice(
+      bytes.byteOffset,
+      bytes.byteOffset + Math.floor(bytes.byteLength / 2),
+    );
+
+    expect(() => readEntryCallSequence(truncated, "_start")).toThrow();
   });
 
   it("keeps an ordinary image outside secure startup", async () => {

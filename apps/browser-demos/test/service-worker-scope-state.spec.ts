@@ -873,6 +873,168 @@ test("a navigation reset cannot be undone by an in-flight cookie commit", async 
   expect((await capturedCookies(page, "reset-race")).at(-1)).toBe("");
 });
 
+test("two same-profile windows route app requests to their own bridges", async ({
+  context,
+  page,
+}) => {
+  await page.goto(`${FIXTURE_ORIGIN}/a/`);
+  await registerScope(page, "/a/");
+  expect(await installBridge(page, "/a/app/", SESSION_A, "window-a"))
+    .toEqual({
+      reply: { type: "bridge-ready" },
+      body: "bridge:window-a",
+    });
+
+  const second = await context.newPage();
+  try {
+    await second.goto(`${FIXTURE_ORIGIN}/a/`);
+    await registerScope(second, "/a/");
+    expect(await installBridge(second, "/a/app/", SESSION_B, "window-b"))
+      .toEqual({
+        reply: { type: "bridge-ready" },
+        body: "bridge:window-b",
+      });
+
+    expect(await fetchText(page, "/a/app/first-window-after-second-init"))
+      .toBe("bridge:window-a");
+    expect(await fetchText(page, "/a/app/first-window-own-cookie"))
+      .toBe("bridge:window-a");
+    expect((await capturedCookies(page, "window-a")).at(-1))
+      .toBe("window-a=1");
+    expect(await fetchText(second, "/a/app/second-window"))
+      .toBe("bridge:window-b");
+    expect((await capturedCookies(second, "window-b")).at(-1))
+      .toBe("window-b=1");
+    expect(await readBridgeAuthority(page)).toMatchObject({
+      version: 1,
+      appPrefix: "/a/app/",
+      sessionId: SESSION_B,
+    });
+  } finally {
+    await second.close();
+  }
+});
+
+test("an app iframe follows its window's bridge across a demotion", async ({
+  context,
+  page,
+}) => {
+  await page.goto(`${FIXTURE_ORIGIN}/a/`);
+  await registerScope(page, "/a/");
+  expect(await installBridge(page, "/a/app/", SESSION_A, "frame-owner"))
+    .toEqual({
+      reply: { type: "bridge-ready" },
+      body: "bridge:frame-owner",
+    });
+  await page.evaluate(() => new Promise<void>((resolve, reject) => {
+    const frame = document.createElement("iframe");
+    frame.src = "/a/app/frame";
+    frame.onload = () => resolve();
+    frame.onerror = () => reject(new Error("iframe failed to load"));
+    document.body.appendChild(frame);
+  }));
+
+  const second = await context.newPage();
+  try {
+    await second.goto(`${FIXTURE_ORIGIN}/a/`);
+    await registerScope(second, "/a/");
+    expect(await installBridge(second, "/a/app/", SESSION_B, "frame-other"))
+      .toEqual({
+        reply: { type: "bridge-ready" },
+        body: "bridge:frame-other",
+      });
+
+    const frame = page.frames().find((candidate) =>
+      candidate.url().endsWith("/a/app/frame")
+    );
+    expect(frame).toBeTruthy();
+    await frame!.evaluate(() => {
+      location.assign("/a/app/frame-article");
+    }).catch(() => {
+      // The navigation may tear down the evaluation context first.
+    });
+    await frame!.waitForURL("**/a/app/frame-article");
+    expect(await frame!.evaluate(() => document.body.textContent))
+      .toBe("bridge:frame-owner");
+    expect(await frame!.evaluate(async () => {
+      const response = await fetch("/a/app/from-frame", { cache: "no-store" });
+      return response.text();
+    })).toBe("bridge:frame-owner");
+    expect(await fetchText(second, "/a/app/second-window-own"))
+      .toBe("bridge:frame-other");
+  } finally {
+    await second.close();
+  }
+});
+
+test("a demoted window's departure keeps the live session's cookies", async ({
+  context,
+  page,
+}) => {
+  await page.goto(`${FIXTURE_ORIGIN}/a/`);
+  await registerScope(page, "/a/");
+  expect(await installBridge(page, "/a/app/", SESSION_A, "departing"))
+    .toEqual({
+      reply: { type: "bridge-ready" },
+      body: "bridge:departing",
+    });
+
+  const second = await context.newPage();
+  try {
+    await second.goto(`${FIXTURE_ORIGIN}/a/`);
+    await registerScope(second, "/a/");
+    expect(await installBridge(second, "/a/app/", SESSION_B, "kept"))
+      .toEqual({
+        reply: { type: "bridge-ready" },
+        body: "bridge:kept",
+      });
+
+    await page.goto(`${FIXTURE_ORIGIN}/a/departing-away`, {
+      waitUntil: "domcontentloaded",
+    });
+
+    expect(await fetchText(second, "/a/app/after-first-window-left"))
+      .toBe("bridge:kept");
+    expect((await capturedCookies(second, "kept")).at(-1)).toBe("kept=1");
+  } finally {
+    await second.close();
+  }
+});
+
+test("a second window's departure ends only its own session", async ({
+  context,
+  page,
+}) => {
+  await page.goto(`${FIXTURE_ORIGIN}/a/`);
+  await registerScope(page, "/a/");
+  expect(await installBridge(page, "/a/app/", SESSION_A, "staying"))
+    .toEqual({
+      reply: { type: "bridge-ready" },
+      body: "bridge:staying",
+    });
+
+  const second = await context.newPage();
+  try {
+    await second.goto(`${FIXTURE_ORIGIN}/a/`);
+    await registerScope(second, "/a/");
+    expect(await installBridge(second, "/a/app/", SESSION_B, "leaving"))
+      .toEqual({
+        reply: { type: "bridge-ready" },
+        body: "bridge:leaving",
+      });
+    expect(await fetchText(page, "/a/app/before-departure"))
+      .toBe("bridge:staying");
+    await second.goto(`${FIXTURE_ORIGIN}/a/departure`, {
+      waitUntil: "domcontentloaded",
+    });
+  } finally {
+    await second.close();
+  }
+
+  expect(await fetchText(page, "/a/app/after-departure"))
+    .toBe("bridge:staying");
+});
+
 test("a delayed restoration cannot overwrite a newer acknowledged init", async ({
   context,
   page,
@@ -1159,6 +1321,55 @@ test("a stale first client cannot starve a later matching restoration", async ({
     body: "bridge:matching-second-client",
     staleCookies: [],
     matchingCookies: ["multi-client-old=1"],
+  });
+});
+
+test("a demoted window's answer after the authority commit still routes its own fetch", async ({
+  context,
+  page,
+}) => {
+  await page.goto(`${FIXTURE_ORIGIN}/a/`);
+  await registerScope(page, "/a/");
+  expect(await installBridge(page, "/a/app/", SESSION_A, "demoted-owner"))
+    .toEqual({
+      reply: { type: "bridge-ready" },
+      body: "bridge:demoted-owner",
+    });
+
+  const authorityPage = await context.newPage();
+  let result: { demotedBody: string; authorityBody: string } | undefined;
+  try {
+    await authorityPage.goto(`${FIXTURE_ORIGIN}/a/second-client`);
+    await registerScope(authorityPage, "/a/");
+    expect(await installBridge(authorityPage, "/a/app/", SESSION_B, "authority"))
+      .toEqual({
+        reply: { type: "bridge-ready" },
+        body: "bridge:authority",
+      });
+    await installRestoreResponder(authorityPage, {
+      appPrefix: "/a/app/",
+      sessionId: SESSION_B,
+      label: "authority-answer",
+    });
+    await installRestoreResponder(page, {
+      appPrefix: "/a/app/",
+      sessionId: SESSION_A,
+      label: "demoted-answer",
+      delayMs: 150,
+    });
+    await stopWorker(context, page, `${FIXTURE_ORIGIN}/a/service-worker.js`);
+
+    result = {
+      demotedBody: await fetchText(page, "/a/app/late-secondary-route"),
+      authorityBody: await fetchText(authorityPage, "/a/app/authority-route"),
+    };
+  } finally {
+    await authorityPage.close();
+  }
+
+  expect(result).toEqual({
+    demotedBody: "bridge:demoted-answer",
+    authorityBody: "bridge:authority-answer",
   });
 });
 

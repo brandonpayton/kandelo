@@ -58,6 +58,21 @@ export function navigateToGalleryItemUrl(item: GalleryItem): void {
   window.location.assign(next);
 }
 
+/**
+ * Point the address bar at a gallery item without leaving the document.
+ *
+ * WHY: a peer connection exists only in the document that opened it. Following
+ * the URL would tear that document down and close the connection, and manual
+ * signaling offers no way back — both people would have to exchange codes
+ * again. A page holding a peer moves its URL rather than following it, so the
+ * address stays shareable and the link survives the boot.
+ */
+export function replaceGalleryItemUrl(item: GalleryItem): void {
+  const next = galleryItemUrl(item);
+  if (next === window.location.href) return;
+  window.history.replaceState(window.history.state, "", next);
+}
+
 export function vfsImageUrlFromDescriptor(
   descriptor: BootDescriptor,
   baseHref = currentHref(),

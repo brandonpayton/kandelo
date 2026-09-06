@@ -4,8 +4,10 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveBinary } from "../../../host/src/binary-resolver";
+import { ABI_VERSION } from "../../../host/src/generated/abi";
+import { buildAbiStampedFixture } from "../../../host/test/fixtures/abi-stamped-wat";
 import {
-  RAW_GC_REFERENCE_STATE_FRESH_WORKER_HEX,
+  rawGcReferenceStateFreshWorkerBytes,
 } from "../../../host/test/fixtures/gc-reference-state-fresh-worker-bytes";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -197,16 +199,12 @@ test("Chromium reconstructs CatchRef state in a fresh child worker", async ({
     resolve(__dirname, ".catch-ref-fresh-worker-"),
   );
   try {
-    const rawPath = resolve(workDir, "catch-ref-fresh-worker.raw.wasm");
-    const programPath = resolve(workDir, "catch-ref-fresh-worker.wasm");
-    execFileSync("wat2wasm", [
-      "--enable-exceptions",
-      "--enable-threads",
+    const programPath = buildAbiStampedFixture(
       catchRefFixtureSource,
-      "-o",
-      rawPath,
-    ]);
-    execFileSync(forkInstrumenterPath, [rawPath, "-o", programPath]);
+      workDir,
+      "catch-ref-fresh-worker",
+      ABI_VERSION,
+    );
 
     // The parent waits for the child, whose exit 91 means CatchRef payload
     // reconstruction failed after the browser worker instantiated a fresh
@@ -238,22 +236,12 @@ test("Chromium reconstructs reference-bearing catches in fresh child workers", a
     resolve(__dirname, ".reference-catch-payload-fresh-worker-"),
   );
   try {
-    const rawPath = resolve(
-      workDir,
-      "reference-catch-payload-fresh-worker.raw.wasm",
-    );
-    const programPath = resolve(
-      workDir,
-      "reference-catch-payload-fresh-worker.wasm",
-    );
-    execFileSync("wat2wasm", [
-      "--enable-exceptions",
-      "--enable-threads",
+    const programPath = buildAbiStampedFixture(
       referenceCatchPayloadFixtureSource,
-      "-o",
-      rawPath,
-    ]);
-    execFileSync(forkInstrumenterPath, [rawPath, "-o", programPath]);
+      workDir,
+      "reference-catch-payload-fresh-worker",
+      ABI_VERSION,
+    );
 
     // One fresh child calls the reconstructed non-null funcref; a second
     // verifies the nullable externref path. Either child exits nonzero if its
@@ -287,10 +275,7 @@ test("Chromium reconstructs aliased Wasm GC state in a fresh child worker", asyn
   try {
     const rawPath = resolve(workDir, "gc-reference-state.raw.wasm");
     const programPath = resolve(workDir, "gc-reference-state.wasm");
-    writeFileSync(
-      rawPath,
-      Buffer.from(RAW_GC_REFERENCE_STATE_FRESH_WORKER_HEX, "hex"),
-    );
+    writeFileSync(rawPath, rawGcReferenceStateFreshWorkerBytes(ABI_VERSION));
     execFileSync(forkInstrumenterPath, [rawPath, "-o", programPath]);
 
     // The child verifies one cyclic identity through a live parameter,

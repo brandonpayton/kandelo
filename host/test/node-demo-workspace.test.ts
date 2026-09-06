@@ -1,18 +1,16 @@
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   NODE_WORKSPACE_PROFILE_PATH,
   stageSpiderMonkeyNpmRuntime,
 } from "../../images/vfs/lib/init/spidermonkey-npm-runtime";
+import { resolveBinary } from "../src/binary-resolver";
 import { ensureDirRecursive, writeVfsFile } from "../src/vfs/image-helpers";
 import { MemoryFileSystem } from "../src/vfs/memory-fs";
 import { NodeTimeProvider } from "../src/vfs/time";
 import { VirtualPlatformIO } from "../src/vfs/vfs";
 import { runCentralizedProgram } from "./centralized-test-helper";
 
-const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const SHELL_WASM = join(REPO_ROOT, "local-binaries/programs/wasm32/dash.wasm");
+const SHELL_WASM = resolveBinary("programs/dash.wasm");
 const STARTER_PACKAGE = '{\n  "name": "demo",\n  "version": "0.0.1"\n}\n';
 const NPM_PATCH_INPUTS = [
   "/usr/local/lib/npm/lib/utils/display.js",

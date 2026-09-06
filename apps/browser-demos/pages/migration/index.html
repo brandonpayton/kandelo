@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Kandelo Tab Handover</title>
+  <link rel="icon" href="data:," />
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1.5rem; background: #111; color: #ddd; }
+    #status { margin: 0.5rem 0 1rem; }
+    button { font-size: 1rem; padding: 0.4rem 1rem; margin-right: 0.5rem; }
+    canvas { border: 1px solid #444; image-rendering: pixelated; outline: none; }
+    details { margin: 1rem 0; }
+    summary { cursor: pointer; }
+    #connect-panel { border: 1px solid #333; padding: 0.75rem 1rem; max-width: 42rem; }
+    #connect-panel p { margin: 0.5rem 0; }
+    #connect-panel textarea { width: 100%; height: 4rem; background: #1a1a1a; color: #ddd; border: 1px solid #444; font-family: monospace; font-size: 0.8rem; }
+    #connect-panel button { font-size: 0.9rem; }
+    #link-status { margin: 0.5rem 0 0; color: #9c9; }
+  </style>
+</head>
+<body>
+  <h1>Tab-to-tab machine handover</h1>
+  <details>
+    <summary>Start fbDOOM here, watch it live in a second tab, take it over there.</summary>
+    <p>
+      Start fbDOOM in this tab, open this page in a second tab, and watch the
+      same game render live there. Press "Take over" in the watching tab and
+      the running machine freezes, crosses the BroadcastChannel, and continues
+      there from the same frame — the keyboard moves with it, and the tab that
+      handed over keeps watching live. Take it back whenever you like — the
+      machine moves between the tabs as often as you ask, and only the tab
+      that holds it can play.
+    </p>
+  </details>
+  <details id="connect">
+    <summary>Connect another computer</summary>
+    <div id="connect-panel">
+      <details>
+        <summary>Create an invite code on the watching computer, answer it on the running one.</summary>
+        <p>
+          Two tabs on one computer connect by themselves. Another computer must
+          be introduced by hand: one side creates an invite code, the other
+          answers it, and you carry both codes across (chat, e-mail, a shouted
+          dictation). Once connected, the machine mirrors, hands over, and
+          comes back across the network exactly as it does between tabs.
+        </p>
+        <p>
+          On the watching computer press "Create invite code" and send the code
+          to the computer that runs the game. There, paste it below, press
+          "Answer invite", and send the answer code back. Paste the answer on
+          the watching computer and press "Complete connection".
+        </p>
+        <p>
+          The page needs a secure context on both computers: serve it over
+          HTTPS, or open Chromium with
+          <code>--unsafely-treat-insecure-origin-as-secure=http://&lt;host-ip&gt;:5401</code>
+          for LAN testing.
+        </p>
+      </details>
+      <div>
+        <button id="invite-create" type="button">Create invite code</button>
+        <button id="invite-answer" type="button">Answer invite</button>
+        <button id="invite-complete" type="button">Complete connection</button>
+      </div>
+      <p>Your code — send it to the other computer:</p>
+      <textarea id="local-signal" readonly placeholder="Your invite or answer code appears here."></textarea>
+      <p>The other computer's code — paste it here:</p>
+      <textarea id="remote-signal" placeholder="Paste the code you received."></textarea>
+      <div id="link-status">Not connected.</div>
+    </div>
+  </details>
+  <div>
+    <button id="start" type="button">Start fbDOOM</button>
+    <button id="take" type="button">Take over the running machine</button>
+  </div>
+  <div id="status">Idle.</div>
+  <canvas id="screen" tabindex="0"></canvas>
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

@@ -43,6 +43,13 @@ const GUIDE_ITEM: DockItem<"guide"> = {
   icon: <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4"><path d="M4 2.5h6.5L13 5v8.5H4z" /><path d="M10.5 2.5V5H13" /><path d="M6 7h5M6 9.5h5M6 12h3" /></svg>,
 };
 
+const NETWORK_ITEM: DockItem<"network"> = {
+  id: "network",
+  label: "Network",
+  title: "Share this machine with another computer",
+  icon: <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4"><circle cx="3.6" cy="4" r="1.8" /><circle cx="12.4" cy="4" r="1.8" /><circle cx="8" cy="12.4" r="1.8" /><path d="M5.4 4h5.2M4.5 5.6 7 10.8M11.5 5.6 9 10.8" /></svg>,
+};
+
 const THEME_ITEM: DockItem<"theme"> = {
   id: "theme",
   label: "Theme",
@@ -90,22 +97,37 @@ export const Dock: React.FC<{
   viewControls?: React.ReactNode;
   guidePopup?: React.ReactNode;
   internalsPopup?: React.ReactNode;
+  networkPopup?: React.ReactNode;
   themePopup?: React.ReactNode;
   guideAvailable: boolean;
   guideOpen: boolean;
   internalsAvailable: boolean;
   internalsOpen: boolean;
+  networkOpen: boolean;
+  networkConnected: boolean;
   themeOpen: boolean;
   status: MachineStatus;
+  /**
+   * Which side of a shared pair this computer is on, or null when it is not in
+   * one.
+   *
+   * A shared terminal is read-only and gives no sign of it, because a caption
+   * over the screen covers the thing the person came to watch. The dock is
+   * always visible and never over the machine, so the answer to "why does my
+   * keyboard do nothing" lives here instead.
+   */
+  role: "user" | "viewer" | null;
   machineTitle?: string;
   viewDisabled?: Partial<Record<DockViewId, boolean>>;
   onSelectPane: (pane: DockPaneId | null) => void;
   onSelectView: (view: DockViewId) => void;
   onToggleGuide: () => void;
   onToggleInternals: () => void;
+  onToggleNetwork: () => void;
   onToggleTheme: () => void;
   onCloseGuide: () => void;
   onCloseInternals: () => void;
+  onCloseNetwork: () => void;
   onCloseTheme: () => void;
   onHeightChange: (height: number) => void;
   onLayoutChange?: (layout: DockLayoutState) => void;
@@ -115,11 +137,15 @@ export const Dock: React.FC<{
   viewControls,
   guidePopup,
   internalsPopup,
+  networkPopup,
   themePopup,
   guideAvailable,
   guideOpen,
   internalsAvailable,
   internalsOpen,
+  networkOpen,
+  networkConnected,
+  role,
   themeOpen,
   status,
   machineTitle,
@@ -128,9 +154,11 @@ export const Dock: React.FC<{
   onSelectView,
   onToggleGuide,
   onToggleInternals,
+  onToggleNetwork,
   onToggleTheme,
   onCloseGuide,
   onCloseInternals,
+  onCloseNetwork,
   onCloseTheme,
   onHeightChange,
   onLayoutChange,
@@ -140,9 +168,11 @@ export const Dock: React.FC<{
   const rowRef = React.useRef<HTMLDivElement | null>(null);
   const guideButtonRef = React.useRef<HTMLButtonElement | null>(null);
   const internalsButtonRef = React.useRef<HTMLButtonElement | null>(null);
+  const networkButtonRef = React.useRef<HTMLButtonElement | null>(null);
   const themeButtonRef = React.useRef<HTMLButtonElement | null>(null);
   const guidePopoverRef = React.useRef<HTMLDivElement | null>(null);
   const internalsPopoverRef = React.useRef<HTMLDivElement | null>(null);
+  const networkPopoverRef = React.useRef<HTMLDivElement | null>(null);
   const themePopoverRef = React.useRef<HTMLDivElement | null>(null);
   const compactClampPausedUntilRef = React.useRef(0);
   const dragRef = React.useRef<{
@@ -160,6 +190,7 @@ export const Dock: React.FC<{
   const [viewportWidth, setViewportWidth] = React.useState(() => window.innerWidth);
   const guideAnchor = useDockPopoverAnchor(guideOpen, guidePopup, shellRef, guideButtonRef, 380);
   const internalsAnchor = useDockPopoverAnchor(internalsOpen, internalsPopup, shellRef, internalsButtonRef, 980);
+  const networkAnchor = useDockPopoverAnchor(networkOpen, networkPopup, shellRef, networkButtonRef, 460);
   const themeAnchor = useDockPopoverAnchor(themeOpen, themePopup, shellRef, themeButtonRef, 360);
   const statusLabel = formatMachineStatus(status);
   const title = machineTitle || "Kandelo machine";
@@ -230,11 +261,12 @@ export const Dock: React.FC<{
     if (!collapsed) return;
     onCloseGuide();
     onCloseInternals();
+    onCloseNetwork();
     onCloseTheme();
-  }, [collapsed, onCloseGuide, onCloseInternals, onCloseTheme]);
+  }, [collapsed, onCloseGuide, onCloseInternals, onCloseNetwork, onCloseTheme]);
 
   React.useEffect(() => {
-    if (!guideOpen && !internalsOpen && !themeOpen) return;
+    if (!guideOpen && !internalsOpen && !networkOpen && !themeOpen) return;
 
     const handleOutsidePointerDown = (event: PointerEvent) => {
       const target = event.target;
@@ -252,6 +284,12 @@ export const Dock: React.FC<{
         }
       }
 
+      if (networkOpen) {
+        if (!networkPopoverRef.current?.contains(target) && !networkButtonRef.current?.contains(target)) {
+          onCloseNetwork();
+        }
+      }
+
       if (themeOpen) {
         if (!themePopoverRef.current?.contains(target) && !themeButtonRef.current?.contains(target)) {
           onCloseTheme();
@@ -261,10 +299,20 @@ export const Dock: React.FC<{
 
     document.addEventListener("pointerdown", handleOutsidePointerDown, true);
     return () => document.removeEventListener("pointerdown", handleOutsidePointerDown, true);
-  }, [guideOpen, internalsOpen, themeOpen, onCloseGuide, onCloseInternals, onCloseTheme]);
+  }, [
+    guideOpen,
+    internalsOpen,
+    networkOpen,
+    themeOpen,
+    onCloseGuide,
+    onCloseInternals,
+    onCloseNetwork,
+    onCloseTheme,
+  ]);
 
   const guidePopoverStyle = popoverStyle(guideAnchor, 380);
   const internalsPopoverStyle = popoverStyle(internalsAnchor, 980);
+  const networkPopoverStyle = popoverStyle(networkAnchor, 460);
   const themePopoverStyle = popoverStyle(themeAnchor, 360);
   const expandedDockWidth = dockCenter !== null
     ? Math.ceil(2 * Math.max(dockCenter, viewportWidth - dockCenter))
@@ -434,9 +482,10 @@ export const Dock: React.FC<{
             <button
               type="button"
               className="kdock-status"
+              data-role={role ?? undefined}
               onClick={() => onSelectPane(null)}
               title={`${title}: ${statusLabel}`}
-              aria-label={`Current machine: ${title}, ${statusLabel}`}
+              aria-label={`Current machine: ${title}, ${statusLabel}${role === null ? "" : role === "user" ? ", User" : ", Viewer"}`}
             >
               <img src={markUrl} alt="" />
               <span className="kdock-status-copy">
@@ -446,6 +495,11 @@ export const Dock: React.FC<{
                   {statusLabel}
                 </span>
               </span>
+              {role !== null && (
+                <span className="kdock-role">
+                  {role === "user" ? "User" : "Viewer"}
+                </span>
+              )}
             </button>
             <div className="kdock">
               <div className="kdock-section" aria-label="Machine tools">
@@ -499,6 +553,18 @@ export const Dock: React.FC<{
                   <span className="kdock-label">{INTERNALS_ITEM.label}</span>
                 </button>
                 <button
+                  ref={networkButtonRef}
+                  type="button"
+                  className={networkConnected ? "kdock-item is-connected" : "kdock-item"}
+                  aria-pressed={networkOpen}
+                  aria-expanded={networkOpen}
+                  title={NETWORK_ITEM.title}
+                  onClick={onToggleNetwork}
+                >
+                  <span className="kdock-icon">{NETWORK_ITEM.icon}</span>
+                  <span className="kdock-label">{NETWORK_ITEM.label}</span>
+                </button>
+                <button
                   ref={themeButtonRef}
                   type="button"
                   className="kdock-item"
@@ -550,6 +616,31 @@ export const Dock: React.FC<{
             onClick={(event) => event.stopPropagation()}
           >
             {internalsPopup}
+          </div>
+        </>
+      )}
+
+      {networkOpen && networkPopup && networkPopoverStyle && (
+        <>
+          <div
+            className="kdock-popover-dismiss-layer"
+            aria-hidden="true"
+            onPointerDown={(event) => {
+              event.stopPropagation();
+              onCloseNetwork();
+            }}
+          />
+          <div
+            ref={networkPopoverRef}
+            className="kdock-popover kdock-network-popover"
+            role="dialog"
+            aria-label="Network"
+            style={networkPopoverStyle}
+            onPointerDown={(event) => event.stopPropagation()}
+            onPointerUp={(event) => event.stopPropagation()}
+            onClick={(event) => event.stopPropagation()}
+          >
+            {networkPopup}
           </div>
         </>
       )}

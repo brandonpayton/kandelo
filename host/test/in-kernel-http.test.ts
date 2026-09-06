@@ -17,6 +17,7 @@ import {
   parseRawHttpResponse,
   type HttpRequest,
 } from "../src/networking";
+import { parseRawRequestLine } from "../src/networking/in-kernel-http";
 
 const tinyServerPath = tryResolveBinary("programs/tiny-http-server.wasm");
 
@@ -159,5 +160,26 @@ describe("buildRawHttpRequest / parseRawHttpResponse", () => {
     expect(() => parseRawHttpResponse(
       new TextEncoder().encode("not-http 200 maybe\r\nContent-Length: 0\r\n\r\n"),
     )).toThrow(/status line/);
+  });
+});
+
+describe("parseRawRequestLine", () => {
+  it("reads the method and target off a built request", () => {
+    const raw = buildRawHttpRequest({
+      method: "GET",
+      url: "/replicated?x=1",
+      headers: { Host: "h" },
+      body: null,
+    });
+    expect(parseRawRequestLine(raw)).toEqual({
+      method: "GET",
+      target: "/replicated?x=1",
+    });
+  });
+
+  it("rejects a malformed request line", () => {
+    expect(() => parseRawRequestLine(
+      new TextEncoder().encode("expected body without HTTP framing\r\n"),
+    )).toThrow(/request line/);
   });
 });

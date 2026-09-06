@@ -487,4 +487,157 @@ describe("query handler", () => {
     const { b } = setup();
     expect(runGlQuery(b, 0xfe, input([]), out(4))).toBe(-22);
   });
+
+  it("QOP_GET_UNIFORM_LOC retains the (program, uniform) behind each index", () => {
+    const { b } = setup();
+    b.programs.set(7, { kind: "program", id: 1 } as unknown as WebGLProgram);
+
+    const name = new TextEncoder().encode("u_color");
+    const inp = new Uint8Array(8 + name.byteLength);
+    new DataView(inp.buffer).setUint32(0, 7, true);
+    new DataView(inp.buffer).setUint32(4, name.byteLength, true);
+    inp.set(name, 8);
+    runGlQuery(b, O.QOP_GET_UNIFORM_LOC, inp, out(4));
+
+    expect(b.uniformLocationNames.get(1)).toEqual({
+      program: 7,
+      uniform: "u_color",
+    });
+  });
+
+  it("QOP_GET_UNIFORM_LOC retains nothing for a missing uniform", () => {
+    const { b } = setup();
+    b.programs.set(1, { kind: "program" } as unknown as WebGLProgram);
+    const name = new TextEncoder().encode("u_unknown");
+    const inp = new Uint8Array(8 + name.byteLength);
+    new DataView(inp.buffer).setUint32(0, 1, true);
+    new DataView(inp.buffer).setUint32(4, name.byteLength, true);
+    inp.set(name, 8);
+    runGlQuery(b, O.QOP_GET_UNIFORM_LOC, inp, out(4));
+    expect(b.uniformLocationNames.size).toBe(0);
+  });
+});
+
+describe("cmdbuf decoder — texture shape retention", () => {
+  const GL_TEXTURE_2D = 0x0DE1;
+  const GL_RGBA = 0x1908;
+  const GL_UNSIGNED_BYTE = 0x1401;
+
+  function genAndBind(t: Tlv, name: number) {
+    let h = t.op(O.OP_GEN_TEXTURES, 8);
+    t.view.setUint32(h.p, 1, true);
+    t.view.setUint32(h.p + 4, name, true);
+    h = t.op(O.OP_BIND_TEXTURE, 8);
+    t.view.setUint32(h.p, GL_TEXTURE_2D, true);
+    t.view.setUint32(h.p + 4, name, true);
+  }
+
+  function texImage(t: Tlv, level: number, w: number, h_: number) {
+    const h = t.op(O.OP_TEX_IMAGE_2D, 36);
+    t.view.setUint32(h.p, GL_TEXTURE_2D, true);
+    t.view.setInt32(h.p + 4, level, true);
+    t.view.setInt32(h.p + 8, GL_RGBA, true);
+    t.view.setInt32(h.p + 12, w, true);
+    t.view.setInt32(h.p + 16, h_, true);
+    t.view.setInt32(h.p + 20, 0, true);
+    t.view.setUint32(h.p + 24, GL_RGBA, true);
+    t.view.setUint32(h.p + 28, GL_UNSIGNED_BYTE, true);
+    t.view.setUint32(h.p + 32, 0, true);
+  }
+
+  it("TexImage2D records the level's shape under the bound name", () => {
+    const gl = new RecordingGl();
+    const { b } = setupBinding(gl);
+    const t = new Tlv(b.cmdbufView!.buffer);
+    genAndBind(t, 5);
+    texImage(t, 0, 64, 48);
+
+    decodeAndDispatch(b, 0, t.p);
+
+    expect(b.textureUnitNames.get(0)).toBe(5);
+    expect(b.textureShapes.get(5)!.levels.get(0)).toEqual({
+      internalFormat: GL_RGBA,
+      width: 64,
+      height: 48,
+      format: GL_RGBA,
+      type: GL_UNSIGNED_BYTE,
+    });
+    expect(b.textureShapes.get(5)!.mipmapped).toBe(false);
+  });
+
+  it("a re-upload replaces the level's shape", () => {
+    const gl = new RecordingGl();
+    const { b } = setupBinding(gl);
+    const t = new Tlv(b.cmdbufView!.buffer);
+    genAndBind(t, 5);
+    texImage(t, 0, 64, 48);
+    texImage(t, 0, 128, 96);
+
+    decodeAndDispatch(b, 0, t.p);
+
+    expect(b.textureShapes.get(5)!.levels.get(0)!.width).toBe(128);
+    expect(b.textureShapes.get(5)!.levels.size).toBe(1);
+  });
+
+  it("GenerateMipmap marks the bound texture", () => {
+    const gl = new RecordingGl();
+    const { b } = setupBinding(gl);
+    const t = new Tlv(b.cmdbufView!.buffer);
+    genAndBind(t, 5);
+    texImage(t, 0, 64, 48);
+    const h = t.op(O.OP_GENERATE_MIPMAP, 4);
+    t.view.setUint32(h.p, GL_TEXTURE_2D, true);
+
+    decodeAndDispatch(b, 0, t.p);
+
+    expect(b.textureShapes.get(5)!.mipmapped).toBe(true);
+  });
+
+  it("DeleteTextures forgets the shape and the unit it was bound on", () => {
+    const gl = new RecordingGl();
+    const { b } = setupBinding(gl);
+    const t = new Tlv(b.cmdbufView!.buffer);
+    genAndBind(t, 5);
+    texImage(t, 0, 64, 48);
+    const h = t.op(O.OP_DELETE_TEXTURES, 8);
+    t.view.setUint32(h.p, 1, true);
+    t.view.setUint32(h.p + 4, 5, true);
+
+    decodeAndDispatch(b, 0, t.p);
+
+    expect(b.textureShapes.has(5)).toBe(false);
+    expect(b.textureUnitNames.has(0)).toBe(false);
+  });
+
+  it("tracks names per texture unit", () => {
+    const gl = new RecordingGl();
+    const { b } = setupBinding(gl);
+    const t = new Tlv(b.cmdbufView!.buffer);
+    genAndBind(t, 5);
+    let h = t.op(O.OP_ACTIVE_TEXTURE, 4);
+    t.view.setUint32(h.p, 0x84C1 /* GL_TEXTURE1 */, true);
+    genAndBind(t, 6);
+    texImage(t, 0, 32, 32);
+
+    decodeAndDispatch(b, 0, t.p);
+
+    expect(b.textureUnitNames.get(0)).toBe(5);
+    expect(b.textureUnitNames.get(1)).toBe(6);
+    expect(b.textureShapes.has(5)).toBe(false);
+    expect(b.textureShapes.get(6)!.levels.get(0)!.width).toBe(32);
+  });
+
+  it("binding name 0 clears the unit's name", () => {
+    const gl = new RecordingGl();
+    const { b } = setupBinding(gl);
+    const t = new Tlv(b.cmdbufView!.buffer);
+    genAndBind(t, 5);
+    const h = t.op(O.OP_BIND_TEXTURE, 8);
+    t.view.setUint32(h.p, GL_TEXTURE_2D, true);
+    t.view.setUint32(h.p + 4, 0, true);
+
+    decodeAndDispatch(b, 0, t.p);
+
+    expect(b.textureUnitNames.has(0)).toBe(false);
+  });
 });

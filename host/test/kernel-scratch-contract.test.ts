@@ -629,7 +629,25 @@ const reviewedScalarKernelExportCalls: AuditAllowance[] = [
     "apps/browser-demos/test/fixtures/reusable-kernel-export-stack-worker.ts::runProbe::kernel-export-direct-use::exports.kernel_set_current_tid(pid, pid)",
   ),
   reviewedScalarKernelExportCall(
-    "host/src/kernel-worker.ts::CentralizedKernelWorker.#attachThreadChannelWithinKernelEntry::kernel-export-direct-use::setMaxAddr(pid, this.toKernelPtr(tlsPageAddr))",
+    "host/src/kernel-worker.ts::CentralizedKernelWorker.#installThreadChannelTransportWithinKernelEntry::kernel-export-direct-use::setMaxAddr(pid, this.toKernelPtr(tlsPageAddr))",
+  ),
+  reviewedScalarKernelExportCall(
+    "host/src/kernel-worker.ts::CentralizedKernelWorker.#readRestoredHostHandlePlanWithinKernelEntry::kernel-export-direct-use::fcntl(exemplar.fd, F_GETFL, 0)",
+  ),
+  reviewedScalarKernelExportCall(
+    "host/src/kernel-worker.ts::CentralizedKernelWorker.#readRestoredHostHandlePlanWithinKernelEntry::kernel-export-direct-use::lseek(exemplar.fd, 0, 0, SEEK_CUR)",
+  ),
+  reviewedScalarKernelExportCall(
+    "host/src/kernel-worker.ts::CentralizedKernelWorker.#applyRestoredHostHandleRemapsWithinKernelEntry::kernel-export-direct-use::lseek(stream.fd, 0, 0, SEEK_CUR)",
+  ),
+  reviewedScalarKernelExportCall(
+    "host/src/kernel-worker.ts::CentralizedKernelWorker.#applyRestoredHostHandleRemapsWithinKernelEntry::kernel-export-direct-use::lseek(dir.fd, low, high, SEEK_SET)",
+  ),
+  reviewedScalarKernelExportCall(
+    "host/src/kernel-worker.ts::CentralizedKernelWorker.#applyRestoredHostHandleRemapsWithinKernelEntry::kernel-export-direct-use::remap( 0, BigInt(stream.oldHandle), BigInt(stream.newHandle), )",
+  ),
+  reviewedScalarKernelExportCall(
+    "host/src/kernel-worker.ts::CentralizedKernelWorker.#applyRestoredHostHandleRemapsWithinKernelEntry::kernel-export-direct-use::remap(1, BigInt(dir.oldHandle), BigInt(dir.newHandle))",
   ),
   reviewedScalarKernelExportCall(
     "host/src/kernel-worker.ts::CentralizedKernelWorker.#bindKernelTid::kernel-export-direct-use::setTid(pid, tid)",
@@ -693,6 +711,9 @@ const reviewedScalarKernelExportCalls: AuditAllowance[] = [
     "host/src/kernel-worker.ts::CentralizedKernelWorker.#prepareTcpListenerRegistration::kernel-export-direct-use::getAcceptWake?.(pid, fd)",
   ),
   reviewedScalarKernelExportCall(
+    "host/src/kernel-worker.ts::CentralizedKernelWorker.#rearmRestoredIntervalTimerWithinKernelEntry::kernel-export-direct-use::rearm(pid)",
+  ),
+  reviewedScalarKernelExportCall(
     "host/src/kernel-worker.ts::CentralizedKernelWorker.#releaseBlockingRetrySnapshot::kernel-export-direct-use::release( channel.pid, this.guestTidForChannel(channel), snapshot.retryToken, )",
   ),
   reviewedScalarKernelExportCall(
@@ -712,6 +733,9 @@ const reviewedScalarKernelExportCalls: AuditAllowance[] = [
   ),
   reviewedScalarKernelExportCall(
     "host/src/kernel-worker.ts::CentralizedKernelWorker.#replaceProcessMetadataWithinKernelEntry::kernel-export-direct-use::commit(pid, token)",
+  ),
+  reviewedScalarKernelExportCall(
+    "host/src/kernel-worker.ts::CentralizedKernelWorker.#reseedRestoredPtyIndexWithinKernelEntry::kernel-export-direct-use::ptyIndexForPid(pid)",
   ),
   reviewedScalarKernelExportCall(
     "host/src/kernel-worker.ts::CentralizedKernelWorker.#reserveHostRegionAtWithinKernelEntry::kernel-export-direct-use::reserveHostRegionAtFn( pid, this.toKernelPtr(request.pointer), this.toKernelPtr(request.length), )",
@@ -1241,6 +1265,22 @@ const auditAllowances: AuditAllowance[] = [
     key: "host/src/kernel-worker.ts::CentralizedKernelWorker.claimPcmTransport::kernel-memory-escape::kernelEntryIntrinsicApply( kernelEntryIntrinsicMemoryBuffer, this.#kernelMemory!, [], )",
     disposition: "kernel-control",
     why: "The trusted Node/browser audio driver must retain the shared backing for the checked PCM control-and-ring range; the exact claim entry validates the pointer, length, shared backing, and transport header before this machine-level descriptor is published.",
+  },
+  {
+    key: "host/src/kernel-worker.ts::CentralizedKernelWorker.copyKernelMemoryForCheckpoint::kernel-memory-escape::kernelEntryIntrinsicApply( kernelEntryIntrinsicMemoryBuffer, this.#kernelMemory, [], )",
+    disposition: "kernel-read",
+    why: "A checkpoint's kernel bucket is the whole kernel memory, so this is the one read with no pointer or length left to check; the backing never escapes, because the view is copied with slice() in the same expression and only the detached copy is returned.",
+  },
+  {
+    key: "host/src/kernel-worker.ts::CentralizedKernelWorker.#adoptKernelMemoryImage::kernel-memory-escape::kernelEntryIntrinsicApply( kernelEntryIntrinsicMemoryBuffer, this.#kernelMemory, [], )",
+    disposition: "kernel-control",
+    count: 2,
+    why: "A checkpoint restore overwrites the whole freshly instantiated kernel memory with a validated captured image before the first kernel call; both buffer reads exist only to size and target that one whole-buffer copy, and neither view outlives the method.",
+  },
+  {
+    key: "host/src/kernel-worker.ts::CentralizedKernelWorker.#adoptKernelMemoryImage::kernel-memory-escape::this.#kernelMemory.grow(deltaPages)",
+    disposition: "kernel-control",
+    why: "Host-side growth is normally forbidden because dlmalloc would not know the pages; here the whole buffer is overwritten with the captured image immediately after, so the pages become exactly the pages the captured kernel grew itself and the restored allocator state describes every one of them.",
   },
   {
     key: "host/src/kernel-worker.ts::CentralizedKernelWorker.#createTestAuthority::scratch-address-contract::options.instance",

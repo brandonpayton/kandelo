@@ -731,6 +731,16 @@ fn render_c_channel_contract() -> String {
          #define WASM_POSIX_CHANNEL_SIGINFO_WORD_2_OFFSET {siginfo_word_2}u\n\
          #define WASM_POSIX_CHANNEL_SIG_ALT_SP_OFFSET {sig_alt_sp}u\n\
          #define WASM_POSIX_CHANNEL_SIG_ALT_SIZE_OFFSET {sig_alt_size}u\n\
+         \n\
+         /* Checkpoint request wire, reserved below the signal-delivery area. */\n\
+         #define WASM_POSIX_CHANNEL_CHECKPOINT_AREA_SIZE {checkpoint_area_size}u\n\
+         #define WASM_POSIX_CHANNEL_CHECKPOINT_WIRE_SIZE {checkpoint_wire_size}u\n\
+         #define WASM_POSIX_CHANNEL_CHECKPOINT_BASE_OFFSET {checkpoint_base}u\n\
+         #define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_OFFSET {checkpoint_request}u\n\
+         #define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_UNWIND {checkpoint_request_unwind}u\n\
+         #define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_RESTART {checkpoint_request_restart}u\n\
+         #define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_KNOWN_MASK \
+         {checkpoint_request_known_mask}u\n\
          \n",
         status_idle = shared::ChannelStatus::Idle as u32,
         status_pending = shared::ChannelStatus::Pending as u32,
@@ -775,6 +785,13 @@ fn render_c_channel_contract() -> String {
         siginfo_word_2 = channel::SIGINFO_WORD_2,
         sig_alt_sp = channel::SIG_ALT_SP,
         sig_alt_size = channel::SIG_ALT_SIZE,
+        checkpoint_area_size = channel::CHECKPOINT_AREA_SIZE,
+        checkpoint_wire_size = channel::CHECKPOINT_WIRE_SIZE,
+        checkpoint_base = channel::CHECKPOINT_BASE,
+        checkpoint_request = channel::CHECKPOINT_REQUEST,
+        checkpoint_request_unwind = channel::CHECKPOINT_REQUEST_UNWIND,
+        checkpoint_request_restart = channel::CHECKPOINT_REQUEST_RESTART,
+        checkpoint_request_known_mask = channel::CHECKPOINT_REQUEST_KNOWN_MASK,
     )
 }
 
@@ -2107,6 +2124,14 @@ fn render_ts_module() -> String {
         render_ts_program_artifact_types(process_fork_import.params),
         render_ts_program_artifact_types(process_fork_import.results),
     ));
+    let process_checkpoint_import = shared::abi::WPK_CHECKPOINT_PROCESS_IMPORT;
+    out.push_str(&format!(
+        "export const WPK_CHECKPOINT_PROCESS_IMPORT = {{ module: {:?}, name: {:?}, params: {}, results: {} }} as const;\n",
+        process_checkpoint_import.module,
+        process_checkpoint_import.name,
+        render_ts_program_artifact_types(process_checkpoint_import.params),
+        render_ts_program_artifact_types(process_checkpoint_import.results),
+    ));
     out.push_str("export const WPK_FORK_REQUIRED_IMPORTS = [\n");
     for requirement in shared::abi::WPK_FORK_REQUIRED_IMPORTS {
         out.push_str(&format!(
@@ -3041,6 +3066,34 @@ fn render_ts_module() -> String {
         channel::SIG_ALT_SIZE
     ));
     out.push_str(&format!(
+        "export const CH_CHECKPOINT_BASE = {} as const;\n",
+        channel::CHECKPOINT_BASE
+    ));
+    out.push_str(&format!(
+        "export const CH_CHECKPOINT_AREA_SIZE = {} as const;\n",
+        channel::CHECKPOINT_AREA_SIZE
+    ));
+    out.push_str(&format!(
+        "export const CH_CHECKPOINT_WIRE_SIZE = {} as const;\n",
+        channel::CHECKPOINT_WIRE_SIZE
+    ));
+    out.push_str(&format!(
+        "export const CH_CHECKPOINT_REQUEST = {} as const;\n",
+        channel::CHECKPOINT_REQUEST
+    ));
+    out.push_str(&format!(
+        "export const CH_CHECKPOINT_REQUEST_UNWIND = {} as const;\n",
+        channel::CHECKPOINT_REQUEST_UNWIND
+    ));
+    out.push_str(&format!(
+        "export const CH_CHECKPOINT_REQUEST_RESTART = {} as const;\n",
+        channel::CHECKPOINT_REQUEST_RESTART
+    ));
+    out.push_str(&format!(
+        "export const CH_CHECKPOINT_REQUEST_KNOWN_MASK = {} as const;\n\n",
+        channel::CHECKPOINT_REQUEST_KNOWN_MASK
+    ));
+    out.push_str(&format!(
         "export const SIGNAL_ACTION_RESTART = {} as const;\n\n",
         shared::signal::SA_RESTART
     ));
@@ -3785,6 +3838,10 @@ fn build_snapshot(kernel_wasm: &std::path::Path) -> Result<JsonMap, String> {
     root.insert("channel_header".into(), channel_header());
     root.insert("channel_request_flags".into(), channel_request_flags());
     root.insert("channel_signal_area".into(), channel_signal_area());
+    root.insert(
+        "channel_checkpoint_area".into(),
+        channel_checkpoint_area(),
+    );
     root.insert("channel_buffers".into(), channel_buffers());
     root.insert("channel_scalar_contract".into(), channel_scalar_contract());
 
@@ -4739,6 +4796,43 @@ fn channel_signal_area() -> Value {
         json!(SIG_AREA_SIZE - SIG_DELIVERY_SIZE),
     );
     m.insert("slots".into(), Value::Array(list));
+    Value::Object(m.into_iter().collect())
+}
+
+fn channel_checkpoint_area() -> Value {
+    use shared::channel::*;
+    let mut request: JsonMap = BTreeMap::new();
+    request.insert("name".into(), json!("CHECKPOINT_REQUEST"));
+    request.insert("offset".into(), json!(CHECKPOINT_REQUEST));
+    request.insert("size".into(), json!(CHECKPOINT_WIRE_SIZE));
+    request.insert(
+        "meaning".into(),
+        json!("u32 request bit set, host-published, guest-cleared (0=none)"),
+    );
+    let mut m: JsonMap = BTreeMap::new();
+    m.insert("area_size".into(), json!(CHECKPOINT_AREA_SIZE));
+    m.insert("base".into(), json!(CHECKPOINT_BASE));
+    m.insert("wire_size".into(), json!(CHECKPOINT_WIRE_SIZE));
+    m.insert(
+        "reserved_tail_size".into(),
+        json!(CHECKPOINT_AREA_SIZE - CHECKPOINT_WIRE_SIZE),
+    );
+    m.insert(
+        "request_unwind".into(),
+        json!(CHECKPOINT_REQUEST_UNWIND),
+    );
+    m.insert(
+        "request_restart".into(),
+        json!(CHECKPOINT_REQUEST_RESTART),
+    );
+    m.insert(
+        "request_known_mask".into(),
+        json!(CHECKPOINT_REQUEST_KNOWN_MASK),
+    );
+    m.insert(
+        "slots".into(),
+        Value::Array(vec![Value::Object(request.into_iter().collect())]),
+    );
     Value::Object(m.into_iter().collect())
 }
 
@@ -5775,7 +5869,8 @@ fn program_artifact() -> Value {
         WPK_FORK_REFERENCE_TRANSACTION_FLAG_SEALED, WPK_FORK_REFERENCE_TRANSACTION_KNOWN_FLAGS,
         WPK_FORK_REFERENCE_TRANSACTION_MAGIC, WPK_FORK_REFERENCE_TRANSACTION_MANIFEST_SIZE,
         WPK_FORK_REFERENCE_TRANSACTION_OWNER, WPK_FORK_REFERENCE_TRANSACTION_VERSION,
-        WPK_FORK_REFERENCE_VECTOR_INDEX_SIZE, WPK_FORK_PROCESS_IMPORT, WPK_FORK_REQUIRED_EXPORTS,
+        WPK_FORK_REFERENCE_VECTOR_INDEX_SIZE, WPK_CHECKPOINT_PROCESS_IMPORT,
+        WPK_FORK_PROCESS_IMPORT, WPK_FORK_REQUIRED_EXPORTS,
         WPK_FORK_REQUIRED_IMPORTS, WPK_FORK_REQUIRED_TABLE_IMPORTS, WPK_FORK_STATIC_ROOT_CATALOG_EXPORT,
         WPK_FORK_STATIC_ROOT_CATALOG_HEADER_SIZE, WPK_FORK_STATIC_ROOT_CATALOG_MAGIC,
         WPK_FORK_STATIC_ROOT_CATALOG_SECTION, WPK_FORK_STATIC_ROOT_CATALOG_VERSION,
@@ -5861,6 +5956,22 @@ fn program_artifact() -> Value {
     process_import.insert(
         "results".into(),
         value_types(WPK_FORK_PROCESS_IMPORT.results),
+    );
+
+    let mut checkpoint_import: JsonMap = BTreeMap::new();
+    checkpoint_import.insert("kind".into(), json!("func"));
+    checkpoint_import.insert(
+        "module".into(),
+        json!(WPK_CHECKPOINT_PROCESS_IMPORT.module),
+    );
+    checkpoint_import.insert("name".into(), json!(WPK_CHECKPOINT_PROCESS_IMPORT.name));
+    checkpoint_import.insert(
+        "params".into(),
+        value_types(WPK_CHECKPOINT_PROCESS_IMPORT.params),
+    );
+    checkpoint_import.insert(
+        "results".into(),
+        value_types(WPK_CHECKPOINT_PROCESS_IMPORT.results),
     );
 
     let pointer_widths = WPK_FORK_LINKED_FRAME_POINTER_WIDTHS
@@ -6667,6 +6778,10 @@ fn program_artifact() -> Value {
     fork.insert(
         "process_import".into(),
         Value::Object(process_import.into_iter().collect()),
+    );
+    fork.insert(
+        "checkpoint_import".into(),
+        Value::Object(checkpoint_import.into_iter().collect()),
     );
     fork.insert(
         "process_modes".into(),
@@ -7576,6 +7691,13 @@ mod tests {
             "#define WASM_POSIX_CHANNEL_SIGINFO_WORD_2_OFFSET 65588u",
             "#define WASM_POSIX_CHANNEL_SIG_ALT_SP_OFFSET 65592u",
             "#define WASM_POSIX_CHANNEL_SIG_ALT_SIZE_OFFSET 65600u",
+            "#define WASM_POSIX_CHANNEL_CHECKPOINT_AREA_SIZE 8u",
+            "#define WASM_POSIX_CHANNEL_CHECKPOINT_WIRE_SIZE 4u",
+            "#define WASM_POSIX_CHANNEL_CHECKPOINT_BASE_OFFSET 65544u",
+            "#define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_OFFSET 65544u",
+            "#define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_UNWIND 1u",
+            "#define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_RESTART 2u",
+            "#define WASM_POSIX_CHANNEL_CHECKPOINT_REQUEST_KNOWN_MASK 3u",
         ] {
             assert!(header.contains(expected), "missing generated C: {expected}");
         }
@@ -7595,6 +7717,13 @@ mod tests {
             "export const CH_SIGINFO_WORD_2 = 65588 as const;",
             "export const CH_SIG_ALT_SP = 65592 as const;",
             "export const CH_SIG_ALT_SIZE = 65600 as const;",
+            "export const CH_CHECKPOINT_BASE = 65544 as const;",
+            "export const CH_CHECKPOINT_AREA_SIZE = 8 as const;",
+            "export const CH_CHECKPOINT_WIRE_SIZE = 4 as const;",
+            "export const CH_CHECKPOINT_REQUEST = 65544 as const;",
+            "export const CH_CHECKPOINT_REQUEST_UNWIND = 1 as const;",
+            "export const CH_CHECKPOINT_REQUEST_RESTART = 2 as const;",
+            "export const CH_CHECKPOINT_REQUEST_KNOWN_MASK = 3 as const;",
         ] {
             assert!(
                 typescript.contains(expected),
@@ -7627,6 +7756,20 @@ mod tests {
                 "SIG_ALT_SIZE",
             ],
         );
+
+        let checkpoint = channel_checkpoint_area();
+        assert_eq!(checkpoint["area_size"], json!(8));
+        assert_eq!(checkpoint["base"], json!(65544));
+        assert_eq!(checkpoint["wire_size"], json!(4));
+        assert_eq!(checkpoint["reserved_tail_size"], json!(4));
+        assert_eq!(checkpoint["request_unwind"], json!(1));
+        let checkpoint_slot_names: Vec<&str> = checkpoint["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|slot| slot["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(checkpoint_slot_names, vec!["CHECKPOINT_REQUEST"]);
     }
 
     #[test]
@@ -7849,6 +7992,16 @@ mod tests {
             })
         );
         assert_eq!(fork["process_modes"], json!({"fork": 0, "vfork": 1}));
+        assert_eq!(
+            fork["checkpoint_import"],
+            json!({
+                "kind": "func",
+                "module": "kernel",
+                "name": "kernel_checkpoint",
+                "params": [],
+                "results": []
+            })
+        );
         let descriptor = &fork["linked_frame_descriptor"];
         assert_eq!(
             descriptor["section"],

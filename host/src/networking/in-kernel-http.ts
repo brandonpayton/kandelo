@@ -39,6 +39,30 @@ export interface HttpResponse {
   body: Uint8Array;
 }
 
+/**
+ * One HTTP injection as the guest observes it: the listener port it was
+ * dispatched to, the synthetic peer port the host drew, and the raw request
+ * bytes written into the pipe. What a replication log records, and what a
+ * replaying machine is handed back.
+ */
+export interface HttpExchangeInjection {
+  port: number;
+  remotePort: number;
+  request: Uint8Array;
+}
+
+/**
+ * Replication's hand on `sendHttpRequest`.
+ *
+ * A recording machine hands every injection to `record` before the guest can
+ * observe it. A replaying machine installs the replay mode, which makes any
+ * live send refuse — its injections come from the log, via
+ * `replayHttpExchange`, or the machine diverges.
+ */
+export type HttpExchangeTap =
+  | { mode: "record"; record: (injection: HttpExchangeInjection) => void }
+  | { mode: "replay" };
+
 /** Options for {@link CentralizedKernelWorker.sendHttpRequest}. */
 export interface SendHttpRequestOptions {
   /** Time to wait for a complete response before bailing with status 504.
@@ -115,6 +139,30 @@ export function buildRawHttpRequest(req: HttpRequest): Uint8Array {
   out.set(headerBytes, 0);
   out.set(req.body, headerBytes.length);
   return out;
+}
+
+/**
+ * The method and request-target on a raw request's request line.
+ *
+ * A recorded injection carries bytes rather than a parsed request. The
+ * response parser needs the method back — HEAD forbids a body — and a viewer
+ * pairing its page's requests with replayed exchanges needs the target, so
+ * both come from the one place they are authoritative.
+ */
+export function parseRawRequestLine(
+  rawRequest: Uint8Array,
+): { method: string; target: string } {
+  const lineEnd = rawRequest.indexOf(0x0d);
+  const line = decoder.decode(
+    rawRequest.subarray(0, lineEnd > 0 ? lineEnd : rawRequest.length),
+  );
+  const match = /^([!#$%&'*+.^_`|~0-9A-Za-z-]+) (\S+) HTTP\/1\.[01]$/u.exec(
+    line,
+  );
+  if (match === null) {
+    throw new Error("in-kernel HTTP request line is malformed");
+  }
+  return { method: match[1]!, target: match[2]! };
 }
 
 /**

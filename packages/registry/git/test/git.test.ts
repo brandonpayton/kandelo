@@ -251,29 +251,23 @@ describe.skipIf(!hasGit || !hasGitRemoteHttp)("Git HTTP clone", () => {
       const cloneDir = `/clone-${Date.now()}`;
       const cloneHostDir = join(guestRoot, cloneDir.slice(1));
 
-      // Git's prepare_cmd() resolves helper commands via locate_in_PATH().
-      // Install the actual Wasm programs in the guest VFS so the kernel's
-      // authoritative exec preflight sees the same bytes as the resolver.
+      // Git's prepare_cmd() resolves helper commands via locate_in_PATH(),
+      // which uses access() against the guest filesystem, and then execs the
+      // path it found. execve reads that file: its authority is the executable
+      // already present in the VFS, never a host-side program map. Stage the
+      // real Wasm at each helper path so both steps see the same program.
       const gitExecPath = "/exec";
       const hostGitExecPath = join(guestRoot, "exec");
       mkdirSync(hostGitExecPath, { recursive: true });
-      writeFileSync(
-        join(hostGitExecPath, "git-remote-http"),
-        readFileSync(gitRemoteHttpBinary!),
-        { mode: 0o755 },
-      );
-      writeFileSync(join(hostGitExecPath, "git"), readFileSync(gitBinary!), {
-        mode: 0o755,
-      });
-
-      const execPrograms = new Map<string, string>([
-        [`${gitExecPath}/git-remote-http`, gitRemoteHttpBinary!],
-        [`${gitExecPath}/git`, gitBinary!],
-        // Fallback paths git may also try
-        ["/usr/libexec/git-core/git-remote-http", gitRemoteHttpBinary!],
-        ["/usr/bin/git-remote-http", gitRemoteHttpBinary!],
-        ["/usr/bin/git", gitBinary!],
-      ]);
+      for (const [name, binary] of [
+        ["git-remote-http", gitRemoteHttpBinary!],
+        // git re-execs itself through GIT_EXEC_PATH as well.
+        ["git", gitBinary!],
+      ] as const) {
+        writeFileSync(join(hostGitExecPath, name), readFileSync(binary), {
+          mode: 0o755,
+        });
+      }
 
       const cloneEnv = [...gitEnv, `GIT_EXEC_PATH=${gitExecPath}`];
 
@@ -282,7 +276,6 @@ describe.skipIf(!hasGit || !hasGitRemoteHttp)("Git HTTP clone", () => {
         argv: ["git", "clone", `http://${hostAlias}:${httpPort}/`, cloneDir],
         env: cloneEnv,
         io,
-        execPrograms,
         timeout: 60_000,
       });
 

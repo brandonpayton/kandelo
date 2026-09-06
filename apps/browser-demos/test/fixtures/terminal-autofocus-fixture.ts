@@ -29,6 +29,7 @@ export function mountDelayedPtyShell(
     close() {},
     onData: () => () => {},
     resize() {},
+    size: () => ({ cols: 80, rows: 24 }),
     write() {},
   };
   const host = {

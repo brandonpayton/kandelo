@@ -25,7 +25,9 @@ import {
   type DirEntry,
   type MountConfig,
   type MountSetIdCapability,
+  type TimeProvider,
 } from "./types";
+import type { CheckpointBytes } from "../migration/checkpoint";
 import {
   EROFS,
   O_CREAT,
@@ -98,6 +100,9 @@ function capturePrivatePrototype(prototype: object): object {
 const immutableProductSharedFsPrototype = capturePrivatePrototype(
   SharedFS.prototype,
 );
+
+/** The clock whose readings inode atime, mtime and ctime record. */
+const CLOCK_REALTIME = 0;
 
 const NOSUID_CAPABILITY: MountSetIdCapability = intrinsicObjectFreeze({
   kind: "nosuid",
@@ -3201,6 +3206,14 @@ export class MemoryFileSystem implements FileSystemBackend {
     intrinsicApply(intrinsicWeakSetAdd, memoryFileSystemInstances, [this]);
   }
 
+  /** Stamp inode times from the machine's clock, in the milliseconds they hold. */
+  setTimeProvider(time: TimeProvider): void {
+    this.fs.setClock(() => {
+      const { sec, nsec } = time.clockGettime(CLOCK_REALTIME);
+      return sec * 1_000 + Math.floor(nsec / 1_000_000);
+    });
+  }
+
   /** Capture one self-contained product tree without retaining producer state. */
   private snapshotForImmutableProduct(): MemoryFileSystem {
     if (this.lazyFiles.size !== 0 || this.lazyArchiveInodes.size !== 0) {
@@ -4145,6 +4158,10 @@ export class MemoryFileSystem implements FileSystemBackend {
     return this.fs.buffer as SharedArrayBuffer;
   }
 
+  checkpointBytes(): CheckpointBytes {
+    return { kind: "bytes", buffer: this.sharedBuffer };
+  }
+
   static create(
     sab: SharedArrayBuffer,
     maxSizeBytes?: number,
@@ -4174,6 +4191,56 @@ export class MemoryFileSystem implements FileSystemBackend {
 
   static fromExisting(sab: SharedArrayBuffer): MemoryFileSystem {
     return new MemoryFileSystem(SharedFS.mount(sab));
+  }
+
+  /**
+   * Mount captured bytes while keeping the deferred content this image knows.
+   *
+   * Which files are still deferred, and where their bytes come from, lives in
+   * the image's own sections rather than in the SharedFS buffer, so a
+   * filesystem mounted on captured bytes alone reports every deferred path as
+   * an existing file and reads none of them.
+   *
+   * The registry comes from this image and never from the capture. A capture
+   * crosses the network from another computer, and one that carried fetch URLs
+   * would let the sending computer choose what the receiving one downloads.
+   *
+   * Each entry is adopted only where the captured inode, its generation and
+   * its data sequence all still match, so a file the captured machine already
+   * materialized keeps its captured bytes.
+   *
+   * The buffer is allocated here, growable to the ceiling the captured
+   * superblock records. A capture is a live filesystem's buffer, grown on
+   * demand and so nearly full; mounted on a fixed buffer of its own length,
+   * the first write that needs a fresh block — materializing a deferred
+   * program on exec, most visibly — fails with ENOSPC.
+   */
+  mountCapturedBytes(bytes: Uint8Array): MemoryFileSystem {
+    const capacity = SharedFS.inspectImageCapacity(bytes);
+    const SharedArrayBufferCtor = SharedArrayBuffer as new (
+      byteLength: number,
+      options?: { maxByteLength?: number },
+    ) => SharedArrayBuffer;
+    const sab = new SharedArrayBufferCtor(bytes.byteLength, {
+      maxByteLength: capacity.maxByteLength,
+    });
+    new Uint8Array(sab).set(bytes);
+    const captured = new MemoryFileSystem(
+      SharedFS.mount(sab),
+      cloneMetadata(this.imageMetadata),
+    );
+    captured.importLazyEntries(this.exportLazyEntries());
+    // The export refuses to serialize a sealed group this instance has not
+    // authenticated, so everything that reaches here is already verified and
+    // stays verified. Re-admitting these groups as pending would leave the
+    // mounted filesystem unable to hand the machine on again.
+    captured.importLazyArchiveEntriesInternal(
+      this.exportLazyArchiveEntries(),
+      false,
+      true,
+      "verified",
+    );
+    return captured;
   }
 
   /**

@@ -9,6 +9,23 @@ export type HostFb = {
   pitch: number;
 };
 
+/** One CRTC the guest drove `drmModeSetCrtc` on, and the framebuffer it scans
+ *  out. */
+export type KmsCrtcBinding = {
+  readonly crtc_id: number;
+  readonly fb_id: number;
+};
+
+/** Every DRM object this registry holds, without the pixels.
+ *
+ *  Pixels belong to the buffer objects the framebuffers name, so a caller that
+ *  carries this also carries `GbmBoRegistry.snapshot`. */
+export type KmsSnapshot = {
+  readonly fbs: readonly HostFb[];
+  readonly crtcs: readonly KmsCrtcBinding[];
+  readonly masterPid: number | null;
+};
+
 export class KmsRegistry {
   private fbs = new Map<number, HostFb>();
   private crtcBindings = new Map<number, number>();
@@ -40,6 +57,31 @@ export class KmsRegistry {
       return crtc_id;
     }
     return null;
+  }
+
+  /** Every DRM object the guest has created, for a checkpoint to carry.
+   *
+   *  A CRTC binding outlives `rmFb` on its framebuffer, matching DRM, where
+   *  removing a scanned-out framebuffer leaves the CRTC modeset. A snapshot
+   *  can therefore name a framebuffer it does not list, and a restore must
+   *  accept that rather than treat it as a broken record. */
+  snapshot(): KmsSnapshot {
+    return {
+      fbs: [...this.fbs.values()].map((fb) => ({ ...fb })),
+      crtcs: [...this.crtcBindings].map(([crtc_id, fb_id]) => ({ crtc_id, fb_id })),
+      masterPid: this.masterPid,
+    };
+  }
+
+  /** Adopt a snapshot, replacing whatever this registry holds.
+   *
+   *  A restore runs this on a registry a fresh machine has not touched yet. */
+  restore(state: KmsSnapshot): void {
+    this.fbs = new Map(state.fbs.map((fb) => [fb.fb_id, { ...fb }]));
+    this.crtcBindings = new Map(
+      state.crtcs.map(({ crtc_id, fb_id }) => [crtc_id, fb_id]),
+    );
+    this.masterPid = state.masterPid;
   }
 
   scanoutBytes(crtc_id: number): Uint8Array | undefined {

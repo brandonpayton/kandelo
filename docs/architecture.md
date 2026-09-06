@@ -803,9 +803,20 @@ Offset  Size   Field
 64      4      errno_value (i32)
 68      4      request_flags (u32; cancellation and signal-delivery authority)
 72      65536  data_buffer (for path strings, read/write buffers, etc.)
+65544   8      checkpoint request area (reserved data_buffer tail)
+65552   56     signal delivery area (reserved data_buffer tail)
 ```
 
 Total: 65,608 bytes (header 72 bytes + data buffer 65,536 bytes).
+
+The last 64 bytes of the data buffer are reserved. The signal delivery area
+holds one dequeued caught signal for libc's post-syscall trampoline. The
+checkpoint request area holds one `u32` request word directly below it: the
+host publishes the word before completing a process's pending syscall, and
+the glue clears it and calls `kernel.kernel_checkpoint` from the same
+post-syscall hook that delivers signals. Both reservations sit inside the
+declared 65,536-byte buffer, so a syscall that transfers the full buffer
+writes across them; neither value is expected to survive such a transfer.
 
 Both wasm32 and wasm64 write six 64-bit argument slots. On wasm32, musl's
 public variadic `syscall()` entry point still reads 32-bit `long` arguments,

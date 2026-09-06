@@ -148,6 +148,7 @@ unsafe extern "C" {
         addr_c: u32,
         addr_d: u32,
     ) -> i32;
+    fn host_accept_select(accept_wake_idx: u32, pid: u32) -> i32;
     fn host_udp_bind(
         handle: i32,
         addr_a: u32,
@@ -833,6 +834,10 @@ impl HostIO for WasmHostIO {
             )
         };
         i32_to_result(result)
+    }
+
+    fn accept_select(&mut self, accept_wake_idx: u32, pid: u32) -> bool {
+        unsafe { host_accept_select(accept_wake_idx, pid) != 0 }
     }
 
     fn host_udp_bind(&mut self, handle: i32, addr: &[u8; 4], port: u16) -> Result<(), Errno> {
@@ -2267,6 +2272,34 @@ pub extern "C" fn kernel_generate_host_signal(pid: u32, signum: u32) -> i32 {
     0
 }
 
+/// Retire the kernel wait state one task holds, naming that task explicitly.
+///
+/// WHY: a checkpoint freeze has to move a process parked in a blocking syscall
+/// to its post-syscall hook, and the only way to do that is to complete the
+/// parked request. Completing it while the kernel still believes the task is
+/// waiting would leave the capture reading an incoherent machine, so the wait
+/// is retired first.
+///
+/// Routing that through the target's own channel as a synthetic
+/// `SYS_THREAD_CANCEL` cannot work. `kernel_handle_channel` activates a
+/// blocking retry for the calling task, and a task that already holds a
+/// binding is refused with `EBUSY` — which is every task this boundary exists
+/// to release. Like `kernel_generate_host_signal`, this export names the
+/// target explicitly and creates no caller task authority, so it reaches the
+/// parked task without competing with the retry it is retiring.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_cancel_host_owned_wait(pid: u32, tid: u32) -> i32 {
+    let _gkl = GklGuard::acquire();
+    let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+    let Some(proc) = table.get_mut(pid) else {
+        return -(Errno::ESRCH as i32);
+    };
+    match syscalls::cancel_host_owned_wait_for_live_tid(proc, tid) {
+        Ok(()) => 0,
+        Err(error) => -(error as i32),
+    }
+}
+
 /// Get fork exec path for a specific process.
 /// Writes path to buf, returns bytes written, 0 if no exec path, -ESRCH if not found.
 #[unsafe(no_mangle)]
@@ -2384,6 +2417,97 @@ pub extern "C" fn kernel_fd_supports_mmap_writeback(pid: u32, fd: i32) -> i32 {
     match table.get(pid) {
         Some(proc) => i32::from(syscalls::fd_supports_mmap_writeback(proc, fd)),
         None => -(Errno::ESRCH as i32),
+    }
+}
+
+/// Enumerate every live host handle held inside kernel memory.
+///
+/// A machine checkpoint's kernel memory names host resources through opaque
+/// handles the receiver cannot find by scanning bytes. This walk names each
+/// one: every open file description slot holding a non-negative handle, per
+/// descriptor that can reach it. A handle shared by dup, fork, or spawn
+/// appears once per (pid, fd) naming it, so the reader sees the sharing and
+/// deduplicates by (kind, handle). Negative handles are kernel-internal
+/// encodings (sockets, backing tables, synthetic and sentinel values) and
+/// are never emitted.
+///
+/// Wire format (all integers little-endian):
+///
+///   u32  count
+///   for each record (20 bytes):
+///     u32  pid
+///     u32  fd
+///     u32  kind      -- 0 = stream slot, 1 = directory iterator slot
+///     i64  handle
+///
+/// Returns total bytes written, or -ENOSPC when the buffer is too small.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_enumerate_host_handles(out_ptr: *mut u8, out_len: u32) -> i32 {
+    let table = unsafe { &*PROCESS_TABLE.0.get() };
+    let out = unsafe { slice::from_raw_parts_mut(out_ptr, out_len as usize) };
+    match table.write_host_handle_records(out) {
+        Ok(written) => written as i32,
+        Err(e) => -(e as i32),
+    }
+}
+
+/// Remap one live host handle to its receiver-side replacement, machine-wide.
+///
+/// Generalises `kernel_convert_pipe_to_host`: instead of rewriting one open
+/// file description of the current process, this rewrites every description
+/// in every process whose slot of the given kind holds `old_handle`, and
+/// moves the cross-process refcount entry with them, so shared descriptions
+/// stay shared. `kind` 0 names the stream slot (`host_handle`), `kind` 1 the
+/// directory iterator slot (`dir_host_handle`).
+///
+/// Returns the number of rewritten slots (> 0), -EINVAL for a bad kind or a
+/// negative handle, -EEXIST when a different resource already answers to
+/// `new_handle`, and -EBADF when no slot holds `old_handle`. An identity
+/// remap (`old_handle == new_handle`) is legal.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_remap_host_handles(kind: u32, old_handle: i64, new_handle: i64) -> i32 {
+    let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+    match table.remap_host_handles(kind, old_handle, new_handle) {
+        Ok(rewritten) => rewritten as i32,
+        Err(e) => -(e as i32),
+    }
+}
+
+/// Re-arm this machine's host timers for one restored process.
+///
+/// A restored kernel memory carries armed ITIMER_REAL state — the monotonic
+/// deadline and the interval — but the platform timer the captured machine
+/// scheduled through `host_set_alarm` died with it. Returns 1 when the
+/// interval timer was re-armed with its remaining time, 0 when none was
+/// armed, and a negative errno on failure. POSIX timer slots store their
+/// original relative value rather than a deadline, so kernel state cannot
+/// reproduce their remaining time; that gap stays open until the state
+/// carries one.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_rearm_host_timers(pid: u32) -> i32 {
+    let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+    let Some(proc) = table.get_mut(pid) else {
+        return -(Errno::ESRCH as i32);
+    };
+    let mut host = WasmHostIO;
+    match syscalls::rearm_host_interval_timer(proc, &mut host) {
+        Ok(rearmed) => i32::from(rearmed),
+        Err(e) => -(e as i32),
+    }
+}
+
+/// Name the PTY pair serving as `pid`'s terminal, for restore.
+///
+/// A restored kernel memory carries the captured machine's whole PTY table,
+/// but the host routing that feeds keyboard input to a PTY master died with
+/// the captured machine. Returns the PTY index (>= 0), -ENOENT when the
+/// process holds no PTY slave descriptor, and -ESRCH for a dead pid.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_pty_index_for_pid(pid: u32) -> i32 {
+    let table = unsafe { &*PROCESS_TABLE.0.get() };
+    match table.pty_index_for_pid(pid) {
+        Ok(pty_idx) => pty_idx as i32,
+        Err(e) => -(e as i32),
     }
 }
 

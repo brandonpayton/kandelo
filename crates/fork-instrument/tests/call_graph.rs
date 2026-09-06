@@ -194,10 +194,114 @@ fn custom_entry_import_name() {
     let bytes = wat::parse_str(wat).expect("wat parse");
     let opts = Options {
         entry_import: "host.do_async".into(),
+        ..Options::default()
     };
     let analysis = analyze(&bytes, &opts).expect("analyze");
     assert_eq!(analysis.fork_path.len(), 2);
     assert!(analysis.fork_path.iter().any(|e| e.name == "a"));
+}
+
+#[test]
+fn a_checkpoint_seed_adds_to_the_entry_seed_rather_than_replacing_it() {
+    // The closure is walked from a seed's callers, so an import joins it only
+    // by being a seed itself. Naming the checkpoint import through
+    // `entry_import` would drop the fork boundary, leaving its call site
+    // without unwind transport.
+    let wat = r#"
+        (module
+          (import "kernel" "kernel_fork" (func $fork (param i32) (result i32)))
+          (import "kernel" "kernel_checkpoint" (func $checkpoint))
+          (func $forker (export "forker") (result i32)
+            i32.const 0
+            call $fork)
+          (func $syscaller (export "syscaller")
+            call $checkpoint))
+    "#;
+    let bytes = wat::parse_str(wat).expect("wat parse");
+    let opts = Options {
+        checkpoint_import: Some("kernel.kernel_checkpoint".into()),
+        ..Options::default()
+    };
+    let analysis = analyze(&bytes, &opts).expect("analyze");
+    let found: HashSet<String> = analysis.fork_path.iter().map(|e| e.name.clone()).collect();
+    for name in ["fork", "forker", "checkpoint", "syscaller"] {
+        assert!(found.contains(name), "got {found:?}");
+    }
+}
+
+#[test]
+fn a_checkpoint_seed_is_the_only_seed_a_program_that_never_forks_has() {
+    let wat = r#"
+        (module
+          (import "kernel" "kernel_checkpoint" (func $checkpoint))
+          (func $syscaller (export "syscaller")
+            call $checkpoint))
+    "#;
+    let bytes = wat::parse_str(wat).expect("wat parse");
+    analyze(&bytes, &Options::default())
+        .expect_err("no fork import means there is nothing to instrument");
+
+    let opts = Options {
+        checkpoint_import: Some("kernel.kernel_checkpoint".into()),
+        ..Options::default()
+    };
+    let analysis = analyze(&bytes, &opts).expect("analyze");
+    let found: HashSet<String> = analysis.fork_path.iter().map(|e| e.name.clone()).collect();
+    for name in ["checkpoint", "syscaller"] {
+        assert!(found.contains(name), "got {found:?}");
+    }
+}
+
+#[test]
+fn a_missing_checkpoint_seed_is_named_alongside_the_entry_seed() {
+    let wat = r#"
+        (module
+          (import "kernel" "kernel_other" (func $other (result i32)))
+          (func $caller (export "caller") (result i32)
+            call $other))
+    "#;
+    let bytes = wat::parse_str(wat).expect("wat parse");
+    let opts = Options {
+        checkpoint_import: Some("kernel.kernel_checkpoint".into()),
+        ..Options::default()
+    };
+    let message = analyze(&bytes, &opts)
+        .expect_err("neither seed is present")
+        .to_string();
+    assert!(message.contains("`kernel.kernel_fork`"), "got {message}");
+    assert!(
+        message.contains("`kernel.kernel_checkpoint`"),
+        "got {message}"
+    );
+}
+
+#[test]
+fn a_checkpoint_seed_naming_the_entry_import_seeds_it_once() {
+    let wat = r#"
+        (module
+          (import "kernel" "kernel_fork" (func $fork (param i32) (result i32)))
+          (func $forker (export "forker") (result i32)
+            i32.const 0
+            call $fork))
+    "#;
+    let bytes = wat::parse_str(wat).expect("wat parse");
+    let opts = Options {
+        checkpoint_import: Some("kernel.kernel_fork".into()),
+        ..Options::default()
+    };
+    let analysis = analyze(&bytes, &opts).expect("analyze");
+    let names: Vec<String> = analysis.fork_path.iter().map(|e| e.name.clone()).collect();
+    let unique: HashSet<String> = names.iter().cloned().collect();
+    assert_eq!(names.len(), unique.len(), "got {names:?}");
+    assert_eq!(
+        unique,
+        analyze(&bytes, &Options::default())
+            .expect("analyze")
+            .fork_path
+            .iter()
+            .map(|e| e.name.clone())
+            .collect::<HashSet<String>>()
+    );
 }
 
 #[test]

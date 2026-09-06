@@ -1474,6 +1474,156 @@ impl ProcessTable {
         self.processes.keys().copied().collect()
     }
 
+    /// Walk every live host handle held inside kernel memory.
+    ///
+    /// Emits one `(pid, fd, kind, handle)` tuple per open file description
+    /// slot holding a non-negative handle, per descriptor that can reach it.
+    /// A handle shared by dup, fork, or spawn appears once per (pid, fd)
+    /// naming it, so a reader sees the sharing and deduplicates by
+    /// (kind, handle). Negative handles are kernel-internal encodings
+    /// (sockets, backing tables, synthetic and sentinel values) and are
+    /// never emitted. `kind` 0 names the stream slot (`host_handle`),
+    /// `kind` 1 the directory iterator slot (`dir_host_handle`).
+    pub fn enumerate_host_handles(&self, emit: &mut dyn FnMut(u32, i32, u32, i64)) {
+        for (&pid, proc) in self.processes.iter() {
+            for (fd, entry) in proc.fd_table.iter() {
+                let Some(ofd) = proc.ofd_table.get(entry.ofd_ref.0) else {
+                    continue;
+                };
+                if ofd.host_handle >= 0 {
+                    emit(pid, fd, 0, ofd.host_handle);
+                }
+                if ofd.dir_host_handle >= 0 {
+                    emit(pid, fd, 1, ofd.dir_host_handle);
+                }
+            }
+        }
+    }
+
+    /// Serialize [`Self::enumerate_host_handles`] for the host.
+    ///
+    /// Wire format (all integers little-endian):
+    ///
+    ///   u32  count
+    ///   for each record (20 bytes):
+    ///     u32  pid
+    ///     u32  fd
+    ///     u32  kind
+    ///     i64  handle
+    ///
+    /// Returns total bytes written, or `ENOSPC` when `out` is too small.
+    pub fn write_host_handle_records(&self, out: &mut [u8]) -> Result<usize, Errno> {
+        const RECORD_SIZE: usize = 4 + 4 + 4 + 8;
+        let mut records: usize = 0;
+        self.enumerate_host_handles(&mut |_, _, _, _| records += 1);
+        let need = 4 + records * RECORD_SIZE;
+        if out.len() < need {
+            return Err(Errno::ENOSPC);
+        }
+        out[0..4].copy_from_slice(&(records as u32).to_le_bytes());
+        let mut off = 4usize;
+        self.enumerate_host_handles(&mut |pid, fd, kind, handle| {
+            out[off..off + 4].copy_from_slice(&pid.to_le_bytes());
+            out[off + 4..off + 8].copy_from_slice(&(fd as u32).to_le_bytes());
+            out[off + 8..off + 12].copy_from_slice(&kind.to_le_bytes());
+            out[off + 12..off + 20].copy_from_slice(&handle.to_le_bytes());
+            off += RECORD_SIZE;
+        });
+        Ok(off)
+    }
+
+    /// Rewrite every open file description slot of `kind` that holds
+    /// `old_handle` to `new_handle`, machine-wide.
+    ///
+    /// A restored machine's kernel memory still names the captured machine's
+    /// host handles. The receiver reopens each host resource, then remaps the
+    /// old handle to the fresh one here. Rewriting by value in one call keeps
+    /// dup-, fork-, and spawn-shared descriptions shared: every slot naming
+    /// the old handle moves together, and the cross-process refcount entry
+    /// moves with them.
+    ///
+    /// `kind` 0 names the stream slot (`host_handle`: files, host-delegated
+    /// pipes, host-backed devices); `kind` 1 names the directory iterator
+    /// slot (`dir_host_handle`). Negative handles are kernel-internal
+    /// encodings, never host identities, so both handles must be
+    /// non-negative. Returns the number of rewritten slots, `EINVAL` for a
+    /// bad kind or a negative handle, `EEXIST` when a different resource
+    /// already answers to `new_handle` (rewriting would merge two host
+    /// identities under one number), and `EBADF` when no slot holds
+    /// `old_handle`. An identity remap (`old_handle == new_handle`) is
+    /// legal: a deterministic receiver can reopen into the same number.
+    pub fn remap_host_handles(
+        &mut self,
+        kind: u32,
+        old_handle: i64,
+        new_handle: i64,
+    ) -> Result<u32, Errno> {
+        if kind > 1 || old_handle < 0 || new_handle < 0 {
+            return Err(Errno::EINVAL);
+        }
+        fn slot_of(kind: u32, ofd: &mut crate::ofd::OpenFileDesc) -> &mut i64 {
+            if kind == 0 {
+                &mut ofd.host_handle
+            } else {
+                &mut ofd.dir_host_handle
+            }
+        }
+        if new_handle != old_handle {
+            for proc in self.processes.values_mut() {
+                for (_, ofd) in proc.ofd_table.iter_mut() {
+                    if *slot_of(kind, ofd) == new_handle {
+                        return Err(Errno::EEXIST);
+                    }
+                }
+            }
+        }
+        let mut rewritten: u32 = 0;
+        for proc in self.processes.values_mut() {
+            for (_, ofd) in proc.ofd_table.iter_mut() {
+                let slot = slot_of(kind, ofd);
+                if *slot == old_handle {
+                    *slot = new_handle;
+                    rewritten += 1;
+                }
+            }
+        }
+        if rewritten == 0 {
+            return Err(Errno::EBADF);
+        }
+        if kind == 0 && new_handle != old_handle {
+            crate::ofd::host_handle_migrate_refs(old_handle, new_handle);
+        }
+        Ok(rewritten)
+    }
+
+    /// Name the PTY pair serving as `pid`'s terminal.
+    ///
+    /// A restored kernel memory carries the whole PTY table, but the host's
+    /// pid → PTY routing (keyboard input, winsize, output drain) died with
+    /// the captured machine. The slave side lives in the process's own file
+    /// descriptors, so the lowest slave descriptor names the terminal.
+    /// Returns `ESRCH` for a dead pid and `ENOENT` for a process holding no
+    /// PTY slave descriptor.
+    pub fn pty_index_for_pid(&self, pid: u32) -> Result<u32, Errno> {
+        let Some(proc) = self.processes.get(&pid) else {
+            return Err(Errno::ESRCH);
+        };
+        let mut named: Option<(i32, u32)> = None;
+        for (fd, entry) in proc.fd_table.iter() {
+            let Some(ofd) = proc.ofd_table.get(entry.ofd_ref.0) else {
+                continue;
+            };
+            if ofd.file_type != FileType::PtySlave || ofd.host_handle < 0 {
+                continue;
+            }
+            match named {
+                Some((named_fd, _)) if named_fd <= fd => {}
+                _ => named = Some((fd, ofd.host_handle as u32)),
+            }
+        }
+        named.map(|(_, pty_idx)| pty_idx).ok_or(Errno::ENOENT)
+    }
+
     /// Collect PIDs that should be visible through procfs.
     ///
     /// Exited processes remain visible as zombies until their parent reaps
@@ -4078,5 +4228,271 @@ mod tests {
         proc.fd_table
             .alloc_at_min(OpenFileDescRef(ofd_idx), 0, fd)
             .unwrap();
+    }
+
+    #[test]
+    fn walk_names_every_host_handle_and_remap_round_trips() {
+        use crate::fd::OpenFileDescRef;
+        use crate::ofd::{OfdTable, host_handle_ref_count};
+        use crate::process::PosixTimerState;
+        use wasm_posix_shared::flags::O_RDONLY;
+
+        // Unique high values: other tests share the global refcount table
+        // while the runner executes in parallel.
+        const FILE_HANDLE: i64 = 900_210_001;
+        const FILE_HANDLE_NEW: i64 = 900_210_002;
+        const DIR_HANDLE: i64 = 900_210_011;
+        const DIR_HANDLE_NEW: i64 = 900_210_012;
+        const DIR_ITER_HANDLE: i64 = 900_210_021;
+        const DIR_ITER_HANDLE_NEW: i64 = 900_210_022;
+        const UNKNOWN_HANDLE: i64 = 900_210_099;
+
+        fn walked(table: &ProcessTable) -> Vec<(u32, i32, u32, i64)> {
+            let mut records = Vec::new();
+            table.enumerate_host_handles(&mut |pid, fd, kind, handle| {
+                records.push((pid, fd, kind, handle));
+            });
+            records.sort_unstable();
+            records
+        }
+
+        // T2.1's walk: a machine with open files (dup- and fork-shared), an
+        // open directory mid-iteration, a kernel pipe, a socket, and an
+        // armed POSIX timer. Only the stream and directory-iterator slots
+        // hold real (non-negative) host handles. Pipes and sockets store
+        // negative kernel-internal encodings, and a timer stores no handle
+        // at all — the host re-arms one by (pid, timer slot).
+        let mut table = ProcessTable::new();
+        let pid_a = table.create_process().unwrap();
+        let pid_b = table.create_process().unwrap();
+
+        let proc_a = table.get_mut(pid_a).unwrap();
+        proc_a.fd_table = crate::fd::FdTable::new();
+        proc_a.ofd_table = OfdTable::new();
+        let file_ofd = proc_a.ofd_table.create(
+            FileType::Regular,
+            O_RDONLY,
+            FILE_HANDLE,
+            b"/tmp/walk-file".to_vec(),
+        );
+        let fd_file = proc_a
+            .fd_table
+            .alloc(OpenFileDescRef(file_ofd), 0)
+            .unwrap();
+        let fd_dup = proc_a
+            .fd_table
+            .alloc(OpenFileDescRef(file_ofd), 0)
+            .unwrap();
+        proc_a.ofd_table.get_mut(file_ofd).unwrap().ref_count += 1;
+        let dir_ofd = proc_a.ofd_table.create(
+            FileType::Directory,
+            O_RDONLY,
+            DIR_HANDLE,
+            b"/tmp/walk-dir".to_vec(),
+        );
+        let fd_dir = proc_a.fd_table.alloc(OpenFileDescRef(dir_ofd), 0).unwrap();
+        {
+            let dir = proc_a.ofd_table.get_mut(dir_ofd).unwrap();
+            dir.dir_host_handle = DIR_ITER_HANDLE;
+            dir.dir_entry_offset = 5;
+        }
+        let pipe_ofd = proc_a
+            .ofd_table
+            .create(FileType::Pipe, O_RDONLY, -7, Vec::new());
+        proc_a
+            .fd_table
+            .alloc(OpenFileDescRef(pipe_ofd), 0)
+            .unwrap();
+        let sock_ofd = proc_a
+            .ofd_table
+            .create(FileType::Socket, O_RDONLY, -4, Vec::new());
+        proc_a
+            .fd_table
+            .alloc(OpenFileDescRef(sock_ofd), 0)
+            .unwrap();
+        proc_a.posix_timers.push(Some(PosixTimerState {
+            clock_id: 0,
+            sigev_signo: 14,
+            sigev_value_bits: 0,
+            sigev_notify: 0,
+            sigev_tid: 0,
+            interval_sec: 0,
+            interval_nsec: 0,
+            value_sec: 5,
+            value_nsec: 0,
+            notification_pending: false,
+            overrun_current: 0,
+            overrun_last: 0,
+        }));
+
+        let proc_b = table.get_mut(pid_b).unwrap();
+        proc_b.fd_table = crate::fd::FdTable::new();
+        proc_b.ofd_table = OfdTable::new();
+        let file_ofd_b = proc_b.ofd_table.create(
+            FileType::Regular,
+            O_RDONLY,
+            FILE_HANDLE,
+            b"/tmp/walk-file".to_vec(),
+        );
+        let fd_file_b = proc_b
+            .fd_table
+            .alloc(OpenFileDescRef(file_ofd_b), 0)
+            .unwrap();
+        crate::ofd::host_handle_fork_ref(FILE_HANDLE);
+        assert_eq!(host_handle_ref_count(FILE_HANDLE), 2);
+
+        // The uncovered class the walk found: the handle values themselves.
+        // The enumeration names every real handle, nothing kernel-internal,
+        // and shows dup/fork sharing as repeated values.
+        let mut expected = alloc::vec![
+            (pid_a, fd_file, 0, FILE_HANDLE),
+            (pid_a, fd_dup, 0, FILE_HANDLE),
+            (pid_a, fd_dir, 0, DIR_HANDLE),
+            (pid_a, fd_dir, 1, DIR_ITER_HANDLE),
+            (pid_b, fd_file_b, 0, FILE_HANDLE),
+        ];
+        expected.sort_unstable();
+        assert_eq!(walked(&table), expected);
+
+        // The wire round-trips the same records and refuses a short buffer.
+        let mut out = [0u8; 4096];
+        let written = table.write_host_handle_records(&mut out).unwrap();
+        assert_eq!(written, 4 + expected.len() * 20);
+        let count = u32::from_le_bytes(out[0..4].try_into().unwrap()) as usize;
+        assert_eq!(count, expected.len());
+        let mut decoded: Vec<(u32, i32, u32, i64)> = (0..count)
+            .map(|i| {
+                let off = 4 + i * 20;
+                (
+                    u32::from_le_bytes(out[off..off + 4].try_into().unwrap()),
+                    u32::from_le_bytes(out[off + 4..off + 8].try_into().unwrap()) as i32,
+                    u32::from_le_bytes(out[off + 8..off + 12].try_into().unwrap()),
+                    i64::from_le_bytes(out[off + 12..off + 20].try_into().unwrap()),
+                )
+            })
+            .collect();
+        decoded.sort_unstable();
+        assert_eq!(decoded, expected);
+        let mut tiny = [0u8; 8];
+        assert_eq!(
+            table.write_host_handle_records(&mut tiny),
+            Err(Errno::ENOSPC),
+        );
+
+        // The remap refusals.
+        assert_eq!(
+            table.remap_host_handles(2, FILE_HANDLE, FILE_HANDLE_NEW),
+            Err(Errno::EINVAL),
+        );
+        assert_eq!(
+            table.remap_host_handles(0, -1, FILE_HANDLE_NEW),
+            Err(Errno::EINVAL),
+        );
+        assert_eq!(
+            table.remap_host_handles(0, FILE_HANDLE, -1),
+            Err(Errno::EINVAL),
+        );
+        assert_eq!(
+            table.remap_host_handles(0, UNKNOWN_HANDLE, FILE_HANDLE_NEW),
+            Err(Errno::EBADF),
+        );
+        assert_eq!(
+            table.remap_host_handles(0, FILE_HANDLE, DIR_HANDLE),
+            Err(Errno::EEXIST),
+        );
+
+        // An identity remap is a legal no-op that still reports its slots: a
+        // deterministic receiver can reopen into the same number.
+        assert_eq!(table.remap_host_handles(0, FILE_HANDLE, FILE_HANDLE), Ok(2));
+        assert_eq!(host_handle_ref_count(FILE_HANDLE), 2);
+
+        // The remap: one call per handle moves every slot naming it, and the
+        // shared refcount entry moves with the stream handle.
+        assert_eq!(
+            table.remap_host_handles(0, FILE_HANDLE, FILE_HANDLE_NEW),
+            Ok(2),
+        );
+        assert_eq!(host_handle_ref_count(FILE_HANDLE), 0);
+        assert_eq!(host_handle_ref_count(FILE_HANDLE_NEW), 2);
+        assert_eq!(
+            table.remap_host_handles(0, DIR_HANDLE, DIR_HANDLE_NEW),
+            Ok(1),
+        );
+        assert_eq!(
+            table.remap_host_handles(1, DIR_ITER_HANDLE, DIR_ITER_HANDLE_NEW),
+            Ok(1),
+        );
+
+        // Reads through the new handles: the same descriptors answer with
+        // the new values, dup/fork sharing intact, and the directory keeps
+        // its path and iteration position.
+        let mut expected_new = alloc::vec![
+            (pid_a, fd_file, 0, FILE_HANDLE_NEW),
+            (pid_a, fd_dup, 0, FILE_HANDLE_NEW),
+            (pid_a, fd_dir, 0, DIR_HANDLE_NEW),
+            (pid_a, fd_dir, 1, DIR_ITER_HANDLE_NEW),
+            (pid_b, fd_file_b, 0, FILE_HANDLE_NEW),
+        ];
+        expected_new.sort_unstable();
+        assert_eq!(walked(&table), expected_new);
+        let dir = table.get(pid_a).unwrap().ofd_table.get(dir_ofd).unwrap();
+        assert_eq!(dir.path, b"/tmp/walk-dir");
+        assert_eq!(dir.dir_entry_offset, 5);
+
+        table.remove_process(pid_a).unwrap();
+        table.remove_process(pid_b).unwrap();
+        assert_eq!(host_handle_ref_count(FILE_HANDLE_NEW), 0);
+    }
+
+    #[test]
+    fn pty_index_for_pid_names_the_lowest_slave_descriptor() {
+        use crate::fd::OpenFileDescRef;
+        use crate::ofd::OfdTable;
+        use wasm_posix_shared::flags::{O_RDONLY, O_RDWR};
+
+        // Unique high value: other tests share the global PTY table while
+        // the runner executes in parallel, and this index must name none of
+        // theirs.
+        const PTY_INDEX: i64 = 900_211_001;
+
+        let mut table = ProcessTable::new();
+        let pid = table.create_process().unwrap();
+        let bare_pid = table.create_process().unwrap();
+
+        let proc = table.get_mut(pid).unwrap();
+        proc.fd_table = crate::fd::FdTable::new();
+        proc.ofd_table = OfdTable::new();
+        let file_ofd = proc.ofd_table.create(
+            FileType::Regular,
+            O_RDONLY,
+            900_211_101,
+            b"/tmp/pty-file".to_vec(),
+        );
+        proc.fd_table.alloc(OpenFileDescRef(file_ofd), 0).unwrap();
+        let slave_ofd = proc.ofd_table.create(
+            FileType::PtySlave,
+            O_RDWR,
+            PTY_INDEX,
+            b"/dev/pts/900211001".to_vec(),
+        );
+        let slave_fd = proc.fd_table.alloc(OpenFileDescRef(slave_ofd), 0).unwrap();
+        let dup_fd = proc.fd_table.alloc(OpenFileDescRef(slave_ofd), 0).unwrap();
+        assert!(slave_fd < dup_fd);
+        let later_ofd = proc.ofd_table.create(
+            FileType::PtySlave,
+            O_RDWR,
+            PTY_INDEX + 1,
+            b"/dev/pts/900211002".to_vec(),
+        );
+        let later_fd = proc.fd_table.alloc(OpenFileDescRef(later_ofd), 0).unwrap();
+        assert!(dup_fd < later_fd);
+
+        let bare = table.get_mut(bare_pid).unwrap();
+        bare.fd_table = crate::fd::FdTable::new();
+        bare.ofd_table = OfdTable::new();
+
+        assert_eq!(table.pty_index_for_pid(pid), Ok(PTY_INDEX as u32));
+        assert_eq!(table.pty_index_for_pid(bare_pid), Err(Errno::ENOENT));
+        assert_eq!(table.pty_index_for_pid(4_000_000), Err(Errno::ESRCH));
     }
 }

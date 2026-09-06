@@ -42,6 +42,9 @@ export function emptyProcessTimerCleanup(
  * Structural export mocks remain owned by the test. The worker receives only
  * a genuine Wasm instance, its exact gate-bound facade, and an
  * allocator-created region for that same generation.
+ *
+ * The installed gate comes back so a test can model a busy kernel entry
+ * without rebuilding the instance this helper already made.
  */
 export function installKernelWorkerTestScratch(
   worker: {
@@ -51,7 +54,7 @@ export function installKernelWorkerTestScratch(
   pointer = 128,
   pointerWidth: 4 | 8 = 4,
   options: KernelWorkerTestScratchOptions = {},
-): number {
+): { readonly pointer: number; readonly gate: KernelEntryGate } {
   const authority = worker.testAuthority;
   if (authority === undefined) {
     throw new Error("worker is not a module-authorized kernel test double");
@@ -109,5 +112,5 @@ export function installKernelWorkerTestScratch(
     gate,
     mainScratch,
   });
-  return pointer;
+  return { pointer, gate };
 }

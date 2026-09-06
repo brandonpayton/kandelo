@@ -15,13 +15,6 @@ SRC_DIR="$SCRIPT_DIR/msmtp-src"
 BIN_DIR="$SCRIPT_DIR/bin"
 OUT="$BIN_DIR/msmtpd.wasm"
 
-if [ -f "$OUT" ]; then
-    echo "==> Reusing existing msmtpd artifact in $BIN_DIR (skip rebuild)."
-    source "$REPO_ROOT/scripts/install-local-binary.sh"
-    install_local_binary msmtpd "$OUT"
-    exit 0
-fi
-
 if ! command -v wasm32posix-cc >/dev/null 2>&1; then
     echo "ERROR: wasm32posix-cc not found. Run 'npm link' in sdk/ first." >&2
     exit 1

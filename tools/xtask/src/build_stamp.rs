@@ -25,6 +25,17 @@ use wasmparser::{Parser, Payload};
 pub(crate) const BUILD_KEY_SECTION: &str = "kandelo.build.key";
 pub(crate) const ABI_CONTRACT_SECTION: &str = "kandelo.abi.contract";
 
+/// Whether these bytes are a wasm module at all (`\0asm` magic).
+///
+/// A package may declare non-module artifacts -- zip lazy-archives such as
+/// `lsof-docs.zip` or a browser bundle's runtime archive -- as program
+/// outputs. Only a wasm module can carry the build-key custom section, so
+/// stamping and stamp verification both gate on this instead of parsing and
+/// failing on bytes that were never wasm.
+pub(crate) fn is_wasm_module(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x00, 0x61, 0x73, 0x6d])
+}
+
 /// Read the 32-byte payload of the first custom section named `name`, or
 /// `None` if the module carries no such section.
 pub(crate) fn read_named_section(wasm: &[u8], name: &str) -> Result<Option<[u8; 32]>, String> {
@@ -119,6 +130,13 @@ mod tests {
             read_named_section(&empty_module(), ABI_CONTRACT_SECTION).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn zip_bytes_are_not_a_wasm_module() {
+        assert!(is_wasm_module(&empty_module()));
+        assert!(!is_wasm_module(b"PK\x03\x04qux"));
+        assert!(!is_wasm_module(b""));
     }
 
     #[test]

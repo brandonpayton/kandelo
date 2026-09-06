@@ -1,0 +1,562 @@
+import { expect, test, type Page } from "@playwright/test";
+
+/**
+ * One machine, running on both computers at once.
+ *
+ * A mirror sends the user's pixels and the viewer paints them, so the viewer's
+ * computer runs nothing. Replication sends the user's decisions instead: the
+ * viewer restores the user's checkpoint into a machine of its own and runs it
+ * on the values the user's host produced, so the second browser renders a
+ * machine it did not start rather than a picture of one.
+ *
+ * That is the claim these tests make. Not that the two look alike — a mirror
+ * already achieves that — but that the second computer is running the
+ * processes, from the state the first one was in, on the first one's clock.
+ * The exact-equality half of that claim is
+ * `host/test/replication/live-join.test.ts`, which compares what the two
+ * machines print reading by reading. Here it is the product surface: which
+ * computer holds a machine, which one may type, and what each is told it is
+ * looking at.
+ *
+ * Replication starts on its own, as soon as the link opens: the computer
+ * holding a machine is the user, and the computer holding none is the viewer.
+ * The one choice there is belongs to the user — joining sends the machine's
+ * whole state to the other computer, so the Network popup's Watch and Join
+ * buttons are the machine owner's grant, offered before the connection is
+ * completed and switchable at any point in either direction.
+ *
+ * Chromium only, for the same reason as `kandelo-network-share.spec.ts`: only
+ * headless Chromium forms a loopback ICE pair.
+ */
+
+import { distinctColors, regionBrightness } from "./support/canvas";
+import {
+  appUrl,
+  closeDockPopovers,
+  connectPeers,
+  expectReplica,
+  networkButton,
+  openNetworkPopover,
+  takeOverButton as takeButton,
+  terminalText,
+  typeIntoTerminal,
+} from "./support/peer-pair";
+
+/**
+ * Open a terminal on a fresh machine and wait for its shell.
+ *
+ * A machine with no PTY session carries no terminal into a checkpoint, so a
+ * replica of it would have nothing to show and the test would be measuring an
+ * empty screen rather than a running one.
+ */
+async function openShell(page: Page): Promise<void> {
+  await page.getByRole("button", { name: "Terminal", exact: true })
+    .click({ timeout: 60_000 });
+  await expect(page.locator(".kshell-host .xterm-rows").first())
+    .toBeVisible({ timeout: 120_000 });
+  await expect
+    .poll(() => terminalText(page, ".kshell-host"), { timeout: 120_000 })
+    .toContain("$");
+}
+
+test("runs the user's machine on the computer that was watching it", async ({
+  browser,
+  baseURL,
+  browserName,
+}) => {
+  test.skip(
+    browserName !== "chromium",
+    "only headless Chromium can form a loopback ICE pair",
+  );
+  test.setTimeout(300_000);
+  expect(baseURL).toBeTruthy();
+
+  const userContext = await browser.newContext();
+  const viewerContext = await browser.newContext();
+  const user = await userContext.newPage();
+  const viewer = await viewerContext.newPage();
+  try {
+    await user.goto(appUrl("/?demo=shell"), { waitUntil: "domcontentloaded" });
+    await viewer.goto(appUrl("/"), { waitUntil: "domcontentloaded" });
+    await openShell(user);
+
+    // Something the user's machine did before the two computers met. It is in
+    // the state the viewer adopts, so finding it on the viewer is finding the
+    // user's machine there rather than a second one that looks like it.
+    const before = `kandelo-before-${Date.now().toString(36)}`;
+    await closeDockPopovers([user]);
+    await typeIntoTerminal(user, ".kshell-host", `echo ${before}`);
+    await expect
+      .poll(() => terminalText(user, ".kshell-host"), { timeout: 60_000 })
+      .toContain(before);
+
+    await connectPeers(user, viewer, (reason) => test.skip(true, reason));
+
+    // The viewer ends up holding a machine, with no shared surface left to
+    // watch. Nothing was pressed to make that happen: a computer that connects
+    // to a machine is a computer that runs it.
+    await expectReplica(viewer);
+
+    // And what it holds is the user's machine, carried across as state rather
+    // than redrawn as pixels: the line the user's shell printed before the two
+    // computers had ever met is on the viewer's own screen.
+    await expect
+      .poll(() => terminalText(viewer, ".kshell-host"), { timeout: 120_000 })
+      .toContain(before);
+
+    // Both computers are told which of them they are. The viewer runs a
+    // machine and still cannot type into it, which is the one thing a summary
+    // derived from "does this computer hold a machine" would get backwards.
+    await openNetworkPopover(user);
+    await openNetworkPopover(viewer);
+    await expect(viewer.locator(".knetwork-status"))
+      .toContainText("This computer is running a copy of it", {
+        timeout: 30_000,
+      });
+    await expect(user.locator(".knetwork-status"))
+      .toContainText("The other computer is running a copy of this machine", {
+        timeout: 30_000,
+      });
+
+    // The dock says the same thing in one word, which is what the read-only
+    // badge on the viewer's terminal is derived from.
+    await expect(viewer.locator(".kdock-status"))
+      .toHaveAttribute("data-role", "viewer");
+    await expect(user.locator(".kdock-status"))
+      .toHaveAttribute("data-role", "user");
+
+    // A replica is a copy of one machine, not a second machine. The user is
+    // offered no way to take it, because taking it would leave two copies of
+    // one state with nothing keeping them one. Take-over still runs the other
+    // way, and still means the user's machine.
+    await expect(takeButton(user)).toHaveCount(0);
+    await expect(takeButton(viewer)).toHaveCount(1);
+  } finally {
+    await viewerContext.close();
+    await userContext.close();
+  }
+});
+
+test("gives the viewer the user's shell, not a shell of its own", async ({
+  browser,
+  baseURL,
+  browserName,
+}) => {
+  test.skip(
+    browserName !== "chromium",
+    "only headless Chromium can form a loopback ICE pair",
+  );
+  test.setTimeout(420_000);
+  expect(baseURL).toBeTruthy();
+
+  const userContext = await browser.newContext();
+  const viewerContext = await browser.newContext();
+  const user = await userContext.newPage();
+  const viewer = await viewerContext.newPage();
+  try {
+    await user.goto(appUrl("/?demo=shell"), { waitUntil: "domcontentloaded" });
+    await viewer.goto(appUrl("/"), { waitUntil: "domcontentloaded" });
+    await openShell(user);
+
+    // Connected while the user's shell sits at a prompt, and touched only
+    // afterwards. A machine is read by freezing it and a process that makes no
+    // syscall reaches no freeze hook, so this is the order in which the first
+    // join is refused and the replica arrives on a later attempt — at the very
+    // moment the person at the other computer types. What arrives then must be
+    // the user's shell. A second shell of the viewer's own would look almost
+    // the same on screen, and would be a different machine.
+    await connectPeers(user, viewer, (reason) => test.skip(true, reason));
+    await closeDockPopovers([user, viewer]);
+    const typed = `kandelo-after-${Date.now().toString(36)}`;
+    await typeIntoTerminal(user, ".kshell-host", `echo ${typed}`);
+    await expect
+      .poll(() => terminalText(user, ".kshell-host"), { timeout: 60_000 })
+      .toContain(typed);
+
+    await expectReplica(viewer);
+    await expect
+      .poll(() => terminalText(viewer, ".kshell-host"), { timeout: 180_000 })
+      .toContain(typed);
+
+    // The guide belongs to a launch. This computer launched nothing — it
+    // connected to a machine — so the replica arriving must not open one
+    // over the shell the person was already watching.
+    await expect(viewer.locator(".kdemo")).toHaveCount(0);
+
+    // And the viewer cannot answer it. A keystroke here reaches no log, so the
+    // machine the user holds would never make the decision this one just made.
+    const refused = `kandelo-refused-${Date.now().toString(36)}`;
+    await typeIntoTerminal(viewer, ".kshell-host", `echo ${refused}`);
+    await viewer.waitForTimeout(5_000);
+    expect(await terminalText(viewer, ".kshell-host")).not.toContain(refused);
+    expect(await terminalText(user, ".kshell-host")).not.toContain(refused);
+  } finally {
+    await viewerContext.close();
+    await userContext.close();
+  }
+});
+
+test("follows the user to the demo they launch next", async ({
+  browser,
+  baseURL,
+  browserName,
+}) => {
+  test.skip(
+    browserName !== "chromium",
+    "only headless Chromium can form a loopback ICE pair",
+  );
+  test.setTimeout(600_000);
+  expect(baseURL).toBeTruthy();
+
+  const userContext = await browser.newContext();
+  const viewerContext = await browser.newContext();
+  const user = await userContext.newPage();
+  const viewer = await viewerContext.newPage();
+  try {
+    await user.goto(appUrl("/?demo=shell"), { waitUntil: "domcontentloaded" });
+    await viewer.goto(appUrl("/"), { waitUntil: "domcontentloaded" });
+    await openShell(user);
+    await connectPeers(user, viewer, (reason) => test.skip(true, reason));
+    await expectReplica(viewer);
+    await expect(viewer.locator(".kdock-status-title")).not.toHaveText("fbDOOM");
+
+    // Launching a demo destroys the machine the viewer is a copy of and boots
+    // a different one in its place. The page boots it where it stands rather
+    // than navigating, because navigating would drop the link — so nothing
+    // about the viewer's own computer changes, and a viewer that watched only
+    // its own status would go on running a machine that exists nowhere.
+    await closeDockPopovers([user, viewer]);
+    await user.getByRole("button", { name: "New", exact: true }).click();
+    await user.getByRole("row", { name: "Launch fbDOOM" })
+      .getByRole("button", { name: "Launch" }).click();
+    await expect(user.locator(".kdock-status-text"))
+      .toHaveAttribute("data-status", "running", { timeout: 300_000 });
+    await expect(user.locator(".kdock-status-title")).toHaveText("fbDOOM");
+    await expect(user.locator(".kdock-status")).toHaveAttribute("data-role", "user");
+
+    // The viewer joins the machine that replaced the one it was running, and
+    // is the viewer of that one on the same terms: it holds a machine, it is
+    // told it holds a copy, and there is no mirror pane to watch.
+    await expect(viewer.locator(".kdock-status-title"))
+      .toHaveText("fbDOOM", { timeout: 300_000 });
+    await expectReplica(viewer);
+
+    // And it is running fbDOOM rather than being shown a picture of one: the
+    // pixels on this screen were painted by this computer, from the decisions
+    // the other one made.
+    const viewerCanvas = viewer.locator("canvas.kframebuffer-canvas").first();
+    await expect(viewerCanvas).toBeVisible({ timeout: 180_000 });
+    await expect.poll(() => distinctColors(viewerCanvas), {
+      timeout: 180_000,
+      intervals: [1_000, 2_000, 3_000],
+    }).toBeGreaterThan(4);
+  } finally {
+    await viewerContext.close();
+    await userContext.close();
+  }
+});
+
+test("lets the user grant the mirror only, and the replica again", async ({
+  browser,
+  baseURL,
+  browserName,
+}) => {
+  test.skip(
+    browserName !== "chromium",
+    "only headless Chromium can form a loopback ICE pair",
+  );
+  test.setTimeout(420_000);
+  expect(baseURL).toBeTruthy();
+
+  const userContext = await browser.newContext();
+  const viewerContext = await browser.newContext();
+  const user = await userContext.newPage();
+  const viewer = await viewerContext.newPage();
+  try {
+    await user.goto(appUrl("/?demo=shell"), { waitUntil: "domcontentloaded" });
+    await viewer.goto(appUrl("/"), { waitUntil: "domcontentloaded" });
+    await openShell(user);
+
+    // The grant is offered before the connection exists, to the computer
+    // holding the machine, and joining is what a link gives by default.
+    await openNetworkPopover(user);
+    const watch = user.getByRole("button", { name: "Watch", exact: true });
+    const join = user.getByRole("button", { name: "Join", exact: true });
+    await expect(join).toHaveAttribute("aria-pressed", "true");
+    await watch.click();
+    await expect(watch).toHaveAttribute("aria-pressed", "true");
+
+    await connectPeers(user, viewer, (reason) => test.skip(true, reason));
+
+    // The grant chosen before connecting holds: the viewer gets the mirror,
+    // and no machine boots on its computer. A line typed on the user's
+    // machine reaches it as pixels.
+    const mirrored = `kandelo-mirrored-${Date.now().toString(36)}`;
+    await expect(viewer.locator(".kshared-machine"))
+      .toHaveCount(1, { timeout: 120_000 });
+    await closeDockPopovers([user, viewer]);
+    await typeIntoTerminal(user, ".kshell-host", `echo ${mirrored}`);
+    await expect
+      .poll(() => terminalText(viewer, ".kshell-host"), { timeout: 120_000 })
+      .toContain(mirrored);
+    await expect(viewer.locator(".kdock-status-text"))
+      .toHaveAttribute("data-status", "idle");
+
+    // Granting Join serves the viewer's standing wish: its computer adopts
+    // the machine, and the line typed while it could only watch is in the
+    // state it adopts — the machine that arrives is the user's, not a fresh
+    // one.
+    await openNetworkPopover(user);
+    await user.getByRole("button", { name: "Join", exact: true }).click();
+    await closeDockPopovers([user, viewer]);
+    // The read freezes the machine at a syscall, so an untouched shell at its
+    // prompt refuses it; typing is what lets the join land.
+    await typeIntoTerminal(user, ".kshell-host", "true");
+    await expectReplica(viewer);
+    await expect
+      .poll(() => terminalText(viewer, ".kshell-host"), { timeout: 120_000 })
+      .toContain(mirrored);
+
+    // Taking the grant back ends the recording, and the viewer's page lets
+    // the replica go: the mirror pane returns on a computer that was running
+    // a machine a moment ago.
+    await openNetworkPopover(user);
+    await user.getByRole("button", { name: "Watch", exact: true }).click();
+    await expect(viewer.locator(".kshared-machine"))
+      .toHaveCount(1, { timeout: 120_000 });
+    await expect(user.getByRole("button", { name: "Watch", exact: true }))
+      .toHaveAttribute("aria-pressed", "true");
+  } finally {
+    await viewerContext.close();
+    await userContext.close();
+  }
+});
+
+/**
+ * Stir the fluid with the pointer, so the dye the replica must show exists.
+ *
+ * Pavel's sim splats dye on a drag — a button held during motion
+ * (`modeset.c` guards on `buttons`) — and the dye fades, so a machine left
+ * alone converges to a black screen that says nothing. The motion crosses
+ * the wire as pointer decisions, never as pixels.
+ */
+async function stirFluid(page: Page): Promise<void> {
+  const box = await page.locator(".kmodeset-stage").first().boundingBox();
+  if (!box) return;
+  const centerX = box.x + box.width / 2;
+  const centerY = box.y + box.height / 2;
+  await page.mouse.move(centerX - 80, centerY - 40, { steps: 5 });
+  await page.mouse.down();
+  await page.mouse.move(centerX + 80, centerY + 40, { steps: 10 });
+  await page.mouse.move(centerX, centerY - 60, { steps: 10 });
+  await page.mouse.up();
+}
+
+test("replicates a machine whose screen only a GL context painted", async ({
+  browser,
+  baseURL,
+  browserName,
+}) => {
+  test.skip(
+    browserName !== "chromium",
+    "only headless Chromium can form a loopback ICE pair",
+  );
+  test.setTimeout(600_000);
+  expect(baseURL).toBeTruthy();
+
+  const userContext = await browser.newContext();
+  const viewerContext = await browser.newContext();
+  const user = await userContext.newPage();
+  const viewer = await viewerContext.newPage();
+  try {
+    await user.goto(appUrl("/?demo=modeset"), { waitUntil: "domcontentloaded" });
+    await viewer.goto(appUrl("/"), { waitUntil: "domcontentloaded" });
+
+    // The fluid sim paints through the EGL to WebGL2 bridge: no frame of it
+    // ever reaches a host buffer, which is exactly the machine a checkpoint
+    // used to refuse.
+    await expect(user.locator(".kdock-status-text"))
+      .toHaveAttribute("data-status", "running", { timeout: 300_000 });
+    const userCanvas = user.locator("canvas.kmodeset-canvas").first();
+    await expect(userCanvas).toBeVisible({ timeout: 180_000 });
+
+    await connectPeers(user, viewer, (reason) => test.skip(true, reason));
+    await expectReplica(viewer);
+
+    // The replica shows the same demo's GL surface, painted by this
+    // computer's own context from the restored machine's state.
+    const viewerCanvas = viewer.locator("canvas.kmodeset-canvas").first();
+    await expect(viewerCanvas).toBeVisible({ timeout: 180_000 });
+
+    // Stirring on the user reaches the viewer as decisions: the splats are
+    // pointer deltas in the log, and the color on the viewer's canvas was
+    // rendered here, from them.
+    await closeDockPopovers([user, viewer]);
+    await expect.poll(async () => {
+      await stirFluid(user);
+      return distinctColors(viewerCanvas);
+    }, {
+      timeout: 240_000,
+      intervals: [2_000, 3_000, 5_000],
+    }).toBeGreaterThan(4);
+    await expect.poll(() => distinctColors(userCanvas), { timeout: 60_000 })
+      .toBeGreaterThan(4);
+  } finally {
+    await viewerContext.close();
+    await userContext.close();
+  }
+});
+
+test("puts the taker's splats where the taker points after a take-over", async ({
+  browser,
+  baseURL,
+  browserName,
+}) => {
+  test.skip(
+    browserName !== "chromium",
+    "only headless Chromium can form a loopback ICE pair",
+  );
+  test.setTimeout(600_000);
+  expect(baseURL).toBeTruthy();
+
+  // modeset.c has no absolute cursor — it integrates PS/2 deltas — so the
+  // page mirrors the guest cursor and teleports it with a synthetic delta.
+  // A taken-over machine restores its cursor wherever the giver left it,
+  // which is the case that broke: a mirror that assumed the boot-time
+  // midpoint offset every splat by the giver's parking distance.
+  const userContext = await browser.newContext();
+  const viewerContext = await browser.newContext();
+  const user = await userContext.newPage();
+  const viewer = await viewerContext.newPage();
+  try {
+    await user.goto(appUrl("/?demo=modeset"), { waitUntil: "domcontentloaded" });
+    await viewer.goto(appUrl("/"), { waitUntil: "domcontentloaded" });
+    await expect(user.locator(".kdock-status-text"))
+      .toHaveAttribute("data-status", "running", { timeout: 300_000 });
+    const userCanvas = user.locator("canvas.kmodeset-canvas").first();
+    await expect(userCanvas).toBeVisible({ timeout: 180_000 });
+
+    await connectPeers(user, viewer, (reason) => test.skip(true, reason));
+    await expectReplica(viewer);
+    await closeDockPopovers([user, viewer]);
+
+    // Park the giver's cursor deep in the bottom-right, so the checkpoint
+    // carries a cursor far from the midpoint the old mirror assumed.
+    const userBox = await userCanvas.boundingBox();
+    expect(userBox).toBeTruthy();
+    await user.mouse.move(
+      userBox!.x + userBox!.width * 0.95,
+      userBox!.y + userBox!.height * 0.95,
+      { steps: 8 },
+    );
+
+    await openNetworkPopover(viewer);
+    await takeButton(viewer).click();
+    await closeDockPopovers([user, viewer]);
+    await expect(viewer.locator(".kdock-status"))
+      .toHaveAttribute("data-role", "user", { timeout: 300_000 });
+    await expect(viewer.locator(".kdock-status-text"))
+      .toHaveAttribute("data-status", "running", { timeout: 300_000 });
+    const viewerCanvas = viewer.locator("canvas.kmodeset-canvas").first();
+    await expect(viewerCanvas).toBeVisible({ timeout: 180_000 });
+
+    // Stir only inside the top-left of the taker's canvas. The dye must
+    // land there — brighter than the far corner — not at the click plus
+    // the giver's parking offset. The pointer leaves the canvas before
+    // every stir because that is the discriminating motion: each re-entry
+    // teleports the guest cursor again, so a teleport measured from the
+    // wrong origin re-offsets every stir, while relative tracking alone
+    // lets edge clamping slowly absorb the offset and hide the bug.
+    const topLeft = { x: 0.05, y: 0.05, w: 0.35, h: 0.35 };
+    const bottomRight = { x: 0.6, y: 0.6, w: 0.35, h: 0.35 };
+    await expect.poll(async () => {
+      const box = await viewerCanvas.boundingBox();
+      if (!box) return -255;
+      const px = (fx: number) => box.x + box.width * fx;
+      const py = (fy: number) => box.y + box.height * fy;
+      await viewer.mouse.move(px(0.5), box.y - 40, { steps: 4 });
+      await viewer.mouse.move(px(0.12), py(0.12), { steps: 5 });
+      await viewer.mouse.down();
+      await viewer.mouse.move(px(0.3), py(0.3), { steps: 12 });
+      await viewer.mouse.move(px(0.12), py(0.28), { steps: 12 });
+      await viewer.mouse.up();
+      const near = await regionBrightness(viewerCanvas, topLeft);
+      const far = await regionBrightness(viewerCanvas, bottomRight);
+      return near - far;
+    }, {
+      timeout: 240_000,
+      intervals: [2_000, 3_000, 5_000],
+    }).toBeGreaterThan(5);
+  } finally {
+    await viewerContext.close();
+    await userContext.close();
+  }
+});
+
+test("gives the machine to the viewer, and a replica back to the user", async ({
+  browser,
+  baseURL,
+  browserName,
+}) => {
+  test.skip(
+    browserName !== "chromium",
+    "only headless Chromium can form a loopback ICE pair",
+  );
+  test.setTimeout(420_000);
+  expect(baseURL).toBeTruthy();
+
+  const userContext = await browser.newContext();
+  const viewerContext = await browser.newContext();
+  const user = await userContext.newPage();
+  const viewer = await viewerContext.newPage();
+  try {
+    await user.goto(appUrl("/?demo=shell"), { waitUntil: "domcontentloaded" });
+    await viewer.goto(appUrl("/"), { waitUntil: "domcontentloaded" });
+    await openShell(user);
+    await connectPeers(user, viewer, (reason) => test.skip(true, reason));
+    await expectReplica(viewer);
+
+    // Taking the machine over replaces the viewer's replica with the machine
+    // itself. The replica was a copy kept the same by the log; what arrives
+    // now is the state, and this computer decides for it from here.
+    await openNetworkPopover(viewer);
+    await takeButton(viewer).click();
+    await closeDockPopovers([user, viewer]);
+    await expect(viewer.locator(".kdock-status"))
+      .toHaveAttribute("data-role", "user", { timeout: 300_000 });
+    // Running, not merely booting. A machine only answers a request to
+    // replicate it once it is one, so the computer that gave it up is waiting
+    // for this before it can start following it again.
+    await expect(viewer.locator(".kdock-status-text"))
+      .toHaveAttribute("data-status", "running", { timeout: 300_000 });
+
+    // Which makes the two computers each other's opposite, without either of
+    // them re-deciding anything: the roles follow the machine. The computer
+    // that gave it up is running a replica of it now, so it holds a machine
+    // again and still may not type into one.
+    //
+    // Typing first because a machine is read by freezing it, and a process
+    // that makes no syscall reaches no freeze hook: a shell sitting at a
+    // prompt refuses to be read until something wakes it. The viewer asks
+    // again on its own, and this is the keystroke that lets the next attempt
+    // succeed — the same thing that would make it succeed for a person.
+    const typed = `kandelo-after-${Date.now().toString(36)}`;
+    await typeIntoTerminal(viewer, ".kshell-host", `echo ${typed}`);
+    await expect
+      .poll(() => terminalText(viewer, ".kshell-host"), { timeout: 90_000 })
+      .toContain(typed);
+    await expectReplica(user);
+
+    // And the keyboard went with the machine: what the computer that took it
+    // typed above reached a shell. The other one is offered the take, not the
+    // typing.
+    await openNetworkPopover(user);
+    await openNetworkPopover(viewer);
+    await expect(takeButton(user)).toHaveCount(1);
+    await expect(takeButton(viewer)).toHaveCount(0);
+    await expect(networkButton(user)).toHaveClass(/is-connected/);
+  } finally {
+    await viewerContext.close();
+    await userContext.close();
+  }
+});

@@ -95,7 +95,7 @@ describe("process memory creator destroy gate", () => {
   it("keeps transferred exec-plan ownership in the destroy drain until release", async () => {
     const gate = new ProcessMemoryCreatorGate();
     const sweep = vi.fn();
-    const admission = gate.acquire("an exec replacement plan");
+    const admission = await gate.acquire("an exec replacement plan");
 
     const destroy = gate.closeAndRunAfterDrain(sweep);
     await Promise.resolve();
@@ -105,7 +105,7 @@ describe("process memory creator destroy gate", () => {
     admission.release();
     await expect(destroy).resolves.toBeUndefined();
     expect(sweep).toHaveBeenCalledOnce();
-    expect(() => gate.acquire("a late exec replacement plan")).toThrow(
+    await expect(gate.acquire("a late exec replacement plan")).rejects.toThrow(
       "kernel worker is being destroyed; cannot start a late exec replacement plan",
     );
   });
@@ -170,6 +170,68 @@ describe("process memory creator destroy gate", () => {
 
     vforkLifetime.resolve();
     await expect(vfork).resolves.toBe(41);
+  });
+
+  it("queues a launch behind a freeze and runs it when the machine resumes", async () => {
+    const gate = new ProcessMemoryCreatorGate();
+    const spawn = deferred();
+    const capture = deferred();
+    const queued = vi.fn();
+    const lateExec = vi.fn(() => 0);
+    const offQueued = gate.onLaunchQueuedDuringExclusive(queued);
+    const admittedSpawn = gate.run("spawn", async () => {
+      await spawn.promise;
+      return 5;
+    });
+
+    const freeze = gate.runExclusive("a checkpoint freeze", () => capture.promise);
+    const queuedExec = gate.run("exec", lateExec);
+    await Promise.resolve();
+    expect(queued).toHaveBeenCalledOnce();
+    expect(gate.hasQueuedAdmissions()).toBe(true);
+    expect(lateExec).not.toHaveBeenCalled();
+
+    spawn.resolve();
+    await expect(admittedSpawn).resolves.toBe(5);
+    expect(lateExec).not.toHaveBeenCalled();
+
+    capture.resolve();
+    await expect(freeze).resolves.toBeUndefined();
+    await expect(queuedExec).resolves.toBe(0);
+    expect(gate.hasQueuedAdmissions()).toBe(false);
+    offQueued();
+  });
+
+  it("reopens admission when a freeze rejects", async () => {
+    const gate = new ProcessMemoryCreatorGate();
+    await expect(
+      gate.runExclusive("a checkpoint freeze", () => {
+        throw new Error("injected freeze failure");
+      }),
+    ).rejects.toThrow("injected freeze failure");
+
+    await expect(gate.run("spawn", () => 3)).resolves.toBe(3);
+  });
+
+  it("refuses a second freeze and refuses to freeze during destroy", async () => {
+    const gate = new ProcessMemoryCreatorGate();
+    const capture = deferred();
+    const freeze = gate.runExclusive("a checkpoint freeze", () => capture.promise);
+    await expect(
+      gate.runExclusive("a second checkpoint freeze", () => undefined),
+    ).rejects.toThrow(
+      "a checkpoint freeze is in progress; cannot start a second checkpoint freeze",
+    );
+
+    capture.resolve();
+    await expect(freeze).resolves.toBeUndefined();
+
+    await gate.closeAndWait();
+    await expect(
+      gate.runExclusive("a late checkpoint freeze", () => undefined),
+    ).rejects.toThrow(
+      "kernel worker is being destroyed; cannot start a late checkpoint freeze",
+    );
   });
 
   it("keeps pre-commit creation failures in the destroy drain", async () => {

@@ -24,10 +24,12 @@ import {
   SFSError,
 } from "../src/vfs/sharedfs-vendor";
 import { NodeTimeProvider } from "../src/vfs/time";
+import { askMountsForCheckpointBytes } from "../src/migration/checkpoint";
 import {
   ST_NOSUID,
   type FileSystemBackend,
   type MountConfig,
+  type TimeProvider,
 } from "../src/vfs/types";
 import type { StatResult, StatfsResult } from "../src/types";
 
@@ -1376,6 +1378,58 @@ describe("VirtualPlatformIO constructor validation", () => {
   });
 });
 
+describe("VirtualPlatformIO clock routing", () => {
+  function clockedBackend(): FileSystemBackend & { adopted: TimeProvider[] } {
+    const backend = createMockBackend() as FileSystemBackend & {
+      adopted: TimeProvider[];
+    };
+    backend.adopted = [];
+    backend.setTimeProvider = (time) => void backend.adopted.push(time);
+    return backend;
+  }
+
+  it("hands the machine's clock to every mount that keeps file times", () => {
+    const root = clockedBackend();
+    const tmp = clockedBackend();
+    const time = new NodeTimeProvider();
+    new VirtualPlatformIO(
+      [
+        { mountPoint: "/", backend: root },
+        { mountPoint: "/tmp", backend: tmp },
+      ],
+      time,
+    );
+    expect(root.adopted).toEqual([time]);
+    expect(tmp.adopted).toEqual([time]);
+  });
+
+  it("hands every mount the replacement clock too", () => {
+    // A restored machine and a replicated one both swap the provider after
+    // the mounts exist, so a backend given only the boot clock would go on
+    // stamping file times from the host it happens to be running on.
+    const backend = clockedBackend();
+    const io = new VirtualPlatformIO(
+      [{ mountPoint: "/", backend }],
+      new NodeTimeProvider(),
+    );
+    const replacement = new NodeTimeProvider();
+    io.setTimeProvider(replacement);
+    expect(backend.adopted).toHaveLength(2);
+    expect(backend.adopted[1]).toBe(replacement);
+  });
+
+  it("skips a mount that keeps no file times of its own", () => {
+    const backend = createMockBackend();
+    expect(
+      () =>
+        new VirtualPlatformIO(
+          [{ mountPoint: "/", backend }],
+          new NodeTimeProvider(),
+        ),
+    ).not.toThrow();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // 8. Time provider tests
 // ---------------------------------------------------------------------------
@@ -1413,5 +1467,59 @@ describe("NodeTimeProvider", () => {
     const boottimeNs = BigInt(boottime.sec) * 1_000_000_000n + BigInt(boottime.nsec);
     expect(boottimeNs).toBeGreaterThanOrEqual(monotonicNs);
     expect(boottimeNs - monotonicNs).toBeLessThan(100_000_000n);
+  });
+});
+
+describe("what a mount answers when a checkpoint asks for its bytes", () => {
+  it("gives a MemoryFileSystem's buffer, which the freeze copies", () => {
+    const sab = new SharedArrayBuffer(1024 * 1024);
+    const mfs = MemoryFileSystem.create(sab);
+    expect(mfs.checkpointBytes()).toEqual({ kind: "bytes", buffer: sab });
+  });
+
+  it("refuses for a HostFileSystem, naming the backing and not the path", () => {
+    const root = mkdtempSync(join(tmpdir(), "kandelo-checkpoint-bytes-"));
+    try {
+      const answer = new HostFileSystem(root).checkpointBytes();
+      expect(answer).toEqual({
+        kind: "none",
+        reason: "a host directory backs this mount and owns no shared buffer",
+      });
+      // A checkpoint travels to another computer; the sandbox root does not.
+      expect(JSON.stringify(answer)).not.toContain(root);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses for a backend that does not answer at all", () => {
+    expect(
+      askMountsForCheckpointBytes([
+        { mountPoint: "/proc", backend: createMockBackend() },
+      ]),
+    ).toEqual([
+      {
+        mountPoint: "/proc",
+        bytes: {
+          kind: "none",
+          reason: "this mount's backend reports no checkpoint bytes",
+        },
+      },
+    ]);
+  });
+
+  it("keeps every mount in mount order, answered or not", () => {
+    const root = mkdtempSync(join(tmpdir(), "kandelo-checkpoint-bytes-"));
+    try {
+      const sab = new SharedArrayBuffer(1024 * 1024);
+      const asked = askMountsForCheckpointBytes([
+        { mountPoint: "/", backend: MemoryFileSystem.create(sab) },
+        { mountPoint: "/tmp", backend: new HostFileSystem(root) },
+      ]);
+      expect(asked.map((mount) => [mount.mountPoint, mount.bytes.kind]))
+        .toEqual([["/", "bytes"], ["/tmp", "none"]]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

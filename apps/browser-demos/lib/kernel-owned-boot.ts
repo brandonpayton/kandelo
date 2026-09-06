@@ -81,7 +81,7 @@ export async function finalizeKernelOwnedImage(buildFs: MemoryFileSystem): Promi
 }
 
 /** Create a fresh, empty build-time MemoryFileSystem for assembling an image
- *  that the kernel worker will own. Scratch mounts (/tmp, /var, /home/user, …)
+ *  that the kernel worker will own. Scratch mounts (/tmp, /var, /home/maker, …)
  *  are provided worker-side, so only the image's `/` content (e.g. /etc, /bin)
  *  needs to live here. */
 export function createEmptyBuildFs(maxByteLength = 64 * 1024 * 1024): MemoryFileSystem {

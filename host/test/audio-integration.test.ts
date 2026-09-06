@@ -55,6 +55,7 @@ async function runAudioProgram(
   relativePath: string,
   argv: string[],
   timeoutMs = 15_000,
+  replicationBehind = false,
 ): Promise<AudioProgramResult> {
   const consumedChunks: Uint8Array[] = [];
   let kernel: CentralizedKernelWorker | null = null;
@@ -63,10 +64,14 @@ async function runAudioProgram(
   let initialProducer = 0n;
   let initialConsumer = 0n;
   let initialDiscard = 0n;
+  // Resolving a programs/ path re-checks program-index freshness through
+  // xtask on every call; keep that resolver cost out of the real-time
+  // pacing measurement below.
+  const programPath = resolveBinary(relativePath);
   const start = performance.now();
   try {
     const result = await runCentralizedProgram({
-      programPath: resolveBinary(relativePath),
+      programPath,
       argv,
       env: ["SDL_AUDIODRIVER=dsp"],
       timeout: timeoutMs,
@@ -77,6 +82,9 @@ async function runAudioProgram(
         // after exit. It proves which unmodified upstream backend path ran
         // without adding a production-only ioctl counter or weakening the ABI.
         readyKernel.enableSyscallTrace();
+        if (replicationBehind) {
+          readyKernel.setReplicationAheadProbe(() => Number.POSITIVE_INFINITY);
+        }
         transport = readyKernel.claimPcmTransport(false);
         const words = pcmControlWords(transport);
         initialProducer = readProducerPosition(words);
@@ -480,10 +488,42 @@ describe("audio integration", () => {
     );
   }
 
+  it("frees a replica's audio backlog instead of re-serving its waits", async () => {
+    const fixture = deterministicWave(44_100, 2, 16, 120);
+    const tempDir = mkdtempSync(join(tmpdir(), "kandelo-playwave-"));
+    const wavePath = join(tempDir, "deterministic.wav");
+    writeFileSync(wavePath, fixture.bytes);
+
+    let result: AudioProgramResult;
+    try {
+      result = await runAudioProgram(
+        "programs/playwave.wasm",
+        ["playwave", wavePath],
+        20_000,
+        true,
+      );
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(result.producerBytes).toBeGreaterThanOrEqual(
+      fixture.pcm.byteLength,
+    );
+    // A replica behind the log discards the samples the primary's listener
+    // already heard instead of waiting out the physical clock again, so the
+    // whole sample finishes in far less than its audio-clock duration.
+    expect(result.discardedBytes).toBeGreaterThan(0);
+    expect(result.elapsedMs).toBeLessThan(fixture.durationMs * 0.75);
+  }, 30_000);
+
   it("paces SDL through the production dedicated Node kernel worker", async () => {
+    const programPath = resolveBinary(
+      "programs/sdl-dsp-test/sdl2-dsp-test.wasm",
+    );
     const start = performance.now();
     const result = await runCentralizedProgram({
-      programPath: resolveBinary("programs/sdl-dsp-test/sdl2-dsp-test.wasm"),
+      programPath,
       argv: ["sdl2-dsp-test"],
       env: ["SDL_AUDIODRIVER=dsp"],
       timeout: 20_000,

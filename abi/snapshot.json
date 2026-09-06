@@ -1,9 +1,26 @@
 {
-  "abi_version": 43,
+  "abi_version": 45,
   "channel_buffers": {
     "data_offset": 72,
     "data_size": 65536,
     "min_channel_size": 65608
+  },
+  "channel_checkpoint_area": {
+    "area_size": 8,
+    "base": 65544,
+    "request_known_mask": 3,
+    "request_restart": 2,
+    "request_unwind": 1,
+    "reserved_tail_size": 4,
+    "slots": [
+      {
+        "meaning": "u32 request bit set, host-published, guest-cleared (0=none)",
+        "name": "CHECKPOINT_REQUEST",
+        "offset": 65544,
+        "size": 4
+      }
+    ],
+    "wire_size": 4
   },
   "channel_header": {
     "fields": [
@@ -976,7 +993,7 @@
   },
   "host_adapter": {
     "manifest": {
-      "abi_version": 43,
+      "abi_version": 45,
       "channel_data_offset": 72,
       "channel_data_size": 65536,
       "channel_header_size": 72,
@@ -985,7 +1002,7 @@
       "manifest_size": 40,
       "manifest_version": 1,
       "optional_kernel_features": 0,
-      "required_host_adapter_version": 1,
+      "required_host_adapter_version": 2,
       "required_worker_features": 7
     },
     "manifest_fields": [
@@ -1135,7 +1152,7 @@
       "kernel_wait_child_poll"
     ],
     "required_worker_features": 7,
-    "version": 1,
+    "version": 2,
     "worker_features": [
       {
         "bit": 2,
@@ -1832,6 +1849,11 @@
     },
     {
       "kind": "func",
+      "name": "kernel_cancel_host_owned_wait",
+      "signature": "(i32,i32) -> (i32)"
+    },
+    {
+      "kind": "func",
       "name": "kernel_chdir",
       "signature": "(i32,i32) -> (i32)"
     },
@@ -1948,6 +1970,11 @@
     {
       "kind": "func",
       "name": "kernel_enum_procs",
+      "signature": "(i32,i32) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_enumerate_host_handles",
       "signature": "(i32,i32) -> (i32)"
     },
     {
@@ -2777,6 +2804,11 @@
     },
     {
       "kind": "func",
+      "name": "kernel_pty_index_for_pid",
+      "signature": "(i32) -> (i32)"
+    },
+    {
+      "kind": "func",
       "name": "kernel_pty_master_read",
       "signature": "(i32,i32,i32) -> (i32)"
     },
@@ -2842,6 +2874,11 @@
     },
     {
       "kind": "func",
+      "name": "kernel_rearm_host_timers",
+      "signature": "(i32) -> (i32)"
+    },
+    {
+      "kind": "func",
       "name": "kernel_recv",
       "signature": "(i32,i32,i32,i32) -> (i32)"
     },
@@ -2854,6 +2891,11 @@
       "kind": "func",
       "name": "kernel_recvmsg",
       "signature": "(i32,i32,i32,i64) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_remap_host_handles",
+      "signature": "(i32,i64,i64) -> (i32)"
     },
     {
       "kind": "func",
@@ -5500,6 +5542,13 @@
         "required_flags": 4,
         "section": "kandelo.wpk_fork.capabilities",
         "version": 1
+      },
+      "checkpoint_import": {
+        "kind": "func",
+        "module": "kernel",
+        "name": "kernel_checkpoint",
+        "params": [],
+        "results": []
       },
       "exception_codec": {
         "activation_import": {

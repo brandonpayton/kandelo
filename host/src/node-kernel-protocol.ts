@@ -20,6 +20,9 @@ import type {
 } from "./vfs/closed-lazy-assets";
 import type { MountSpec } from "./vfs/default-mounts";
 import type { NodeSessionSeedTree } from "./vfs/default-mounts-node";
+import type { MachineCheckpoint } from "./migration/checkpoint";
+import type { ReplicationLogEntry } from "./replication/log";
+import type { ReplicationReplaySpec } from "./replication/worker";
 
 export type { HttpRequest, HttpResponse };
 export type { HostDiagnostic } from "./host-diagnostic";
@@ -62,6 +65,26 @@ export interface InitMessage {
   rootfsImage?: ArrayBuffer;
   /** Exact image/scratch mount contract. Absent preserves the host default. */
   rootfsMountSpec?: MountSpec[];
+  /**
+   * Boot this machine from a captured checkpoint instead of fresh state.
+   *
+   * The worker validates the checkpoint before instantiating anything, then
+   * adopts its kernel memory and its rootfs bytes. Requires `rootfsImage`:
+   * the mount layout is host configuration a checkpoint does not carry, so
+   * the caller supplies the same mounts the captured machine ran with.
+   */
+  restoreCheckpoint?: MachineCheckpoint;
+  /**
+   * Run this machine on a primary's decisions from its very first instruction.
+   *
+   * A replica joining a machine that is already running restores that
+   * machine's processes, and those processes resume inside this `init`. A
+   * `replication_replay_start` sent afterwards therefore arrives after they
+   * have read this computer's clock. Passing the replay here installs it
+   * between the machine's own setup and the first restored process, so the
+   * replica's first reading is the primary's.
+   */
+  replicationReplay?: ReplicationReplaySpec;
   /** Base used to resolve relative lazy URLs embedded in rootfsImage. */
   rootfsLazyUrlBase?: string;
   /** Exhaustive exact-byte lazy transport for this rootfs; no network fallback. */
@@ -288,6 +311,37 @@ export interface ReadProcMapsRequestMessage {
   pid: number;
 }
 
+/**
+ * Freeze the machine, read it, and resume it. Mirrors the browser host's
+ * capture_checkpoint request in browser-kernel-protocol.ts.
+ *
+ * Response carries a {@link CheckpointCaptureResponse}: a summary when the
+ * freeze completed, or the reason it timed out or failed. A process that makes
+ * no syscall never reaches its unwind hook, so a timeout is an ordinary
+ * outcome and the machine keeps running.
+ *
+ * With `includeBytes`, a captured response carries the full
+ * `MachineCheckpoint` instead of the summary, its kernel, filesystem, and
+ * process buffers in the transfer list. Every transferred buffer is a copy
+ * the freeze took; the worker keeps only live state.
+ */
+export interface CaptureCheckpointRequestMessage {
+  type: "capture_checkpoint";
+  requestId: number;
+  unwindTimeoutMs: number;
+  vforkTimeoutMs: number;
+  includeBytes?: true;
+  /**
+   * Begin streaming the decision log from the state this capture reads.
+   *
+   * This is how a replica joins a running machine: it restores the checkpoint
+   * and replays from the log's first entry, so the two have to meet at one
+   * instant. The recorder starts while the machine is still parked, which no
+   * caller on the main thread can arrange for itself.
+   */
+  beginReplicationStream?: true;
+}
+
 /** Enable / disable the syscall trace ring. Mirrors the browser host. */
 export interface SetSyscallTraceMessage {
   type: "set_syscall_trace";
@@ -298,6 +352,106 @@ export interface SetSyscallTraceMessage {
 export interface DrainSyscallTraceMessage {
   type: "drain_syscall_trace";
   requestId: number;
+}
+
+/**
+ * Start recording the machine's decision log.
+ *
+ * Only the guest clock is recorded today, because it is the only pulled
+ * decision routed through the log. A machine that also reads randomness or
+ * external bytes produces a log that is complete for its clock and silent
+ * about the rest, so a replay of such a machine will diverge rather than
+ * mislead. See `host/src/replication/log.ts`.
+ */
+export interface ReplicationRecordStartMessage {
+  type: "replication_record_start";
+  requestId: number;
+  /**
+   * Publish each decision as it is made, and keep none.
+   *
+   * A live replica joins at boot and needs the log from sequence 0, so
+   * somebody must hold all of it. Streaming moves that holder to the main
+   * thread, where the wire is, rather than keeping a second copy here.
+   */
+  stream?: boolean;
+}
+
+/**
+ * Stop recording and take the log.
+ *
+ * Response carries the entries this recorder retained, which is none of them
+ * when it was started with `stream`.
+ */
+export interface ReplicationRecordStopMessage {
+  type: "replication_record_stop";
+  requestId: number;
+}
+
+/** Decisions a streaming recorder made, in the order it made them. */
+export interface ReplicationRecordedMessage {
+  type: "replication_recorded";
+  entries: readonly ReplicationLogEntry[];
+}
+
+/**
+ * Serve the guest clock from a primary's log instead of from this host's clock.
+ *
+ * Sent after `init` and before the replayed guest runs, which covers a machine
+ * this host booted fresh. A replica that adopted a checkpoint cannot use it:
+ * its restored processes resume inside `init` and read the clock before this
+ * message could arrive, so it passes `replicationReplay` on {@link InitMessage}
+ * instead.
+ */
+export interface ReplicationReplayStartMessage extends ReplicationReplaySpec {
+  type: "replication_replay_start";
+  requestId: number;
+}
+
+/**
+ * Stop replaying and report how far the replica got.
+ *
+ * The response is `{ consumed, total }`. Two replicas that consumed different
+ * amounts of one log ran different machines, which is the divergence this
+ * measures.
+ */
+export interface ReplicationReplayStopMessage {
+  type: "replication_replay_stop";
+  requestId: number;
+}
+
+/**
+ * Say the primary's log grew, so the replica applies what needs no guest.
+ *
+ * A keystroke or a resize has no guest request to answer: a guest that is not
+ * reading the clock would never pull it out of the queue, and the queue is
+ * shared memory the kernel worker only looks at when asked. Fire-and-forget —
+ * the entries themselves travel on the queue, not here.
+ */
+export interface ReplicationReplayDrainMessage {
+  type: "replication_replay_drain";
+}
+
+/**
+ * What a replica took from the log it was replaying.
+ *
+ * `total` is what the replica had been given, which for a live replay is what
+ * the primary had recorded by the time it stopped rather than the whole of a
+ * finished recording.
+ */
+export interface ReplicationReplayProgress {
+  readonly consumed: number;
+  readonly total: number;
+  /**
+   * Clock reads served the machine-latest reading because their process's
+   * own next reading was not coming. See
+   * `ReplicationLogReader.borrowedClockReadings`.
+   */
+  readonly borrowedClockReadings: number;
+  /**
+   * Accepts taken by whichever worker asked because the primary never said
+   * which one won. See `ReplicationLogReader.borrowedAcceptSelections`.
+   */
+  readonly borrowedAcceptSelections: number;
 }
 
 /** Send an HTTP request to a server running in the kernel and wait for the
@@ -362,8 +516,14 @@ export type MainToKernelMessage =
   | ResolveExecResponseMessage
   | EnumProcsRequestMessage
   | ReadProcMapsRequestMessage
+  | CaptureCheckpointRequestMessage
   | SetSyscallTraceMessage
   | DrainSyscallTraceMessage
+  | ReplicationRecordStartMessage
+  | ReplicationRecordStopMessage
+  | ReplicationReplayStartMessage
+  | ReplicationReplayStopMessage
+  | ReplicationReplayDrainMessage
   | HttpRequestMessage
   | KmsAttachCanvasMessage
   | KmsAttachStatsMessage;
@@ -451,4 +611,5 @@ export type KernelToMainMessage =
   | PtyOutputMessage
   | ResolveExecRequestMessage
   | ProcEventMessage
-  | LazyDownloadMessage;
+  | LazyDownloadMessage
+  | ReplicationRecordedMessage;

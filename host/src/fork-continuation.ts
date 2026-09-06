@@ -95,7 +95,7 @@ export function writeForkContinuationAnchor(
 }
 
 export function readForkContinuationAnchor(
-  memory: WebAssembly.Memory,
+  memory: { readonly buffer: ArrayBufferLike },
   anchorAddr: number,
   ptrWidth: 4 | 8,
 ): number {

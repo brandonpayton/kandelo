@@ -334,6 +334,7 @@ export class SharedFS {
   private blockAllocHint = 0;
   private inodeAllocHint = 2;
   private atomicsWaitAllowed: boolean | undefined;
+  private clock: () => number = () => Date.now();
 
   /**
    * Directory operations are stored in ext2-style variable-length entries.
@@ -346,6 +347,16 @@ export class SharedFS {
     this.view = new DataView(buffer);
     this.i32 = new Int32Array(buffer);
     this.u8 = new Uint8Array(buffer);
+  }
+
+  /**
+   * Replace the wall clock that stamps inode atime, mtime and ctime, in
+   * milliseconds since the epoch. Inode times are machine state, so a machine
+   * replaying a recorded clock must stamp the recorded milliseconds rather
+   * than whatever its own host reads.
+   */
+  setClock(now: () => number): void {
+    this.clock = now;
   }
 
   // ── Factory methods ──────────────────────────────────────────────
@@ -1084,7 +1095,7 @@ export class SharedFS {
     const linkCount = this.r32(off + INO_LINK_COUNT);
     if (linkCount > 1) {
       this.w32(off + INO_LINK_COUNT, linkCount - 1);
-      this.w64(off + INO_CTIME, Date.now());
+      this.w64(off + INO_CTIME, this.clock());
       return false;
     }
     return this.inodeOrphanLocked(ino);
@@ -1093,7 +1104,7 @@ export class SharedFS {
   private inodeOrphanLocked(ino: number): boolean {
     const off = this.inodeOffset(ino);
     this.w32(off + INO_LINK_COUNT, 0);
-    this.w64(off + INO_CTIME, Date.now());
+    this.w64(off + INO_CTIME, this.clock());
     if (this.r32(off + INO_OPEN_COUNT) > 0) return false;
     const mode = this.r32(off + INO_MODE);
     const size = this.r64(off + INO_SIZE);
@@ -1333,7 +1344,7 @@ export class SharedFS {
       this.w64(inoOff + INO_SIZE, offset);
     }
     if (totalWritten > 0) {
-      const now = Date.now();
+      const now = this.clock();
       this.w64(inoOff + INO_MTIME, now);
       this.w64(inoOff + INO_CTIME, now);
       Atomics.add(this.i32, (inoOff + INO_DATA_SEQUENCE) >> 2, 1);
@@ -1459,7 +1470,7 @@ export class SharedFS {
       }
       this.w64(inoOff + INO_SIZE, newSize);
       if (sizeChanged || forceDataMutation) {
-        const now = Date.now();
+        const now = this.clock();
         this.w64(inoOff + INO_MTIME, now);
         this.w64(inoOff + INO_CTIME, now);
         Atomics.add(this.i32, (inoOff + INO_DATA_SEQUENCE) >> 2, 1);
@@ -1477,7 +1488,7 @@ export class SharedFS {
     this.freeBlocksFrom(ino, keepBlocks);
     this.w64(inoOff + INO_SIZE, newSize);
     if (sizeChanged || forceDataMutation) {
-      const now = Date.now();
+      const now = this.clock();
       this.w64(inoOff + INO_MTIME, now);
       this.w64(inoOff + INO_CTIME, now);
       Atomics.add(this.i32, (inoOff + INO_DATA_SEQUENCE) >> 2, 1);
@@ -1499,7 +1510,7 @@ export class SharedFS {
 
   private touchDirectoryMutation(dirIno: number): void {
     const inoOff = this.inodeOffset(dirIno);
-    const now = Date.now();
+    const now = this.clock();
     this.w64(inoOff + INO_MTIME, now);
     this.w64(inoOff + INO_CTIME, now);
     const mutationSequence =
@@ -2715,7 +2726,7 @@ export class SharedFS {
             this.w32(newOff + INO_MODE, S_IFREG | (createMode & 0o7777));
             this.w32(newOff + INO_LINK_COUNT, 1);
             this.w64(newOff + INO_SIZE, 0);
-            const now = Date.now();
+            const now = this.clock();
             this.w64(newOff + INO_ATIME, now);
             this.w64(newOff + INO_MTIME, now);
             this.w64(newOff + INO_CTIME, now);
@@ -3213,7 +3224,7 @@ export class SharedFS {
               newParent,
             );
             if (dotdotRc < 0) throw new SFSError(dotdotRc);
-            this.w64(srcOff + INO_CTIME, Date.now());
+            this.w64(srcOff + INO_CTIME, this.clock());
           } finally {
             this.inodeWriteUnlock(srcIno);
           }
@@ -3260,7 +3271,7 @@ export class SharedFS {
       this.w32(newOff + INO_MODE, S_IFDIR | mode);
       this.w32(newOff + INO_LINK_COUNT, 2);
       this.w64(newOff + INO_SIZE, 0);
-      const now = Date.now();
+      const now = this.clock();
       this.w64(newOff + INO_ATIME, now);
       this.w64(newOff + INO_MTIME, now);
       this.w64(newOff + INO_CTIME, now);
@@ -3420,7 +3431,7 @@ export class SharedFS {
       const off = this.inodeOffset(ino);
       const oldMode = this.r32(off + INO_MODE);
       this.w32(off + INO_MODE, (oldMode & S_IFMT) | (mode & 0o7777));
-      this.w64(off + INO_CTIME, Date.now());
+      this.w64(off + INO_CTIME, this.clock());
     } finally {
       this.inodeWriteUnlock(ino);
     }
@@ -3434,7 +3445,7 @@ export class SharedFS {
       const off = this.inodeOffset(entry.ino);
       const oldMode = this.r32(off + INO_MODE);
       this.w32(off + INO_MODE, (oldMode & S_IFMT) | (mode & 0o7777));
-      this.w64(off + INO_CTIME, Date.now());
+      this.w64(off + INO_CTIME, this.clock());
     } finally {
       this.inodeWriteUnlock(entry.ino);
     }
@@ -3489,7 +3500,7 @@ export class SharedFS {
     if (gid !== UID_GID_UNCHANGED) this.w32(off + INO_GID, gid);
 
     this.invalidateSetIdAfterRegularFileMutation(ino, "ownership");
-    this.w64(off + INO_CTIME, Date.now());
+    this.w64(off + INO_CTIME, this.clock());
   }
 
   utimens(
@@ -3518,7 +3529,7 @@ export class SharedFS {
       const off = this.inodeOffset(ino);
       const UTIME_NOW = 0x3fffffff;
       const UTIME_OMIT = 0x3ffffffe;
-      const now = Date.now();
+      const now = this.clock();
       if (atimeNsec !== UTIME_OMIT) {
         const atimeMs =
           atimeNsec === UTIME_NOW
@@ -3570,7 +3581,7 @@ export class SharedFS {
       try {
         const linkCount = this.r32(srcOff + INO_LINK_COUNT);
         this.w32(srcOff + INO_LINK_COUNT, linkCount + 1);
-        this.w64(srcOff + INO_CTIME, Date.now());
+        this.w64(srcOff + INO_CTIME, this.clock());
       } finally {
         this.inodeWriteUnlock(srcIno);
       }

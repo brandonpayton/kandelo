@@ -150,12 +150,29 @@ pub struct Options {
     /// every function import and unresolved reference dispatch becomes a
     /// possible cross-instance fork boundary.
     pub entry_import: String,
+
+    /// A second seed import, added to the closure beside `entry_import` rather
+    /// than replacing it. Format: `module.field` (e.g.
+    /// `kernel.kernel_checkpoint`).
+    ///
+    /// A checkpoint unwinds at a syscall return, so this seed discovers every
+    /// function that can be live there. A program that never forks imports no
+    /// `kernel_fork` and is 0 % instrumented without it.
+    ///
+    /// It must add to the seeds, never replace them. Discovery walks a seed's
+    /// callers and never descends into callees, so an import joins the closure
+    /// only by being a seed itself. Naming the checkpoint import through
+    /// `entry_import` instead would drop `kernel_fork` from the closure, leave
+    /// its call site without unwind transport, and hand the guest the
+    /// ignored-during-unwind fork result, which it reads as the child.
+    pub checkpoint_import: Option<String>,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             entry_import: "kernel.kernel_fork".into(),
+            checkpoint_import: None,
         }
     }
 }
@@ -179,19 +196,25 @@ pub fn analyze(input: &[u8], opts: &Options) -> Result<Analysis> {
     legacy_dlopen::lower(&mut module)?;
     let side_boundaries = uses_side_module_boundaries(&module, opts);
     let entry_imports = call_graph::find_import_funcs(&module, &opts.entry_import);
+    let boundary_imports = boundary_seed_imports(&module, opts, &entry_imports);
 
-    if entry_imports.is_empty()
+    if boundary_imports.is_empty()
         && !side_boundaries
         && !call_graph::has_dynamic_linker_imports(&module)
     {
+        let checkpoint = match opts.checkpoint_import.as_deref() {
+            Some(name) => format!(" and checkpoint import `{name}`"),
+            None => String::new(),
+        };
         bail!(
-            "entry import `{}` not found (or not a function) in the module. \
-             If this module does not use fork, there is nothing to instrument.",
+            "entry import `{}`{checkpoint} not found (or not a function) in \
+             the module. If this module does not use fork, there is nothing \
+             to instrument.",
             opts.entry_import
         );
     }
 
-    let seeds = fork_boundary_seeds(&module, &entry_imports, side_boundaries);
+    let seeds = fork_boundary_seeds(&module, &boundary_imports, side_boundaries);
     let reaching = prepare_fork_path(
         &module,
         &seeds,
@@ -240,6 +263,28 @@ fn ensure_side_module_abi_version(module: &mut walrus::Module, input: &[u8]) -> 
     let function = builder.finish(Vec::new(), &mut module.funcs);
     module.exports.add("__abi_version", function);
     Ok(())
+}
+
+/// The boundary imports that seed discovery: `entry_import`, plus
+/// `checkpoint_import` when one is named.
+///
+/// `entry_imports` is passed in rather than recomputed because the caller also
+/// needs it on its own, to decide the fork capability claim. That claim must
+/// describe the fork boundary only, so it must not see the checkpoint seed.
+fn boundary_seed_imports(
+    module: &walrus::Module,
+    opts: &Options,
+    entry_imports: &[walrus::FunctionId],
+) -> Vec<walrus::FunctionId> {
+    let Some(checkpoint) = opts.checkpoint_import.as_deref() else {
+        return entry_imports.to_vec();
+    };
+
+    let mut imports = entry_imports.to_vec();
+    imports.extend(call_graph::find_import_funcs(module, checkpoint));
+    imports.sort();
+    imports.dedup();
+    imports
 }
 
 fn fork_boundary_seeds(
@@ -309,11 +354,12 @@ pub fn instrument(input: &[u8], opts: &Options) -> Result<Vec<u8>> {
         ensure_side_module_abi_version(&mut module, input)?;
     }
     let entry_imports = call_graph::find_import_funcs(&module, &opts.entry_import);
-    let seeds = fork_boundary_seeds(&module, &entry_imports, side_boundaries);
+    let boundary_imports = boundary_seed_imports(&module, opts, &entry_imports);
+    let seeds = fork_boundary_seeds(&module, &boundary_imports, side_boundaries);
     let has_dynamic_linker_imports = call_graph::has_dynamic_linker_imports(&module);
     let external_dynamic_dispatch = side_boundaries || has_dynamic_linker_imports;
     reject_reserved_unwind_import(&module)?;
-    if entry_imports.is_empty() && !external_dynamic_dispatch {
+    if boundary_imports.is_empty() && !external_dynamic_dispatch {
         // WHY: this is a standalone executable with no route into fork or a
         // process-wide dynamic activation. Keeping the exact linker bytes
         // avoids imposing ABI 43's GC/exnref replay types on non-forking

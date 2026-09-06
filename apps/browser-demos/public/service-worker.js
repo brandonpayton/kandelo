@@ -172,6 +172,8 @@ if (typeof window !== "undefined") {
   var CACHE_NAMESPACE = "kandelo-sw:" + encodeURIComponent(SCOPE_PATH) + ":";
   var BRIDGE_CACHE = CACHE_NAMESPACE + "bridge-v2";
   var BRIDGE_AUTHORITY_KEY = "bridge-authority-v1";
+  var SECONDARY_AUTHORITIES_KEY = "bridge-secondary-authorities-v1";
+  var SECONDARY_AUTHORITY_LIMIT = 4;
   var BRIDGE_AUTHORITY_VERSION = 1;
   var BRIDGE_AUTHORITY_MAX_BYTES = 64 * 1024;
   var BRIDGE_AUTHORITY_MAX_COOKIES = 32;
@@ -236,6 +238,15 @@ if (typeof window !== "undefined") {
   // Used to distinguish "never configured" from "configured but SW restarted".
   var bridgeConfigured = false;
   var appClientIds = new Set();
+  // Two same-profile windows share this one worker. Live bridges that a later
+  // registration displaced are kept here by sessionId so their own clients
+  // keep routing to their own machine instead of the machine that registered
+  // last. Secondary jars are in-memory only; the durable authority always
+  // belongs to the current bridge.
+  var secondaryBridges = new Map();
+  // SW client id → owning sessionId. A page maps itself on init-bridge and
+  // the documents it navigates inherit the mapping in markAppClient.
+  var clientSessions = new Map();
 
   // --- Bridge restoration state ---
   // Single in-flight restoration promise, shared by concurrent fetch events
@@ -246,6 +257,59 @@ if (typeof window !== "undefined") {
   // Changes only when a different live bridge/session is installed. Cookie
   // writes capture this epoch so obsolete ports cannot persist into a successor.
   var liveBridgeEpoch = 0;
+  // Restoration resolves at the authority commit, but a demoted machine's
+  // answer — the only thing that can map that machine's clients — may still
+  // be in postMessage transit. A fetch whose client is unmapped while an
+  // attempt is open waits for its own mapping (or this grace), never for the
+  // whole attempt. clientId → resolvers.
+  var clientMappingWaiters = new Map();
+  var openRestorationAttempts = 0;
+  var CLIENT_MAPPING_GRACE_MS = 1000;
+
+  function resolveClientMappingWaiters(clientId) {
+    var waiters = clientMappingWaiters.get(clientId);
+    if (!waiters) return;
+    clientMappingWaiters.delete(clientId);
+    waiters.forEach(function (waiter) {
+      waiter();
+    });
+  }
+
+  function flushClientMappingWaiters() {
+    var flushed = [];
+    clientMappingWaiters.forEach(function (waiters) {
+      flushed.push.apply(flushed, waiters);
+    });
+    clientMappingWaiters.clear();
+    flushed.forEach(function (waiter) {
+      waiter();
+    });
+  }
+
+  function waitForClientMapping(clientId) {
+    if (!clientId || clientSessions.has(clientId)) return Promise.resolve();
+    if (openRestorationAttempts === 0) return Promise.resolve();
+    return new Promise(function (resolve) {
+      var grace;
+      function settle() {
+        clearTimeout(grace);
+        var waiters = clientMappingWaiters.get(clientId);
+        if (waiters) {
+          var index = waiters.indexOf(settle);
+          if (index !== -1) waiters.splice(index, 1);
+          if (waiters.length === 0) clientMappingWaiters.delete(clientId);
+        }
+        resolve();
+      }
+      grace = setTimeout(settle, CLIENT_MAPPING_GRACE_MS);
+      var waiters = clientMappingWaiters.get(clientId);
+      if (!waiters) {
+        waiters = [];
+        clientMappingWaiters.set(clientId, waiters);
+      }
+      waiters.push(settle);
+    });
+  }
   // The only record restart trusts. Legacy records are migration inputs and
   // cleanup candidates, never authority once this record exists.
   var durableAuthority = null;
@@ -392,10 +456,10 @@ if (typeof window !== "undefined") {
     return mutated;
   }
 
-  function getCookiesForPath(path, bridgeEpoch, sessionId) {
+  function matchCookiesForPath(jar, path, onExpiredKeys) {
     var matches = [];
     var expiredKeys = [];
-    cookieJar.forEach(function (cookie, key) {
+    jar.forEach(function (cookie, key) {
       if (cookie.expires !== undefined && cookie.expires < Date.now()) {
         expiredKeys.push(key);
         return;
@@ -404,9 +468,24 @@ if (typeof window !== "undefined") {
         matches.push(cookie);
       }
     });
+    if (expiredKeys.length > 0) {
+      onExpiredKeys(expiredKeys);
+    }
+    // RFC 6265: when several cookies match, list longer paths first.
+    matches.sort(function (a, b) {
+      return b.path.length - a.path.length;
+    });
+    return matches
+      .map(function (cookie) {
+        return cookie.name + "=" + cookie.value;
+      })
+      .join("; ");
+  }
+
+  function getCookiesForPath(path, bridgeEpoch, sessionId) {
     // Expiration persistence uses the same authority queue and epoch guard as
     // Set-Cookie. It is non-blocking for this outgoing request.
-    if (expiredKeys.length > 0) {
+    return matchCookiesForPath(cookieJar, path, function (expiredKeys) {
       scheduleCookieJarMutation(
         bridgeEpoch,
         sessionId,
@@ -418,16 +497,15 @@ if (typeof window !== "undefined") {
           return mutated;
         },
       ).catch(function () {});
-    }
-    // RFC 6265: when several cookies match, list longer paths first.
-    matches.sort(function (a, b) {
-      return b.path.length - a.path.length;
     });
-    return matches
-      .map(function (cookie) {
-        return cookie.name + "=" + cookie.value;
-      })
-      .join("; ");
+  }
+
+  function secondaryCookiesForPath(bridge, path) {
+    return matchCookiesForPath(bridge.cookieJar, path, function (expiredKeys) {
+      expiredKeys.forEach(function (key) {
+        bridge.cookieJar.delete(key);
+      });
+    });
   }
 
   // --- Authoritative bridge persistence (survives SW termination/restart) ---
@@ -571,6 +649,69 @@ if (typeof window !== "undefined") {
     return mutation;
   }
 
+  // Sessions whose live bridge was demoted rather than ended. A restarted
+  // worker trusts a restoration answer only against a durable record —
+  // without these, a demoted machine's answer is indistinguishable from a
+  // stale one, and its page loses its bridge whenever the browser reclaims
+  // an idle worker while two machines share this scope.
+  function readSecondaryAuthorities() {
+    return caches.open(BRIDGE_CACHE).then(function (cache) {
+      return cache.match(SECONDARY_AUTHORITIES_KEY);
+    }).then(function (response) {
+      if (!response) return [];
+      return response.text().then(function (text) {
+        try {
+          var records = JSON.parse(text);
+          if (!Array.isArray(records)) return [];
+          return records.filter(function (record) {
+            return record && isValidAppPrefix(record.appPrefix) &&
+              isValidSessionId(record.sessionId);
+          });
+        } catch (_error) {
+          return [];
+        }
+      });
+    }).catch(function () {
+      return [];
+    });
+  }
+
+  function writeSecondaryAuthorities(records) {
+    return caches.open(BRIDGE_CACHE).then(function (cache) {
+      return cache.put(
+        SECONDARY_AUTHORITIES_KEY,
+        new Response(JSON.stringify(records), {
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    }).catch(function () {});
+  }
+
+  function recordSecondaryAuthority(recordedAppPrefix, recordedSessionId) {
+    return readSecondaryAuthorities().then(function (records) {
+      var kept = records.filter(function (record) {
+        return record.sessionId !== recordedSessionId;
+      });
+      kept.push({
+        appPrefix: recordedAppPrefix,
+        sessionId: recordedSessionId,
+      });
+      return writeSecondaryAuthorities(
+        kept.slice(-SECONDARY_AUTHORITY_LIMIT),
+      );
+    });
+  }
+
+  function eraseSecondaryAuthority(erasedSessionId) {
+    return readSecondaryAuthorities().then(function (records) {
+      var kept = records.filter(function (record) {
+        return record.sessionId !== erasedSessionId;
+      });
+      if (kept.length === records.length) return undefined;
+      return writeSecondaryAuthorities(kept);
+    });
+  }
+
   function readLegacyCookieJarForSession(sessionId) {
     return caches.open(BRIDGE_CACHE).then(function (cache) {
       return cache.match(cookieJarKeyFor(sessionId));
@@ -668,7 +809,7 @@ if (typeof window !== "undefined") {
   }
 
   // --- Bridge port setup ---
-  function initBridgePort(port) {
+  function wireBridgePort(port) {
     port.onmessage = function (event) {
       var msg = event.data;
       if (msg && msg.type === "http-response") {
@@ -689,20 +830,70 @@ if (typeof window !== "undefined") {
         }
       }
     };
-    bridgePort = port;
+  }
+
+  // A newcomer must not strand a still-open page: the displaced bridge moves
+  // to the secondary registry so clients mapped to its session keep routing
+  // to their own machine. The caller chooses the jar the demoted bridge
+  // keeps: the live jar on a replacement init, an empty jar on a navigation
+  // reset (the reset's promise is that no cookie survives it).
+  function demoteCurrentBridge(jar) {
+    if (!bridgePort || !currentSessionId) return;
+    secondaryBridges.set(currentSessionId, {
+      port: bridgePort,
+      appPrefix: appPrefix,
+      sessionId: currentSessionId,
+      cookieJar: jar,
+    });
+    // Captured now: the caller reassigns both the moment this returns. The
+    // write queues behind the running mutation rather than racing it.
+    var recordedPrefix = appPrefix;
+    var recordedSession = currentSessionId;
+    enqueueStateMutation(function () {
+      return recordSecondaryAuthority(recordedPrefix, recordedSession);
+    });
+  }
+
+  // A page boots one machine at a time, so when a page replaces its own
+  // bridge the previous machine is dead: its port must not survive as a
+  // secondary and no demotion record may claim it is a live machine.
+  function retireCurrentBridge() {
+    if (!bridgePort || !currentSessionId) return;
+    var retired = currentSessionId;
+    clientSessions.forEach(function (owner, clientId) {
+      if (owner === retired) clientSessions.delete(clientId);
+    });
+    bridgePort = null;
   }
 
   function commitBridgeState(port, authority) {
+    if (currentSessionId !== authority.sessionId) {
+      demoteCurrentBridge(cookieJar);
+    }
+    secondaryBridges.delete(authority.sessionId);
+    // The committed session is the primary again; a demotion record left
+    // standing would let a stale restoration answer shadow it after the next
+    // worker restart.
+    enqueueStateMutation(function () {
+      return eraseSecondaryAuthority(authority.sessionId);
+    });
     appPrefix = authority.appPrefix;
     bridgeConfigured = true;
     currentSessionId = authority.sessionId;
     cookieJar = authority.cookieJar;
     cookieJarReady = Promise.resolve();
     liveBridgeEpoch += 1;
-    initBridgePort(port);
+    wireBridgePort(port);
+    bridgePort = port;
   }
 
-  function scheduleBridgeTransition(port, replyPort, nextAppPrefix, nextSessionId) {
+  function scheduleBridgeTransition(
+    port,
+    replyPort,
+    nextAppPrefix,
+    nextSessionId,
+    initiatorPriorSession,
+  ) {
     return enqueueStateMutation(function () {
       return prepareBridgeTransition(nextAppPrefix, nextSessionId).then(
         function (authority) {
@@ -712,6 +903,12 @@ if (typeof window !== "undefined") {
             durableAuthority = authority;
             legacyBridgeMigrationAllowed = false;
             bridgeIntentVersion += 1;
+            if (
+              initiatorPriorSession &&
+              initiatorPriorSession === currentSessionId
+            ) {
+              retireCurrentBridge();
+            }
             commitBridgeState(port, authority);
             replyPort.postMessage({ type: "bridge-ready" });
             // Legacy bytes are no longer authoritative; cleanup is best effort.
@@ -722,14 +919,11 @@ if (typeof window !== "undefined") {
     });
   }
 
-  function bridgeFetch(request) {
-    if (!bridgePort) {
-      return Promise.reject(new Error("Bridge port not initialized"));
-    }
+  function bridgeFetchOn(port, request) {
     var requestId = nextRequestId++;
     return new Promise(function (resolve, reject) {
       pendingRequests.set(requestId, { resolve: resolve, reject: reject });
-      bridgePort.postMessage({
+      port.postMessage({
         type: "http-request",
         requestId: requestId,
         method: request.method,
@@ -738,6 +932,13 @@ if (typeof window !== "undefined") {
         body: request.body,
       });
     });
+  }
+
+  function bridgeFetch(request) {
+    if (!bridgePort) {
+      return Promise.reject(new Error("Bridge port not initialized"));
+    }
+    return bridgeFetchOn(bridgePort, request);
   }
 
   // --- Bridge restoration ---
@@ -772,6 +973,7 @@ if (typeof window !== "undefined") {
         var responsePorts = [];
         var candidateQueue = Promise.resolve();
         var timeout;
+        openRestorationAttempts += 1;
 
         function closeResponsePorts() {
           responsePorts.forEach(function (port) {
@@ -786,11 +988,17 @@ if (typeof window !== "undefined") {
           attemptState = "settled";
           clearTimeout(timeout);
           closeResponsePorts();
+          openRestorationAttempts -= 1;
+          flushClientMappingWaiters();
           resolve(result);
         }
 
         function attemptIsDiscovering() {
           return attemptState === "discovering";
+        }
+
+        function attemptAcceptsCandidates() {
+          return attemptState !== "settled";
         }
 
         function claimAttemptForCommit() {
@@ -799,8 +1007,28 @@ if (typeof window !== "undefined") {
           // commit, discovery timeout and later candidates must stand behind it.
           attemptState = "committing";
           clearTimeout(timeout);
-          closeResponsePorts();
           return true;
+        }
+
+        // The committed authority answers the fetch that started this
+        // attempt immediately — a hold here would let a pending init
+        // overtake the fetch this attempt already committed a bridge for.
+        // But it is not the only machine that answered: the other machines'
+        // candidates may still be in postMessage transit, so the attempt
+        // keeps listening. Each late candidate that matches a demotion
+        // record installs as a secondary and maps its clients; a fetch
+        // whose client is not yet mapped waits on that mapping in
+        // fetchRestoredAppRequest, never on this attempt.
+        function beginLingering() {
+          if (attemptState !== "discovering" && attemptState !== "committing") {
+            return;
+          }
+          attemptState = "lingering";
+          clearTimeout(timeout);
+          timeout = setTimeout(function () {
+            finish(true);
+          }, 5000);
+          resolve(true);
         }
 
         timeout = setTimeout(function () {
@@ -813,7 +1041,7 @@ if (typeof window !== "undefined") {
           ch.port1.onmessage = function (event) {
             var data = event.data;
             var candidatePort = event.ports[0];
-            if (!attemptIsDiscovering()) {
+            if (!attemptAcceptsCandidates()) {
               if (candidatePort && typeof candidatePort.close === "function") {
                 candidatePort.close();
               }
@@ -833,10 +1061,18 @@ if (typeof window !== "undefined") {
                 }
                 return;
               }
+              // The answering window is a client of the session it answers
+              // for. The map died with the terminated worker; this rebuilds
+              // it. An existing mapping is never overwritten: an init-bridge
+              // is the client's freshest declaration, and a delayed
+              // restoration answer must not displace it.
+              if (!clientSessions.has(client.id)) {
+                clientSessions.set(client.id, data.sessionId);
+              }
               // Candidates are evaluated in arrival order. A well-formed but
               // stale tab does not settle the attempt or starve later clients.
               candidateQueue = candidateQueue.then(function () {
-                if (!attemptIsDiscovering()) {
+                if (!attemptAcceptsCandidates()) {
                   candidatePort.close();
                   return;
                 }
@@ -849,8 +1085,11 @@ if (typeof window !== "undefined") {
                   claimAttemptForCommit,
                 ).then(function (result) {
                   if (!result.installed) candidatePort.close();
-                  if (result.satisfied) finish(true);
+                  if (result.satisfied) beginLingering();
                   else if (attemptState === "committing") finish(false);
+                  // The mapping decision for this candidate's client is
+                  // final; a fetch waiting on it routes now.
+                  resolveClientMappingWaiters(client.id);
                 });
               }).catch(function () {
                 candidatePort.close();
@@ -876,6 +1115,39 @@ if (typeof window !== "undefined") {
       );
   }
 
+  // A restoration candidate for a session other than the authority's is
+  // trusted only against a durable demotion record — the same rule the
+  // authority itself follows. A recorded session is a live machine whose
+  // demoted bridge died with the terminated worker; reinstall it as a
+  // secondary so its own clients keep routing to their machine. An
+  // unrecorded one is a stale answer and its port is discarded. Its cookie
+  // jar died with the worker — secondary jars are in-memory only. Runs
+  // inside the state mutation that evaluates the candidate.
+  function maybeInstallRecordedSecondary(
+    port,
+    candidateAppPrefix,
+    candidateSessionId,
+  ) {
+    if (candidateSessionId === currentSessionId) {
+      return Promise.resolve(false);
+    }
+    return readSecondaryAuthorities().then(function (records) {
+      var recorded = records.some(function (record) {
+        return record.sessionId === candidateSessionId &&
+          record.appPrefix === candidateAppPrefix;
+      });
+      if (!recorded || candidateSessionId === currentSessionId) return false;
+      wireBridgePort(port);
+      secondaryBridges.set(candidateSessionId, {
+        port: port,
+        appPrefix: candidateAppPrefix,
+        sessionId: candidateSessionId,
+        cookieJar: new Map(),
+      });
+      return true;
+    });
+  }
+
   function scheduleBridgeRestoration(
     port,
     restoredAppPrefix,
@@ -891,7 +1163,18 @@ if (typeof window !== "undefined") {
         !isAttemptActive() ||
         !restorationObservationIsCurrent(observation)
       ) {
-        return { satisfied: Boolean(bridgePort), installed: false };
+        // The authority already committed (its commit advanced the epoch) or
+        // an init won the race. A candidate that answers for a recorded
+        // demoted session still installs beside the winner; anything else is
+        // discarded exactly as before.
+        var lateSatisfied = Boolean(bridgePort);
+        return maybeInstallRecordedSecondary(
+          port,
+          restoredAppPrefix,
+          restoredSessionId,
+        ).then(function (installed) {
+          return { satisfied: lateSatisfied, installed: installed };
+        });
       }
 
       if (durableAuthority) {
@@ -899,7 +1182,15 @@ if (typeof window !== "undefined") {
           durableAuthority.appPrefix !== restoredAppPrefix ||
           durableAuthority.sessionId !== restoredSessionId
         ) {
-          return { satisfied: false, installed: false };
+          // Not the authority — a live demoted machine answering for itself,
+          // or a stale tab. The demotion record tells them apart.
+          return maybeInstallRecordedSecondary(
+            port,
+            restoredAppPrefix,
+            restoredSessionId,
+          ).then(function (installed) {
+            return { satisfied: false, installed: installed };
+          });
         }
         if (!claimAttemptForCommit()) {
           return { satisfied: Boolean(bridgePort), installed: false };
@@ -980,6 +1271,16 @@ if (typeof window !== "undefined") {
         return;
       }
 
+      // The registering page's own requests must keep routing to its bridge
+      // even after another page registers. event.source is that page's client.
+      // Its prior mapping tells the transition whether the displaced bridge
+      // belongs to this same page — a dead machine to retire, not demote.
+      var initiatorPriorSession = null;
+      if (event.source && event.source.id) {
+        initiatorPriorSession = clientSessions.get(event.source.id) || null;
+        clientSessions.set(event.source.id, msg.sessionId);
+      }
+
       // waitUntil owns preparation and the single authority replacement. Live
       // state and readiness advance synchronously only after that put commits.
       event.waitUntil(
@@ -988,6 +1289,7 @@ if (typeof window !== "undefined") {
           replyPort,
           msg.appPrefix,
           msg.sessionId,
+          initiatorPriorSession,
         ).catch(function () {
           replyPort.postMessage({
             type: "bridge-error",
@@ -1307,6 +1609,27 @@ if (typeof window !== "undefined") {
     return event.clientId && appClientIds.has(event.clientId);
   }
 
+  function secondaryBridgeFor(event) {
+    if (!event.clientId) return null;
+    var sessionId = clientSessions.get(event.clientId);
+    if (!sessionId || sessionId === currentSessionId) return null;
+    return secondaryBridges.get(sessionId) || null;
+  }
+
+  function secondaryBridgeIsLive(bridge) {
+    return secondaryBridges.get(bridge.sessionId) === bridge;
+  }
+
+  function dropSecondaryBridge(sessionId) {
+    secondaryBridges.delete(sessionId);
+    clientSessions.forEach(function (owner, clientId) {
+      if (owner === sessionId) clientSessions.delete(clientId);
+    });
+    enqueueStateMutation(function () {
+      return eraseSecondaryAuthority(sessionId);
+    });
+  }
+
   function isAppInitiatedRequest(event, request) {
     return getAppReferer(request) !== null || isAppClient(event);
   }
@@ -1315,14 +1638,25 @@ if (typeof window !== "undefined") {
     return !isAppPath(url.pathname) && isAppInitiatedRequest(event, request);
   }
 
-  function markAppClient(event, request) {
+  function markAppClient(event, request, servingSessionId) {
     var appReferer = getAppReferer(request);
+    // The session this document belongs to: an in-frame navigation carries
+    // the frame document's client id, but Chromium hands a parent-created
+    // iframe navigation an empty clientId — there the request's owner is
+    // whichever session served it, which is what the caller routed by.
+    var ownerSession = clientSessions.get(event.clientId) || servingSessionId;
     if (isNavigationRequest(request)) {
       if (event.resultingClientId) {
         appClientIds.add(event.resultingClientId);
+        if (ownerSession) {
+          clientSessions.set(event.resultingClientId, ownerSession);
+        }
       }
       if (appReferer !== null && event.clientId) {
         appClientIds.add(event.clientId);
+        if (ownerSession && !clientSessions.has(event.clientId)) {
+          clientSessions.set(event.clientId, ownerSession);
+        }
       }
       return;
     }
@@ -1333,6 +1667,9 @@ if (typeof window !== "undefined") {
     // already inside appPrefix should mark their client.
     if (appReferer !== null && event.clientId) {
       appClientIds.add(event.clientId);
+      if (ownerSession && !clientSessions.has(event.clientId)) {
+        clientSessions.set(event.clientId, ownerSession);
+      }
     }
   }
 
@@ -1517,7 +1854,22 @@ if (typeof window !== "undefined") {
   function fetchRestoredAppRequest(event, request, url) {
     markAppClient(event, request);
     return ensureBridge().then(function (restored) {
-      if (restored) return handleAppRequest(request, url);
+      if (restored) {
+        // Restoration resolves at the authority commit, but the answer that
+        // maps this fetch's client to a demoted machine may still be in
+        // transit. Wait for that mapping (or a short grace), then route: a
+        // client owned by a demoted bridge goes to its own machine here,
+        // exactly as it does on the live path — not to the machine that
+        // holds the durable authority.
+        return waitForClientMapping(event.clientId).then(function () {
+          var secondaryBridge = secondaryBridgeFor(event);
+          if (secondaryBridge) {
+            markAppClient(event, request, secondaryBridge.sessionId);
+            return handleAppRequest(request, url, secondaryBridge);
+          }
+          return handleAppRequest(request, url);
+        });
+      }
       return new Response(
         "Service worker bridge unavailable — please reload the page",
         {
@@ -1546,7 +1898,20 @@ if (typeof window !== "undefined") {
       !isCrossOrigin(url) &&
       !isAppPath(url.pathname)
     ) {
-      resetSessionState();
+      var navigatorSession = clientSessions.get(event.clientId);
+      if (navigatorSession && secondaryBridges.has(navigatorSession)) {
+        // A page that owns a demoted bridge is leaving; only its session
+        // ends. The live session belongs to another window and stays intact.
+        dropSecondaryBridge(navigatorSession);
+      } else {
+        // Another window may still own the live session. Demote its bridge —
+        // jarless, so the reset keeps its promise that no cookie survives —
+        // before the live state is cleared for the incoming page.
+        if (navigatorSession !== currentSessionId) {
+          demoteCurrentBridge(new Map());
+        }
+        resetSessionState();
+      }
     }
 
     // Group assets have an immutable deployment-local identity. Cache only
@@ -1566,9 +1931,18 @@ if (typeof window !== "undefined") {
       return;
     }
 
+    // A client owned by a demoted bridge routes to its own machine, not to
+    // the machine that registered last.
+    var secondaryBridge = secondaryBridgeFor(event);
+    if (secondaryBridge && isAppPath(url.pathname)) {
+      markAppClient(event, event.request, secondaryBridge.sessionId);
+      event.respondWith(handleAppRequest(event.request, url, secondaryBridge));
+      return;
+    }
+
     // Fast path: bridge is active and the URL matches app prefix.
     if (bridgePort && isAppPath(url.pathname)) {
-      markAppClient(event, event.request);
+      markAppClient(event, event.request, currentSessionId);
       event.respondWith(handleAppRequest(event.request, url));
       return;
     }
@@ -1619,14 +1993,19 @@ if (typeof window !== "undefined") {
     event.respondWith(fetchWithCoiHeaders(event.request));
   });
 
-  function handleAppRequest(request, url) {
+  function handleAppRequest(request, url, secondaryBridge) {
     return (async function () {
       try {
         // The session this request belongs to. If the session switches while
         // the request is in flight (page reload / new instance), we must not
         // inject or store this request's cookies into the new session.
-        var reqSessionId = currentSessionId;
+        var reqSessionId = secondaryBridge
+          ? secondaryBridge.sessionId
+          : currentSessionId;
         var reqBridgeEpoch = liveBridgeEpoch;
+        var reqAppPrefix = secondaryBridge
+          ? secondaryBridge.appPrefix
+          : appPrefix;
         // Strip appPrefix so nginx sees the original path.
         var hasAppPrefix = isAppPath(url.pathname);
         var appPath = hasAppPrefix
@@ -1646,15 +2025,24 @@ if (typeof window !== "undefined") {
         // Inject cookies from our jar. Wait for the current session's jar to
         // finish loading so we don't send an empty jar during the async load
         // right after the bridge (re)connects. Skip if the session changed
-        // out from under this request.
-        await cookieJarReady;
+        // out from under this request. Secondary jars are in-memory only and
+        // usable only while their bridge is still registered.
+        if (!secondaryBridge) await cookieJarReady;
         var cookiePath = hasAppPrefix
           ? url.pathname
-          : appPrefix.slice(0, -1) + url.pathname;
-        var jarCookies =
-          reqSessionId === currentSessionId && reqBridgeEpoch === liveBridgeEpoch
-            ? getCookiesForPath(cookiePath, reqBridgeEpoch, reqSessionId)
+          : reqAppPrefix.slice(0, -1) + url.pathname;
+        var jarCookies;
+        if (secondaryBridge) {
+          jarCookies = secondaryBridgeIsLive(secondaryBridge)
+            ? secondaryCookiesForPath(secondaryBridge, cookiePath)
             : "";
+        } else {
+          jarCookies =
+            reqSessionId === currentSessionId &&
+              reqBridgeEpoch === liveBridgeEpoch
+              ? getCookiesForPath(cookiePath, reqBridgeEpoch, reqSessionId)
+              : "";
+        }
         if (jarCookies) {
           var existing = headers["cookie"];
           headers["cookie"] = existing
@@ -1670,22 +2058,33 @@ if (typeof window !== "undefined") {
           }
         }
 
-        var bridgeResp = await bridgeFetch({
+        var bridgeRequest = {
           method: request.method,
           url: appPath + url.search,
           headers: headers,
           body: body,
-        });
+        };
+        var bridgeResp = await (secondaryBridge
+          ? bridgeFetchOn(secondaryBridge.port, bridgeRequest)
+          : bridgeFetch(bridgeRequest));
 
 
         // Store cookies from bridge response
         var rawSetCookie =
           bridgeResp.headers["Set-Cookie"] ||
           bridgeResp.headers["set-cookie"];
-        // Only store into the jar if this request still belongs to the current
-        // session — an in-flight response from a superseded session must not
-        // pollute the new session's jar.
-        if (
+        // Only store into the jar if this request still belongs to a live
+        // session — an in-flight response from a superseded or dropped
+        // session must not pollute another session's jar.
+        if (rawSetCookie && secondaryBridge) {
+          if (secondaryBridgeIsLive(secondaryBridge)) {
+            storeCookies(
+              secondaryBridge.cookieJar,
+              secondaryBridge.appPrefix,
+              rawSetCookie.split("\n"),
+            );
+          }
+        } else if (
           rawSetCookie && reqSessionId === currentSessionId &&
           reqBridgeEpoch === liveBridgeEpoch
         ) {
@@ -1736,8 +2135,8 @@ if (typeof window !== "undefined") {
               var locUrl = new URL(location, url.origin);
               if (locUrl.hostname === url.hostname) {
                 locUrl.protocol = url.protocol;
-                if (!locUrl.pathname.startsWith(appPrefix)) {
-                  locUrl.pathname = appPrefix.slice(0, -1) + locUrl.pathname;
+                if (!locUrl.pathname.startsWith(reqAppPrefix)) {
+                  locUrl.pathname = reqAppPrefix.slice(0, -1) + locUrl.pathname;
                 }
               }
               var redirectStatus = bridgeResp.status;

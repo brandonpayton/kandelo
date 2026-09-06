@@ -38,6 +38,7 @@ import {
   SEEK_WHENCE,
 } from "../generated/abi";
 import { ST_NOSUID, type FileSystemBackend, type DirEntry } from "./types";
+import type { CheckpointBytes } from "../migration/checkpoint";
 import { DEFAULT_STATFS_BLOCK_SIZE, DEFAULT_STATFS_NAMELEN } from "../statfs";
 
 const UTIME_NOW = 0x3fffffff;
@@ -161,6 +162,17 @@ export class HostFileSystem implements FileSystemBackend {
     if (options.exclusiveNativeWriters === true) {
       intrinsicApply(intrinsicWeakSetAdd, exclusiveNativeWriterHostFileSystems, [this]);
     }
+  }
+
+  /**
+   * The reason names the backing kind and not the path: a checkpoint travels
+   * to another computer, and the sandbox root is this computer's business.
+   */
+  checkpointBytes(): CheckpointBytes {
+    return {
+      kind: "none",
+      reason: "a host directory backs this mount and owns no shared buffer",
+    };
   }
 
   /**

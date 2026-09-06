@@ -141,6 +141,20 @@ pub fn host_handle_ref_count(h: i64) -> u32 {
     get_host_handle_refs().get(&h).copied().unwrap_or(0)
 }
 
+/// Move the cross-process refcount entry from a remapped handle to its
+/// replacement. A handle absent from the table has one implicit owner, so
+/// absence needs no migration.
+pub fn host_handle_migrate_refs(old: i64, new: i64) {
+    let refs = get_host_handle_refs();
+    if let Some(count) = refs.remove(&old) {
+        debug_assert!(
+            !refs.contains_key(&new),
+            "remap target handle already has a shared refcount entry",
+        );
+        refs.insert(new, count);
+    }
+}
+
 /// The set of flags that F_SETFL is allowed to modify (POSIX semantics).
 const SETFL_MODIFIABLE: u32 = O_APPEND | O_NONBLOCK;
 

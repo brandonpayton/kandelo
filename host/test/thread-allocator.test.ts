@@ -230,4 +230,39 @@ describe("ThreadPageAllocator", () => {
     alloc.free(pthread.slotStartPage);
     expect(alloc.allocate(mem).slotStartPage).toBe(pthread.slotStartPage);
   });
+
+  it("snapshots the state a checkpoint carries beside the process memory", () => {
+    const alloc = makeAllocator();
+    const mem = makeMemory();
+    expect(alloc.snapshotState()).toEqual({
+      nextPage: FIRST_THREAD_SLOT_PAGE,
+      freePages: [],
+      activeCount: 0,
+      hostControlPages: [],
+    });
+
+    const first = alloc.allocate(mem);
+    alloc.allocate(mem);
+    const control = alloc.allocateHostControl(mem);
+    alloc.free(first.slotStartPage);
+
+    expect(alloc.snapshotState()).toEqual({
+      nextPage: FIRST_THREAD_SLOT_PAGE + 3 * PAGES_PER_THREAD,
+      freePages: [first.slotStartPage],
+      activeCount: 1,
+      hostControlPages: [control.slotStartPage],
+    });
+  });
+
+  it("detaches the snapshot from later allocations", () => {
+    const alloc = makeAllocator();
+    const mem = makeMemory();
+    const slot = alloc.allocate(mem);
+    alloc.free(slot.slotStartPage);
+    const snapshot = alloc.snapshotState();
+
+    alloc.allocate(mem);
+    expect(snapshot.freePages).toEqual([slot.slotStartPage]);
+    expect(snapshot.activeCount).toBe(0);
+  });
 });

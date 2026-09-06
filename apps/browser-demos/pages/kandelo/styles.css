@@ -595,6 +595,7 @@
   text-align: left;
   flex: 0 1 240px;
   user-select: none;
+  position: relative;
 }
 
 .kdock-status img {
@@ -631,6 +632,9 @@
 }
 
 .kdock-status-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -639,6 +643,31 @@
   font-weight: 760;
   letter-spacing: 0;
   line-height: 1.15;
+}
+
+/* The title runs under a corner the badge takes out of the flow. */
+.kdock-status[data-role] .kdock-status-title {
+  padding-right: 44px;
+}
+
+.kdock-role {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  padding: 1px 5px;
+  border: 1px solid var(--kdock-border);
+  border-radius: 5px;
+  color: var(--kdock-muted);
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+  line-height: 1.4;
+  text-transform: uppercase;
+}
+
+.kdock-status[data-role="user"] .kdock-role {
+  border-color: var(--kdock-text);
+  color: var(--kdock-text);
 }
 
 .kdock-toggle-pill {
@@ -1036,6 +1065,10 @@
   --kdock-popover-width: 360px;
 }
 
+.kdock-network-popover {
+  --kdock-popover-width: 460px;
+}
+
 .kdock-internals-popover {
   --kdock-popover-width: 980px;
   height: min(680px, calc(100dvh - var(--kdock-popover-bottom, 100px) - 12px));
@@ -1043,6 +1076,7 @@
 
 .kdock-popover .kdemo,
 .kdock-popover .ktheme-popup,
+.kdock-popover .knetwork-popup,
 .kdock-internals-popover .kinternals-popup {
   flex: 1;
   max-height: inherit;
@@ -1053,6 +1087,7 @@
 
 :root[data-k-mode="dark"] .kdock-popover .kdemo,
 :root[data-k-mode="dark"] .kdock-popover .ktheme-popup,
+:root[data-k-mode="dark"] .kdock-popover .knetwork-popup,
 :root[data-k-mode="dark"] .kdock-internals-popover .kinternals-popup {
   background: transparent;
 }
@@ -2923,12 +2958,31 @@
 /* ── Web preview pane ───────────────────────────────────────────────────── */
 
 .kdisplay-surface {
+  position: relative;
   flex: 1;
   min-width: 0;
   min-height: 0;
   display: flex;
   background: #fff;
   overflow: hidden;
+}
+
+.kweb-remote-cursor {
+  position: absolute;
+  pointer-events: none;
+  transform: translate(-2px, -1px);
+  transition: left 90ms linear, top 90ms linear;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.35));
+}
+
+/* Each shape points at the position from a different place: the arrow from
+   its tip, the hand from its fingertip, the I-beam from its middle. */
+.kweb-remote-cursor[data-shape="pointer"] {
+  transform: translate(-6px, -2px);
+}
+
+.kweb-remote-cursor[data-shape="text"] {
+  transform: translate(-5px, -10px);
 }
 
 .kweb-frame {
@@ -4331,6 +4385,14 @@
   color: var(--k-text-muted);
   font-weight: 500;
 }
+.kempty-peer-note {
+  margin-top: 4px;
+  padding: 6px 12px;
+  border: 1px solid var(--k-border);
+  border-radius: 999px;
+  font-size: 13px;
+  color: var(--k-text-muted);
+}
 .kempty-doors {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -4699,4 +4761,159 @@
 }
 @keyframes kweb-spin {
   to { transform: rotate(360deg); }
+}
+
+.knetwork-popup {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 14px;
+  background: var(--k-surface);
+  color: var(--k-text);
+}
+
+.knetwork-section {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.knetwork-label {
+  color: var(--k-text-muted);
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0.06em;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+
+.knetwork-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.knetwork-button {
+  padding: 6px 10px;
+  border: 1px solid var(--k-border);
+  border-radius: 8px;
+  background: var(--k-surface-raised, transparent);
+  color: var(--k-text);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.knetwork-button:hover {
+  border-color: var(--k-accent, var(--k-border));
+}
+
+.knetwork-link-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.knetwork-take:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.knetwork-grant[aria-pressed="true"] {
+  background: var(--kdock-active-fill);
+  color: var(--kdock-active-text);
+  border-color: transparent;
+  box-shadow: inset 0 0 0 1px var(--kdock-active-ring);
+}
+
+.knetwork-code {
+  min-height: 64px;
+  resize: vertical;
+  padding: 8px;
+  border: 1px solid var(--k-border);
+  border-radius: 8px;
+  background: var(--k-surface);
+  color: var(--k-text);
+  font-family: var(--k-font-mono, monospace);
+  font-size: 11px;
+  line-height: 1.4;
+  word-break: break-all;
+}
+
+.knetwork-status,
+.knetwork-take-note,
+.knetwork-grant-note,
+.knetwork-replication-note {
+  color: var(--k-text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.kdock-item.is-connected .kdock-icon {
+  color: var(--k-ok, var(--k-accent, currentColor));
+}
+
+.kshared-machine {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+/* One machine sends one surface — the one its holder is looking at — so the
+   surface that is live takes the whole column. Splitting it between the two
+   would leave a divider under a screen with nothing beneath it. */
+.kshared-machine > .kshared-framebuffer,
+.kshared-machine > .kshared-terminal {
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+/* A surface the other computer is not using shows nothing and takes no room
+   in the column. Both panes stay mounted, because a mirror only learns that
+   its surface has started by already watching for it.
+
+   `visibility` rather than `display: none`: xterm measures its character cell
+   from the live box, and a terminal opened into a box with no layout renders
+   nothing once it is shown again. Taking the pane out of flow keeps that box
+   without letting an unused surface take a share of the column. */
+.kshared-machine > [hidden] {
+  display: flex;
+  position: absolute;
+  inset: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.kshared-framebuffer {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.kshared-terminal {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.kshared-terminal-host {
+  flex: 1;
+  min-height: 0;
+  padding: 8px;
+}
+
+/* The surface a machine left behind when it was handed over. Dimmed for as
+   long as it is the last thing this computer saw rather than the machine's
+   current one, so it never reads as a machine still running here. */
+.kshared-terminal.is-held .kshared-terminal-host,
+.kshared-framebuffer.is-held .kframebuffer-surface {
+  opacity: 0.45;
+  transition: opacity 200ms ease-out;
 }

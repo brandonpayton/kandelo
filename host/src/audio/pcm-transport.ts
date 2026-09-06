@@ -271,6 +271,23 @@ export function writeConsumerPosition(words: Int32Array, value: bigint): void {
   );
 }
 
+/**
+ * Raise the discard floor, making every byte below `value` unreachable.
+ *
+ * The kernel worker calls this on the same thread every kernel entry runs
+ * on, so it cannot race Rust's own discard writes; the seqlock covers the
+ * consumer-side readers.
+ */
+export function writeDiscardPosition(words: Int32Array, value: bigint): void {
+  writeSeqlockedU64(
+    words,
+    PCM_CONTROL.discardSeq,
+    PCM_CONTROL.discardLo,
+    PCM_CONTROL.discardHi,
+    value,
+  );
+}
+
 export function signalPcmConsumerProgress(words: Int32Array): void {
   Atomics.add(words, PCM_CONTROL.wakeSeq, 1);
   // The persistent kernel observer and a bounded teardown drain may both be

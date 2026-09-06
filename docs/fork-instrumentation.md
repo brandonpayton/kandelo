@@ -1184,11 +1184,15 @@ for the implementation.
 
 ## Call-graph discovery
 
-Instrumentation only rewrites functions that can transitively reach the
-designated async import (default: `kernel.kernel_fork`). The discovery
-algorithm in `crates/fork-instrument/src/call_graph.rs`:
+Instrumentation only rewrites functions that can transitively reach a seed
+import. There are two seeds. `--entry` names the fork boundary and defaults to
+`kernel.kernel_fork`. `--checkpoint-entry` names a second boundary and adds to
+the first rather than replacing it; `scripts/install-local-binary.sh` passes
+`kernel.kernel_checkpoint` for every package it instruments, so a program that
+never forks is still covered at its syscall returns. The discovery algorithm in
+`crates/fork-instrument/src/call_graph.rs`:
 
-1. Seed set `S` = { the imported `kernel.kernel_fork` function }.
+1. Seed set `S` = { each named seed import present in the module }.
 2. **Direct reverse closure.** For every newly discovered callee `g`, add
    every local function that directly calls `g`.
 3. **Indirect reverse closure.** If `g` can be dispatched from a function

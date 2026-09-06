@@ -12,6 +12,8 @@ OUT_DIR="${WASM_POSIX_DEP_OUT_DIR:-}"
 WORK_DIR="${WASM_POSIX_DEP_WORK_DIR:-}"
 NODE_DIR="${WASM_POSIX_DEP_NODE_DIR:-}"
 SOURCE_DIR="${WASM_POSIX_DEP_SOURCE_DIR:-}"
+SOURCE_URL="${WASM_POSIX_DEP_SOURCE_URL:-}"
+SOURCE_SHA256="${WASM_POSIX_DEP_SOURCE_SHA256:-}"
 TARGET_ARCH="${WASM_POSIX_DEP_TARGET_ARCH:-}"
 
 fail() { echo "build-node-browser-bundle: $*" >&2; exit 2; }
@@ -26,6 +28,22 @@ require_real_directory() {
 require_real_directory WASM_POSIX_DEP_OUT_DIR "$OUT_DIR"
 require_real_directory WASM_POSIX_DEP_WORK_DIR "$WORK_DIR"
 require_real_directory WASM_POSIX_DEP_NODE_DIR "$NODE_DIR"
+
+# The source-only resolver hands the verified npm dist as
+# WASM_POSIX_DEP_SOURCE_DIR; the default-policy resolver hands only the
+# declared URL and sha256 and the recipe acquires its own source.
+if [ -z "$SOURCE_DIR" ]; then
+    [ -n "$SOURCE_URL" ] && [ -n "$SOURCE_SHA256" ] \
+        || fail "WASM_POSIX_DEP_SOURCE_DIR or WASM_POSIX_DEP_SOURCE_URL and WASM_POSIX_DEP_SOURCE_SHA256 are required"
+    tarball="$WORK_DIR/npm-dist.tgz"
+    curl --retry 10 --retry-delay 5 --retry-max-time 300 \
+        -fsSL "$SOURCE_URL" -o "$tarball"
+    echo "$SOURCE_SHA256  $tarball" | shasum -a 256 -c -
+    SOURCE_DIR="$WORK_DIR/npm-dist"
+    rm -rf "$SOURCE_DIR"
+    mkdir -p "$SOURCE_DIR"
+    tar xzf "$tarball" -C "$SOURCE_DIR" --strip-components=1
+fi
 require_real_directory WASM_POSIX_DEP_SOURCE_DIR "$SOURCE_DIR"
 
 node_wasm="$NODE_DIR/node.wasm"

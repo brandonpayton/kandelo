@@ -22,6 +22,64 @@ describe("KmsRegistry", () => {
     expect(kms.currentFb(1)).toBeUndefined();
   });
 
+  it("snapshot lists every modeset CRTC and survives rmFb", () => {
+    const kms = new KmsRegistry(new GbmBoRegistry());
+    expect(kms.snapshot()).toEqual({ fbs: [], crtcs: [], masterPid: null });
+
+    kms.addFb(fb(10));
+    expect(kms.snapshot().crtcs).toEqual([]);
+
+    kms.setFb(1, 10);
+    kms.setFb(2, 10);
+    kms.setMasterPid(7);
+    expect(kms.snapshot().crtcs).toEqual([
+      { crtc_id: 1, fb_id: 10 },
+      { crtc_id: 2, fb_id: 10 },
+    ]);
+    expect(kms.snapshot().masterPid).toBe(7);
+
+    // DRM leaves a CRTC modeset when its scanned-out framebuffer goes, so the
+    // snapshot keeps naming an fb_id it no longer lists.
+    kms.rmFb(10);
+    expect(kms.currentFb(1)).toBeUndefined();
+    expect(kms.snapshot().fbs).toEqual([]);
+    expect(kms.snapshot().crtcs).toEqual([
+      { crtc_id: 1, fb_id: 10 },
+      { crtc_id: 2, fb_id: 10 },
+    ]);
+  });
+
+  it("restore rebuilds a snapshotted display and replaces what it held", () => {
+    const source = new KmsRegistry(new GbmBoRegistry());
+    source.addFb(fb(10));
+    source.setFb(1, 10);
+    source.setMasterPid(7);
+
+    const target = new KmsRegistry(new GbmBoRegistry());
+    target.addFb(fb(99, 555));
+    target.setFb(3, 99);
+    target.restore(source.snapshot());
+
+    expect(target.snapshot()).toEqual(source.snapshot());
+    expect(target.currentFb(1)?.bo_id).toBe(100);
+    expect(target.currentFb(3)).toBeUndefined();
+    expect(target.isMasterPid(7)).toBe(true);
+  });
+
+  it("neither snapshot nor restore aliases a framebuffer record", () => {
+    const source = new KmsRegistry(new GbmBoRegistry());
+    source.addFb(fb(10));
+    source.setFb(1, 10);
+    const snapshot = source.snapshot();
+
+    const target = new KmsRegistry(new GbmBoRegistry());
+    target.restore(snapshot);
+    snapshot.fbs[0]!.width = 1;
+
+    expect(source.currentFb(1)?.width).toBe(64);
+    expect(target.currentFb(1)?.width).toBe(64);
+  });
+
   it("setMasterPid / dropMaster / isMasterPid", () => {
     const kms = new KmsRegistry(new GbmBoRegistry());
     expect(kms.isMasterPid(7)).toBe(false);

@@ -96,6 +96,12 @@ export class VirtualPlatformIO implements PlatformIO {
     if (this.mounts.length === 0) {
       throw new Error("VirtualPlatformIO requires at least one mount");
     }
+    this.publishTimeProvider();
+  }
+
+  /** Hand the machine's clock to every mount that stamps its own file times. */
+  private publishTimeProvider(): void {
+    for (const mount of this.mounts) mount.backend.setTimeProvider?.(this.time);
   }
 
   /** Whether the mount owning an absolute guest path ignores set-ID bits. */
@@ -201,6 +207,15 @@ export class VirtualPlatformIO implements PlatformIO {
   async preparePath(path: string): Promise<boolean> {
     const { backend, relativePath } = this.resolve(path);
     return backend.preparePath?.(relativePath) ?? false;
+  }
+
+  reserveHandleFloors(fileFloor: number, dirFloor: number): void {
+    if (this.nextFileHandle < fileFloor) this.nextFileHandle = fileFloor;
+    if (this.nextDirHandle < dirFloor) this.nextDirHandle = dirFloor;
+  }
+
+  advanceMonotonicFloor(floorNs: number): void {
+    this.time.advanceMonotonicFloor?.(floorNs);
   }
 
   open(path: string, flags: number, mode: number): number {
@@ -423,6 +438,20 @@ export class VirtualPlatformIO implements PlatformIO {
   }
 
   // --- Time operations ---
+
+  /**
+   * Replace the clock this machine reads.
+   *
+   * The guest clock belongs to the platform, not to the host it happens to
+   * run on: a restored machine already carries a monotonic floor, and a
+   * replicated one takes its readings from a log rather than from its own
+   * host. Swapping the provider is how a machine changes which of those it
+   * is without every syscall path having to know.
+   */
+  setTimeProvider(time: TimeProvider): void {
+    this.time = time;
+    this.publishTimeProvider();
+  }
 
   clockGettime(clockId: number): { sec: number; nsec: number } {
     return this.time.clockGettime(clockId);

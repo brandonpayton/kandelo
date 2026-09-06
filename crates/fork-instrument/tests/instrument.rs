@@ -4046,3 +4046,40 @@ fn reference_payload_emits_complete_exception_dispatch() {
     let module = Module::from_buffer(&bytes).unwrap();
     assert_function_uses_exception_recipe(&module, "caller");
 }
+
+#[test]
+fn a_checkpoint_seed_instruments_a_module_that_never_forks() {
+    let wat = r#"
+        (module
+          (import "kernel" "kernel_checkpoint" (func $checkpoint))
+          (memory 1)
+          (func (export "_start")
+            call $checkpoint))
+    "#;
+    let bytes = parse_wat(wat);
+    assert_eq!(
+        instrument(&bytes, &Options::default()).expect("instrument"),
+        bytes,
+        "no seed import leaves the linker bytes untouched",
+    );
+
+    let opts = Options {
+        checkpoint_import: Some("kernel.kernel_checkpoint".into()),
+        ..Options::default()
+    };
+    let instrumented = instrument(&bytes, &opts).expect("instrument");
+    validate(&instrumented);
+    let module = Module::from_buffer(&instrumented).expect("walrus parse");
+    for export in [
+        runtime_names::EXPORT_UNWIND_BEGIN,
+        runtime_names::EXPORT_UNWIND_END,
+        runtime_names::EXPORT_REWIND_BEGIN,
+        runtime_names::EXPORT_REWIND_END,
+        runtime_names::EXPORT_STATE,
+    ] {
+        assert!(
+            module.exports.iter().any(|e| e.name == export),
+            "`{export}` export missing",
+        );
+    }
+}

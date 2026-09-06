@@ -376,6 +376,667 @@ describe("LiveKernelHost: process events", () => {
   });
 });
 
+describe("LiveKernelHost: terminal sharing", () => {
+  function seedPtySession(host: LiveKernelHost, path: string, pid: number) {
+    const listeners = new Set<(bytes: Uint8Array) => void>();
+    const session = {
+      path,
+      pid,
+      logicalGeneration: 0,
+      processGeneration: 0,
+      restartTimer: null,
+      removed: false,
+      closed: false,
+      cols: 100,
+      rows: 30,
+      history: [new TextEncoder().encode("kandelo:~$ ")],
+      dataListeners: {
+        add: (cb: (bytes: Uint8Array) => void) => {
+          listeners.add(cb);
+          return () => listeners.delete(cb);
+        },
+      },
+    };
+    (host as any).ptySessions.set(path, session);
+    (host as any).emitTerminalSessions();
+    return {
+      emit: (text: string) => {
+        const bytes = new TextEncoder().encode(text);
+        for (const cb of [...listeners]) cb(bytes);
+      },
+      listenerCount: () => listeners.size,
+    };
+  }
+
+  function sharingHost(): { host: LiveKernelHost; ptyWrite: ReturnType<typeof vi.fn> } {
+    const host = new LiveKernelHost();
+    const ptyWrite = vi.fn();
+    host.attachKernel({
+      ptyWrite,
+      terminateProcess: vi.fn(async () => {}),
+    } as any);
+    return { host, ptyWrite };
+  }
+
+  it("offers nothing to share until a terminal is attached", () => {
+    const { host } = sharingHost();
+    expect(host.getTerminalSessions()).toEqual([]);
+    // A terminal nobody opened is not one to share, and the host says so
+    // rather than handing back a handle onto nothing.
+    expect(host.sharePty("/dev/pts/0")).toBeNull();
+  });
+
+  it("reports the terminals that exist as they come and go", () => {
+    const { host } = sharingHost();
+    const seen: string[][] = [];
+    const off = host.subscribeTerminalSessions((paths) => seen.push(paths));
+    seedPtySession(host, "/dev/pts/0", 42);
+    seedPtySession(host, "/dev/pts/1", 43);
+    host.removePty("/dev/pts/0");
+    off();
+    seedPtySession(host, "/dev/pts/2", 44);
+    expect(seen).toEqual([
+      ["/dev/pts/0"],
+      ["/dev/pts/0", "/dev/pts/1"],
+      ["/dev/pts/1"],
+    ]);
+  });
+
+  it("seeds a sharer with the history and adopts the session's geometry", () => {
+    const { host } = sharingHost();
+    const pty = seedPtySession(host, "/dev/pts/0", 42);
+    const shared = host.sharePty("/dev/pts/0")!;
+    const chunks: string[] = [];
+    shared.onData((bytes) => chunks.push(new TextDecoder().decode(bytes)));
+    pty.emit("ls\r\n");
+    expect(chunks).toEqual(["kandelo:~$ ", "ls\r\n"]);
+    expect(shared.size()).toEqual({ cols: 100, rows: 30 });
+  });
+
+  it("gives a sharer no way to type into the session", () => {
+    // The computer holding the machine keeps the keyboard, because two people
+    // typing into one shell interleave their keystrokes inside a single line
+    // of input. A sharer that could write would be that second keyboard, so
+    // the handle does not carry one at all.
+    const { host, ptyWrite } = sharingHost();
+    seedPtySession(host, "/dev/pts/0", 42);
+    const shared = host.sharePty("/dev/pts/0")!;
+    expect("write" in shared).toBe(false);
+    expect(ptyWrite).not.toHaveBeenCalled();
+  });
+
+  it("close detaches the sharer without disturbing the session", () => {
+    const { host } = sharingHost();
+    const pty = seedPtySession(host, "/dev/pts/0", 42);
+    const shared = host.sharePty("/dev/pts/0")!;
+    shared.onData(() => {});
+    expect(pty.listenerCount()).toBe(1);
+
+    shared.close();
+    expect(pty.listenerCount()).toBe(0);
+    // The logical PTY outlives the sharer: closing a share must not silence
+    // the terminal the machine's own user is looking at.
+    expect(host.getTerminalSessions()).toEqual(["/dev/pts/0"]);
+  });
+});
+
+describe("LiveKernelHost: framebuffer sharing", () => {
+  type FakeBinding = {
+    w: number;
+    h: number;
+    stride: number;
+    hostBuffer: Uint8ClampedArray | null;
+  };
+
+  function fakeRegistry() {
+    const bound = new Map<number, FakeBinding>();
+    const changeListeners = new Set<(pid: number, ev: "bind" | "unbind") => void>();
+    const writeListeners = new Set<
+      (pid: number, offset: number, bytes: Uint8Array) => void
+    >();
+    const registry = {
+      list: () => [...bound.keys()].map((pid) => ({ pid })),
+      get: (pid: number) => bound.get(pid),
+      onChange: (fn: (pid: number, ev: "bind" | "unbind") => void) => {
+        changeListeners.add(fn);
+        return () => changeListeners.delete(fn);
+      },
+      onWrite: (fn: (pid: number, offset: number, bytes: Uint8Array) => void) => {
+        writeListeners.add(fn);
+        return () => writeListeners.delete(fn);
+      },
+    };
+    return {
+      registry,
+      bind: (pid: number, hostBuffer: Uint8ClampedArray | null) => {
+        bound.set(pid, { w: 8, h: 1, stride: 32, hostBuffer });
+        for (const cb of [...changeListeners]) cb(pid, "bind");
+      },
+      unbind: (pid: number) => {
+        bound.delete(pid);
+        for (const cb of [...changeListeners]) cb(pid, "unbind");
+      },
+      changeListenerCount: () => changeListeners.size,
+    };
+  }
+
+  function sharingHost(): { host: LiveKernelHost; fb: ReturnType<typeof fakeRegistry> } {
+    const host = new LiveKernelHost();
+    const fb = fakeRegistry();
+    host.attachKernel({ framebuffers: fb.registry } as any);
+    return { host, fb };
+  }
+
+  it("offers nothing to share until a kernel exposes a framebuffer registry", () => {
+    expect(new LiveKernelHost().shareFramebuffer()).toBeNull();
+    const host = new LiveKernelHost();
+    host.attachKernel({} as any);
+    expect(host.shareFramebuffer()).toBeNull();
+  });
+
+  it("adopts an owner that bound /dev/fb0 before the sharer joined", () => {
+    const { host, fb } = sharingHost();
+    fb.bind(42, new Uint8ClampedArray(32));
+    expect(host.shareFramebuffer()!.getBoundPid()).toBe(42);
+  });
+
+  it("reports the owner of /dev/fb0 as it comes and goes", () => {
+    const { host, fb } = sharingHost();
+    const shared = host.shareFramebuffer()!;
+    const seen: (number | null)[] = [];
+    shared.onBoundPidChange((pid) => seen.push(pid));
+
+    expect(shared.getBoundPid()).toBeNull();
+    fb.bind(42, new Uint8ClampedArray(32));
+    expect(shared.getBoundPid()).toBe(42);
+    fb.unbind(42);
+    expect(shared.getBoundPid()).toBeNull();
+    expect(seen).toEqual([42, null]);
+  });
+
+  it("reports the owner gone when its process exits without an unbind", () => {
+    const { host, fb } = sharingHost();
+    const shared = host.shareFramebuffer()!;
+    fb.bind(42, new Uint8ClampedArray(32));
+
+    // A mirror that kept publishing a dead pid would keep showing that
+    // process's last frame as a live machine.
+    host.emitProcessEvent({ kind: "exit", pid: 42, exitStatus: 0 });
+    expect(shared.getBoundPid()).toBeNull();
+  });
+
+  it("hands back the live registry a mirror publishes from", () => {
+    const { host, fb } = sharingHost();
+    fb.bind(42, new Uint8ClampedArray(32));
+    const shared = host.shareFramebuffer()!;
+    // Same object, not a copy: a publisher reads the pixels the machine is
+    // writing now, and it can tell a write-based binding it can mirror from
+    // an mmap-based one it cannot.
+    expect(shared.registry).toBe(fb.registry);
+    expect(shared.registry.get(42)?.hostBuffer).not.toBeNull();
+    fb.bind(43, null);
+    expect(shared.registry.get(43)?.hostBuffer).toBeNull();
+  });
+
+  it("close detaches the sharer without disturbing the binding", () => {
+    const { host, fb } = sharingHost();
+    // The host itself watches the registry to report surface availability,
+    // so measure what the sharer adds rather than the total.
+    const beforeShare = fb.changeListenerCount();
+    const shared = host.shareFramebuffer()!;
+    fb.bind(42, new Uint8ClampedArray(32));
+    expect(fb.changeListenerCount()).toBe(beforeShare + 1);
+
+    shared.close();
+    expect(fb.changeListenerCount()).toBe(beforeShare);
+    // The binding outlives the sharer: closing a share must not blank the
+    // screen the machine's own user is looking at.
+    expect(fb.registry.list()).toEqual([{ pid: 42 }]);
+  });
+});
+
+describe("LiveKernelHost: machine handover", () => {
+  const FROZEN = { processes: [{ pid: 7 }, { pid: 9 }] };
+
+  function keeper(
+    capture: KernelLike["captureCheckpointBytes"],
+  ): { host: LiveKernelHost; destroy: ReturnType<typeof vi.fn> } {
+    const host = new LiveKernelHost({ status: "running" });
+    const destroy = vi.fn(async () => {});
+    host.attachKernel({ captureCheckpointBytes: capture, destroy } as any);
+    return { host, destroy };
+  }
+
+  it("offers nothing to capture until a kernel that can freeze itself is attached", async () => {
+    await expect(new LiveKernelHost().captureMachine()).resolves.toBeNull();
+    const host = new LiveKernelHost();
+    host.attachKernel({} as any);
+    await expect(host.captureMachine()).resolves.toBeNull();
+  });
+
+  it("captures the frozen machine together with the descriptor naming its image", async () => {
+    const { host } = keeper(async () => ({ status: "captured", checkpoint: FROZEN }));
+    host.setDescriptor(DUMMY_DESCRIPTOR);
+
+    const captured = await host.captureMachine();
+    expect(captured?.checkpoint).toBe(FROZEN);
+    // A taker may hold no image at all, so the descriptor travels with the
+    // processes rather than being assumed to match on the other side.
+    expect(captured?.boot.id).toBe(DUMMY_DESCRIPTOR.id);
+  });
+
+  it("reports why a freeze failed instead of handing back a machine it does not have", async () => {
+    const { host } = keeper(async () => ({
+      status: "timed-out",
+      reason: "pid 7 never left its syscall",
+    }));
+    await expect(host.captureMachine()).rejects.toThrow(
+      /timed-out: pid 7 never left its syscall/,
+    );
+  });
+
+  it("leaves the machine running after a capture", async () => {
+    const capture = vi.fn(async () => ({
+      status: "captured" as const,
+      checkpoint: FROZEN,
+    }));
+    const { host, destroy } = keeper(capture);
+
+    await host.captureMachine();
+    // A capture that is never delivered must leave the machine exactly where
+    // it was: the keeper gives it up on release, not on freeze.
+    expect(host.getStatus()).toBe("running");
+    expect(destroy).not.toHaveBeenCalled();
+    await host.captureMachine();
+    expect(capture).toHaveBeenCalledTimes(2);
+  });
+
+  it("releaseMachine ends at idle, because the machine moved rather than stopped", async () => {
+    const { host, destroy } = keeper(async () => ({
+      status: "captured",
+      checkpoint: FROZEN,
+    }));
+
+    await host.releaseMachine();
+    // "halted" would claim a shutdown that never happened, and only "idle"
+    // lets this page watch the peer that now holds the machine.
+    expect(host.getStatus()).toBe("idle");
+    expect(destroy).toHaveBeenCalledOnce();
+    // No surface of a machine that left may still read as available here.
+    expect(host.getSurfaceAvailability()).toMatchObject({
+      terminal: false,
+      framebuffer: false,
+      web: false,
+      kms: false,
+    });
+  });
+
+  it("adoptMachine boots the peer's descriptor with the checkpoint it sent", async () => {
+    const applyBootDescriptor = vi.fn(
+      async (desc: BootDescriptor, host: LiveKernelHost) => {
+        host.setDescriptor(desc);
+        host.setStatus("running");
+      },
+    );
+    const host = new LiveKernelHost({ applyBootDescriptor });
+
+    await host.adoptMachine(DUMMY_DESCRIPTOR, FROZEN);
+    // No replay: a taker runs the machine, it does not follow one. A page that
+    // received a log here would boot a copy of a machine the other computer
+    // has already given up.
+    expect(applyBootDescriptor).toHaveBeenCalledWith(
+      DUMMY_DESCRIPTOR,
+      host,
+      FROZEN,
+      undefined,
+    );
+    expect(host.getStatus()).toBe("running");
+  });
+
+  // The other half of the same call. A replica boots the same descriptor from
+  // the same checkpoint and differs in one thing: it runs on the user's
+  // decisions rather than its own host's, and the boot has to be told so
+  // before it starts, because the restored processes resume inside it.
+  it("replicateMachine boots the peer's machine onto the peer's log", async () => {
+    const applyBootDescriptor = vi.fn(
+      async (desc: BootDescriptor, host: LiveKernelHost) => {
+        host.setDescriptor(desc);
+        // As a real boot does: the gate moves from arriving to held here, and
+        // a boot that never reaches a kernel releases it instead.
+        host.attachKernel({} as any);
+        host.setStatus("running");
+      },
+    );
+    const host = new LiveKernelHost({ applyBootDescriptor });
+    const replay = {
+      entries: [],
+      queue: new SharedArrayBuffer(1024),
+      release: vi.fn(),
+    };
+
+    await host.replicateMachine(DUMMY_DESCRIPTOR, FROZEN, [], replay);
+    expect(applyBootDescriptor).toHaveBeenCalledWith(
+      DUMMY_DESCRIPTOR,
+      host,
+      FROZEN,
+      replay,
+    );
+    expect(host.getStatus()).toBe("running");
+    // Still waiting on the user, not released: the replica is running.
+    expect(replay.release).not.toHaveBeenCalled();
+
+    // Every path that lets go of a replica's kernel releases its gate first. A
+    // kernel worker blocked waiting for the user's next decision answers
+    // nothing, including the graceful half of its own teardown.
+    await host.halt();
+    expect(replay.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("replicateMachine releases the gate when the boot reaches no kernel", async () => {
+    // A replica whose boot failed still has a queue somebody is feeding, and
+    // nothing left that will ever drain it.
+    const host = new LiveKernelHost({
+      applyBootDescriptor: async () => { throw new Error("no image"); },
+    });
+    const release = vi.fn();
+
+    await expect(
+      host.replicateMachine(DUMMY_DESCRIPTOR, FROZEN, [], {
+        entries: [],
+        queue: new SharedArrayBuffer(1024),
+        release,
+      }),
+    ).rejects.toThrow(/no image/);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("adoptMachine refuses when the host cannot boot a descriptor", async () => {
+    await expect(
+      new LiveKernelHost().adoptMachine(DUMMY_DESCRIPTOR, FROZEN),
+    ).rejects.toThrow(/cannot boot a descriptor/);
+  });
+
+  // A checkpoint restores the process on the far end of a PTY but says nothing
+  // about which process that is. A taker left to guess starts a second one on
+  // the same terminal: two shells reading one keyboard, and the new one's
+  // banner painted over the screen the person was reading.
+  const TERMINAL_POLICY: TerminalSessionPolicy = {
+    initial: { programPath: "/usr/bin/login", argv: ["login", "-f", "maker"] },
+    shortRunThresholdMs: 2_000,
+    initialRestartDelayMs: 250,
+    maximumRestartDelayMs: 5_000,
+  };
+
+  function seedRunningTerminal(
+    host: LiveKernelHost,
+    path: string,
+    pid: number,
+    printed: string,
+  ) {
+    (host as any).ptySessions.set(path, {
+      path,
+      pid,
+      logicalGeneration: 1,
+      processGeneration: 1,
+      autologinConsumed: true,
+      startedAt: 0,
+      restartDelayMs: 0,
+      restartTimer: null,
+      removed: false,
+      dataListeners: { add: () => () => {} },
+      history: [new TextEncoder().encode(printed)],
+      closed: false,
+      cols: 100,
+      rows: 30,
+      supervised: true,
+    });
+  }
+
+  /** A computer with no machine, ready to take one. */
+  function taker(livePids: number[]) {
+    const spawnFromVfs = vi.fn(async () => ({
+      pid: 999,
+      exit: new Promise<number>(() => {}),
+    }));
+    const ptyWrite = vi.fn();
+    const kernel = {
+      spawnFromVfs,
+      ptyWrite,
+      ptyResize: vi.fn(),
+      onPtyOutput: vi.fn(),
+      enumProcs: async () => livePids.map((pid) => ({ pid })),
+      terminateProcess: vi.fn(async () => {}),
+    };
+    const host = new LiveKernelHost({
+      applyBootDescriptor: async (desc, h) => {
+        // The order live-setup.ts uses: the kernel arrives, then the policy
+        // that says what a terminal on it runs.
+        h.setDescriptor(desc);
+        (h as LiveKernelHost).attachKernel(kernel as any);
+        (h as LiveKernelHost).setTerminalSessionPolicy(TERMINAL_POLICY);
+        (h as LiveKernelHost).setStatus("running");
+      },
+    });
+    return { host, kernel, spawnFromVfs, ptyWrite };
+  }
+
+  it("carries the terminals the machine had open", async () => {
+    const { host } = keeper(async () => ({ status: "captured", checkpoint: FROZEN }));
+    seedRunningTerminal(host, "/dev/pts/0", 7, "maker@kandelo:~$ ");
+
+    const captured = await host.captureMachine();
+    expect(captured?.terminals).toEqual([{
+      path: "/dev/pts/0",
+      pid: 7,
+      cols: 100,
+      rows: 30,
+      screen: new TextEncoder().encode("maker@kandelo:~$ "),
+    }]);
+  });
+
+  it("leaves behind a terminal whose process is already gone", async () => {
+    const { host } = keeper(async () => ({ status: "captured", checkpoint: FROZEN }));
+    seedRunningTerminal(host, "/dev/pts/0", 7, "maker@kandelo:~$ ");
+    (host as any).ptySessions.get("/dev/pts/0").closed = true;
+
+    // There is no process on the far end to adopt, so the taker should start
+    // one of its own exactly as this computer would have.
+    const captured = await host.captureMachine();
+    expect(captured?.terminals).toEqual([]);
+  });
+
+  it("adopts a restored terminal instead of starting a second one on its PTY", async () => {
+    const { host, spawnFromVfs, ptyWrite } = taker([7]);
+    await host.adoptMachine(DUMMY_DESCRIPTOR, FROZEN, [{
+      path: "/dev/pts/0",
+      pid: 7,
+      cols: 100,
+      rows: 30,
+      screen: new TextEncoder().encode("maker@kandelo:~$ "),
+    }]);
+
+    const pty = await host.attachPty("/dev/pts/0", { cols: 100, rows: 30 });
+    expect(spawnFromVfs).not.toHaveBeenCalled();
+    // The keyboard reaches the process that arrived, not a new one beside it.
+    pty.write("ls\n");
+    expect(ptyWrite).toHaveBeenCalledWith(7, expect.anything());
+  });
+
+  // The same terminal, on a computer that is only copying the machine. A
+  // keystroke here reaches no log, so this copy would answer it and the machine
+  // it copies would not: two machines under one name, with only this screen
+  // showing the difference. The keyboard arrives with the take-over above.
+  it("refuses the keyboard on a machine it is only replicating", async () => {
+    const { host, ptyWrite } = taker([7]);
+    await host.replicateMachine(
+      DUMMY_DESCRIPTOR,
+      FROZEN,
+      [{
+        path: "/dev/pts/0",
+        pid: 7,
+        cols: 100,
+        rows: 30,
+        screen: new TextEncoder().encode("maker@kandelo:~$ "),
+      }],
+      { entries: [], queue: new SharedArrayBuffer(1024), release: vi.fn() },
+    );
+
+    const pty = await host.attachPty("/dev/pts/0", { cols: 100, rows: 30 });
+    pty.write("ls\n");
+    expect(ptyWrite).not.toHaveBeenCalled();
+  });
+
+  // A window change is a decision too: it delivers SIGWINCH and a new
+  // TIOCGWINSZ, so a program that redraws on it takes a turn the primary's
+  // program never took. The emulator here is a different size from the one the
+  // machine was read at, which is the ordinary case — two people do not share a
+  // window — and the machine's terminal must keep the primary's size.
+  it("refuses to resize a machine it is only replicating", async () => {
+    const { host, kernel } = taker([7]);
+    await host.replicateMachine(
+      DUMMY_DESCRIPTOR,
+      FROZEN,
+      [{
+        path: "/dev/pts/0",
+        pid: 7,
+        cols: 100,
+        rows: 30,
+        screen: new TextEncoder().encode("maker@kandelo:~$ "),
+      }],
+      { entries: [], queue: new SharedArrayBuffer(1024), release: vi.fn() },
+    );
+
+    const pty = await host.attachPty("/dev/pts/0", { cols: 158, rows: 39 });
+    pty.resize(80, 24);
+    expect(kernel.ptyResize).not.toHaveBeenCalled();
+    // And the terminal still reports the size the machine runs at, so a later
+    // take-over hands on the primary's geometry rather than this page's.
+    expect(pty.size()).toEqual({ cols: 100, rows: 30 });
+  });
+
+  // A keystroke or a resize the user records has no guest request to answer,
+  // so a replica whose guest sits at a prompt only sees it when told the log
+  // grew. The nudge goes to a machine this page copies, and to nothing else —
+  // a machine this page decides for has no replay to drain. The copy is also
+  // nudged once as it arrives: what the user decided while the replica was
+  // booting is already queued, and those nudges found no machine to take it.
+  it("nudges only a copy when the user's log grows", async () => {
+    const { host, kernel } = taker([7]);
+    const drainReplicationReplay = vi.fn();
+    (kernel as any).drainReplicationReplay = drainReplicationReplay;
+
+    host.drainReplicationReplay();
+    expect(drainReplicationReplay).not.toHaveBeenCalled();
+
+    await host.replicateMachine(DUMMY_DESCRIPTOR, FROZEN, [], {
+      entries: [],
+      queue: new SharedArrayBuffer(1024),
+      release: vi.fn(),
+    });
+    expect(drainReplicationReplay).toHaveBeenCalledTimes(1);
+    host.drainReplicationReplay();
+    expect(drainReplicationReplay).toHaveBeenCalledTimes(2);
+  });
+
+  // A replica taken off its log is a machine no computer decides for. Its
+  // guests read a clock that has no answer, they die, and `init` starts fresh
+  // ones — so a copy kept past its recording becomes a second machine wearing
+  // the first one's name, on a page that still calls itself the viewer.
+  it("lets go of the copy when it stops replicating", async () => {
+    const { host, kernel } = taker([7]);
+    const stopReplicationReplay = vi.fn(async () => ({ consumed: 4, total: 4 }));
+    (kernel as any).stopReplicationReplay = stopReplicationReplay;
+    const release = vi.fn();
+    await host.replicateMachine(DUMMY_DESCRIPTOR, FROZEN, [], {
+      entries: [],
+      queue: new SharedArrayBuffer(1024),
+      release,
+    });
+    expect(host.getStatus()).toBe("running");
+
+    expect(await host.stopReplicatingMachine())
+      .toEqual({ consumed: 4, total: 4 });
+    expect(host.getStatus()).toBe("idle");
+    // And the gate goes with it. A replica parked on a decision that will not
+    // come answers nothing, including the graceful half of its own teardown.
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it("redraws the screen the other computer was showing", async () => {
+    const { host } = taker([7]);
+    await host.adoptMachine(DUMMY_DESCRIPTOR, FROZEN, [{
+      path: "/dev/pts/0",
+      pid: 7,
+      cols: 100,
+      rows: 30,
+      screen: new TextEncoder().encode("maker@kandelo:~$ make\r\nok\r\n"),
+    }]);
+
+    const pty = await host.attachPty("/dev/pts/0", { cols: 100, rows: 30 });
+    const drawn: string[] = [];
+    pty.onData((bytes) => drawn.push(new TextDecoder().decode(bytes)));
+    // Without this the person who took the machine gets an empty terminal and
+    // has to press a key to learn that anything is on the far end of it.
+    expect(drawn.join("")).toBe("maker@kandelo:~$ make\r\nok\r\n");
+  });
+
+  it("starts a terminal of its own when the restored process is not there", async () => {
+    // A machine with processes, just not the one the peer named for this PTY.
+    const { host, spawnFromVfs } = taker([1]);
+    await host.adoptMachine(DUMMY_DESCRIPTOR, FROZEN, [{
+      path: "/dev/pts/0",
+      pid: 7,
+      cols: 100,
+      rows: 30,
+      screen: new Uint8Array(),
+    }]);
+
+    await host.attachPty("/dev/pts/0", { cols: 100, rows: 30 });
+    // A restore that lost the process owes the person a working terminal, not
+    // an empty one wired to a pid that is not running.
+    expect(spawnFromVfs).toHaveBeenCalledOnce();
+  });
+
+  it("refuses a peer's terminal that names no process", async () => {
+    const { host } = taker([7]);
+    await expect(host.adoptMachine(DUMMY_DESCRIPTOR, FROZEN, [{
+      path: "/dev/pts/0",
+      pid: 0,
+      cols: 100,
+      rows: 30,
+      screen: new Uint8Array(),
+    }])).rejects.toThrow(/names no process/);
+  });
+
+  it("refuses a peer's terminal carrying more screen than a screen", async () => {
+    const { host } = taker([7]);
+    await expect(host.adoptMachine(DUMMY_DESCRIPTOR, FROZEN, [{
+      path: "/dev/pts/0",
+      pid: 7,
+      cols: 100,
+      rows: 30,
+      screen: new Uint8Array(128 * 1024 + 1),
+    }])).rejects.toThrow(/over the 131072 allowed/);
+  });
+
+  it("does not let a terminal nobody attached to outlive its machine", async () => {
+    const { host, spawnFromVfs } = taker([7]);
+    await host.adoptMachine(DUMMY_DESCRIPTOR, FROZEN, [{
+      path: "/dev/pts/0",
+      pid: 7,
+      cols: 100,
+      rows: 30,
+      screen: new Uint8Array(),
+    }]);
+    // Booting something else discards the machine that arrived. Its terminals
+    // go with it: pid 7 belongs to processes that are no longer running here.
+    await host.applyBootDescriptor(DUMMY_DESCRIPTOR);
+
+    await host.attachPty("/dev/pts/0", { cols: 100, rows: 30 });
+    expect(spawnFromVfs).toHaveBeenCalledOnce();
+  });
+});
+
 describe("LiveKernelHost: lazy download events", () => {
   it("fans out kernel lazy download events and records history", () => {
     let kernelCb: ((event: LazyDownloadEvent) => void) | null = null;
@@ -782,6 +1443,107 @@ describe("LiveKernelHost: machine PCM lifecycle", () => {
     expect(suspendAudio).not.toHaveBeenCalled();
     expect(output!.getState()).toBe("running");
     framebuffer.close();
+  });
+
+  it("types into a taken-over machine's screen before any terminal is opened", async () => {
+    // A machine that arrives by handover, showing a screen. The checkpoint
+    // brings its /dev/fb0 binding back with the process, so the framebuffer is
+    // bound before the terminals it arrived with are registered — and on a
+    // machine showing a screen nobody opens a terminal pane at all, so the
+    // shell that owns the PTY is never registered the ordinary way.
+    //
+    // The shell is running the whole time: fbdoom was launched from it and
+    // reads its keystrokes from its PTY. Answered from the shells this host
+    // started, the route is never found, and every key the person presses goes
+    // to a stdin buffer nothing reads.
+    vi.stubGlobal("requestAnimationFrame", () => 0);
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+    const ptyWrite = vi.fn();
+    const appendStdinData = vi.fn();
+    const arrived = {
+      fs: makeFs({ "/etc/passwd": "" }),
+      framebuffers: {
+        list: () => [{ pid: 101 }],
+        onChange: () => () => {},
+        get: () => undefined,
+      },
+      getProcessMemory: () => undefined,
+      enumProcs: async () => [
+        { pid: 100, ppid: 1, uid: 0, gid: 0, vsizeBytes: 1024, state: "S", comm: "bash", cmdline: "bash -l -i" },
+        { pid: 101, ppid: 100, uid: 0, gid: 0, vsizeBytes: 1024, state: "S", comm: "fbdoom", cmdline: "fbdoom" },
+      ],
+      ptyWrite,
+      appendStdinData,
+    } as never;
+    const host = new LiveKernelHost({
+      applyBootDescriptor: async (_desc, target) => {
+        (target as LiveKernelHost).attachKernel(arrived);
+      },
+    } as never);
+    await host.adoptMachine(
+      host.getBootDescriptor(),
+      {} as never,
+      [{ path: "/dev/pts/0", pid: 100, cols: 80, rows: 24, screen: new Uint8Array() }],
+    );
+
+    const framebuffer = host.attachFramebuffer(
+      { getContext: () => ({}) } as unknown as HTMLCanvasElement,
+    );
+
+    // The route is read off the process table, so it settles a turn after the
+    // machine arrives rather than inside it.
+    await vi.waitFor(() => {
+      framebuffer.sendInput(new Uint8Array([0x1b]));
+      expect(ptyWrite).toHaveBeenCalledWith(100, expect.anything());
+    });
+
+    ptyWrite.mockClear();
+    appendStdinData.mockClear();
+    framebuffer.sendInput(new Uint8Array([0x1b]));
+    expect(ptyWrite).toHaveBeenCalledWith(100, expect.anything());
+    expect(appendStdinData).not.toHaveBeenCalled();
+
+    framebuffer.close();
+    vi.unstubAllGlobals();
+  });
+
+  it("hands on a terminal that no emulator ever opened", async () => {
+    // The second hop of a handover. This machine arrived showing a screen, so
+    // nobody opened a terminal pane on it and its shell never entered
+    // `ptySessions`. The shell is running all the same, and it owns the PTY
+    // that the screen program reads its keystrokes from.
+    //
+    // Captured from the emulators alone, the terminal is dropped here, and the
+    // computer that takes the machine next has a live mouse and a dead
+    // keyboard.
+    const captured = {
+      checkpoint: {},
+      captureCheckpointBytes: async () => ({
+        status: "captured",
+        checkpoint: {},
+      }),
+      fs: makeFs({ "/etc/passwd": "" }),
+      framebuffers: { list: () => [], onChange: () => () => {}, get: () => undefined },
+      getProcessMemory: () => undefined,
+    } as never;
+    const host = new LiveKernelHost({
+      applyBootDescriptor: async (_desc, target) => {
+        (target as LiveKernelHost).attachKernel(captured);
+      },
+    } as never);
+    const arrivedWith = {
+      path: "/dev/pts/0",
+      pid: 100,
+      cols: 80,
+      rows: 24,
+      screen: new Uint8Array([0x68, 0x69]),
+    };
+    await host.adoptMachine(host.getBootDescriptor(), {} as never, [arrivedWith]);
+
+    const handedOn = await host.captureMachine();
+
+    expect(handedOn).not.toBeNull();
+    expect(handedOn!.terminals).toEqual([arrivedWith]);
   });
 });
 

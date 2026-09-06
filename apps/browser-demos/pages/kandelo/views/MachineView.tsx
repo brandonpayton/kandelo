@@ -18,6 +18,7 @@ import { Display, type DisplayHandle, type WordPressLoginOptions } from "../pane
 import { Shell, type ShellTerminal } from "../panes/Shell";
 import { DemoGuide } from "../panes/DemoGuide";
 import type { DemoActionConfig } from "../../../../../web-libs/kandelo-session/src/demo-config";
+import type { PreviewCursor, PreviewScroll } from "@host/replication/log-local";
 import type {
   DemoPresentation,
   MachineStatus,
@@ -168,6 +169,15 @@ export interface MachineViewProps {
   activeTerminalId: string;
   onActiveTerminalId: (id: string) => void;
   onAddTerminal: () => void;
+  onPreviewPathChange?: (path: string) => void;
+  previewViewerPath?: string | null;
+  onPreviewCursorChange?: (position: PreviewCursor | null) => void;
+  previewViewerCursor?: PreviewCursor | null;
+  onPreviewScrollChange?: (position: PreviewScroll) => void;
+  previewViewerScroll?: PreviewScroll | null;
+  /** Reloads the web preview when it changes, so a recording that just
+   *  started carries the exchanges behind the page the user is on. */
+  previewReloadToken?: number;
 }
 
 export const MachineView: React.FC<MachineViewProps> = ({
@@ -181,9 +191,21 @@ export const MachineView: React.FC<MachineViewProps> = ({
   activeTerminalId,
   onActiveTerminalId,
   onAddTerminal,
+  onPreviewPathChange,
+  previewViewerPath,
+  onPreviewCursorChange,
+  previewViewerCursor,
+  onPreviewScrollChange,
+  previewViewerScroll,
+  previewReloadToken,
 }) => {
   const demoGuide = useDemoGuide();
   const displayRef = React.useRef<DisplayHandle | null>(null);
+
+  React.useEffect(() => {
+    if (!previewReloadToken) return;
+    displayRef.current?.reloadPreview();
+  }, [previewReloadToken]);
   const {
     activePrimary,
     demoSurface,
@@ -248,6 +270,12 @@ export const MachineView: React.FC<MachineViewProps> = ({
                 autoFocus={activePrimary === demoSurface}
                 surface={demoSurface ?? undefined}
                 onDockControlsChange={onDemoDockControlsChange}
+                onPreviewPathChange={onPreviewPathChange}
+                previewViewerPath={previewViewerPath}
+                onPreviewCursorChange={onPreviewCursorChange}
+                previewViewerCursor={previewViewerCursor}
+                onPreviewScrollChange={onPreviewScrollChange}
+                previewViewerScroll={previewViewerScroll}
               />
             </PrimarySurfaceSlot>
           )}
