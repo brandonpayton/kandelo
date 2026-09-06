@@ -63,6 +63,39 @@ not preventing races. Do not reach for it as a routine default — a
 per-worktree cache discards the cross-worktree reuse the shared cache exists
 to provide.
 
+A workspace-crate-backed package's cache-key inputs must derive from that
+crate's actual `cargo metadata` dependency closure (`inputs = ["cargo:<crate
+name>"]` in `build.toml`; see `tools/xtask/src/cargo_closure.rs`), never a
+hand-maintained file list. A hand list silently omits a compile input the
+first time a new file or dependency is added — this is exactly what let
+`crates/runtime-core/src/netif.rs` slip out of the kernel's cache key before
+the `cargo:kandelo` fix (kernel-staleness Stage 1, #1351). A build artifact
+with no resolver `build.toml` at all (e.g. `crates/fork-module`, built by a
+standalone `build-wasm.sh`) should still get the same coverage via `xtask
+workspace-closure-sha --crates <a,b,c>`, which unions the cargo closures of
+one or more named crates into a single content digest a script can stamp and
+later re-verify (see `crates/fork-module/build-wasm.sh --verify-fresh`).
+`tools/xtask/src/cargo_closure.rs`'s
+`registry_packages_that_cargo_build_a_workspace_crate_declare_its_closure_input`
+test fails the build if any `packages/registry/*/build.toml` package compiles
+a workspace crate directly without declaring the matching `cargo:<crate>`
+input, so this class of gap cannot reappear undetected.
+
+The local-build engine's "skip fast path" (`compute_skip_receipts` /
+`source_only_skip_receipt_if_clean` in `tools/xtask/src/local_build.rs` and
+`build_deps.rs`) reports a package node `Cached` without launching a child
+process when a valid canonical cache entry for the package's current content
+key already exists. It must verify that any file already sitting at the
+node's *output projection path* (e.g.
+`local-binaries/source-only-v1/kernel.wasm`) actually matches that cache
+entry's recorded content digest before trusting it — a same-size file
+existing there is not proof of that (a differently-keyed generation, from an
+earlier build or a sibling session sharing the cache root, can occupy the
+same path). Checking mere presence let a `Cached` disposition leave a stale
+generation's bytes in place indefinitely; `xtask verify-fresh` still caught
+it because it recomputes the expected key directly rather than trusting the
+skip path's notion of "already projected."
+
 ## Line editing for REPL CLIs
 
 A command-line program with an interactive REPL — a read-eval-print loop that
