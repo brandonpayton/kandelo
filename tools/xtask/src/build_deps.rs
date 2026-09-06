@@ -9185,10 +9185,34 @@ pub(crate) fn source_only_skip_receipt_if_clean(
         .flatten()?;
     for member in &receipt.materialized_members {
         let projected = output_root.join(&member.mirror_path);
-        let present = std::fs::symlink_metadata(&projected)
-            .map(|meta| meta.is_file())
-            .unwrap_or(false);
-        if !present {
+        let metadata = match std::fs::symlink_metadata(&projected) {
+            Ok(meta) if meta.is_file() => meta,
+            _ => return None,
+        };
+        // A present file at the mirror path is not proof it holds THIS
+        // generation's bytes: this skip fast path runs before any per-node
+        // child launches, so it is the only gate standing between a stale
+        // projection and a "Cached" disposition. A file can already sit at
+        // `mirror_path` from a DIFFERENT cache-key generation that once
+        // occupied the same output path -- e.g. a source edit that changed
+        // the package's cache key, got projected here, and was later
+        // reverted so the current tree resolves back to an OLDER key whose
+        // canonical cache entry still exists but whose mirrored copy was
+        // never re-materialized. Matching file size is not sufficient (two
+        // generations of the same wasm can be byte-for-byte the same length
+        // while differing only in embedded content), so re-hash the file
+        // and compare against the receipt's recorded digest -- the same
+        // digest `materialize_source_only_program_target_with_cache_root`
+        // computed when it wrote this member. Only an exact content match
+        // proves the mirror is this generation's output; anything else
+        // falls back to the real per-node resolve, which unconditionally
+        // re-projects from the canonical cache entry.
+        if metadata.len() != member.size {
+            return None;
+        }
+        let bytes = std::fs::read(&projected).ok()?;
+        let actual_sha256 = hex(&Sha256::digest(&bytes));
+        if actual_sha256 != member.sha256 {
             return None;
         }
     }
@@ -36933,6 +36957,80 @@ commit = "1111111111111111111111111111111111111111"
             ),
             None,
             "a node whose projected output is missing must fall back to a child build"
+        );
+    }
+
+    // Regression test for the build-freshness bug this task fixes: the skip
+    // fast path in `run_aggregate`/`compute_skip_receipts` runs BEFORE any
+    // per-node child launches, so it is the only gate standing between a
+    // stale mirror file and a "Cached" disposition that never re-projects.
+    // A file merely being PRESENT at the mirror path is not proof it holds
+    // the CURRENT generation's bytes: the same path can be left over from a
+    // different cache-key generation that once projected there (e.g. an
+    // edit that changed the package's cache key, got projected, and was
+    // later reverted so the tree resolves back to an older key whose
+    // canonical entry still exists but whose mirror was never
+    // re-materialized). Reproduced live against a real kernel build during
+    // this task (see task-15-build-freshness-report.md): `local-build run`
+    // reported the kernel package `Cached` while
+    // `local-binaries/source-only-v1/kernel.wasm` held a DIFFERENT
+    // generation's bytes than the one the current source resolves to.
+    #[cfg(unix)]
+    #[test]
+    fn source_only_skip_returns_none_when_projected_output_content_is_stale() {
+        let repo = tempdir("source-only-skip-stale-content");
+        prepare_local_rebuild_fixture_repo(&repo);
+        write_program(
+            &repo,
+            "skipstale",
+            "1.0.0",
+            &[],
+            &emit_wasm_build_script("skipstale.wasm", &minimal_executable_wasm()),
+            &[("skipstale", "skipstale.wasm")],
+        );
+        write_source_only_repository_inputs(&repo, "skipstale");
+        let manifest_path = repo.join("skipstale/package.toml");
+        let disabled = fs::read_to_string(&manifest_path).unwrap().replace(
+            "wasm = \"skipstale.wasm\"",
+            "wasm = \"skipstale.wasm\"\nfork_instrumentation = \"disabled\"",
+        );
+        fs::write(&manifest_path, &disabled).unwrap();
+        let registry = Registry {
+            roots: vec![repo.clone()],
+        };
+        let target = registry.load("skipstale").unwrap();
+        let (base, compiled) = source_only_test_roots("source-only-skip-stale-cache");
+        let roots = SourceOnlyCacheRoots { base, compiled };
+        let output = tempdir("source-only-skip-stale-output");
+
+        let built =
+            run_local_rebuild_fixture(&target, &registry, &roots, &repo, &output, false).unwrap();
+        let receipt = built.package_receipt.clone().unwrap();
+
+        let _override =
+            crate::install_repo_root_override(fs::canonicalize(&repo).unwrap()).unwrap();
+
+        // Overwrite the already-projected mirror file with different bytes of
+        // the SAME length, simulating a stale projection left over from a
+        // different generation that happened to produce a same-size output
+        // (exactly what was observed live: two kernel generations were both
+        // 1003144 bytes, differing only in an embedded content region).
+        let projected = output.join(&receipt.materialized_members[0].mirror_path);
+        let mut stale_bytes = fs::read(&projected).unwrap();
+        for byte in stale_bytes.iter_mut() {
+            *byte ^= 0xff;
+        }
+        fs::write(&projected, &stale_bytes).unwrap();
+
+        let mut memo = BTreeMap::new();
+        assert_eq!(
+            source_only_skip_receipt_if_clean(
+                &target, &registry, TEST_ARCH, TEST_ABI, &roots, &output, &mut memo,
+            ),
+            None,
+            "a node whose projected output no longer matches the receipt's recorded \
+             content digest must fall back to a child build, never a silent Cached \
+             disposition over stale bytes"
         );
     }
 
