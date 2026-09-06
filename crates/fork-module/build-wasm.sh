@@ -13,10 +13,26 @@
 # the change additive and scoped to `crates/fork-module`.
 #
 # Usage:
-#   scripts/dev-shell.sh bash crates/fork-module/build-wasm.sh          # wasm32
-#   scripts/dev-shell.sh bash crates/fork-module/build-wasm.sh --run    # + harness
+#   scripts/dev-shell.sh bash crates/fork-module/build-wasm.sh                # wasm32
+#   scripts/dev-shell.sh bash crates/fork-module/build-wasm.sh --run          # + harness
+#   scripts/dev-shell.sh bash crates/fork-module/build-wasm.sh --verify-fresh # freshness check only, no build
 #
 # Artifact: target/wasm32-unknown-unknown/release/fork_module.wasm
+#
+# FRESHNESS: fork-module has no packages/registry/<name>/build.toml, so it
+# gets none of the resolver's content-addressed cache-key machinery (see
+# packages/registry/kernel/build.toml's `cargo:kandelo` input and
+# docs/agent-guidance/packages-and-builds.md). Left alone, that means a
+# staged local-binaries/fork_module32.wasm could silently go stale relative
+# to crates/fork-module, crates/fork-module-inject, crates/fork-codec, or
+# crates/shared, with no automated signal. This script closes that gap with
+# a build-key STAMP: every successful build writes a content digest (over
+# the real cargo dependency closure of fork-module + fork-module-inject,
+# computed the SAME way the resolver derives a `cargo:<crate>` cache-key
+# input -- see `xtask workspace-closure-sha` / `cargo_closure.rs`) beside
+# each staged artifact, and `--verify-fresh` re-derives that digest from the
+# CURRENT source tree and fails loud on any mismatch or missing stamp,
+# instead of silently trusting whatever is already staged.
 set -euo pipefail
 
 # The PIC side-module flags. Release is required (the whole-memory byte view is
@@ -47,6 +63,57 @@ PIC_RUSTFLAGS=(
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
+HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
+FORK_MODULE_CLOSURE_CRATES="fork-module,fork-module-inject"
+
+# The closure-derived freshness fingerprint for the current source tree. A
+# debug xtask build is fine here (this runs on every invocation, including
+# `--verify-fresh`, so it should stay cheap); the digest itself is what
+# matters, not the tool's own optimization level.
+closure_sha() {
+  cargo run -q -p xtask --target "$HOST_TRIPLE" -- workspace-closure-sha \
+    --crates "$FORK_MODULE_CLOSURE_CRATES"
+}
+
+build_key_path() {
+  echo "$REPO_ROOT/local-binaries/fork_module${1}.wasm.build-key"
+}
+
+# `--verify-fresh`: report whether the ALREADY-STAGED artifacts still match
+# the current source tree, without building anything. Exits non-zero (and
+# says exactly why) on any mismatch or missing stamp -- an unstamped
+# artifact (one staged before this check existed, or one whose stamp was
+# lost) is unverifiable and must not be silently trusted, matching the
+# kernel's `xtask verify-fresh` "no build key stamp" failure mode.
+if [[ "${1:-}" == "--verify-fresh" ]]; then
+  current_sha="$(closure_sha)"
+  status=0
+  for width in 32 64; do
+    artifact="$REPO_ROOT/local-binaries/fork_module${width}.wasm"
+    key_path="$(build_key_path "$width")"
+    if [[ ! -f "$artifact" ]]; then
+      continue # this width was never built here (e.g. wasm64 best-effort); nothing to verify.
+    fi
+    if [[ ! -f "$key_path" ]]; then
+      echo "fork-module: $artifact carries no build-key stamp ($key_path is missing);" \
+        "rebuild with 'bash crates/fork-module/build-wasm.sh' so freshness can be verified." >&2
+      status=1
+      continue
+    fi
+    staged_sha="$(cat "$key_path")"
+    if [[ "$staged_sha" != "$current_sha" ]]; then
+      echo "fork-module: $artifact is stale: it was built for closure key $staged_sha," \
+        "but the current source tree (crates/fork-module, crates/fork-module-inject," \
+        "crates/fork-codec, crates/shared) resolves to $current_sha." \
+        "Rebuild with 'bash crates/fork-module/build-wasm.sh'." >&2
+      status=1
+      continue
+    fi
+    echo "fork-module: $artifact matches current source ($current_sha)"
+  done
+  exit "$status"
+fi
+
 echo "== building fork-module (PIC side module, wasm32) =="
 RUSTFLAGS="${PIC_RUSTFLAGS[*]}" \
   cargo build --release -p fork-module --target wasm32-unknown-unknown -Z build-std=core,alloc
@@ -62,8 +129,8 @@ echo "wasm32 artifact: $WASM32"
 # module before staging. See crates/fork-module-inject.
 echo "== building fork-module injector (host) =="
 # The repo `.cargo/config.toml` defaults `build.target` to wasm32; the injector
-# is a HOST tool (it needs std + walrus), so build it for the host triple.
-HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
+# is a HOST tool (it needs std + walrus), so build it for the host triple
+# ($HOST_TRIPLE was already resolved above, for the freshness stamp).
 cargo build --release -p fork-module-inject --target "$HOST_TRIPLE"
 INJECTOR="target/$HOST_TRIPLE/release/fork-module-inject"
 
@@ -89,14 +156,22 @@ inject_funcref_decode "$WASM32"
 #
 # The per-width filename (`fork_module32.wasm` / `fork_module64.wasm`) lets the
 # kernel host ship the width matching the guest's pointer width.
+#
+# Also (re)writes this generation's build-key stamp so a later
+# `--verify-fresh` (or a stale-mirror bug in some OTHER build path that
+# copies from `local-binaries/`) has something authoritative to compare
+# against. The stamp is computed once, right before staging starts, so
+# every width staged in this run gets the SAME source-tree digest.
 stage_fork_module() {
   local src="$1" width="$2"
   local name="fork_module${width}.wasm"
   mkdir -p "$REPO_ROOT/local-binaries" "$REPO_ROOT/host/wasm"
   cp "$src" "$REPO_ROOT/local-binaries/$name"
   cp "$src" "$REPO_ROOT/host/wasm/$name"
-  echo "staged $name -> local-binaries/$name, host/wasm/$name"
+  printf '%s\n' "$FRESH_CLOSURE_SHA" > "$(build_key_path "$width")"
+  echo "staged $name -> local-binaries/$name, host/wasm/$name (build-key $FRESH_CLOSURE_SHA)"
 }
+FRESH_CLOSURE_SHA="$(closure_sha)"
 stage_fork_module "$WASM32" 32
 
 # The wasm64 (`pointer_width = 8` guest) variant. wasm64-unknown-unknown is a

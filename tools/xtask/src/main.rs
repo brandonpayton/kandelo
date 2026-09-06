@@ -8,6 +8,13 @@
 //!                         Args: --package <dir> --arch <wasm32|wasm64>. Used by the
 //!                         pre-flight workflow to skip already-published
 //!                         matrix entries.
+//!   workspace-closure-sha Print a content digest (64 hex chars) over the union
+//!                         of one or more workspace crates' cargo dependency
+//!                         closures. Args: --crates <a,b,c>. For a build
+//!                         artifact with no resolver `build.toml` (so it has
+//!                         no `cargo:<crate>` cache-key input), this gives the
+//!                         same drift-proof, cargo-metadata-derived freshness
+//!                         coverage. Used by `crates/fork-module/build-wasm.sh`.
 //!   sort-package-matrix   Order a package matrix so selected package dependencies
 //!                         appear before their dependents.
 //!   partition-package-matrix
@@ -87,6 +94,7 @@ fn main() -> ExitCode {
         "bundle-program" => bundle_program::run(rest),
         "build-deps" => build_deps::run(rest),
         "compute-cache-key-sha" => build_deps::run_compute_cache_key_sha(rest),
+        "workspace-closure-sha" => cargo_closure::run_workspace_closure_sha(rest),
         "sort-package-matrix" => package_matrix::run_sort(rest),
         "partition-package-matrix" => package_matrix::run_partition(rest),
         "package-dependency-artifacts" => package_matrix::run_dependency_artifacts(rest),

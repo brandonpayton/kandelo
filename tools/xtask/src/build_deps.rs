@@ -8570,7 +8570,7 @@ fn require_selected_registry_build_input(
     ))
 }
 
-fn hash_build_input(path: &Path) -> Result<[u8; 32], String> {
+pub(crate) fn hash_build_input(path: &Path) -> Result<[u8; 32], String> {
     let mut h = Sha256::new();
     hash_build_input_entry(&mut h, path, path)?;
     Ok(h.finalize().into())
