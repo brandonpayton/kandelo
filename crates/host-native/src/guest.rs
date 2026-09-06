@@ -3338,6 +3338,19 @@ enum ForkEntry {
     /// image_ptr, image_len)` then `wpk_fork_rewind_begin(root)` then
     /// `wpk_fork_resume_start()` — see `run_fork_capable_entry`.
     ChildReplay { root: u32, image_ptr: u32, image_len: u32 },
+    /// Real vfork (N1 residual): a BORROWED child sharing the parked
+    /// parent's `SharedMemory` — the borrowed sibling of `ChildReplay`. Same
+    /// `root`/`image_ptr`/`image_len` (the parent's live continuation
+    /// anchor and journal image, read read-only, never copied), plus
+    /// `private_prefix`: the child-private region `fm_begin_borrowed_child_
+    /// replay` copies the parent's mutable fixed runtime prefix into, so the
+    /// guest's active-frame-pointer rewrites during replay never touch the
+    /// parked parent's own prefix. The child drives `fm_begin_borrowed_
+    /// child_replay(root, image_ptr, image_len, private_prefix)` then
+    /// `wpk_fork_rewind_begin(private_prefix)` (NOT `root` — see
+    /// `run_fork_capable_entry`'s doc comment on this arm) then
+    /// `wpk_fork_resume_start()`.
+    ChildBorrowedReplay { root: u32, image_ptr: u32, image_len: u32, private_prefix: u32 },
 }
 
 /// `kernel_fork`'s two reachable phases on a native guest thread (N1-I4 Task
@@ -3966,6 +3979,13 @@ pub struct ForkModule {
     pub fm_begin_replay: wasmtime::TypedFunc<(), ()>,
     pub fm_finish_replay: wasmtime::TypedFunc<(), ()>,
     pub fm_begin_child_replay: wasmtime::TypedFunc<(u32, u32, u32), ()>,
+    /// Real vfork (N1 residual): the borrowed sibling of `fm_begin_child_
+    /// replay` — see `crates/fork-module/src/lib.rs`'s `fm_begin_borrowed_
+    /// child_replay` doc comment. `(module_buffer, image_ptr, image_len,
+    /// private_prefix)`; on success the guest's `wpk_fork_rewind_begin` must
+    /// be called with `private_prefix`, NOT `module_buffer` — see
+    /// `run_fork_capable_entry`'s `ForkEntry::ChildBorrowedReplay` arm.
+    pub fm_begin_borrowed_child_replay: wasmtime::TypedFunc<(u32, u32, u32, u32), ()>,
     pub fm_last_errno: wasmtime::TypedFunc<(), i32>,
     /// Proof-of-use counter: frames committed (unwind) since worker start.
     pub fm_frames_committed: wasmtime::TypedFunc<(), i64>,
@@ -4146,6 +4166,72 @@ pub(crate) fn compute_fork_module_region(layout: &ProcessLayout) -> anyhow::Resu
         "fork-module region top 0x{stack_top:x} does not fit in a wasm32 i32 address"
     );
     Ok((memory_base, region_bytes))
+}
+
+/// Real vfork (N1 residual): the child-private region a BORROWED vfork
+/// child needs, reserved up front (whether or not a vfork ever actually
+/// happens) for every `use_fork_module` process — the same "reserve now,
+/// use lazily" precedent as [`RESERVED_THREAD_SLOTS`].
+///
+/// A COW fork child reuses the PARENT's exact numeric [`ProcessLayout`]
+/// (`handle_fork`'s `let layout = processes[pi].layout;`), because it gets
+/// its OWN, separate `SharedMemory` — same addresses, different bytes. A
+/// vfork child instead shares the SAME `SharedMemory` as the parent, so
+/// reusing the parent's layout verbatim would make the child's own
+/// fork-module instance collide byte-for-byte with the still-live parent's
+/// one (both anchored at the SAME `compute_fork_module_region(&layout)`
+/// address). This function carves a SECOND, same-shaped fork-module region
+/// strictly BELOW the parent's own (`compute_fork_module_region` again, fed
+/// a synthetic layout whose `max_addr` is the parent's own region's base),
+/// plus a private channel and a private fixed-runtime-prefix target
+/// immediately below that — pure functions of `layout` alone, so parent and
+/// (thanks to `handle_fork`'s existing layout-reuse) any vfork child agree
+/// on the same numbers without needing any new per-process state.
+///
+/// At most one vfork child can ever be live per parent today (the kernel's
+/// own `vfork_child` re-entrancy guard, and this host's fork/vfork-is-
+/// main-thread-only restriction — see `kernel_fork`'s doc comment —
+/// together make a second concurrent borrower from the SAME parent
+/// unreachable), so reserving exactly one such region is always enough.
+#[derive(Debug, Clone, Copy)]
+struct VforkBorrowedRegion {
+    /// The ceiling every `use_fork_module` process's own `kernel_set_max_
+    /// addr` must use (via `launch_process`) instead of the raw fork-module
+    /// region base, so the guest's own brk/mmap allocator can never
+    /// encroach on either reserved region.
+    guest_ceiling: usize,
+    /// The `layout.max_addr` a borrowed child's OWN `instantiate_fork_
+    /// module` call must use (via a layout clone), so its module lands in
+    /// `[private_prefix's page, this)`, never overlapping the parent's own
+    /// live `[this, layout.max_addr)`.
+    child_module_max_addr: usize,
+    /// The child's private main channel — never the parent's own `layout.
+    /// channel_offset`.
+    channel_offset: usize,
+    /// The child-private `target` [`crates/fork-module`]'s `copy_borrowed_
+    /// child_prefix` (via `fm_begin_borrowed_child_replay`) copies the
+    /// parent's mutable fixed runtime prefix into.
+    private_prefix: usize,
+}
+
+fn compute_vfork_borrowed_region(layout: &ProcessLayout) -> anyhow::Result<VforkBorrowedRegion> {
+    let (parent_module_base, _) = compute_fork_module_region(layout)?;
+    let mut child_module_layout = *layout;
+    child_module_layout.max_addr = parent_module_base;
+    let (child_module_base, _) = compute_fork_module_region(&child_module_layout)?;
+    let reserved_below_child_module = CHANNEL_PAGES * WASM_PAGE_SIZE + WASM_PAGE_SIZE;
+    anyhow::ensure!(
+        child_module_base >= reserved_below_child_module,
+        "vfork-borrowed region has no room for a private channel/prefix below {child_module_base:#x}"
+    );
+    let channel_offset = child_module_base - CHANNEL_PAGES * WASM_PAGE_SIZE;
+    let private_prefix = channel_offset - WASM_PAGE_SIZE;
+    Ok(VforkBorrowedRegion {
+        guest_ceiling: private_prefix,
+        child_module_max_addr: parent_module_base,
+        channel_offset,
+        private_prefix,
+    })
 }
 
 pub(crate) fn instantiate_fork_module(
@@ -4391,6 +4477,7 @@ pub(crate) fn instantiate_fork_module(
         fm_begin_replay: fm_func!("fm_begin_replay": () => ()),
         fm_finish_replay: fm_func!("fm_finish_replay": () => ()),
         fm_begin_child_replay: fm_func!("fm_begin_child_replay": (u32, u32, u32) => ()),
+        fm_begin_borrowed_child_replay: fm_func!("fm_begin_borrowed_child_replay": (u32, u32, u32, u32) => ()),
         fm_last_errno: fm_func!("fm_last_errno": () => i32),
         fm_frames_committed: fm_func!("fm_frames_committed": () => i64),
         fm_frames_replayed: fm_func!("fm_frames_replayed": () => i64),
@@ -4527,7 +4614,18 @@ fn launch_process(
     // `handle_fork`). `use_fork_module == false` (every test that predates
     // this increment) keeps the plain `layout.max_addr` ceiling, byte-for-
     // byte unchanged.
-    let max_addr = if use_fork_module { compute_fork_module_region(&layout)?.0 } else { layout.max_addr };
+    //
+    // Real vfork (N1 residual): this ceiling must additionally exclude the
+    // SECOND, private region a future BORROWED vfork child's own co-resident
+    // fork-module instance would need inside this SAME `SharedMemory` (see
+    // `compute_vfork_borrowed_region`'s doc comment) — reserved here, up
+    // front, for every `use_fork_module` process regardless of whether it
+    // ever actually vforks, exactly like `RESERVED_THREAD_SLOTS`.
+    let max_addr = if use_fork_module {
+        compute_vfork_borrowed_region(&layout)?.guest_ceiling
+    } else {
+        layout.max_addr
+    };
 
     for (name, val) in [
         ("kernel_set_brk_base", set_brk_base.call(&mut *kernel_store, (pid, layout.brk_base as i32))?),
@@ -4565,6 +4663,103 @@ fn launch_process(
         next_thread_slot: 0,
         thread_handles,
         fork_format,
+        vfork_parent_release: None,
+    })
+}
+
+/// Real vfork (N1 residual): launch a BORROWED vfork child sharing the
+/// parent's exact `SharedMemory` handle (never `clone_guest_memory`'s
+/// private byte-copy) instead of `launch_process`'s "fresh, owned memory"
+/// shape. Mirrors `launch_process` closely (same `alloc_scratch`/`kernel_
+/// set_brk_base`/`kernel_set_mmap_base`/`kernel_set_max_addr` sequence,
+/// same `spawn_guest_thread` call), but:
+///   - brk/mmap bases are the PARENT's own unchanged values (real vfork
+///     shares the whole address space, heap included);
+///   - `max_addr` is `vregion.guest_ceiling` — the SAME numeric ceiling the
+///     parent's own launch already enforced (a pure function of `parent_
+///     layout`, so this pid's guest-visible ceiling matches the parent's
+///     exactly, as real vfork requires);
+///   - the channel offset and the fork-module's own `__memory_base` are
+///     BOTH the child-private addresses `compute_vfork_borrowed_region`
+///     reserved, never the parent's own (which would collide inside the
+///     literally-shared memory).
+///
+/// Does not set `vfork_parent_release` — the caller (`handle_fork`) does,
+/// once this returns, since only it knows the parent's own channel/request
+/// to defer.
+#[allow(clippy::too_many_arguments)]
+fn launch_vfork_borrowed_child(
+    engine: &Engine,
+    kernel_store: &mut Store<()>,
+    alloc_scratch: &wasmtime::TypedFunc<u32, i32>,
+    set_brk_base: &wasmtime::TypedFunc<(u32, i32), i32>,
+    set_mmap_base: &wasmtime::TypedFunc<(u32, i32), i32>,
+    set_max_addr: &wasmtime::TypedFunc<(u32, i32), i32>,
+    guest_module: Module,
+    guest_mem: SharedMemory,
+    parent_layout: ProcessLayout,
+    vregion: &VforkBorrowedRegion,
+    pid: u32,
+    fork_entry: ForkEntry,
+    fork_format: Option<Arc<GuestForkFormat>>,
+    fork_proof_of_use: Arc<Mutex<ForkProofOfUse>>,
+) -> anyhow::Result<GuestProcess> {
+    let scratch_ptr = alloc_scratch.call(&mut *kernel_store, MIN_CHANNEL_SIZE as u32)?;
+    if scratch_ptr <= 0 {
+        anyhow::bail!("kernel_alloc_scratch({MIN_CHANNEL_SIZE}) returned {scratch_ptr}");
+    }
+    let scratch_base = scratch_ptr as u32 as usize;
+
+    for (name, val) in [
+        (
+            "kernel_set_brk_base",
+            set_brk_base.call(&mut *kernel_store, (pid, parent_layout.brk_base as i32))?,
+        ),
+        (
+            "kernel_set_mmap_base",
+            set_mmap_base.call(&mut *kernel_store, (pid, parent_layout.brk_base as i32))?,
+        ),
+        (
+            "kernel_set_max_addr",
+            set_max_addr.call(&mut *kernel_store, (pid, vregion.guest_ceiling as i32))?,
+        ),
+    ] {
+        if val < 0 {
+            anyhow::bail!("{name} failed: {val}");
+        }
+    }
+
+    let mut child_layout = parent_layout;
+    child_layout.channel_offset = vregion.channel_offset;
+    child_layout.max_addr = vregion.child_module_max_addr;
+
+    let main_handle = spawn_guest_thread(
+        engine,
+        guest_module.clone(),
+        guest_mem.clone(),
+        child_layout,
+        Arc::new(Mutex::new(None)),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+        true, // a borrowed vfork child always co-resides its own fork-module
+        fork_entry,
+        fork_format.clone(),
+        fork_proof_of_use,
+    );
+    let mut thread_handles = HashMap::new();
+    thread_handles.insert(child_layout.channel_offset, main_handle);
+
+    Ok(GuestProcess {
+        pid,
+        module: guest_module,
+        memory: guest_mem,
+        scratch_base,
+        layout: child_layout,
+        channels: vec![PumpChannel { offset: child_layout.channel_offset, tid: pid, is_main: true }],
+        next_thread_slot: 0,
+        thread_handles,
+        fork_format,
+        vfork_parent_release: None,
     })
 }
 
@@ -4694,7 +4889,14 @@ fn spawn_guest_thread(
                 &guest_mem,
                 &layout,
                 Arc::clone(&externref_registry),
-                matches!(fork_entry, ForkEntry::Normal),
+                // A borrowed vfork child's own fork-module instance lands in
+                // a brand-new, never-before-touched region of the SHARED
+                // memory (see `compute_vfork_borrowed_region`'s doc
+                // comment) — exactly like a genuinely fresh (`Normal`)
+                // launch, unlike `ChildReplay`'s byte-for-byte COW copy
+                // (which already carries the parent's real seeded arena at
+                // the SAME address and must not be re-seeded).
+                matches!(fork_entry, ForkEntry::Normal | ForkEntry::ChildBorrowedReplay { .. }),
                 fork_format.as_ref().and_then(|f| f.gc_codec_descriptor.as_deref()),
             ) {
                 Ok(fm) => {
@@ -7074,7 +7276,12 @@ fn run_fork_capable_entry(
     // function at all: the guest's own export list is the ground truth.
     let bootstrap_export = match fork_entry {
         ForkEntry::Normal => wasm_posix_shared::abi::WPK_FORK_EXPORT_MODULE_BOOTSTRAP,
-        ForkEntry::ChildReplay { .. } => wasm_posix_shared::abi::WPK_FORK_EXPORT_MODULE_THREAD_BOOTSTRAP,
+        // A borrowed vfork child is ALSO a fresh instance over the (shared)
+        // memory — same "empty instance-local tables" shape as an ordinary
+        // COW `ChildReplay`, just borrowing rather than owning the bytes.
+        ForkEntry::ChildReplay { .. } | ForkEntry::ChildBorrowedReplay { .. } => {
+            wasm_posix_shared::abi::WPK_FORK_EXPORT_MODULE_THREAD_BOOTSTRAP
+        }
         ForkEntry::ChildPendingStub => unreachable!("handled above"),
     };
     if let Ok(bootstrap) = instance.get_typed_func::<(), ()>(&mut *store, bootstrap_export) {
@@ -7121,6 +7328,65 @@ fn run_fork_capable_entry(
         };
         if let Err(e) = rewind_begin.call(&mut *store, root) {
             eprintln!("wpk_fork_rewind_begin failed: {e:#}");
+            return;
+        }
+        coord.set_phase(ForkCoordPhase::Replaying);
+        coord.set_fork_result(0);
+        entry_is_lexical = false;
+    } else if let ForkEntry::ChildBorrowedReplay { root, image_ptr, image_len, private_prefix } =
+        fork_entry
+    {
+        // Real vfork (N1 residual): the borrowed sibling of the
+        // `ChildReplay` arm above. `module_buffer` is the parent's live,
+        // still-parked continuation anchor (`root`) — read-only; the guest's
+        // OWN mutable prefix state lands in `private_prefix` instead (see
+        // `ForkEntry::ChildBorrowedReplay`'s doc comment), so it never
+        // touches the parent's copy.
+        let Some(fm) = fork_module else {
+            eprintln!("vfork borrowed child replay requested with no fork-module");
+            return;
+        };
+        if let Err(e) = fm
+            .fm_begin_borrowed_child_replay
+            .call(&mut *store, (root, image_ptr, image_len, private_prefix))
+        {
+            eprintln!("fm_begin_borrowed_child_replay failed: {e:#}");
+            return;
+        }
+        match fm.fm_last_errno.call(&mut *store, ()) {
+            Ok(0) => {}
+            Ok(errno) => {
+                eprintln!("fm_begin_borrowed_child_replay failed: errno {errno}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("fm_last_errno after fm_begin_borrowed_child_replay failed: {e:#}");
+                return;
+            }
+        }
+        // N1 vfork residual scope: frames-only, matching this host's own
+        // COW-fork N1-I4 precedent (`smoke_fork_parent_child`) — reference
+        // reconstruction (funcref/externref/exnref/GC) for a BORROWED child
+        // is out of scope here (the fork-module's own borrowed-replay
+        // exports carry no module-state-arena/reference-graph handling —
+        // see `fm_begin_borrowed_child_replay`'s doc comment in
+        // `crates/fork-module/src/lib.rs`, which discusses only the
+        // continuation/frame state), so `drive_reference_replay` is
+        // deliberately NOT called on this path.
+        let Some(rewind_begin) = get_guest_export_typed::<u32, ()>(
+            &mut *store,
+            instance,
+            wasm_posix_shared::abi::WPK_FORK_EXPORT_REWIND_BEGIN,
+        ) else {
+            return;
+        };
+        // NOT `root`: the guest's active-frame-pointer rewrites during
+        // replay must land in the child-private prefix, never the parked
+        // parent's own copy — see `fm_begin_borrowed_child_replay`'s doc
+        // comment ("on success the host hands the guest `private_prefix` as
+        // the rewind root").
+        if let Err(e) = rewind_begin.call(&mut *store, private_prefix) {
+            eprintln!("wpk_fork_rewind_begin (borrowed) failed: {e:#}");
             return;
         }
         coord.set_phase(ForkCoordPhase::Replaying);
@@ -7805,6 +8071,14 @@ struct GuestProcess {
     /// drive a real [`ForkEntry::ChildReplay`] or must fall back to
     /// [`ForkEntry::ChildPendingStub`].
     fork_format: Option<Arc<GuestForkFormat>>,
+    /// Real vfork (N1 residual): `Some` only for a BORROWED vfork child —
+    /// its still-parked parent's own `SYS_FORK`/`SYS_VFORK` channel and
+    /// request, resolved (this pump loop calls `resolve_vfork_parent_
+    /// release`) the moment THIS process reaches `_exit` or a successful
+    /// `execve`/`execveat` commit, and never before — the real POSIX vfork
+    /// contract. `None` for every ordinary process (including an ordinary
+    /// COW fork child, which never defers its parent's completion).
+    vfork_parent_release: Option<VforkParentRelease>,
 }
 
 /// A blocking syscall parked awaiting readiness (or its timeout deadline). The
@@ -7994,6 +8268,42 @@ fn complete_channel(
         .atomic_notify((ch.offset + STATUS_OFFSET) as u64, 1)
         .map_err(|e| anyhow::anyhow!("atomic_notify failed: {e}"))?;
     Ok(())
+}
+
+/// Real vfork (N1 residual): what `handle_fork`'s `MODE_VFORK` branch defers
+/// instead of completing immediately — the still-parked parent's own
+/// `SYS_FORK`/`SYS_VFORK` channel and request. Resolved later by whichever
+/// pump-loop site first observes THIS specific child reaching `_exit` or a
+/// successful `execve`/`execveat` commit (see [`GuestProcess::vfork_parent_
+/// release`]'s doc comment) — never before, matching real POSIX vfork's
+/// contract that the parent stays suspended for exactly that long.
+struct VforkParentRelease {
+    parent_mem: SharedMemory,
+    scratch_ptr: usize,
+    ch: PumpChannel,
+    syscall_nr: u32,
+    args: [i64; 6],
+    child_pid: u32,
+}
+
+/// Resolve a still-parked vfork parent's channel with its child's real pid.
+/// The two call sites (child `_exit`, child `execve`/`execveat` success) are
+/// the ONLY two ways a real vfork's borrow window ends.
+fn resolve_vfork_parent_release(
+    kernel_mem: &SharedMemory,
+    release: VforkParentRelease,
+) -> anyhow::Result<()> {
+    complete_channel(
+        &release.parent_mem,
+        kernel_mem,
+        release.scratch_ptr,
+        release.ch,
+        release.syscall_nr,
+        &release.args,
+        &[],
+        release.child_pid as i64,
+        0,
+    )
 }
 
 /// Test-only hook (N1-R Task 2): counts every reclaimed guest thread whose
@@ -8322,6 +8632,15 @@ fn run_pump(
                     // unwaitable — see `run_guest`), for one uniform path.
                     let signal = get_exit_signal.call(&mut *kernel_store, pid).unwrap_or(0);
                     wait_table.lock().unwrap().exited.insert(pid, encode_wait_status(code, signal));
+                    // Real vfork (N1 residual): this pid may be a BORROWED
+                    // vfork child reaching `_exit` — release its still-
+                    // parked parent NOW, with this child's real pid. This is
+                    // one of the only two moments a real vfork's borrow
+                    // window may end (see `VforkParentRelease`'s doc
+                    // comment); `None` for every ordinary process.
+                    if let Some(release) = processes[pi].vfork_parent_release.take() {
+                        resolve_vfork_parent_release(kernel_mem, release)?;
+                    }
                     // No one reads a response to this final syscall (whether
                     // this is the boot process or a spawned child), so drop
                     // the channel (like a worker thread's exit) rather than
@@ -9147,6 +9466,108 @@ fn handle_fork(
     let child_pid = child_pid as u32;
 
     let layout = processes[pi].layout;
+
+    // Real vfork (N1 residual): a fork-instrumented parent's `vfork()` gets
+    // a genuinely BORROWED child instead of the ordinary COW path below —
+    // the child shares the parent's OWN `SharedMemory` handle (never
+    // `clone_guest_memory`'s private byte-copy) and the parent's own
+    // channel is deliberately NOT completed here; it stays parked (this
+    // pump-serviced call already returns without writing anything to `ch`)
+    // until this exact child reaches `_exit` or a successful `execve`/
+    // `execveat` (`resolve_vfork_parent_release`'s two call sites) — real
+    // POSIX vfork semantics. A NON-instrumented guest's vfork
+    // (`ForkEntry::ChildPendingStub`) has no coordinator to drive a real
+    // borrowed replay and falls through to the ordinary COW path below,
+    // unchanged from this host's pre-existing (POSIX-permissible, if
+    // weaker) behavior for that case.
+    if mode == MODE_VFORK {
+        if let ForkEntry::ChildReplay { root, image_ptr, image_len } = fork_entry {
+            let vregion = match compute_vfork_borrowed_region(&layout) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[host-native] vfork {child_pid}: borrowed-region layout failed: {e:#}");
+                    let removed = remove_process.call(&mut *kernel_store, child_pid)?;
+                    if removed < 0 {
+                        eprintln!(
+                            "[host-native] kernel_remove_process({child_pid}) after a vfork \
+                             region-layout failure failed: {removed}"
+                        );
+                    }
+                    return complete_channel(
+                        &guest_mem, kernel_mem, scratch_ptr, ch, syscall_nr, args, &[], -1,
+                        libc_errno::ENOMEM as u32,
+                    );
+                }
+            };
+            // Defensive: `launch_process`'s own `kernel_set_max_addr` already
+            // reserves this whole range, and instantiating the PARENT's own
+            // fork-module already grew `guest_mem` all the way to
+            // `layout.max_addr` (which covers every byte below it) — this is
+            // a cheap, idempotent insurance call, not new growth in practice.
+            grow_to_cover(&guest_mem, layout.max_addr)?;
+            unsafe {
+                write_bytes(&guest_mem, vregion.channel_offset, &vec![0u8; MIN_CHANNEL_SIZE]);
+            }
+            let child_mem = guest_mem.clone();
+            let child_module = processes[pi].module.clone();
+            let borrowed_entry = ForkEntry::ChildBorrowedReplay {
+                root,
+                image_ptr,
+                image_len,
+                private_prefix: vregion.private_prefix as u32,
+            };
+            wait_table.lock().unwrap().parent_of.insert(child_pid, parent_pid);
+            let launched = launch_vfork_borrowed_child(
+                engine,
+                kernel_store,
+                alloc_scratch,
+                set_brk_base,
+                set_mmap_base,
+                set_max_addr,
+                child_module,
+                child_mem,
+                layout,
+                &vregion,
+                child_pid,
+                borrowed_entry,
+                fork_format.clone(),
+                Arc::clone(fork_proof_of_use),
+            );
+            let mut child = match launched {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[host-native] vfork child {child_pid} launch failed: {e:#}");
+                    let removed = remove_process.call(&mut *kernel_store, child_pid)?;
+                    if removed < 0 {
+                        eprintln!(
+                            "[host-native] kernel_remove_process({child_pid}) after a vfork \
+                             launch failure failed: {removed}"
+                        );
+                    }
+                    return complete_channel(
+                        &guest_mem, kernel_mem, scratch_ptr, ch, syscall_nr, args, &[], -1,
+                        libc_errno::ENOMEM as u32,
+                    );
+                }
+            };
+            child.vfork_parent_release = Some(VforkParentRelease {
+                parent_mem: guest_mem.clone(),
+                scratch_ptr,
+                ch,
+                syscall_nr,
+                args: *args,
+                child_pid,
+            });
+            processes.push(child);
+            // Deliberately do NOT `complete_channel(ch, ...)` here — see this
+            // block's doc comment. The parent's calling OS thread stays
+            // parked (still busy-polling `STATUS_PENDING` on its own
+            // channel, exactly like an ordinary blocking syscall) until one
+            // of `resolve_vfork_parent_release`'s two call sites runs.
+            return Ok(());
+        }
+    }
+
     let child_mem = match clone_guest_memory(engine, &guest_mem) {
         Ok(m) => m,
         Err(e) => {
@@ -9530,7 +9951,7 @@ fn handle_exec_common(
         Ok(v) => v,
         Err(error) => {
             return Ok(Some(terminate_process_after_failed_exec_commit(
-                kernel_store, processes, pi, pid, remove_process, wait_table,
+                kernel_store, kernel_mem, processes, pi, pid, remove_process, wait_table,
                 "compute_guest_memory", &error,
             )));
         }
@@ -9557,7 +9978,7 @@ fn handle_exec_common(
         Ok(v) => v,
         Err(error) => {
             return Ok(Some(terminate_process_after_failed_exec_commit(
-                kernel_store, processes, pi, pid, remove_process, wait_table,
+                kernel_store, kernel_mem, processes, pi, pid, remove_process, wait_table,
                 "launch_process", &error,
             )));
         }
@@ -9582,6 +10003,18 @@ fn handle_exec_common(
     // resumes the doomed image, and none leaks anymore (validated by the
     // spike, `docs/plans/2026-09-05-native-thread-reclamation-spike.md`,
     // `exp_d`).
+    //
+    // Real vfork (N1 residual): `pid` may be a BORROWED vfork child that
+    // just reached a successful `execve`/`execveat` — release its still-
+    // parked parent NOW, before the swap, with this child's real pid. This
+    // is one of the only two moments a real vfork's borrow window may end
+    // (see `VforkParentRelease`'s doc comment). The child's own memory has
+    // already been fully replaced by `compute_guest_memory` above (a fresh,
+    // private `SharedMemory`, never shared with anyone) by this point, so
+    // the borrow is truly over regardless of when the parent wakes up.
+    if let Some(release) = processes[pi].vfork_parent_release.take() {
+        resolve_vfork_parent_release(kernel_mem, release)?;
+    }
     let old_proc = std::mem::replace(&mut processes[pi], new_proc);
     reclaim_all_channels(old_proc);
     Ok(None)
@@ -9662,6 +10095,7 @@ fn cancel_exec_target(
 /// (`run_pump`) can fold it into `root_exit_code` when `pi == 0`.
 fn terminate_process_after_failed_exec_commit(
     kernel_store: &mut Store<()>,
+    kernel_mem: &SharedMemory,
     processes: &mut [GuestProcess],
     pi: usize,
     pid: u32,
@@ -9692,6 +10126,19 @@ fn terminate_process_after_failed_exec_commit(
     }
     const FATAL_EXIT_CODE: i32 = 128 + 9; // shell convention: "killed by SIGKILL"
     wait_table.lock().unwrap().exited.insert(pid, encode_wait_status(FATAL_EXIT_CODE, 0));
+    // Real vfork (N1 residual): never leave a vfork parent parked forever,
+    // even on this rare post-commit-failure path — see `VforkParentRelease`'s
+    // doc comment. `pid` here is already fatally terminated either way, so
+    // the parent wakes with this dead child's real pid, exactly like the
+    // ordinary `_exit`/`execve` release sites.
+    if let Some(release) = processes[pi].vfork_parent_release.take() {
+        if let Err(e) = resolve_vfork_parent_release(kernel_mem, release) {
+            eprintln!(
+                "[host-native] resolving a vfork parent after a post-commit {stage} failure \
+                 failed: {e:#}"
+            );
+        }
+    }
     processes[pi].channels.clear();
     FATAL_EXIT_CODE
 }
