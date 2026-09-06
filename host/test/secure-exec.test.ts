@@ -17,28 +17,15 @@ const probeBinary = join(
 const hasProbe = true;
 const SECURE_STDOUT_SENTINEL = "secure-stdout-sentinel\n";
 const SECURE_STDERR_SENTINEL = "secure-stderr-sentinel\n";
-const localeMo = new Uint8Array([
-  0xde, 0x12, 0x04, 0x95, 0, 0, 0, 0,
-  1, 0, 0, 0, 28, 0, 0, 0, 36, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  3, 0, 0, 0, 44, 0, 0, 0,
-  3, 0, 0, 0, 48, 0, 0, 0,
-  0x53, 0x75, 0x6e, 0, 0x4c, 0x6f, 0x6b, 0,
-]);
-const emptyCatalog = new Uint8Array([
-  0xff, 0x88, 0xff, 0x89,
-  0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0,
-]);
-const testZone = new Uint8Array([
-  0x54, 0x5a, 0x69, 0x66, 0x31,
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0,
-  0, 0, 0, 1, 0, 0, 0, 4,
-  0, 0, 0x0e, 0x10, 0, 0,
-  0x54, 0x53, 0x54, 0,
-]);
+
+// The probe's locale/catalog/timezone fixtures used to be staged at /tmp by a
+// dedicated VirtualPlatformIO mount here. The in-kernel tmpfs is now the
+// unconditional authority over /tmp (VFS: make in-kernel tmpfs scratch mounts
+// unconditional; delete WASM_POSIX_TMPFS kill-switch), so a host-side /tmp
+// mount is never consulted for a guest open under that scratch prefix.
+// secure-exec-probe.c now writes its own fixtures into /tmp at the top of
+// `check_sensitive_lookups`, through the same guest syscalls a real setuid
+// target would use.
 
 function createProbeIo(honorsSetId: boolean): VirtualPlatformIO {
   const bytes = new Uint8Array(readFileSync(probeBinary!));
@@ -47,19 +34,12 @@ function createProbeIo(honorsSetId: boolean): VirtualPlatformIO {
   );
   root.mkdir("/bin", 0o755);
   root.mkdir("/dev", 0o755);
-  root.mkdir("/tmp", 0o1777);
   root.createFileWithOwner("/bin/secure-parent", 0o4755, 0, 0, bytes);
   root.createFileWithOwner("/bin/secure-child", 0o755, 0, 0, bytes);
-  const tmp = MemoryFileSystem.create(new SharedArrayBuffer(1024 * 1024));
-  tmp.chmod("/", 0o1777);
-  tmp.createFileWithOwner("/zz_TEST", 0o644, 1000, 1000, localeMo);
-  tmp.createFileWithOwner("/secure.cat", 0o644, 1000, 1000, emptyCatalog);
-  tmp.createFileWithOwner("/secure-zone", 0o644, 1000, 1000, testZone);
 
   return new VirtualPlatformIO([
     { mountPoint: "/", backend: root, nosuid: !honorsSetId },
     { mountPoint: "/dev", backend: new DeviceFileSystem(), nosuid: true },
-    { mountPoint: "/tmp", backend: tmp, nosuid: true },
   ], new NodeTimeProvider());
 }
 

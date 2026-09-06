@@ -27080,10 +27080,24 @@ export class CentralizedKernelWorker {
       return { kind: "unsupported" };
     }
     if (stat.hostHandle === null) {
-      // MemFd and synthetic regular files complete fstat inside the kernel,
-      // so there is no persistent host capability to retain. They need a
-      // kernel-owned mapping bridge; MAP_PRIVATE keeps its fd-pread path.
-      return { kind: "error", errno: ENOTSUP };
+      // MemFd and synthetic regular files (including in-kernel tmpfs — Phase 5
+      // cutover) complete fstat inside the kernel, so there is no persistent
+      // host capability to retain for genuine MAP_SHARED writeback: a write
+      // through this mapping would need a kernel-owned mapping bridge that
+      // does not exist yet, so a *writable* shared mapping is an honest
+      // ENOTSUP.
+      //
+      // A read-only request needs no such bridge: nothing can ever write
+      // through it, so there is nothing to keep coherent with the backing
+      // store beyond the same one-time content snapshot a MAP_PRIVATE mapping
+      // already gets. Treat it exactly like the MAP_PRIVATE path
+      // ("unsupported" falls through to `populateMmapFromFile`'s fd-pread
+      // population) instead of failing outright — otherwise every read-only
+      // MAP_SHARED mmap of a kernel-owned regular file (e.g. musl's
+      // `__map_file`, used by locale/timezone/message-catalog loading) fails
+      // with ENOTSUP purely because the file happens to live on tmpfs.
+      if (writable) return { kind: "error", errno: ENOTSUP };
+      return { kind: "unsupported" };
     }
     const accessResult = this.getFdAccessModeForSharedMapping(
       channel,
