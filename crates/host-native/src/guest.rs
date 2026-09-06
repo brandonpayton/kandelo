@@ -2506,17 +2506,19 @@ fn ensure_gc_transit_capacity(
 #[derive(Clone)]
 struct GcConstructorRecord {
     layout_id: u32,
-    /// Constructor-only scalar bytes. Always empty for a STRUCT: `crates/
+    /// Constructor-only scalar bytes, already truncated to exactly the
+    /// specialized layout's `provenance_scalar_length` (0..=16 bytes) by
+    /// [`GcProvenanceRegistry::begin`] — see that method's doc comment for
+    /// where the length comes from (the guest's own GC-codec descriptor,
+    /// decoded once per guest OS thread). Always empty for a STRUCT (`crates/
     /// fork-codec/src/gc_codec.rs`'s `validate_layout_payload` rejects a
     /// struct layout whose `provenance_scalar_length != 0` — a struct
     /// constructor's only provenance-worthy arguments are its reference
-    /// fields — so no GC-codec-descriptor decode is needed on native to
-    /// know the correct truncation length for that case. An ARRAY layout
-    /// (`ArrayData`/`ArrayElement`) CAN carry exactly 8 provenance scalar
-    /// bytes (a segment offset+length seed); native does not yet decode
-    /// that descriptor to disambiguate an 8-byte-real case from a 0-byte
-    /// one, so `gc_define` keeps ARRAY gated rather than guess — see its
-    /// own doc comment.
+    /// fields). An ARRAY layout can carry up to 16 real provenance scalar
+    /// bytes (e.g. an `ArrayData`/`ArrayElement` segment offset+length seed,
+    /// or an `ArrayNew` scalar fill value up to `v128` width) — the
+    /// descriptor is what disambiguates each specialized layout's exact
+    /// count from the 0 bytes other constructor forms carry.
     scalars: Vec<u8>,
     /// Constructor-time reference-typed arguments, in canonical order.
     /// `None` is a null seed (e.g. a zero-length nullable-array-of-refs
@@ -2557,11 +2559,45 @@ struct GcProvenanceRegistry {
     finalized: Vec<(wasmtime::OwnedRooted<AnyRef>, GcConstructorRecord)>,
     pending: Option<PendingGcProvenance>,
     next_token: i32,
+    /// N1-F6 Task 5 (array un-gate): per-SPECIALIZED-layout provenance
+    /// scalar byte length (`GcLayoutDescriptor::provenance_scalar_length`,
+    /// 0..=16), decoded once from the guest's own `kandelo.wpk_fork.gc_codec`
+    /// descriptor via `fork_codec::gc_codec::decode_gc_codec` — the SAME
+    /// descriptor bytes already threaded through for `fm_set_activation_
+    /// gc_codec` (`GuestForkFormat::gc_codec_descriptor`), reused here rather
+    /// than re-read. This is the ONLY thing that can tell [`Self::begin`] how
+    /// many of the fixed 16-byte `scalarLo`/`scalarHi` wire bytes a given
+    /// constructor's provenance record actually uses — see
+    /// `module_gc_codec.rs`'s `constructor_provenance`. Empty for a guest
+    /// with no GC codec at all.
+    provenance_scalar_lengths: HashMap<u32, u32>,
 }
 
 impl GcProvenanceRegistry {
-    fn new() -> Self {
-        Self { finalized: Vec::new(), pending: None, next_token: 1 }
+    /// `fork_format` is the SAME `Option<&GuestForkFormat>` computed once at
+    /// guest-module-load time for this guest OS thread (see `spawn_guest_
+    /// thread`'s `fork_format` parameter) — not re-parsed from raw wasm
+    /// bytes here. A guest that declares `gc_provenance_begin` at all always
+    /// has fork-instrument emit a well-formed descriptor alongside it (the
+    /// same tool, same pass, same module); a decode failure here would mean
+    /// the descriptor bytes are corrupt or the wrong shape, a genuine build
+    /// defect worth surfacing loudly rather than silently degrading to
+    /// zero-length provenance for every layout — so a decode failure leaves
+    /// this map EMPTY, and `begin()` then fails closed (see its own doc
+    /// comment) instead of guessing.
+    fn new(fork_format: Option<&GuestForkFormat>) -> Self {
+        let provenance_scalar_lengths = fork_format
+            .and_then(|format| format.gc_codec_descriptor.as_deref())
+            .and_then(|bytes| fork_codec::gc_codec::decode_gc_codec(bytes).ok())
+            .map(|codec| {
+                codec
+                    .layouts
+                    .into_iter()
+                    .map(|layout| (layout.id, layout.provenance_scalar_length))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { finalized: Vec::new(), pending: None, next_token: 1, provenance_scalar_lengths }
     }
 
     /// `ForkGcProvenanceRegistry::begin` port (`host/src/fork-gc-codec.ts:
@@ -2569,6 +2605,18 @@ impl GcProvenanceRegistry {
     /// `object`. Defensively aborts any stale pending transaction first —
     /// mirrors the TS registry's own `abortPending()` guard — so a trap
     /// between a PRIOR `begin` and its `end` can never poison this one.
+    ///
+    /// `scalars` arrives as the full 16-byte `scalarLo ++ scalarHi` wire pair
+    /// every provenance-wrapper call site packs (`emit_provenance_scalars`,
+    /// `module_gc_codec.rs:660-704`) — real bytes always land in the LEADING
+    /// bytes of that buffer (little-endian), with the rest zero-padding. This
+    /// truncates to exactly `layout_id`'s `provenance_scalar_length`
+    /// (looked up in [`Self::provenance_scalar_lengths`]) before storing, so
+    /// [`GcConstructorRecord::scalars`] is never longer than what the layout
+    /// actually declares — a MISSING layout id (would mean the descriptor
+    /// and the wrapper that called this disagree, a genuine build defect)
+    /// fails closed rather than guessing a length and risking silently
+    /// corrupt or oversized scalar bytes downstream.
     fn begin(
         &mut self,
         mut store: impl wasmtime::AsContextMut,
@@ -2578,6 +2626,20 @@ impl GcProvenanceRegistry {
         reference_count: u32,
     ) -> wasmtime::Result<i32> {
         self.abort_pending();
+        let expected_len = *self.provenance_scalar_lengths.get(&layout_id).ok_or_else(|| {
+            wasmtime::Error::msg(format!(
+                "gc_provenance_begin: layout {layout_id} is missing from the GC-codec descriptor"
+            ))
+        })? as usize;
+        if expected_len > scalars.len() {
+            return Err(wasmtime::Error::msg(format!(
+                "gc_provenance_begin: layout {layout_id} declares {expected_len} provenance \
+                 scalar bytes, exceeding the {} the wire buffer carries",
+                scalars.len()
+            )));
+        }
+        let mut scalars = scalars;
+        scalars.truncate(expected_len);
         let owned = object.to_owned_rooted(&mut store)?;
         let token = self.next_token;
         self.next_token = self.next_token.checked_add(1).unwrap_or(1);
@@ -4288,7 +4350,8 @@ fn spawn_guest_thread(
         // `gc_capture_layout`/`gc_define`'s real capture bodies. ONE
         // instance per guest OS thread, matching `ExternrefProvenance`'s own
         // per-generation lifetime argument.
-        let gc_provenance = Arc::new(Mutex::new(GcProvenanceRegistry::new()));
+        let gc_provenance =
+            Arc::new(Mutex::new(GcProvenanceRegistry::new(fork_format.as_deref())));
         // N1-I5b Task 1: raw `Func::to_raw` pointer -> this guest's own
         // funcref-catalog ordinal (activation 0 — single-activation only,
         // matching the REPLAY-side funcref-catalog mirror below), populated
@@ -5629,20 +5692,14 @@ fn spawn_guest_thread(
             // `std::sync::Mutex` held on this thread across a call that
             // re-locks it would deadlock.
             //
-            // ARRAY stays GATED here even though it reaches this far: an
-            // `ArrayData`/`ArrayElement` provenance record carries exactly 8
-            // real scalar seed bytes that only the GC-codec descriptor (not
-            // yet decoded on native) can distinguish from the 0 bytes every
-            // other array constructor's provenance carries — see
-            // `GcConstructorRecord::scalars`'s doc comment. The node is still
-            // fully DEFINED (never left dangling in `pending_gc` —
-            // `ReferenceGraphBuilder::validate` rejects that) so an
-            // interspersed array capture in the same fork as a supported
-            // struct/i31 stays internally consistent; `mark_unsupported`
-            // still forces the WHOLE fork to gate before any child ever
-            // reads this graph, so the array's best-effort (possibly
-            // mis-truncated) scalars are never actually used to reconstruct
-            // anything.
+            // ARRAY is no longer gated here (N1-F6 Task 5): `GcConstructor
+            // Record::scalars` is already truncated to exactly the
+            // specialized layout's `provenance_scalar_length` by
+            // `GcProvenanceRegistry::begin` (using the SAME GC-codec
+            // descriptor `fm_set_activation_gc_codec` seeds), so copying it
+            // verbatim is correct for both KIND_STRUCT (always 0 bytes) and
+            // KIND_ARRAY (0..=16 real bytes per its constructor form) — no
+            // per-kind special-casing is needed.
             let gc_define_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_DEFINE;
             if guest_declares(gc_define_name) {
                 const KIND_STRUCT: i32 = 1;
@@ -5675,9 +5732,12 @@ fn spawn_guest_thread(
                         let mut provenance_ids: Vec<u32> = Vec::new();
                         let mut provenance_scalars: Vec<u8> = Vec::new();
                         if let Some(record) = &record {
-                            if kind == KIND_ARRAY {
-                                provenance_scalars.clone_from(&record.scalars);
-                            }
+                            // Already truncated to the specialized layout's
+                            // exact `provenance_scalar_length` by
+                            // `GcProvenanceRegistry::begin` — always 0 bytes
+                            // for KIND_STRUCT, 0..=16 real bytes for
+                            // KIND_ARRAY. No per-kind branch needed.
+                            provenance_scalars.clone_from(&record.scalars);
                             for reference in &record.references {
                                 let id = match reference {
                                     None => 0,
@@ -5707,13 +5767,6 @@ fn spawn_guest_thread(
                                 };
                                 provenance_ids.push(id);
                             }
-                        }
-
-                        if kind == KIND_ARRAY {
-                            capture_for_gc
-                                .lock()
-                                .unwrap()
-                                .mark_unsupported("struct/array: array provenance scalar length");
                         }
 
                         let snapshot = if scalar_byte_length > 0 {
