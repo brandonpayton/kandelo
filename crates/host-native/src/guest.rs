@@ -8075,6 +8075,43 @@ fn run_worker_thread(
         fork_module = Some(fm);
     }
 
+    // N1 residual #4a: `env.__wpk_fork_resume_table` — mirrors
+    // `spawn_guest_thread`'s identical wiring (see its doc comment for the
+    // full rationale). This is NOT reference-specific: it is the real,
+    // cross-activation dispatch table `wpk_fork_resume_start` `call_indirect`
+    // s during EVERY replay (frames-only or not), so — unlike the large
+    // FUNCTION-only reference-capture import family below, which
+    // `define_unknown_imports_as_traps` safely stubs because a frames-only
+    // fork never calls any of them — this table must hold REAL guest funcrefs
+    // or the first replay traps `undefined element: out of bounds table
+    // access`. Populated further below, once this thread's own `Instance`
+    // exists (must run BEFORE `linker.instantiate`, same as the frame
+    // imports/unwind tag above — an import must be defined before
+    // instantiation resolves it).
+    let mut resume_table: Option<wasmtime::Table> = None;
+    if let Some(fmt) = fork_format.as_ref() {
+        if let Some(import) = module.imports().find(|i| {
+            i.module() == "env" && i.name() == wasm_posix_shared::abi::WPK_FORK_RESUME_IMPORT_TABLE
+        }) {
+            let declared = match import.ty() {
+                ExternType::Table(t) => t,
+                other => anyhow::bail!(
+                    "guest env.{} is a {other:?}, not a table",
+                    wasm_posix_shared::abi::WPK_FORK_RESUME_IMPORT_TABLE
+                ),
+            };
+            let needed = fmt.catalog_ordinals.len() as u64 + 1;
+            let min = needed.max(declared.minimum());
+            let min = u32::try_from(min)
+                .map_err(|_| anyhow::anyhow!("resume table minimum {min} does not fit in a wasm32 table size"))?;
+            let max = declared.maximum().map(|m| u32::try_from(m).unwrap_or(u32::MAX));
+            let table_ty = wasmtime::TableType::new(declared.element().clone(), min, max);
+            let table = Table::new(&mut store, table_ty, Ref::Func(None))?;
+            linker.define(&mut store, "env", wasm_posix_shared::abi::WPK_FORK_RESUME_IMPORT_TABLE, table)?;
+            resume_table = Some(table);
+        }
+    }
+
     // `kernel_fork` (N1 residual #4a): mirrors `spawn_guest_thread`'s own
     // import byte-for-byte, except closed over THIS thread's `channel_offset`
     // and its own, freshly-created `coord`/`capture` above — see this
@@ -8163,16 +8200,101 @@ fn run_worker_thread(
         )?;
     }
 
+    // `kernel_exit` (pre-existing, orthogonal gap this task also closes):
+    // `libc/glue/channel_syscall.c`'s generic dispatcher calls
+    // `kernel.kernel_exit` DIRECTLY for a per-thread `SYS_EXIT` (musl's
+    // `__pthread_exit` path for a NORMALLY-RETURNING thread — distinct from
+    // `SYS_EXIT_GROUP`, which stays on the generic channel path and a
+    // detached thread's `__unmapself` teardown, which posts `SYS_munmap`
+    // then `SYS_exit` over the ordinary channel, matching `is_unreachable_
+    // trap`'s doc comment below). Before this task NO worker-thread `Store`
+    // wired this import at all (an unrelated, pre-existing gap this exact
+    // shape's fixture — a pthread that actually RETURNS rather than parking
+    // forever — happens to also exercise; see `native_thread.c`'s own doc
+    // comment: "a returning pthread would run musl's detached-thread
+    // teardown ... which needs thread-teardown machinery the minimal native
+    // host does not provide yet"). Reuses `post_thread_exit` (the SAME
+    // channel-post-and-wait sequence a thread's `__unmapself` path already
+    // drives) so `run_pump`'s existing per-thread exit handling (`kernel_
+    // thread_exit`, clearing the child-tid futex, dropping the channel) is
+    // the ONE path every worker-thread exit goes through, whether reached
+    // via `__unmapself`'s ordinary channel post or `__pthread_exit`'s direct
+    // import. Returns an `Err` carrying `ThreadKernelExit` (never `Ok`,
+    // matching this import's own `_Noreturn` C declaration) so the entry
+    // loop below can recognize it as a clean, already-handled exit rather
+    // than a genuine failure.
+    {
+        let mem = guest_mem.clone();
+        let ch = channel_offset;
+        linker.func_wrap(
+            "kernel",
+            "kernel_exit",
+            move |_c: Caller<'_, ()>, _status: i32| -> wasmtime::Result<()> {
+                post_thread_exit(&mem, ch);
+                Err(wasmtime::Error::new(ThreadKernelExit))
+            },
+        )?;
+    }
+
     // The worker reaches the kernel through the syscall glue (its own
     // channel), not through the remaining kernel.* imports (kernel_clone,
-    // kernel_wait4, kernel_exit, kernel_get_argc, ...), so every OTHER
-    // kernel.* import can still trap — unchanged from before this task.
-    // Nested `pthread_create`/`kernel_clone` FROM a worker thread is a
-    // separate, pre-existing, out-of-scope gap (the SAME "import not wired
+    // kernel_wait4, kernel_get_argc, ...), so every OTHER kernel.* import
+    // can still trap — unchanged from before this task. Nested `pthread_
+    // create`/`kernel_clone` FROM a worker thread is a separate, pre-
+    // existing, out-of-scope gap (the SAME "import not wired
     // on this Store" shape this task fixes for `kernel_fork` alone).
+    //
+    // N1 residual #4a: the large reference-capture (`__wpk_fork_ref_*`) and
+    // module-state-save/restore FUNCTION import family is declared by every
+    // fork-instrumented guest unconditionally, regardless of whether it ever
+    // actually captures a reference — see `spawn_guest_thread`'s identical
+    // "N1-I4 Task 3" doc comment. A frames-only fork (this fixture's own
+    // shape) never calls any of them, so leaving every FUNCTION import in
+    // that family to `define_unknown_imports_as_traps` above (a trap only
+    // fires if actually CALLED) is the same accepted platform boundary
+    // `smoke_fork_parent_child` already validates on the main thread. The
+    // NON-function imports in that same family (`env.__wpk_fork_ref_gc_
+    // transit`, a table; the two `__wpk_fork_module_*` globals) cannot be
+    // trap-stubbed (a trap has no meaning for a table/global read), so they
+    // fall through to `define_unknown_imports_as_default_values` — the
+    // zero/empty value for their declared type, unreachable by a
+    // frames-only fork for the exact same reason.
     linker.define_unknown_imports_as_traps(module)?;
+    linker.define_unknown_imports_as_default_values(&mut store, module)?;
 
     let instance = linker.instantiate(&mut store, module)?;
+
+    // N1 residual #4a: populate `env.__wpk_fork_resume_table` from THIS
+    // thread's own newly-created `Instance` — mirrors `spawn_guest_thread`'s
+    // identical post-instantiate population (see its doc comment); the data
+    // source (`__wpk_fork_resume_catalog`, the guest's own exported table)
+    // does not exist until instantiation completes, so this must run after
+    // `linker.instantiate` and before this thread ever calls into a resume
+    // path that `call_indirect`s against it.
+    if let (Some(fmt), Some(dest)) = (fork_format.as_ref(), resume_table.as_ref()) {
+        if !fmt.catalog_ordinals.is_empty() {
+            let catalog = instance
+                .get_table(&mut store, "__wpk_fork_resume_catalog")
+                .ok_or_else(|| anyhow::anyhow!("guest missing __wpk_fork_resume_catalog export"))?;
+            for (i, &local_slot) in fmt.catalog_local_slots.iter().enumerate() {
+                let thunk = match catalog.get(&mut store, u64::from(local_slot)) {
+                    Some(Ref::Func(Some(f))) => Ref::Func(Some(f)),
+                    Some(other) => {
+                        anyhow::bail!("__wpk_fork_resume_catalog[{local_slot}] is {other:?}, not a function")
+                    }
+                    None => anyhow::bail!(
+                        "__wpk_fork_resume_catalog[{local_slot}] is out of bounds (catalog size {})",
+                        catalog.size(&mut store)
+                    ),
+                };
+                // Slot `i + 1`, not `i` — slot `0` is the reserved "no resume
+                // event" sentinel, exactly like `spawn_guest_thread`'s
+                // identical population.
+                let slot = i as u64 + 1;
+                dest.set(&mut store, slot, thunk)?;
+            }
+        }
+    }
 
     // Thread prelude (mirrors the TS thread worker): initialize this thread's
     // TLS in its slot, point __stack_pointer at the pthread stack, then run musl
@@ -8208,7 +8330,33 @@ fn run_worker_thread(
         bootstrap.call(&mut store, ())?;
     }
 
-    // Call the thread entry via the indirect function table with its argument.
+    // N1 residual #4a: `wasm-fork-instrument` generates TWO different
+    // "resume-selected call" wrappers for a fork-instrumented guest —
+    // `wpk_fork_resume_start` (`() -> ()`, hardcoded to invoke `_start`
+    // DIRECTLY — see `emit_fixed_resume_boundaries`'s own
+    // `CallTarget::Direct(start)`) and `wpk_fork_resume_thread` (`(i32,
+    // i32) -> i32`, `CallTarget::Indirect` over `__indirect_function_
+    // table` — the ONE shaped for a pthread entry point). Both share the
+    // SAME underlying "is this a fresh call or a resume?" dispatch
+    // (`emit_resume_selected_call`); they differ only in what a FRESH
+    // (non-replayed) call actually invokes. `resume_start` is `_start`-only
+    // and is NEVER correct here (confirmed empirically: calling it for a
+    // worker thread's own resume, or from a fork CHILD launched by a
+    // worker-thread-originated fork, traps `indirect call type mismatch`
+    // inside `wpk_fork_resume_start` — this was this task's real, deep RED
+    // state, not a wiring omission). `resume_thread` takes the SAME
+    // `(table_index, argument)` pair on EVERY call — both the very first
+    // (lexical) entry and every later replay re-entry — since its own
+    // internal dispatch, not this host, decides whether to actually invoke
+    // `__indirect_function_table[table_index](argument)` fresh or resume a
+    // captured continuation instead. A non-instrumented guest declares
+    // neither export, so this falls back to the ORIGINAL raw indirect-call
+    // mechanism unchanged (`smoke_fork_from_thread`'s non-instrumented
+    // sibling scenario, and every pre-existing worker-thread test, use this
+    // branch).
+    let resume_thread = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, wasm_posix_shared::abi::WPK_FORK_EXPORT_RESUME_THREAD)
+        .ok();
     let table = instance
         .get_table(&mut store, "__indirect_function_table")
         .ok_or_else(|| anyhow::anyhow!("guest missing __indirect_function_table"))?;
@@ -8221,34 +8369,21 @@ fn run_worker_thread(
     };
 
     // N1 residual #4a: mirrors `run_fork_capable_entry`'s own loop shape — a
-    // lexical call (here, the pthread's real entry function via the
-    // indirect table, exactly like the pre-existing code did) that may
-    // escape as a THROWN `__wpk_fork_unwind` exception exactly once (a fresh
-    // `fork()` call capturing this thread's own live call stack), after
-    // which this drives the SAME capture/seal/launch-child sequence
-    // (`drive_fork_capture_seal_and_launch_child`, already generic over
-    // "which channel") and re-enters via the module's `wpk_fork_resume_
-    // start` export — a uniform `() -> ()` dispatcher that replays back down
-    // to the ORIGINAL `fork()` call site regardless of what kind of function
-    // (`_start`, or here, a pthread entry point) originally led there.
-    let resume_start = instance
-        .get_typed_func::<(), ()>(&mut store, wasm_posix_shared::abi::WPK_FORK_EXPORT_RESUME_START)
-        .ok();
+    // call that may escape as a THROWN `__wpk_fork_unwind` exception exactly
+    // once (a fresh `fork()` call capturing this thread's own live call
+    // stack), after which this drives the SAME capture/seal/launch-child
+    // sequence (`drive_fork_capture_seal_and_launch_child`, already generic
+    // over "which channel") and re-enters via `resume_thread` — using the
+    // IDENTICAL `(fn_ptr, arg)` pair every time (see above for why this is
+    // correct on both the lexical and the replay call).
     let mut entry_is_lexical = true;
     let result = loop {
-        let step = if entry_is_lexical {
-            let results_len = func.ty(&store).results().len();
-            let mut results = vec![Val::I32(0); results_len];
-            func.call(&mut store, &[Val::I32(arg as i32)], &mut results)
-        } else {
-            match resume_start.as_ref() {
-                Some(f) => f.call(&mut store, ()),
-                None => {
-                    break Err(anyhow::anyhow!(
-                        "guest is missing {} for a required fork replay",
-                        wasm_posix_shared::abi::WPK_FORK_EXPORT_RESUME_START
-                    ));
-                }
+        let step = match resume_thread.as_ref() {
+            Some(f) => f.call(&mut store, (fn_ptr as i32, arg as i32)).map(|_| ()),
+            None => {
+                let results_len = func.ty(&store).results().len();
+                let mut results = vec![Val::I32(0); results_len];
+                func.call(&mut store, &[Val::I32(arg as i32)], &mut results)
             }
         };
         match step {
@@ -8257,6 +8392,12 @@ fn run_worker_thread(
             // `unreachable` to halt the thread. That trap is the expected, clean end
             // of the thread, exactly like the process exit trap on the main thread.
             Err(e) if is_unreachable_trap(&e) => break Ok(()),
+            // `kernel_exit`'s own closure already posted SYS_EXIT and
+            // completed the channel round trip (see its wiring's doc
+            // comment) before returning this marker error to force the wasm
+            // call stack to unwind — an already-fully-handled, clean exit,
+            // not a failure.
+            Err(e) if e.downcast_ref::<ThreadKernelExit>().is_some() => break Ok(()),
             Err(e) if is_thrown_exception_escape(&e) => {
                 // Only valid straight after the LEXICAL entry captured a
                 // fresh fork; an exception escaping during a replay/resume
@@ -8336,6 +8477,22 @@ fn run_worker_thread(
 
     result
 }
+
+/// N1 residual #4a: marker error `run_worker_thread`'s own `kernel_exit`
+/// import closure returns to force its calling wasm frame to unwind — see
+/// that closure's doc comment. Not a real failure; `run_worker_thread`'s
+/// entry loop recognizes this exact type and treats it as an
+/// already-fully-handled clean exit, exactly like `is_unreachable_trap`.
+#[derive(Debug)]
+struct ThreadKernelExit;
+
+impl std::fmt::Display for ThreadKernelExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "kernel_exit (worker thread)")
+    }
+}
+
+impl std::error::Error for ThreadKernelExit {}
 
 /// Whether a Wasmtime error is a guest `unreachable` trap (the expected halt at
 /// the end of the process/thread exit path).

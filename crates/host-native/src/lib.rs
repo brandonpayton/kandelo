@@ -282,6 +282,63 @@ mod tests {
     use std::time::Instant;
     use wasm_posix_shared::Syscall;
 
+    /// N1 residual #4a (non-main-thread `fork()`), non-instrumented sibling
+    /// of `smoke_fork_from_thread`: proves the CORE claim — a pthread's
+    /// `fork()` no longer silently kills the OS thread and no joiner hangs —
+    /// on a plain, non-fork-instrumented guest (`enable_fork_module: false`).
+    /// This is the SAME real-world-common case as `native_thread.c`'s own
+    /// (non-forking) pthread test, just with a `fork()` added, and it is
+    /// fully GREEN end to end (unlike the fork-instrumented sibling — see
+    /// that test's doc comment for the deeper, out-of-native-scope blocker).
+    ///
+    /// RED (pre-fix): identical crash to `smoke_fork_from_thread`'s own RED
+    /// state — an unknown-import trap on `kernel.kernel_fork` silently ended
+    /// the pthread's OS thread; `main`'s `pthread_join` then hung until the
+    /// pump's 30s hard cap.
+    ///
+    /// GREEN: `exit_code == 0`, `stdout` contains "parent\n" (the pthread
+    /// resumed after `fork()` and reaped the child via `waitpid`) and
+    /// "joined\n" (`main`'s `pthread_join` genuinely returned — the pthread
+    /// also reached its own ordinary `pthread_exit` teardown cleanly, which
+    /// needed this task's OTHER small fix: wiring `kernel.kernel_exit` on a
+    /// worker thread's `Store` too — musl's per-thread `SYS_EXIT` calls it
+    /// DIRECTLY, `libc/glue/channel_syscall.c`, a separate, pre-existing gap
+    /// this task's fixture happened to also exercise). `stdout` does NOT
+    /// contain "child\n": a non-instrumented guest's fork child has no
+    /// `wpk_fork_*` exports to replay through, so `handle_fork` falls back
+    /// to `ForkEntry::ChildPendingStub` — the child never runs any of its
+    /// copied program (a pre-existing, accepted, documented limitation of
+    /// EVERY non-instrumented fork, unrelated to which thread called it).
+    #[test]
+    fn smoke_fork_from_thread_non_instrumented() -> anyhow::Result<()> {
+        let Some(path) = kernel_path_or_skip() else {
+            return Ok(());
+        };
+        let guest_wasm = include_bytes!("../fixtures/native_fork_from_thread.wasm");
+        let options = guest::GuestOptions { enable_fork_module: false, ..Default::default() };
+        let outcome = guest::run_guest(&path, guest_wasm, &options)?;
+        assert_eq!(
+            outcome.exit_code, 0,
+            "(stdout: {:?}, stderr: {:?}, trace: {:?})",
+            String::from_utf8_lossy(&outcome.stdout),
+            String::from_utf8_lossy(&outcome.stderr),
+            outcome.syscall_trace,
+        );
+        let stdout = String::from_utf8_lossy(&outcome.stdout);
+        assert!(
+            stdout.contains("parent\n"),
+            "expected the forking PTHREAD to resume after fork() and print \
+             \"parent\\n\": {stdout:?}"
+        );
+        assert!(
+            stdout.contains("joined\n"),
+            "expected main()'s pthread_join to actually return (the OS thread was \
+             NOT silently killed mid-fork(), AND its own later pthread_exit teardown \
+             completed cleanly): {stdout:?}"
+        );
+        Ok(())
+    }
+
     /// Return the kernel path, or `None` (with a clear skip message) if it has
     /// not been built. This keeps a fresh checkout without built binaries from
     /// failing with an obscure file-not-found panic; it is not a substitute for
@@ -1776,6 +1833,173 @@ mod tests {
         // this fixture's switch-dispatch-driven resume, even with a
         // genuinely live `marker` local; the `exit_code == 3` assertion
         // above is the actual frame-preservation proof).
+        let proof = outcome.fork_proof_of_use;
+        assert_eq!(
+            proof.references_reconstructed, 0,
+            "frames-only fork must never reconstruct a reference: {proof:?}"
+        );
+        assert_eq!(
+            proof.externrefs_resolved, 0,
+            "frames-only fork must never resolve an externref: {proof:?}"
+        );
+        assert_eq!(
+            proof.exnrefs_reconstructed, 0,
+            "frames-only fork must never reconstruct an exnref: {proof:?}"
+        );
+        assert_eq!(
+            proof.gc_nodes_reconstructed, 0,
+            "frames-only fork must never reconstruct a typed-GC node: {proof:?}"
+        );
+        Ok(())
+    }
+
+    /// N1 residual #4a (non-main-thread `fork()`): the SAME real-fork proof
+    /// as `smoke_fork_parent_child`, except `fork()` is called from a
+    /// PTHREAD the main thread spawns, never the main thread itself.
+    ///
+    /// RED (pre-fix) state, confirmed live before `guest::run_worker_
+    /// thread` wired `kernel.kernel_fork` on a worker thread's own `Store`:
+    /// `kernel.kernel_fork` was an unknown import on that `Store` (`Linker::
+    /// define_unknown_imports_as_traps` stubbed it, along with every other
+    /// `kernel.*` import) — a worker-thread `fork()` call hit that trap and
+    /// unwound the pthread's ENTIRE Wasm call stack with no channel post, no
+    /// POSIX-shaped return value, and no signal. `run_worker_thread`'s
+    /// caller only special-cased the ordinary `unreachable` exit trap, so
+    /// this different trap fell to `Err(e) => Err(e.into())` and the OS
+    /// thread simply ended; musl's `pthread_join` on it then spun forever on
+    /// a "thread exited" word the dead thread's own exit protocol never got
+    /// to write (real threads clear it via `kernel_thread_exit`, never
+    /// reached here) — this fixture's `main()` would never print "joined\n"
+    /// or return, and `run_guest` would only ever come back via the pump's
+    /// unconditional 30s hard-cap `bail!` (a bounded, not truly infinite,
+    /// RED signal — see `run_pump`'s doc comment), never a clean result.
+    ///
+    /// GREEN proves the OS thread was NOT silently killed and no joiner
+    /// hangs:
+    ///  - `exit_code == 3`: `main`'s `pthread_join` actually returned the
+    ///    forking pthread's own return value (`forker`'s reaped, real
+    ///    `WEXITSTATUS`) — impossible if that OS thread died mid-`fork()`.
+    ///  - `stdout` contains "child\n" (the replayed child ran its copied
+    ///    program), "parent\n" (the SAME pthread — not `main` — resumed
+    ///    after `fork()` and reaped the child), and "joined\n" (`main`'s
+    ///    `pthread_join` genuinely returned, not just `fork()`'s own
+    ///    channel round trip — the strongest available proof the pthread's
+    ///    OS thread reached its own ordinary, cooperative exit protocol
+    ///    afterward, rather than merely not crashing mid-fork).
+    ///  - `marker`'s live-local round trip and the frames-only proof
+    ///    counters mirror `smoke_fork_parent_child`'s identical reasoning —
+    ///    this fixture is the SAME program, just with `fork()` moved from
+    ///    `main` into a pthread `main` creates and joins.
+    ///
+    /// STILL RED, for a DIFFERENT, DEEPER reason than the wiring gap above
+    /// (which this task's `run_worker_thread` changes DO fix — see
+    /// `smoke_fork_from_thread_non_instrumented`, fully GREEN, for proof the
+    /// core "OS thread silently killed" bug is closed for every guest,
+    /// instrumented or not). This exact fork-INSTRUMENTED case hits a
+    /// SEPARATE wall in `crates/fork-instrument`/`crates/fork-codec`
+    /// (explicitly out of this NATIVE-ONLY task's scope), found only after
+    /// wiring the correct native-side machinery and debugging past several
+    /// red herrings:
+    ///   - Confirmed NOT a nested-call-depth issue (a scratch fixture
+    ///     calling the SAME fork()-containing function synchronously from
+    ///     `main`, no thread involved, passes).
+    ///   - Confirmed NOT "reached via an indirect/function-pointer call" in
+    ///     general (a scratch fixture calling that function through a
+    ///     function pointer, still on the main thread/Store, ALSO passes).
+    ///   - Confirmed NOT a fork-module memory-region collision between this
+    ///     thread's own co-resident fork-module instance and the process's
+    ///     main-thread one (forcing this thread's instance into the
+    ///     vfork-borrowed region, i.e. a genuinely distinct address range,
+    ///     changed nothing).
+    ///   - Confirmed NOT a `GuestForkFormat`/resume-catalog mismatch (the
+    ///     computed `fixed_prefix_size`/`catalog_ordinals`/`catalog_local_
+    ///     slots` are byte-for-byte identical across the passing and failing
+    ///     fixtures).
+    ///   - Root-caused to the WRONG resume export: `wasm-fork-instrument`
+    ///     emits TWO "resume-selected call" wrappers per fork-instrumented
+    ///     guest (`emit_fixed_resume_boundaries`) — `wpk_fork_resume_start`
+    ///     (`() -> ()`, hardcoded to re-invoke `_start` DIRECTLY) and
+    ///     `wpk_fork_resume_thread` (`(table_index, argument) -> result`,
+    ///     dispatching through `__indirect_function_table` — the ONE shaped
+    ///     for a pthread entry point, matching the Node/browser reference
+    ///     model this task's own grounding doc names,
+    ///     `host/src/worker-main.ts`'s `wpk_fork_resume_thread`). Calling
+    ///     `resume_start` for a worker thread (this task's first attempt)
+    ///     trapped `indirect call type mismatch` inside `_start`'s own
+    ///     replay — a genuinely wrong entry point, not a missing import.
+    ///   - Switching to `resume_thread` (implemented in `run_worker_thread`)
+    ///     gets substantially further — the fork is captured, the channel
+    ///     round trip completes, and a real child process is created — but
+    ///     the FINAL re-entry into `resume_thread` for the PARENT's own
+    ///     replay now traps `undefined element: out of bounds table access`.
+    ///     Traced (via `crates/fork-codec::rewind_driver::RewindDriver::
+    ///     resume_peek` / `ResumeSlotTable::slot_for`) to the JOURNAL's own
+    ///     resume-slot selection returning a slot number this host's
+    ///     `__wpk_fork_resume_table` population does not cover for a chain
+    ///     whose outermost frame is a `resume_thread`-reached pthread entry
+    ///     (as opposed to `resume_start`'s `_start`) — a `crates/fork-
+    ///     instrument`/`crates/fork-codec` behavior this NATIVE-ONLY task
+    ///     must not modify (and Node/browser's own `wpk_fork_resume_thread`
+    ///     usage was not independently verified against this exact scenario
+    ///     either — this may be a genuinely new gap, not merely
+    ///     native-specific).
+    ///
+    /// `#[ignore]`d rather than deleted or left failing: an honest, visible,
+    /// documented residual (Platform Values Contract) beats either hiding
+    /// the gap or leaving CI red for a wall this task cannot close within
+    /// its NATIVE-ONLY scope. Re-run with `cargo test -- --ignored` once the
+    /// fork-instrument/fork-codec side is fixed.
+    #[ignore = "N1 residual #4a: fork-instrumented worker-thread replay hits a \
+                crates/fork-instrument|fork-codec resume-slot gap for a \
+                wpk_fork_resume_thread-reached (non-_start) captured chain — \
+                see this test's doc comment for the full root-cause trace"]
+    #[test]
+    fn smoke_fork_from_thread() -> anyhow::Result<()> {
+        let Some(path) = kernel_path_or_skip() else {
+            return Ok(());
+        };
+        let Some(_fork_module_path) = fork_module_path_or_skip() else {
+            return Ok(());
+        };
+        let guest_wasm = include_bytes!("../fixtures/native_fork_from_thread.instrumented.wasm");
+
+        let options = guest::GuestOptions { enable_fork_module: true, ..Default::default() };
+        let outcome = guest::run_guest(&path, guest_wasm, &options)?;
+
+        assert_eq!(
+            outcome.exit_code, 3,
+            "the joined pthread's reaped WEXITSTATUS must be the child's REAL _exit(3) \
+             (stdout: {:?}, stderr: {:?}, trace: {:?}, proof: {:?})",
+            String::from_utf8_lossy(&outcome.stdout),
+            String::from_utf8_lossy(&outcome.stderr),
+            outcome.syscall_trace,
+            outcome.fork_proof_of_use,
+        );
+        let stdout = String::from_utf8_lossy(&outcome.stdout);
+        assert!(
+            stdout.contains("child\n"),
+            "expected the REPLAYED child to run its copied program and print \
+             \"child\\n\": {stdout:?}"
+        );
+        assert!(
+            stdout.contains("parent\n"),
+            "expected the forking PTHREAD to resume after fork() and print \
+             \"parent\\n\": {stdout:?}"
+        );
+        assert!(
+            stdout.contains("joined\n"),
+            "expected main()'s pthread_join to actually return (the OS thread was \
+             NOT silently killed mid-fork()): {stdout:?}"
+        );
+        assert!(
+            outcome.syscall_trace.contains(&wasm_posix_shared::abi::host_intercepted::SYS_FORK),
+            "expected the SYS_FORK sentinel in the syscall trace: {:?}",
+            outcome.syscall_trace
+        );
+
+        // Frames-only fork (same fixture shape as `smoke_fork_parent_child`,
+        // just called from a pthread) must never reconstruct a reference —
+        // see that test's doc comment for why these stay exactly `0`.
         let proof = outcome.fork_proof_of_use;
         assert_eq!(
             proof.references_reconstructed, 0,

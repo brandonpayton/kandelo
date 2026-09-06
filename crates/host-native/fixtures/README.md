@@ -107,6 +107,38 @@ scripts/dev-shell.sh bash -lc '
 
 Like every other fixture, `__abi_version` must match the kernel's ABI.
 
+## `native_fork_from_thread.instrumented.wasm` / `native_fork_from_thread.wasm`
+
+`smoke_fork_from_thread`'s (currently `#[ignore]`d) and `smoke_fork_from_
+thread_non_instrumented`'s (passing) fixtures (N1 residual #4a,
+non-main-thread `fork()`): the SAME real-fork proof as `native_fork.c`,
+except `fork()` is called from a PTHREAD `main` creates and joins, never the
+main thread itself. `main` calls `pthread_create`, the pthread's own
+`forker` function calls `fork()`, and `main`'s `pthread_join` must return
+the forking pthread's own reaped exit status — proving the pthread's OS
+thread was not silently killed and no joiner hangs. The non-instrumented
+`.wasm` sibling is fully working (see that test's doc comment); the
+`.instrumented.wasm` variant currently hits a deeper `crates/fork-
+instrument`/`crates/fork-codec` resume-slot gap for a `wpk_fork_resume_
+thread`-reached (non-`_start`) captured chain — see `smoke_fork_from_
+thread`'s own doc comment for the full root-cause trace.
+
+Regenerate both from within the dev shell, same recipe as `native_fork.
+instrumented.wasm`:
+
+```sh
+SYSROOT=<repo>/sysroot scripts/dev-shell.sh bash crates/host-native/fixtures/build-fixtures.sh
+
+scripts/dev-shell.sh bash -lc '
+  cd crates/host-native/fixtures
+  <repo>/scripts/run-wasm-fork-instrument.sh \
+    native_fork_from_thread.wasm -o native_fork_from_thread.instrumented.wasm \
+    --entry kernel.kernel_fork
+'
+```
+
+Like every other fixture, `__abi_version` must match the kernel's ABI.
+
 ## `native_fork_refs.instrumented.wasm`
 
 `smoke_fork_reconstructs_references`'s fixture (N1-I5 Task 3, currently
