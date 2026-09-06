@@ -1648,8 +1648,22 @@ interface PreparedFileSharedMmap {
   backing: SharedMmapBacking;
 }
 
+/**
+ * A writable MAP_SHARED of a kernel-owned regular file (in-kernel tmpfs — Phase
+ * 5 cutover) has no persistent host handle, so it cannot use the host-owned
+ * byte-store backing. It instead flows writes back to the file through the
+ * guest's own kernel fd via pread (initial load) and pwrite (msync/munmap/exec/
+ * teardown flush) — the bare fd-tracked writeback path.
+ */
+interface FdWritebackSharedMmap {
+  fd: number;
+  fileOffset: number;
+  len: number;
+}
+
 type FileSharedMmapPreparationResult =
   | { kind: "prepared"; context: PreparedFileSharedMmap }
+  | { kind: "fd-writeback"; context: FdWritebackSharedMmap }
   | { kind: "unsupported" }
   | { kind: "error"; errno: number };
 
@@ -13598,15 +13612,24 @@ export class CentralizedKernelWorker {
                     fileSharedMmapPreparation.context,
                     entry,
                   )
-                : fileSharedMmapPreparation?.kind === "unsupported"
-                  ? fileSharedMmapPreparation
-                  : this.mapSharedMmapFromFile(
-                    channel,
-                    retVal,
-                    origArgs,
-                    rawArgs[5] ?? 0n,
-                    entry,
-                  );
+                : fileSharedMmapPreparation?.kind === "fd-writeback"
+                  ? this.registerFdWritebackSharedMmap(
+                      channel,
+                      retVal,
+                      fileSharedMmapPreparation.context,
+                      origArgs,
+                      rawArgs[5] ?? 0n,
+                      entry,
+                    )
+                  : fileSharedMmapPreparation?.kind === "unsupported"
+                    ? fileSharedMmapPreparation
+                    : this.mapSharedMmapFromFile(
+                      channel,
+                      retVal,
+                      origArgs,
+                      rawArgs[5] ?? 0n,
+                      entry,
+                    );
             fileSharedMmapPreparation = null;
             if (this.hostReaped?.has(channel.pid)) return;
             if (sharedResult.kind === "unsupported") {
@@ -27043,6 +27066,16 @@ export class CentralizedKernelWorker {
       rawPageOffset,
       entry,
     );
+    if (preparation.kind === "fd-writeback") {
+      return this.registerFdWritebackSharedMmap(
+        channel,
+        mapAddr,
+        preparation.context,
+        origArgs,
+        rawPageOffset,
+        entry,
+      );
+    }
     if (preparation.kind !== "prepared") return preparation;
     return this.registerPreparedSharedMmap(
       channel,
@@ -27082,22 +27115,49 @@ export class CentralizedKernelWorker {
     if (stat.hostHandle === null) {
       // MemFd and synthetic regular files (including in-kernel tmpfs — Phase 5
       // cutover) complete fstat inside the kernel, so there is no persistent
-      // host capability to retain for genuine MAP_SHARED writeback: a write
-      // through this mapping would need a kernel-owned mapping bridge that
-      // does not exist yet, so a *writable* shared mapping is an honest
-      // ENOTSUP.
+      // host handle to anchor the host-owned byte-store backing that ordinary
+      // (host-file) MAP_SHARED mappings use.
       //
-      // A read-only request needs no such bridge: nothing can ever write
-      // through it, so there is nothing to keep coherent with the backing
-      // store beyond the same one-time content snapshot a MAP_PRIVATE mapping
-      // already gets. Treat it exactly like the MAP_PRIVATE path
+      // A read-only request needs no writeback bridge at all: nothing can ever
+      // write through it, so there is nothing to keep coherent with the
+      // backing store beyond the same one-time content snapshot a MAP_PRIVATE
+      // mapping already gets. Treat it exactly like the MAP_PRIVATE path
       // ("unsupported" falls through to `populateMmapFromFile`'s fd-pread
-      // population) instead of failing outright — otherwise every read-only
-      // MAP_SHARED mmap of a kernel-owned regular file (e.g. musl's
-      // `__map_file`, used by locale/timezone/message-catalog loading) fails
-      // with ENOTSUP purely because the file happens to live on tmpfs.
-      if (writable) return { kind: "error", errno: ENOTSUP };
-      return { kind: "unsupported" };
+      // population) — otherwise every read-only MAP_SHARED mmap of a
+      // kernel-owned regular file (e.g. musl's `__map_file`, used by
+      // locale/timezone/message-catalog loading) fails with ENOTSUP purely
+      // because the file happens to live on tmpfs.
+      if (!writable) return { kind: "unsupported" };
+
+      // A *writable* mapping still needs its writes to reach the kernel-owned
+      // file. It does so through the guest's own kernel fd: pread for the
+      // initial load and pwrite at every explicit publication point
+      // (msync/munmap/exec/teardown). This is the bare fd-tracked writeback
+      // path, which is already wired into `flushSharedMappings`,
+      // `prepareAddressSpaceForExec`, and `releaseSharedMemoryForProcess`.
+      //
+      // POSIX requires a shared writable file mapping to be backed by a
+      // readable+writable descriptor. The file is already known to be a
+      // regular file (S_IFMT check above); requiring O_RDWR is the remaining
+      // guarantee that a `pwrite` through this fd is accepted.
+      //
+      // The kernel's `fd_supports_mmap_writeback` capability is deliberately
+      // NOT consulted here: it answers "does a host `pwrite` reach persistent
+      // *host* storage", which is false for every kernel-owned file precisely
+      // because those files have no host handle. This path does not write to
+      // host storage — it writes back to the kernel-owned file through the
+      // guest's own fd, so the file itself is the backing store.
+      const fdAccess = this.getFdAccessModeForSharedMapping(
+        channel,
+        fd,
+        entry,
+      );
+      if (fdAccess.kind === "error") return fdAccess;
+      if (fdAccess.value !== O_RDWR) return { kind: "error", errno: EACCES };
+      return {
+        kind: "fd-writeback",
+        context: { fd, fileOffset, len },
+      };
     }
     const accessResult = this.getFdAccessModeForSharedMapping(
       channel,
@@ -27220,6 +27280,46 @@ export class CentralizedKernelWorker {
       this.releasePreparedSharedMmap(context, entry);
       return { kind: "error", errno: this.sharedMmapErrno(err) };
     }
+  }
+
+  /**
+   * Install a bare fd-tracked writable MAP_SHARED mapping of a kernel-owned
+   * (tmpfs) file after a successful kernel mmap. The region is first populated
+   * from the file through the guest's kernel fd (pread), then registered
+   * without a host byte-store backing so that every publication point
+   * (msync/munmap/exec/teardown) flushes its writes back to the same file
+   * through the guest fd (pwrite). This is the writeback bridge for files that
+   * have no persistent host handle.
+   */
+  private registerFdWritebackSharedMmap(
+    channel: ChannelInfo,
+    mapAddr: number,
+    context: FdWritebackSharedMmap,
+    origArgs: number[],
+    rawPageOffset: bigint,
+    entry?: KernelWorkerEntryContext,
+  ): FileSharedMmapResult {
+    const processMem = new Uint8Array(channel.memory.buffer);
+    if (mapAddr + context.len > processMem.length) {
+      return { kind: "error", errno: EIO };
+    }
+    // Initial content load through the guest's kernel fd, identical to the
+    // read-only tmpfs fall-through, so the mapping observes the file's current
+    // bytes before any write.
+    this.populateMmapFromFile(channel, mapAddr, origArgs, rawPageOffset, entry);
+    if (this.hostReaped?.has(channel.pid)) return { kind: "mapped" };
+    let pidMap = this.sharedMappings.get(channel.pid);
+    if (!pidMap) {
+      pidMap = new Map();
+      this.sharedMappings.set(channel.pid, pidMap);
+    }
+    pidMap.set(mapAddr, {
+      fd: context.fd,
+      fileOffset: context.fileOffset,
+      len: context.len,
+      writable: true,
+    });
+    return { kind: "mapped" };
   }
 
   /** Resolve a backend-qualified identity from the live handle, never its path. */
