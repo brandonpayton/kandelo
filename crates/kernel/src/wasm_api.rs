@@ -201,7 +201,6 @@ unsafe extern "C" {
     ) -> i32;
     fn host_futex_wait(addr: usize, expected: u32, timeout_ns_lo: u32, timeout_ns_hi: u32) -> i32;
     fn host_futex_wake(addr: usize, count: u32) -> i32;
-    fn host_is_thread_worker() -> i32;
     fn host_bind_framebuffer(
         pid: i32,
         addr: usize,
@@ -9995,6 +9994,20 @@ pub extern "C" fn kernel_mprotect(addr: usize, len: usize, prot: u32) -> i32 {
     result
 }
 
+/// True when the currently-dispatched task is a pthread worker rather than
+/// the process leader (main thread).
+///
+/// A process leader's tid is its pid; pthread tids live in the owning
+/// `Process` record (the same convention `syscalls.rs` uses elsewhere, e.g.
+/// `caller_tid != proc.pid`). This used to be a host-supplied fact
+/// (`host_is_thread_worker()`), but the kernel already tracks the exact
+/// information needed to derive it — the currently-bound tid is set by
+/// `kernel_set_current_tid`/`ProcessTable::bind_current_tid` before any
+/// exported syscall runs — so no host import is needed here.
+fn current_task_is_thread_worker(proc: &Process) -> bool {
+    syscalls::current_tid_for_process(proc) != proc.pid
+}
+
 /// Commit the current task's exit transition and return its recorded status.
 ///
 /// WHY: the host adapter must be able to verify process exit without treating
@@ -10006,7 +10019,7 @@ fn commit_current_task_exit(status: i32) -> i32 {
     let committed_status;
     {
         let (_gkl, proc, advisory_locks) = unsafe { get_process_and_advisory_locks() };
-        if unsafe { host_is_thread_worker() } != 0 {
+        if current_task_is_thread_worker(proc) {
             // Thread exit: don't destroy shared process state (FDs, pipes, etc.).
             // Just set exit status and return — the guest import traps after
             // the host completes its exit-channel handshake.
@@ -13450,6 +13463,38 @@ mod thread_exit_tests {
             kernel_thread_exit_in_table(&mut pt, 9_999, tid),
             Err(Errno::ESRCH)
         );
+    }
+}
+
+/// H2 (host-surface minimization): `current_task_is_thread_worker` replaced
+/// the `host_is_thread_worker()` host import. These tests pin the exact
+/// derivation `commit_current_task_exit` relies on: a process leader (main
+/// thread, tid == pid) is never a thread worker; a pthread task (tid != pid)
+/// always is — using a standalone `ProcessTable`, not the kernel's global
+/// singleton, so the test carries no dependency on ambient kernel state.
+#[cfg(test)]
+mod thread_worker_derivation_tests {
+    use super::*;
+
+    #[test]
+    fn main_thread_leader_is_not_a_thread_worker() {
+        let mut pt = crate::process_table::ProcessTable::new();
+        let leader = pt.create_process().unwrap();
+        pt.bind_current_tid(leader, leader).unwrap();
+
+        let (proc, _locks) = pt.current_process_and_advisory_locks().unwrap();
+        assert!(!current_task_is_thread_worker(proc));
+    }
+
+    #[test]
+    fn pthread_task_is_a_thread_worker() {
+        let mut pt = crate::process_table::ProcessTable::new();
+        let leader = pt.create_process().unwrap();
+        let tid = pt.create_thread(leader, leader, 0, 0, 0x2000).unwrap();
+        pt.bind_current_tid(leader, tid).unwrap();
+
+        let (proc, _locks) = pt.current_process_and_advisory_locks().unwrap();
+        assert!(current_task_is_thread_worker(proc));
     }
 }
 

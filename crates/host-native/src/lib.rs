@@ -59,9 +59,13 @@ pub const KERNEL_MEMORY_MAX_PAGES: u32 = 16384;
 /// The 2026-08-25 feasibility spike measured 83 on the ABI-43 kernel; the
 /// ABI-44 opaque-transport flip dropped one (→82), and the Phase-5 in-kernel
 /// rootfs overlay added two byte-provider imports (`host_blob_read`,
-/// `host_fetch_archive`), so the real reconciled ABI-44 artifact imports 84
-/// (verified via `wasm-objdump -x local-binaries/kernel.wasm`).
-pub const EXPECTED_HOST_IMPORT_COUNT: usize = 84;
+/// `host_fetch_archive`), bringing the reconciled ABI-44 artifact to 84.
+/// Workstream H2 (host-surface minimization) then removed
+/// `host_is_thread_worker`: the kernel now derives that fact internally
+/// (current tid vs. the process leader's pid, `commit_current_task_exit` in
+/// `crates/kernel/src/wasm_api.rs`) instead of asking the host, dropping the
+/// count to 83 (verified via `wasm-objdump -x local-binaries/kernel.wasm`).
+pub const EXPECTED_HOST_IMPORT_COUNT: usize = 83;
 
 /// The observed shape of the kernel's `env.memory` import.
 #[derive(Debug, Clone)]

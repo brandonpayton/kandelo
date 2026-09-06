@@ -1660,7 +1660,11 @@ fn define_kernel_host_imports(
             },
         )?;
     }
-    // host_debug_log(ptr, len): kernel diagnostics → this host's stderr.
+    // host_debug_log(ptr, len): kernel diagnostics → this host's stderr,
+    // raw bytes verbatim. No added prefix, no added newline: any prefix/
+    // newline is the Rust caller's responsibility (baked into the `&str`
+    // passed to `runtime_core::debug_log`), so native and Node/browser
+    // produce byte-for-byte identical output for the same call.
     {
         let mem = kernel_mem.clone();
         linker.func_wrap(
@@ -1672,9 +1676,7 @@ fn define_kernel_host_imports(
                 }
                 let bytes = unsafe { read_bytes(&mem, ptr as u32 as usize, len as usize) };
                 let mut err = std::io::stderr();
-                let _ = err.write_all(b"[kernel] ");
                 let _ = err.write_all(&bytes);
-                let _ = err.write_all(b"\n");
             },
         )?;
     }
@@ -2082,10 +2084,6 @@ fn define_kernel_host_imports(
             },
         )?;
     }
-    // host_is_thread_worker() -> i32: 0 — the single guest is the process
-    // leader (tid == pid), not a pthread worker, so exit_group takes the full
-    // process-exit path in commit_current_task_exit.
-    linker.func_wrap("env", "host_is_thread_worker", |_c: Caller<'_, ()>| -> i32 { 0 })?;
     // host_getrandom(buf_ptr, len) -> i32: OS entropy via /dev/urandom.
     {
         let mem = kernel_mem.clone();

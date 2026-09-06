@@ -900,7 +900,6 @@ export class WasmPosixKernel {
     token: object;
     handle: number | null;
   } | null = null;
-  isThreadWorker = false;
   /**
    * Live `/dev/fb0` mappings the kernel has reported via
    * `host_bind_framebuffer`. Renderers (canvas in browser, no-op in
@@ -1537,11 +1536,21 @@ export class WasmPosixKernel {
     return {
       env: {
         memory,
+        // Raw byte sink to this host's stderr: no added prefix, no added
+        // newline. Any prefix/newline is the Rust caller's responsibility
+        // (baked into the `&str` passed to `runtime_core::debug_log`), so
+        // Node/browser and native produce byte-for-byte identical output.
+        // Reuses the same callback/process/console fallback chain as the
+        // fd=2 (stderr) path in `#hostWriteAt`.
         host_debug_log: (ptr: KernelPointer, len: number): void => {
-          const msg = new TextDecoder().decode(
-            this.#readKernelBytes(ptr, len),
-          );
-          console.log(`[KERNEL] ${msg}`);
+          const data = this.#readKernelBytes(ptr, len);
+          if (this.callbacks.onStderr) {
+            this.callbacks.onStderr(data);
+          } else if (typeof process !== "undefined" && process.stderr) {
+            process.stderr.write(data);
+          } else {
+            console.error(new TextDecoder().decode(data));
+          }
         },
         host_open: (pathPtr: KernelPointer, pathLen: number, flags: number, mode: number): bigint => {
           return this.#hostOpen(pathPtr, pathLen, flags, mode);
@@ -2039,9 +2048,6 @@ export class WasmPosixKernel {
         },
         host_futex_wake: (addr: KernelPointer, count: number): number => {
           return this.#hostFutexWake(addr, count);
-        },
-        host_is_thread_worker: (): number => {
-          return this.isThreadWorker ? 1 : 0;
         },
         // /dev/fb0 hooks: the kernel notifies the host when a process
         // maps or unmaps the framebuffer. The registry is purely
