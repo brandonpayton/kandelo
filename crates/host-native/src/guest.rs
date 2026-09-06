@@ -2457,6 +2457,42 @@ fn define_externref_payload_probe(linker: &mut Linker<()>) -> anyhow::Result<()>
     Ok(())
 }
 
+/// N1-I5b Task 1: define `env.native_test_funcref_call(f: funcref) -> i32` —
+/// a TEST-ONLY diagnostic import, never declared by a real program, that
+/// CALLS `f` (a niladic, `i32`-returning function — the only shape this
+/// task's fixture needs) from HOST Rust and returns its result (`-1` for a
+/// null funcref, never expected for a value this fixture's own capture/
+/// replay path produces). This is the funcref analogue of
+/// [`define_externref_payload_probe`]'s `native_test_externref_payload`, and
+/// exists for the SAME reason: `native_fork_refs.wat`'s own doc comment
+/// explains why a genuine funcref VALUE cannot be produced or manipulated
+/// from portable C on this SDK's toolchain, so the WAT fixture needs some
+/// host-provided way to prove "the reconstructed LOCAL, when called, returns
+/// the sentinel's value" without a wasm-level call mechanism of its own.
+/// Deliberately does NOT go through a wasm table/`call_indirect` — an
+/// earlier version of this fixture wrote the local into a destination table
+/// before calling it and tripped a SEPARATE, unrelated gap (`wasm-fork-
+/// instrument` tracks every `table.set` anywhere in the module for
+/// module-state/table-dirty-page capture, an out-of-scope-for-this-task
+/// import family with no native host body yet — see this file's "N1-I5b
+/// Task 1" section doc comment and `native_fork_refs.wat`'s HISTORY note).
+/// Calling `f` directly, HOST-side, from the `Func` value the import
+/// receives needs no table at all.
+fn define_funcref_call_probe(linker: &mut Linker<()>) -> anyhow::Result<()> {
+    linker.func_wrap(
+        "env",
+        "native_test_funcref_call",
+        move |mut caller: Caller<'_, ()>, f: Option<wasmtime::Func>| -> wasmtime::Result<i32> {
+            let Some(f) = f else {
+                return Ok(-1);
+            };
+            let typed = f.typed::<(), i32>(&caller)?;
+            typed.call(&mut caller, ())
+        },
+    )?;
+    Ok(())
+}
+
 /// The `dylink.0` custom section's `mem_info` subsection ID (the WebAssembly
 /// dynamic-linking convention: `WASM_DYLINK_MEM_INFO` in the upstream tool
 /// sources), mirrored from `host/src/fork-module-instance.ts`'s
@@ -3250,6 +3286,7 @@ pub(crate) fn instantiate_fork_module(
     guest_mem: &SharedMemory,
     layout: &ProcessLayout,
     externref_registry: Arc<Mutex<ExternrefRegistry>>,
+    seed_empty_module_state_arena: bool,
 ) -> anyhow::Result<ForkModule> {
     let fork_module_wasm_path = crate::fork_module_path();
     let wasm_bytes = std::fs::read(&fork_module_wasm_path)
@@ -3315,7 +3352,25 @@ pub(crate) fn instantiate_fork_module(
         .map_err(|_| anyhow::anyhow!("capture-scratch address {capture_scratch_base:#x} does not fit in wasm32"))?;
 
     grow_to_cover(guest_mem, memory_base + region_bytes)?;
-    write_empty_module_state_arena(guest_mem, reference_scratch_base)?;
+    // N1-I5b Task 1: this call MUST be skipped for a fork child's own
+    // relaunch (`seed_empty_module_state_arena == false`) — `handle_fork`
+    // hands the child a byte-for-byte `clone_guest_memory` of the PARENT's
+    // memory, taken AFTER `drive_fork_capture_seal_and_launch_child` already
+    // sealed THIS fork's real, capture-filled graph at this exact
+    // `reference_scratch_base` address (see that function's doc comment).
+    // Writing the canonical-null floor here unconditionally, as this
+    // function did before N1-I5b, silently CLOBBERED that real graph back
+    // to empty on every fork child before its own `drive_reference_replay`
+    // call ever ran — the child's rewind would then decode nothing (or
+    // trap/misdecode), a genuine bug this task's own smoke test caught
+    // empirically (a fork of a funcref-carrying guest hung: the child never
+    // reached a valid resume path). A genuinely FRESH, non-fork launch
+    // (`ForkEntry::Normal`, `seed_empty_module_state_arena == true`) still
+    // needs this floor written once: nothing else initializes this address
+    // before that launch's own first possible fork.
+    if seed_empty_module_state_arena {
+        write_empty_module_state_arena(guest_mem, reference_scratch_base)?;
+    }
 
     let mut linker: Linker<()> = Linker::new(engine);
     linker.define(&mut *store, "env", "memory", guest_mem.clone())?;
@@ -3670,7 +3725,14 @@ fn spawn_guest_thread(
         // argument `ExternrefRegistry`'s doc comment already makes).
         let funcref_catalog_lookup: Arc<Mutex<BTreeMap<usize, u32>>> = Arc::new(Mutex::new(BTreeMap::new()));
         if use_fork_module {
-            match instantiate_fork_module(&engine, &mut store, &guest_mem, &layout, Arc::clone(&externref_registry)) {
+            match instantiate_fork_module(
+                &engine,
+                &mut store,
+                &guest_mem,
+                &layout,
+                Arc::clone(&externref_registry),
+                matches!(fork_entry, ForkEntry::Normal),
+            ) {
                 Ok(fm) => {
                     const FRAME_IMPORT_NAMES: [&str; 5] = [
                         "__wpk_fork_frame_reserve",
@@ -4323,6 +4385,12 @@ fn spawn_guest_thread(
             if guest_declares("native_test_externref_payload") {
                 if let Err(e) = define_externref_payload_probe(&mut linker) {
                     eprintln!("wiring env.native_test_externref_payload failed: {e:#}");
+                    return;
+                }
+            }
+            if guest_declares("native_test_funcref_call") {
+                if let Err(e) = define_funcref_call_probe(&mut linker) {
+                    eprintln!("wiring env.native_test_funcref_call failed: {e:#}");
                     return;
                 }
             }
@@ -8092,6 +8160,7 @@ mod fork_module_tests {
             &guest_mem,
             &layout,
             Arc::new(Mutex::new(ExternrefRegistry::new())),
+            true,
         )?;
 
         assert!(fork_module.region_bytes > 0, "expected a non-empty reserved region");

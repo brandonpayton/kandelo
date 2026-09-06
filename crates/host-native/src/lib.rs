@@ -1848,82 +1848,64 @@ mod tests {
         Ok(())
     }
 
-    /// N1-I5 Task 3: a REAL native `fork()` that carries a genuine WASM
-    /// `funcref` AND a genuine WASM `externref` LIVE across the boundary,
-    /// driven through the co-resident fork-module's reference-replay
-    /// sub-sequence (`guest::drive_reference_replay`) — the reference-path
-    /// analogue of `smoke_fork_parent_child` (which proves frames only).
+    /// N1-I5b Task 1: a REAL native `fork()` that carries a genuine WASM
+    /// `funcref` LIVE across the boundary, captured by native's OWN
+    /// `NativeReferenceCapture` host bodies (`guest.rs`'s
+    /// `__wpk_fork_ref_encode_funcref`/`_vector_begin`/`_append`/`_finish`)
+    /// and reconstructed through the co-resident fork-module's
+    /// reference-replay sub-sequence (`guest::drive_reference_replay`,
+    /// already wired by N1-I5) — the reference-path analogue of
+    /// `smoke_fork_parent_child` (which proves frames only).
     ///
     /// Fixture: `native_fork_refs.instrumented.wasm`
     /// (`fixtures/native_fork_refs.wat`), hand-written WAT rather than C —
-    /// see that file's doc comment for why: a genuine `funcref`/`externref`
-    /// *value* (not the ordinary i32 table index this ABI uses for a plain C
-    /// function pointer) is not reachable from portable C on this SDK's
-    /// clang/LLVM 21 toolchain (`__funcref`-qualified pointer types parse but
-    /// ICE on every realistic use tried), matching the Node/browser hosts'
-    /// own reason for hand-writing their `funcref-local-fork-fresh-worker.wat`
-    /// / `externref-local-fork-fresh-worker.wat` ABI-44 integration fixtures.
+    /// see that file's doc comment for why: a genuine `funcref` *value* (not
+    /// the ordinary i32 table index this ABI uses for a plain C function
+    /// pointer) is not reachable from portable C on this SDK's clang/LLVM 21
+    /// toolchain (`__funcref`-qualified pointer types parse but ICE on every
+    /// realistic use tried), matching the Node/browser hosts' own reason for
+    /// hand-writing their `funcref-local-fork-fresh-worker.wat` ABI-44
+    /// integration fixture.
     ///
     /// The fixture:
     ///   1. Loads a sentinel funcref from a table (`table.get`, not a
     ///      rematerializable `ref.func` constant) into a local.
-    ///   2. Mints a genuine externref for handle 7 via native's REAL
-    ///      production `env.resolve_externref` import into a local.
-    ///   3. Forks with BOTH locals live across `kernel_fork`.
-    ///   4. In the CHILD: calls the reconstructed funcref (must return 77)
-    ///      and reads the reconstructed externref's payload via
-    ///      `env.native_test_externref_payload` (must be 7). A wrong or
-    ///      absent reconstruction exits 91/94.
-    ///   5. In the PARENT (after fork returns): re-checks its OWN carried
-    ///      references are unaffected by forking (exits 95/96 on failure),
-    ///      then reaps the child and propagates a nonzero child status as
-    ///      92.
+    ///   2. Forks with the local live across `kernel_fork`.
+    ///   3. In the CHILD: calls the reconstructed funcref (must return 77).
+    ///      A wrong reconstruction exits 91.
+    ///   4. In the PARENT (after fork returns): re-checks its OWN carried
+    ///      reference is unaffected by forking (exits 95 on failure), then
+    ///      reaps the child and propagates a nonzero child status as 92.
     ///
-    /// Asserts BOTH halves of the acceptance bar
-    /// (`docs/plans/2026-09-05-n1-i5-references-grounding.md` §7):
-    /// correctness (`exit_code == 0`, both processes observed identity) AND
-    /// proof of use (`fm_references_reconstructed`/`fm_externrefs_resolved`
-    /// — surfaced here as `ForkProofOfUse::references_reconstructed`/
-    /// `externrefs_resolved` — are `> 0`, so a silent fallback that merely
+    /// Asserts both halves of N1-I5b Task 1's acceptance bar
+    /// (`docs/superpowers/plans/2026-09-05-n1-i5b-native-fork-reference-
+    /// capture.md`): correctness (`exit_code == 0`, both processes observed
+    /// the same funcref identity) AND proof of use
+    /// (`fm_references_reconstructed`, surfaced here as `ForkProofOfUse::
+    /// references_reconstructed`, is `> 0`, so a silent fallback that merely
     /// happened to copy the right bytes cannot pass).
     ///
-    /// BLOCKED (`#[ignore]`), not xfail-deleted: this test is genuine and
-    /// should be un-ignored the moment the gap below closes, with NO other
-    /// change needed (fixture, imports, and assertions are already correct
-    /// for that day). Today it TRAPS during CAPTURE — inside the guest's own
-    /// `kernel_fork()` call, before any replay/decode code runs at all — on
-    /// `unknown import: env::__wpk_fork_ref_vector_begin has not been
-    /// defined`. Root cause, empirically confirmed by dumping this fixture's
-    /// import list: `__wpk_fork_ref_vector_begin`/`_append`/`_finish` (the
-    /// reference-vector CAPTURE builder) and `__wpk_fork_ref_encode_funcref`
-    /// (the funcref CAPTURE encoder) have NO fork-module export to bind to
-    /// (`crates/fork-module/src/lib.rs` defines `fm_ref_vector_get` for
-    /// RESTORE but no `fm_ref_vector_begin`/`append`/`finish`/`encode_*` for
-    /// CAPTURE — grep confirms) and no host-native Rust implementation
-    /// either (grep for these names in `guest.rs` before this task: no
-    /// hits). On Node/browser these four are host JS functions
-    /// (`host/src/fork-activation-registry.ts`'s `beginReferenceVector`/
-    /// `appendReferenceVector`/`finishReferenceVector`/`encodeFuncref`,
-    /// backed by `ForkActivationRegistry`'s reference-capture bookkeeping);
-    /// native has no such capture-time bookkeeping subsystem, and building
-    /// one (plus threading its output root into `drive_reference_replay` in
-    /// place of the hardcoded `empty_module_state_root`, replacing BOTH the
-    /// child's AND the resuming parent's seeded root) is explicitly OUT OF
-    /// THIS TASK'S SCOPE per `guest.rs`'s own pre-existing `write_empty_
-    /// module_state_arena` doc comment: "Native has no module-state CAPTURE
-    /// mechanism yet ... A future task that adds real native module-state
-    /// capture (out of this task's scope) replaces this with the guest's own
-    /// captured arena." This task (N1-I5 Task 3) wired the REPLAY side
-    /// (`drive_reference_replay`, the guest reference-import flip, funcref/
-    /// static-root table mirroring, `env.resolve_externref`) against that
-    /// documented synthesized-empty-arena floor; a fork whose live state
-    /// includes an actual reference needs the CAPTURE side that floor
-    /// deliberately does not provide. `fm_last_errno` is not available as a
-    /// diagnostic here because the trap happens at raw Wasmtime import-call
-    /// resolution, before any `fm_*` module call (and therefore before any
-    /// module-tracked errno) is ever reached.
+    /// HISTORY: through N1-I5 Task 3 this was `#[ignore]`d (and this
+    /// fixture also carried a genuine `externref`) — capture-side imports
+    /// had no host body on ANY host (capture is never module-owned; see
+    /// `docs/plans/2026-09-05-n1-i5b-reference-capture-grounding.md` §1) and
+    /// every fork carrying a live reference TRAPPED on `unknown import:
+    /// env::__wpk_fork_ref_vector_begin has not been defined` before any
+    /// replay code ever ran. N1-I5b Task 1 closes that gap for funcref: a
+    /// native `NativeReferenceCapture` accumulator (`guest.rs`) now backs
+    /// real `encode_funcref`/`vector_begin`/`_append`/`_finish`/
+    /// `scratch_reserve`/`_release` host bodies, and a per-fork KFMS arena
+    /// (sealed at `drive_fork_capture_seal_and_launch_child`, replacing the
+    /// canonical-null floor `write_empty_module_state_arena` used to leave
+    /// there permanently) carries the real captured graph into the
+    /// already-working REPLAY side. externref/typed-GC/static-root capture
+    /// stays gated (`docs/fork-reference-support.md`'s current platform
+    /// contract) — this fixture was trimmed to funcref-only so this test
+    /// does not trip the still-unimplemented `encode_externref` gate; a
+    /// LATER, separate dispatch (N1-I5b Task 2) adds its own
+    /// externref-carrying fixture and asserts the `EOPNOTSUPP` gate instead
+    /// of reconstruction.
     #[test]
-    #[ignore = "blocked on native's documented capture-side gap (no __wpk_fork_ref_vector_begin/_append/_finish or __wpk_fork_ref_encode_funcref host implementation exists yet) — see this test's doc comment"]
     fn smoke_fork_reconstructs_references() -> anyhow::Result<()> {
         let Some(path) = kernel_path_or_skip() else {
             return Ok(());
@@ -1938,8 +1920,8 @@ mod tests {
 
         assert_eq!(
             outcome.exit_code, 0,
-            "expected both the reconstructed CHILD references and the PARENT's \
-             own post-fork references to check out (stdout: {:?}, stderr: {:?}, \
+            "expected both the reconstructed CHILD funcref and the PARENT's \
+             own post-fork funcref to check out (stdout: {:?}, stderr: {:?}, \
              trace: {:?}, proof: {:?})",
             String::from_utf8_lossy(&outcome.stdout),
             String::from_utf8_lossy(&outcome.stderr),
@@ -1956,11 +1938,6 @@ mod tests {
         assert!(
             proof.references_reconstructed > 0,
             "the module must have driven a real funcref/null reconstruction \
-             (not a silent fallback): {proof:?}"
-        );
-        assert!(
-            proof.externrefs_resolved > 0,
-            "the module must have driven a real externref resolution \
              (not a silent fallback): {proof:?}"
         );
         Ok(())

@@ -30,9 +30,13 @@
 ;; `table.get` (not a rematerializable `ref.func` constant), so the
 ;; instrumenter cannot fold it away and must emit a genuine
 ;; `__wpk_fork_ref_decode_funcref` reconstruction on the child rewind. The
-;; child (and, symmetrically, the parent after the fork returns) stores the
-;; local back into a call table and `call_indirect`s it; the sentinel returns
-;; 77.
+;; child (and, symmetrically, the parent after the fork returns) hands the
+;; local straight to native's test-only `env.native_test_funcref_call` import
+;; (`crates/host-native/src/guest.rs::define_funcref_call_probe`), which
+;; calls it HOST-side and hands the `i32` result back; the sentinel returns
+;; 77. This is deliberately NOT a wasm-level `call_indirect`/`call_ref` — see
+;; the HISTORY note below for why this fixture avoids ever writing the local
+;; into a destination table.
 ;;
 ;; Exit codes (parent-observed, after `WEXITSTATUS` unwraps the child's own
 ;; `kernel_exit` code):
@@ -63,6 +67,28 @@
 ;; `EOPNOTSUPP` gate fires cleanly instead — it does not need to touch this
 ;; file.
 ;;
+;; Also during N1-I5b Task 1's own development, an EARLIER version of this
+;; fixture verified the reconstructed funcref by storing the local into a
+;; destination table and `call_indirect`-ing it (mirroring the original
+;; N1-I5 Task 3 design). That tripped a SEPARATE, unrelated native gap:
+;; `wasm-fork-instrument` tracks every `table.set` ANYWHERE in the compiled
+;; module (`crates/fork-instrument/src/module_state.rs`'s
+;; `collect_source_mutated_tables`, over ALL local functions, not just ones
+;; reachable from `kernel.kernel_fork`) for module-state (KFMS table-
+;; dirty-page) capture/restore — a DIFFERENT, out-of-scope-for-this-task
+;; import family (`__wpk_fork_module_state_table_mutation_begin`/`_commit`)
+;; with no native host body at all yet (native's whole `__wpk_fork_module_
+;; state_*` family "stays inert" — see this repo's N1-I4 doc comments).
+;; `docs/plans/2026-09-05-n1-i5b-reference-capture-grounding.md` §4 point 2
+;; explicitly scopes solving THAT gap out of this task ("capture the
+;; reference graph into an otherwise-still-empty-of-table-state KFMS arena,"
+;; not "solve general module-state capture"). This fixture therefore never
+;; writes into any table at runtime: `$source` is populated once via an
+;; ACTIVE element segment (a one-time bootstrap-time `table.init`, not a
+;; `table.set`) and only ever READ; verifying the reconstructed local calls
+;; native's test-only `env.native_test_funcref_call` import directly instead
+;; of any wasm-level `call_indirect`/`call_ref`.
+;;
 ;; Regenerate (from within `scripts/dev-shell.sh`):
 ;;   wat2wasm --enable-exceptions --enable-threads \
 ;;     crates/host-native/fixtures/native_fork_refs.wat \
@@ -74,17 +100,21 @@
 (module
   (import "env" "memory" (memory 1 16384 shared))
   (import "env" "__channel_base" (global $__channel_base (mut i32)))
-  (import "kernel" "kernel_exit" (func $kernel_exit (param i32)))
   (import "kernel" "kernel_fork"
     (func $kernel_fork (param i32) (result i32)))
+  ;; Native test-only diagnostic: calls the given funcref HOST-side and
+  ;; returns its `i32` result — see `guest.rs::define_funcref_call_probe`'s
+  ;; doc comment for why this fixture uses it instead of a wasm-level
+  ;; `call_indirect`/`call_ref`.
+  (import "env" "native_test_funcref_call"
+    (func $native_test_funcref_call (param funcref) (result i32)))
 
   (type $sentinel_type (func (result i32)))
 
   ;; The source table the funcref is dynamically loaded from before fork.
+  ;; Read-only at runtime (see the HISTORY note above for why this fixture
+  ;; never `table.set`s any table).
   (table $source 1 funcref)
-  ;; The destination table both parent and child store the (carried or
-  ;; reconstructed) funcref into and call through `call_indirect`.
-  (table $verify 1 funcref)
 
   (global $__stack_pointer (export "__stack_pointer") (mut i32)
     (i32.const 65536))
@@ -98,17 +128,92 @@
   ;; a real, callable funcref identity the reconstruction must reproduce.
   (elem (table $source) (i32.const 0) func $sentinel)
 
-  ;; Calls the funcref currently in `$verify` slot 0 and traps with
-  ;; `$exit_code` if it does not return 77.
-  (func $check_funcref (param $exit_code i32)
-    i32.const 0
-    call_indirect $verify (type $sentinel_type)
+  ;; Post a REAL `SYS_EXIT_GROUP($code)` on the process's main syscall
+  ;; channel, mirroring `$wait_child`'s hand-rolled channel protocol (the
+  ;; same offsets: `SYSCALL_OFFSET` = base+4, `ARGS_OFFSET` = base+8,
+  ;; `STATUS_OFFSET` = base+0). `exit_group` never returns, so this ends in
+  ;; `unreachable` unconditionally — a recognized-as-clean
+  ;; `Trap::UnreachableCodeReached` on native (`guest.rs::is_unreachable_
+  ;; trap`), the SAME outcome a real musl `_exit`/`exit_group` call produces
+  ;; for every OTHER (C-built) fixture in this crate.
+  ;;
+  ;; Deliberately NOT `kernel.kernel_exit`: that import is native's
+  ;; SIGKILL-ONLY fast path (`guest.rs`'s own doc comment: "A normal exit
+  ;; never calls it"), which returns a raw `wasmtime::Error`, NOT a
+  ;; recognized clean trap — using it for a NORMAL exit (as an earlier
+  ;; version of this fixture did, inherited from the pre-N1-I5b version)
+  ;; surfaces as "guest entry failed" and leaves the real kernel process
+  ;; table never told this process exited, hanging any `wait4`er (here, the
+  ;; PARENT) forever. `SYS_EXIT_GROUP` is the real, replay-safe protocol
+  ;; every other exit in this fixture now goes through.
+  (func $exit_group (param $code i32)
+    (local $base i32)
+    global.get $__channel_base
+    local.set $base
+
+    local.get $base
+    i32.const 4
+    i32.add
+    i32.const 387 ;; SYS_EXIT_GROUP
+    i32.store
+
+    local.get $base
+    i32.const 8
+    i32.add
+    local.get $code
+    i64.extend_i32_s
+    i64.store
+
+    local.get $base
+    i32.const 16
+    i32.add
+    i64.const 0
+    i64.store
+
+    local.get $base
+    i32.const 24
+    i32.add
+    i64.const 0
+    i64.store
+
+    local.get $base
+    i32.const 32
+    i32.add
+    i64.const 0
+    i64.store
+
+    local.get $base
+    i32.const 40
+    i32.add
+    i64.const 0
+    i64.store
+
+    local.get $base
+    i32.const 48
+    i32.add
+    i64.const 0
+    i64.store
+
+    local.get $base
+    i32.const 1
+    i32.atomic.store
+    local.get $base
+    i32.const 1
+    memory.atomic.notify
+    drop
+
+    unreachable)
+
+  ;; Calls `$f` via the native test probe and traps with `$exit_code` if it
+  ;; does not return 77.
+  (func $check_funcref (param $f funcref) (param $exit_code i32)
+    local.get $f
+    call $native_test_funcref_call
     i32.const 77
     i32.ne
     if
       local.get $exit_code
-      call $kernel_exit
-      unreachable
+      call $exit_group
     end)
 
   (func $wait_child (param $pid i32) (result i32)
@@ -216,16 +321,14 @@
     i32.ne
     if
       i32.const 92
-      call $kernel_exit
-      unreachable
+      call $exit_group
     end
 
     i32.const 1024
     i32.load
     if
       i32.const 92
-      call $kernel_exit
-      unreachable
+      call $exit_group
     end)
 
   (func $test_references
@@ -247,20 +350,16 @@
     i32.eqz
     if
       ;; CHILD: the reference must have been reconstructed correctly.
-      i32.const 0
       local.get $funcref_local
-      table.set $verify
       i32.const 91
       call $check_funcref
       i32.const 0
-      call $kernel_exit
+      call $exit_group
       unreachable
     end
 
     ;; PARENT: its own carried reference must be unaffected by forking.
-    i32.const 0
     local.get $funcref_local
-    table.set $verify
     i32.const 95
     call $check_funcref
 
@@ -270,5 +369,5 @@
   (func (export "_start")
     call $test_references
     i32.const 0
-    call $kernel_exit
+    call $exit_group
     unreachable))
