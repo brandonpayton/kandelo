@@ -934,20 +934,19 @@ const SIGSEGV = 11;
  *  docs/jsc-terminate-atomics-wait-workaround.md. */
 const SIGKILL = 9;
 
-/** Network ioctl request codes */
-const SIOCGIFNAME = 0x8910;
+/**
+ * `SIOCGIFCONF` request code. The other network-interface ioctls
+ * (`SIOCGIFNAME`/`SIOCGIFHWADDR`/`SIOCGIFADDR`/`SIOCGIFINDEX`) are fixed-size
+ * `struct ifreq` requests that now flow through the ordinary generic ioctl
+ * path (`IOCTL_REQUESTS`, generated from `crates/shared/src/
+ * ioctl_contract.rs`) straight into the Rust kernel — no named constant or
+ * host-side handler needed for them any more (Workstream H4). `SIOCGIFCONF`
+ * stays host-intercepted because its `struct ifconf.ifc_buf` is a second,
+ * dynamically-sized process-memory pointer nested inside the first, which the
+ * generic one-static-size ioctl contract can't express; see
+ * `handleIoctlIfconf` below.
+ */
 const SIOCGIFCONF = 0x8912;
-const SIOCGIFHWADDR = 0x8927;
-const SIOCGIFADDR = 0x8915;
-const SIOCGIFINDEX = 0x8933;
-const AF_INET = 2;
-const ARPHRD_ETHER = 1;
-const ARPHRD_LOOPBACK = 772;
-const IF_NAMESIZE = 16;
-const VIRTUAL_INTERFACES = [
-  { name: "lo", index: 1, loopback: true },
-  { name: "eth0", index: 2, loopback: false },
-] as const;
 
 /** Ioctl syscall number */
 const SYS_IOCTL = ABI_SYSCALLS.Ioctl;
@@ -3194,8 +3193,6 @@ export class CentralizedKernelWorker {
   /** PTY output callbacks: ptyIdx → callback */
   private ptyOutputCallbacks = new Map<number, (data: Uint8Array) => void>();
 
-  /** Virtual MAC address for this kernel instance (locally administered, unicast) */
-  private virtualMacAddress: Uint8Array<ArrayBuffer>;
   private networkListenObserver:
     | ((pid: number, fd: number, port: number) => void)
     | undefined;
@@ -3444,18 +3441,6 @@ export class CentralizedKernelWorker {
       this.#failKernelInstance(error);
     });
 
-    // Generate a random virtual MAC address (locally administered, unicast)
-    this.virtualMacAddress = new Uint8Array(6);
-    if (typeof globalThis.crypto !== 'undefined' && globalThis.crypto.getRandomValues) {
-      globalThis.crypto.getRandomValues(this.virtualMacAddress);
-    } else {
-      // Fallback for environments without Web Crypto API
-      for (let i = 0; i < 6; i++) {
-        this.virtualMacAddress[i] = Math.floor(Math.random() * 256);
-      }
-    }
-    // Set locally administered bit, clear multicast bit
-    this.virtualMacAddress[0] = (this.virtualMacAddress[0] & 0xFE) | 0x02;
     if (arguments[3] === centralizedKernelWorkerTestCapability) {
       kernelEntryIntrinsicObjectDefineProperty(this, "testAuthority", {
         configurable: false,
@@ -6003,13 +5988,7 @@ export class CentralizedKernelWorker {
       }
       case SYS_IOCTL: {
         const request = Number(BigInt.asUintN(32, rawArgs[1] ?? 0n));
-        if (
-          request === SIOCGIFCONF
-          || request === SIOCGIFNAME
-          || request === SIOCGIFHWADDR
-          || request === SIOCGIFADDR
-          || request === SIOCGIFINDEX
-        ) {
+        if (request === SIOCGIFCONF) {
           pointer(2, "network ioctl pointer");
         }
         return;
@@ -12125,30 +12104,19 @@ export class CentralizedKernelWorker {
       return;
     }
 
-    // --- ioctl: intercept network interface ioctls ---
-    // These require host-side handling because:
-    //   SIOCGIFCONF: struct ifconf contains a pointer to a process-memory buffer
-    //   SIOCGIFHWADDR: returns the virtual MAC address for this kernel instance
+    // --- ioctl: intercept SIOCGIFCONF only ---
+    // struct ifconf contains ifc_buf, a pointer to a *second* process-memory
+    // buffer whose size depends on the caller-supplied ifc_len — a nested,
+    // dynamically-sized indirection the generic one-static-size ioctl
+    // contract can't express (the same reason sendmsg/recvmsg decompose
+    // msghdr host-side elsewhere). SIOCGIFNAME/SIOCGIFHWADDR/SIOCGIFADDR/
+    // SIOCGIFINDEX are plain fixed-size `struct ifreq` requests and now flow
+    // through the ordinary generic ioctl path straight into the Rust kernel
+    // (Workstream H4).
     if (syscallNr === SYS_IOCTL) {
       const request = origArgs[1] >>> 0;
       if (request === SIOCGIFCONF) {
         this.handleIoctlIfconf(channel, origArgs, entry);
-        return;
-      }
-      if (request === SIOCGIFNAME) {
-        this.handleIoctlIfname(channel, origArgs, entry);
-        return;
-      }
-      if (request === SIOCGIFHWADDR) {
-        this.handleIoctlIfhwaddr(channel, origArgs, entry);
-        return;
-      }
-      if (request === SIOCGIFADDR) {
-        this.handleIoctlIfaddr(channel, origArgs, entry);
-        return;
-      }
-      if (request === SIOCGIFINDEX) {
-        this.handleIoctlIfindex(channel, origArgs, entry);
         return;
       }
     }
@@ -20061,45 +20029,16 @@ export class CentralizedKernelWorker {
     }
   }
 
-  private interfaceAddress(
-    iface: (typeof VIRTUAL_INTERFACES)[number],
-  ): Uint8Array | null {
-    if (iface.loopback) return new Uint8Array([127, 0, 0, 1]);
-    const address = this.io.network?.localAddress;
-    return address?.length === 4 ? new Uint8Array(address) : null;
-  }
-
-  /**
-   * `struct ifreq` has a 16-byte name followed by a union. The union is 16
-   * bytes under wasm32, but its `struct ifmap` member grows to 24 bytes under
-   * wasm64 because `unsigned long` is pointer-sized.
-   */
-  private ifreqSize(channel: ChannelInfo): number {
-    return this.getPtrWidth(channel.pid) === 8 ? 40 : 32;
-  }
-
-  private readIfreqName(channel: ChannelInfo, ifreqPtr: number): string {
-    const bytes = new Uint8Array(channel.memory.buffer, ifreqPtr, IF_NAMESIZE);
-    let end = 0;
-    while (end < bytes.length && bytes[end] !== 0) end++;
-    return new TextDecoder().decode(new Uint8Array(bytes.subarray(0, end)));
-  }
-
-  private writeIfreqName(
-    processMem: Uint8Array,
-    ifreqPtr: number,
-    name: string,
-  ): void {
-    const nameBytes = new TextEncoder().encode(name);
-    processMem.fill(0, ifreqPtr, ifreqPtr + IF_NAMESIZE);
-    processMem.set(nameBytes.subarray(0, IF_NAMESIZE - 1), ifreqPtr);
-  }
-
   /**
    * Handle SIOCGIFCONF: enumerate network interfaces.
    * struct ifconf { int ifc_len; union { char *ifc_buf; struct ifreq *ifc_req; }; }
-   * The ifc_buf pointer is in process memory, so the kernel can't write to it
-   * directly — we handle the entire ioctl on the host side.
+   * The ifc_buf pointer is a *second*, dynamically-sized process-memory
+   * buffer nested inside the first, so the host still decodes both pointers
+   * and proves their ranges — the kernel's separate Wasm instance cannot
+   * reach process memory directly. But the interface table, MAC generation,
+   * and every byte written into `ifc_buf` are produced by the Rust kernel
+   * (`crates/runtime-core/src/netif.rs`, `kernel_network_ifconf_write`),
+   * not by host-side logic (Workstream H4).
    */
   private handleIoctlIfconf(
     channel: ChannelInfo,
@@ -20120,7 +20059,6 @@ export class CentralizedKernelWorker {
 
     const processView = new DataView(channel.memory.buffer);
     const processMem = new Uint8Array(channel.memory.buffer);
-    const ifreqSize = this.ifreqSize(channel);
     const ifcLen = processView.getInt32(ifconfPtr, true);
     if (ifcLen < 0) {
       this.finishNetworkIoctl(channel, entry, -EINVAL, EINVAL);
@@ -20130,210 +20068,72 @@ export class CentralizedKernelWorker {
       ? processView.getBigUint64(ifconfPtr + 8, true)
       : processView.getUint32(ifconfPtr + 4, true);
 
+    const kernelInstance = this.#kernelInstanceForEntry(entry);
+    const ifconfSizeExport = kernelInstance.exports.kernel_network_ifconf_size as
+      ((pointerWidth: number) => number) | undefined;
+    const ifreqSizeExport = kernelInstance.exports.kernel_network_ifreq_size as
+      ((pointerWidth: number) => number) | undefined;
+    if (!ifconfSizeExport || !ifreqSizeExport) {
+      this.finishNetworkIoctl(channel, entry, -ENOSYS, ENOSYS);
+      return;
+    }
+
     // Linux permits a null nested buffer as a size query. The outer ifconf is
     // still a required caller-owned structure and was proved above.
     if (ifcBufValue === 0 || ifcBufValue === 0n) {
-      processView.setInt32(
-        ifconfPtr,
-        VIRTUAL_INTERFACES.length * ifreqSize,
-        true,
-      );
+      processView.setInt32(ifconfPtr, ifconfSizeExport(pw), true);
       this.finishNetworkIoctl(channel, entry);
       return;
     }
 
-    if (ifcLen < ifreqSize) {
+    const ifreqSize = ifreqSizeExport(pw);
+    if (ifreqSize <= 0 || ifcLen < ifreqSize) {
       processView.setInt32(ifconfPtr, 0, true);
       this.finishNetworkIoctl(channel, entry);
       return;
     }
 
     const capacity = Math.floor(ifcLen / ifreqSize);
-    const count = Math.min(capacity, VIRTUAL_INTERFACES.length);
-    const bytesToWrite = count * ifreqSize;
+    const bytesRequested = capacity * ifreqSize;
     // WHY: the nested wasm64 pointer must remain bigint until the complete
     // caller-owned output range is proved. Converting first could round an
     // unsafe value or let a high address alias unrelated low process bytes.
     const ifcBufRange = this.checkedNetworkIoctlProcessRange(
       channel,
       ifcBufValue,
-      bytesToWrite,
+      bytesRequested,
       "network ioctl ifconf output",
       entry,
     );
     if (!ifcBufRange) return;
     const ifcBuf = ifcBufRange.pointer;
 
-    for (let i = 0; i < count; i++) {
-      const iface = VIRTUAL_INTERFACES[i];
-      const entryPtr = ifcBuf + i * ifreqSize;
-      this.writeIfreqName(processMem, entryPtr, iface.name);
-      processMem.fill(0, entryPtr + IF_NAMESIZE, entryPtr + ifreqSize);
-      processView.setUint16(entryPtr + IF_NAMESIZE, AF_INET, true);
-      const address = this.interfaceAddress(iface);
-      if (address) processMem.set(address, entryPtr + IF_NAMESIZE + 4);
-    }
-    processView.setInt32(ifconfPtr, bytesToWrite, true);
-    this.finishNetworkIoctl(channel, entry);
-  }
-
-  /**
-   * Handle SIOCGIFNAME: map an interface index to its name.
-   * struct ifreq at arg[2]: ifr_name[16] + union; ifr_ifindex lives at +16.
-   */
-  private handleIoctlIfname(
-    channel: ChannelInfo,
-    origArgs: number[],
-    entry: KernelWorkerEntryContext,
-  ): void {
-    const ifreqRange = this.checkedNetworkIoctlProcessRange(
-      channel,
-      origArgs[2],
-      this.ifreqSize(channel),
-      "network ioctl ifreq",
-      entry,
-    );
-    if (!ifreqRange) return;
-    const ifreqPtr = ifreqRange.pointer;
-    const processView = new DataView(channel.memory.buffer);
-    const processMem = new Uint8Array(channel.memory.buffer);
-    const ifindex = processView.getInt32(ifreqPtr + 16, true);
-    const iface = VIRTUAL_INTERFACES.find((candidate) => candidate.index === ifindex);
-
-    if (!iface) {
-      this.finishNetworkIoctl(channel, entry, -ENODEV, ENODEV);
-      return;
-    }
-
-    this.writeIfreqName(processMem, ifreqPtr, iface.name);
-    this.finishNetworkIoctl(channel, entry);
-  }
-
-  /**
-   * Handle SIOCGIFHWADDR: get hardware (MAC) address for an interface.
-   * struct ifreq at arg[2]: ifr_name[16] + ifr_hwaddr (struct sockaddr, 16 bytes)
-   * Returns the virtual MAC in ifr_hwaddr.sa_data[0..5].
-   */
-  private handleIoctlIfhwaddr(
-    channel: ChannelInfo,
-    origArgs: number[],
-    entry: KernelWorkerEntryContext,
-  ): void {
-    const ifreqRange = this.checkedNetworkIoctlProcessRange(
-      channel,
-      origArgs[2],
-      this.ifreqSize(channel),
-      "network ioctl ifreq",
-      entry,
-    );
-    if (!ifreqRange) return;
-    const ifreqPtr = ifreqRange.pointer;
-    const name = this.readIfreqName(channel, ifreqPtr);
-    const iface = VIRTUAL_INTERFACES.find((candidate) => candidate.name === name);
-    if (!iface) {
-      this.finishNetworkIoctl(channel, entry, -ENODEV, ENODEV);
-      return;
-    }
-    const processView = new DataView(channel.memory.buffer);
-    const processMem = new Uint8Array(channel.memory.buffer);
-
-    processMem.fill(
-      0,
-      ifreqPtr + IF_NAMESIZE,
-      ifreqPtr + this.ifreqSize(channel),
-    );
-    processView.setUint16(
-      ifreqPtr + IF_NAMESIZE,
-      iface.loopback ? ARPHRD_LOOPBACK : ARPHRD_ETHER,
-      true,
-    );
-    if (!iface.loopback) {
-      processMem.set(this.virtualMacAddress, ifreqPtr + IF_NAMESIZE + 2);
-    }
-
-    this.finishNetworkIoctl(channel, entry);
-  }
-
-  /**
-   * Handle SIOCGIFADDR: get interface address.
-   * struct ifreq at arg[2]: ifr_name[16] + ifr_addr (struct sockaddr, 16 bytes)
-   * Returns the selected virtual interface's assigned IPv4 address.
-   */
-  private handleIoctlIfaddr(
-    channel: ChannelInfo,
-    origArgs: number[],
-    entry: KernelWorkerEntryContext,
-  ): void {
-    const ifreqRange = this.checkedNetworkIoctlProcessRange(
-      channel,
-      origArgs[2],
-      this.ifreqSize(channel),
-      "network ioctl ifreq",
-      entry,
-    );
-    if (!ifreqRange) return;
-    const ifreqPtr = ifreqRange.pointer;
-    const name = this.readIfreqName(channel, ifreqPtr);
-    const iface = VIRTUAL_INTERFACES.find((candidate) => candidate.name === name);
-    if (!iface) {
-      this.finishNetworkIoctl(channel, entry, -ENODEV, ENODEV);
-      return;
-    }
-    const address = this.interfaceAddress(iface);
-    if (!address) {
-      this.finishNetworkIoctl(
-        channel,
+    const scratch = this.#requireMainScratchRegion();
+    const result = scratch.withLease((lease) => {
+      const request = Math.min(bytesRequested, scratch.capacity);
+      const written = this.#invokeEntryScratchExport(
         entry,
-        -EADDRNOTAVAIL,
-        EADDRNOTAVAIL,
+        lease,
+        "kernel_network_ifconf_write",
+        [pw, lease.exportPointer(0, request), request],
       );
+      if (written < 0) {
+        return { ok: false as const, retVal: written, errno: -written };
+      }
+      if (!Number.isSafeInteger(written) || written > request) {
+        throw new KernelScratchError(
+          "kernel network ifconf write exceeded scratch capacity",
+          EIO,
+        );
+      }
+      return { ok: true as const, bytes: lease.copyOut(0, written) };
+    });
+    if (!result.ok) {
+      this.finishNetworkIoctl(channel, entry, result.retVal, result.errno);
       return;
     }
-    const processView = new DataView(channel.memory.buffer);
-    const processMem = new Uint8Array(channel.memory.buffer);
-
-    processMem.fill(
-      0,
-      ifreqPtr + IF_NAMESIZE,
-      ifreqPtr + this.ifreqSize(channel),
-    );
-    processView.setUint16(ifreqPtr + IF_NAMESIZE, AF_INET, true);
-    processMem.set(address, ifreqPtr + IF_NAMESIZE + 4);
-
-    this.finishNetworkIoctl(channel, entry);
-  }
-
-  /**
-   * Handle SIOCGIFINDEX: map an interface name to its index.
-   * struct ifreq at arg[2]: ifr_name[16] + union; ifr_ifindex lives at +16.
-   */
-  private handleIoctlIfindex(
-    channel: ChannelInfo,
-    origArgs: number[],
-    entry: KernelWorkerEntryContext,
-  ): void {
-    const ifreqRange = this.checkedNetworkIoctlProcessRange(
-      channel,
-      origArgs[2],
-      this.ifreqSize(channel),
-      "network ioctl ifreq",
-      entry,
-    );
-    if (!ifreqRange) return;
-    const ifreqPtr = ifreqRange.pointer;
-    const name = this.readIfreqName(channel, ifreqPtr);
-    const iface = VIRTUAL_INTERFACES.find((candidate) => candidate.name === name);
-
-    if (!iface) {
-      this.finishNetworkIoctl(channel, entry, -ENODEV, ENODEV);
-      return;
-    }
-
-    new DataView(channel.memory.buffer).setInt32(
-      ifreqPtr + IF_NAMESIZE,
-      iface.index,
-      true,
-    );
+    processMem.set(result.bytes, ifcBuf);
+    processView.setInt32(ifconfPtr, result.bytes.length, true);
     this.finishNetworkIoctl(channel, entry);
   }
 

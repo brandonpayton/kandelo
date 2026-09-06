@@ -67,7 +67,14 @@ pub const KERNEL_MEMORY_MAX_PAGES: u32 = 16384;
 /// (current tid vs. the process leader's pid, `commit_current_task_exit` in
 /// `crates/kernel/src/wasm_api.rs`) instead of asking the host, dropping the
 /// count to 83 (verified via `wasm-objdump -x local-binaries/kernel.wasm`).
-pub const EXPECTED_HOST_IMPORT_COUNT: usize = 83;
+/// Workstream H4 then moved the network-interface `SIOCGIFNAME`/
+/// `SIOCGIFHWADDR`/`SIOCGIFADDR`/`SIOCGIFINDEX`/`SIOCGIFCONF` `ioctl`s'
+/// interface table, MAC generation, and struct marshalling into the Rust
+/// kernel (`crates/runtime-core/src/netif.rs`), but that required one new,
+/// genuinely irreducible host import for the one host-owned fact the kernel
+/// cannot compute itself: the machine's real assigned IPv4 address
+/// (`host_network_local_address`). Net: 83 - 0 + 1 = 84.
+pub const EXPECTED_HOST_IMPORT_COUNT: usize = 84;
 
 /// The observed shape of the kernel's `env.memory` import.
 #[derive(Debug, Clone)]

@@ -1704,6 +1704,30 @@
       "wasm32Size": 4,
       "wasm64Size": 4
     },
+    "35088": {
+      "argKind": "pointer",
+      "direction": "inout",
+      "wasm32Size": 32,
+      "wasm64Size": 40
+    },
+    "35093": {
+      "argKind": "pointer",
+      "direction": "inout",
+      "wasm32Size": 32,
+      "wasm64Size": 40
+    },
+    "35111": {
+      "argKind": "pointer",
+      "direction": "inout",
+      "wasm32Size": 32,
+      "wasm64Size": 40
+    },
+    "35123": {
+      "argKind": "pointer",
+      "direction": "inout",
+      "wasm32Size": 32,
+      "wasm64Size": 40
+    },
     "64": {
       "argKind": "pointer",
       "direction": "in",
@@ -2624,6 +2648,21 @@
     {
       "kind": "func",
       "name": "kernel_nanosleep",
+      "signature": "(i32) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_network_ifconf_size",
+      "signature": "(i32) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_network_ifconf_write",
+      "signature": "(i32,i32,i32) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_network_ifreq_size",
       "signature": "(i32) -> (i32)"
     },
     {

@@ -210,6 +210,15 @@ pub trait HostIO {
         Err(Errno::ENETUNREACH)
     }
     fn host_getaddrinfo(&mut self, name: &[u8], result: &mut [u8]) -> Result<usize, Errno>;
+    /// The machine's real assigned IPv4 address, for the kernel-owned
+    /// network-interface `ioctl`s (`SIOCGIFADDR`, `SIOCGIFCONF`) to report on
+    /// the one non-loopback virtual interface. `None` means the host has no
+    /// address configured (yet) or does not model one at all — hosts that
+    /// don't track network configuration (e.g. `host-native`'s headless
+    /// conformance target) keep this default.
+    fn host_network_local_address(&mut self) -> Option<[u8; 4]> {
+        None
+    }
     /// Futex wait: block if `*addr == expected`, with optional timeout in nanoseconds.
     /// timeout_ns < 0 means infinite wait.
     /// Returns 0 on wake, negative errno on error.

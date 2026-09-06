@@ -29,6 +29,7 @@ pub mod lock;
 pub mod memory;
 pub mod mouse;
 pub mod mqueue;
+pub mod netif;
 pub mod ofd;
 pub mod path;
 pub mod complete_copy;

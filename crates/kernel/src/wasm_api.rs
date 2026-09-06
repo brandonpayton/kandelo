@@ -199,6 +199,12 @@ unsafe extern "C" {
         result_ptr: *mut u8,
         result_len: u32,
     ) -> i32;
+    /// Writes the machine's real assigned IPv4 address (4 bytes) to
+    /// `buf_ptr` and returns 1, or returns 0 if no address is configured.
+    /// Backs `crate::netif::interface_address`'s host-owned, non-loopback
+    /// case (Workstream H4: the interface table, MAC, and struct layout are
+    /// kernel-owned; this is the one fact only the host can know).
+    fn host_network_local_address(buf_ptr: *mut u8) -> i32;
     fn host_futex_wait(addr: usize, expected: u32, timeout_ns_lo: u32, timeout_ns_hi: u32) -> i32;
     fn host_futex_wake(addr: usize, count: u32) -> i32;
     fn host_bind_framebuffer(
@@ -954,6 +960,16 @@ impl HostIO for WasmHostIO {
             }
         } else {
             Ok(result as usize)
+        }
+    }
+
+    fn host_network_local_address(&mut self) -> Option<[u8; 4]> {
+        let mut buf = [0u8; 4];
+        let found = unsafe { host_network_local_address(buf.as_mut_ptr()) };
+        if found != 0 {
+            Some(buf)
+        } else {
+            None
         }
     }
 
@@ -11598,6 +11614,70 @@ pub extern "C" fn kernel_ioctl(
     };
     deliver_pending_signals_with_locks(proc, advisory_locks, &mut host);
     result
+}
+
+/// Bytes per `struct ifreq` entry at the caller's pointer width (32 for
+/// wasm32, 40 for wasm64 — `struct ifmap`'s `unsigned long` members are
+/// pointer-sized). `SIOCGIFCONF`'s host-side pointer arithmetic (how many
+/// whole entries fit in the caller's buffer) needs this; every other detail
+/// of the layout is decided by `kernel_network_ifconf_write` itself.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_network_ifreq_size(process_pointer_width: u32) -> i32 {
+    match u8::try_from(process_pointer_width)
+        .ok()
+        .filter(|width| *width == 4 || *width == 8)
+    {
+        Some(pointer_width) => crate::netif::ifreq_size(pointer_width) as i32,
+        None => -(Errno::EINVAL as i32),
+    }
+}
+
+/// SIOCGIFCONF query-mode support: total bytes needed to enumerate every
+/// network interface's `ifreq` entry at the caller's pointer width. Used
+/// when the caller's `struct ifconf.ifc_buf` is null (a size query).
+///
+/// The host still decodes the outer `ifconf`/`ifc_buf` pointers — a
+/// process-memory address the kernel's separate Wasm instance cannot itself
+/// reach — but the interface table and struct layout are kernel-owned
+/// (Workstream H4). Machine-global, so unlike `kernel_ioctl` this does not
+/// take a `fd` or the global kernel lock, matching other read-only
+/// introspection exports (`kernel_enum_procs`, `kernel_read_proc_maps`).
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_network_ifconf_size(process_pointer_width: u32) -> i32 {
+    match u8::try_from(process_pointer_width)
+        .ok()
+        .filter(|width| *width == 4 || *width == 8)
+    {
+        Some(pointer_width) => crate::netif::ifconf_total_size(pointer_width) as i32,
+        None => -(Errno::EINVAL as i32),
+    }
+}
+
+/// SIOCGIFCONF: write as many complete `ifreq` entries as fit in
+/// `out_ptr[..out_len]` (a kernel-scratch buffer; the host copies the result
+/// into the caller's real `ifc_buf` afterward). Returns the number of bytes
+/// written, or a negative errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_network_ifconf_write(
+    process_pointer_width: u32,
+    out_ptr: *mut u8,
+    out_len: u32,
+) -> i32 {
+    let Some(pointer_width) = u8::try_from(process_pointer_width)
+        .ok()
+        .filter(|width| *width == 4 || *width == 8)
+    else {
+        return -(Errno::EINVAL as i32);
+    };
+    if out_len == 0 {
+        return 0;
+    }
+    if out_ptr.is_null() {
+        return -(Errno::EFAULT as i32);
+    }
+    let out = unsafe { core::slice::from_raw_parts_mut(out_ptr, out_len as usize) };
+    let mut host = WasmHostIO;
+    crate::netif::ifconf_write(pointer_width, out, &mut host) as i32
 }
 
 /// prctl — process control. Returns 0 on success, or negative errno.

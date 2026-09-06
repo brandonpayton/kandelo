@@ -1950,6 +1950,25 @@ export class WasmPosixKernel {
             return negErrno(error);
           }
         },
+        // Workstream H4 (host-surface minimization): the network-interface
+        // ioctl content (interface table, MAC, ifreq/ifconf layout) is now
+        // kernel-owned (`crates/runtime-core/src/netif.rs`). This is the one
+        // remaining host-owned fact the kernel cannot compute itself.
+        host_network_local_address: (bufPtr: KernelPointer): number => {
+          const address = this.io.network?.localAddress;
+          if (address?.length !== 4) return 0;
+          try {
+            const destination = this.#rustLentKernelDestination(
+              bufPtr,
+              4,
+              "host_network_local_address destination",
+            );
+            this.#writeKernelBytes(destination, address);
+            return 1;
+          } catch {
+            return 0;
+          }
+        },
         host_utimensat: (
           pathPtr: KernelPointer, pathLen: number,
           atimeSec: bigint, atimeNsec: bigint, mtimeSec: bigint, mtimeNsec: bigint,

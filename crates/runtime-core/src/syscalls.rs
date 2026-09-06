@@ -15485,6 +15485,78 @@ pub fn sys_ioctl(
         return Ok(());
     }
 
+    // --- Network-interface ioctls: fixed-size `struct ifreq` requests ---
+    // (Workstream H4). `buf` is already sized to exactly `ifreq_size` for the
+    // calling process's pointer width (32 or 40 bytes) by the generic
+    // ioctl-contract dispatch in `wasm_api::kernel_ioctl`; the offsets below
+    // (0..16 = ifr_name, 16.. = union) do not otherwise depend on that width.
+    // Linux requires a socket fd here; Kandelo's prior host-side
+    // implementation validated no fd at all. Reaching this point already
+    // proves `fd` names an open descriptor (the `fd_table.get(fd)` above),
+    // which is a strictly truthful improvement (EBADF on a bogus fd) without
+    // narrowing any previously-working caller (real programs pass a socket).
+    if request == wasm_posix_shared::ioctl_contract::SIOCGIFNAME {
+        if buf.len() < crate::netif::IF_NAMESIZE + 4 {
+            return Err(Errno::EINVAL);
+        }
+        let ifindex = i32::from_le_bytes([
+            buf[crate::netif::IF_NAMESIZE],
+            buf[crate::netif::IF_NAMESIZE + 1],
+            buf[crate::netif::IF_NAMESIZE + 2],
+            buf[crate::netif::IF_NAMESIZE + 3],
+        ]);
+        let iface = crate::netif::find_by_index(ifindex as u32).ok_or(Errno::ENODEV)?;
+        crate::netif::write_name(buf, iface.name.as_bytes());
+        return Ok(());
+    }
+    if request == wasm_posix_shared::ioctl_contract::SIOCGIFHWADDR {
+        if buf.len() < crate::netif::IF_NAMESIZE + 8 {
+            return Err(Errno::EINVAL);
+        }
+        let (name_buf, name_len) = crate::netif::read_name_bytes(buf);
+        let iface =
+            crate::netif::find_by_name(&name_buf[..name_len]).ok_or(Errno::ENODEV)?;
+        let ns = crate::netif::IF_NAMESIZE;
+        buf[ns..].fill(0);
+        let family: u16 = if iface.loopback {
+            crate::netif::ARPHRD_LOOPBACK
+        } else {
+            crate::netif::ARPHRD_ETHER
+        };
+        buf[ns..ns + 2].copy_from_slice(&family.to_le_bytes());
+        if !iface.loopback {
+            let mac = crate::netif::machine_mac(host);
+            buf[ns + 2..ns + 8].copy_from_slice(&mac);
+        }
+        return Ok(());
+    }
+    if request == wasm_posix_shared::ioctl_contract::SIOCGIFADDR {
+        if buf.len() < crate::netif::IF_NAMESIZE + 8 {
+            return Err(Errno::EINVAL);
+        }
+        let (name_buf, name_len) = crate::netif::read_name_bytes(buf);
+        let iface =
+            crate::netif::find_by_name(&name_buf[..name_len]).ok_or(Errno::ENODEV)?;
+        let addr =
+            crate::netif::interface_address(iface, host).ok_or(Errno::EADDRNOTAVAIL)?;
+        let ns = crate::netif::IF_NAMESIZE;
+        buf[ns..].fill(0);
+        buf[ns..ns + 2].copy_from_slice(&crate::netif::AF_INET.to_le_bytes());
+        buf[ns + 4..ns + 8].copy_from_slice(&addr);
+        return Ok(());
+    }
+    if request == wasm_posix_shared::ioctl_contract::SIOCGIFINDEX {
+        if buf.len() < crate::netif::IF_NAMESIZE + 4 {
+            return Err(Errno::EINVAL);
+        }
+        let (name_buf, name_len) = crate::netif::read_name_bytes(buf);
+        let iface =
+            crate::netif::find_by_name(&name_buf[..name_len]).ok_or(Errno::ENODEV)?;
+        let ns = crate::netif::IF_NAMESIZE;
+        buf[ns..ns + 4].copy_from_slice(&iface.index.to_le_bytes());
+        return Ok(());
+    }
+
     // Device-specific handlers intentionally own unknown-ioctl errno policy,
     // but a terminal request on a non-terminal must consistently be ENOTTY.
     // Gate that shared namespace before framebuffer/audio/DRM dispatch so a
