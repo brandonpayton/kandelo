@@ -4843,6 +4843,16 @@
   word-break: break-all;
 }
 
+.knetwork-name {
+  padding: 8px;
+  border: 1px solid var(--k-border);
+  border-radius: 8px;
+  background: var(--k-surface);
+  color: var(--k-text);
+  font-family: var(--k-font-mono, monospace);
+  font-size: 12px;
+}
+
 .knetwork-status,
 .knetwork-take-note,
 .knetwork-grant-note,

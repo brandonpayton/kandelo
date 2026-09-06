@@ -1,8 +1,12 @@
-// Network popup — the three steps that connect two Kandelo computers.
+// Network popup — the exchange that connects two Kandelo computers.
 //
-// The humans carry the codes: one side creates an invite, the other answers
-// it, the first completes. Both codes are plain text so they travel through
-// whatever chat window the two people already share.
+// With a signalling server configured, the pair shares a session name and
+// the server carries the codes: one side hosts the name, the other joins
+// it. The manual exchange stays underneath it, because it is the one flow
+// that needs nobody: the humans carry the codes, one side creates an
+// invite, the other answers it, the first completes. Both codes are plain
+// text so they travel through whatever chat window the two people already
+// share.
 
 import * as React from "react";
 import type { MachineHandover } from "./machine-handover";
@@ -300,63 +304,110 @@ export const NetworkPopup: React.FC<{
     );
   }
 
+  const manualSteps = (
+    <div className="knetwork-steps">
+      {/* Each computer is shown one side of the exchange, decided by
+          whether it runs a machine. Inviting means offering a machine, so
+          a computer running none has nothing to invite anyone to; and a
+          computer already running one has something to offer, so answering
+          someone else's invite is not the step in front of it. Showing
+          both sides to either computer offers two ways to start and makes
+          the pair agree by hand on which of them is which. */}
+      {hasMachine ? (
+        <button
+          type="button"
+          className="knetwork-button"
+          onClick={session.createInvite}
+        >
+          Create invite code
+        </button>
+      ) : (
+        <button
+          type="button"
+          className="knetwork-button"
+          onClick={session.answerInvite}
+        >
+          Answer invite
+        </button>
+      )}
+    </div>
+  );
+
+  // In the order the exchange happens: the invite makes your code, you
+  // send it, you paste the answer, you say what the other computer may
+  // do, and only then is there a connection to complete.
+  const manualExchange = hasMachine ? (
+    <>
+      {localCodeSection}
+      {remoteCodeSection}
+      {grantSection}
+      <section className="knetwork-section">
+        <div className="knetwork-steps">
+          <button
+            type="button"
+            className="knetwork-button"
+            onClick={session.completeConnection}
+          >
+            Complete connection
+          </button>
+        </div>
+      </section>
+    </>
+  ) : (
+    <>
+      {remoteCodeSection}
+      {localCodeSection}
+    </>
+  );
+
   return (
     <div className="knetwork-popup">
       <section className="knetwork-section">
         <div className="knetwork-label">Connect another computer</div>
-        <div className="knetwork-steps">
-          {/* Each computer is shown one side of the exchange, decided by
-              whether it runs a machine. Inviting means offering a machine, so
-              a computer running none has nothing to invite anyone to; and a
-              computer already running one has something to offer, so answering
-              someone else's invite is not the step in front of it. Showing
-              both sides to either computer offers two ways to start and makes
-              the pair agree by hand on which of them is which. */}
-          {hasMachine ? (
-            <button
-              type="button"
-              className="knetwork-button"
-              onClick={session.createInvite}
-            >
-              Create invite code
-            </button>
-          ) : (
-            <button
-              type="button"
-              className="knetwork-button"
-              onClick={session.answerInvite}
-            >
-              Answer invite
-            </button>
-          )}
-        </div>
+        {session.signalling ? (
+          <>
+            <label className="knetwork-label" htmlFor="knetwork-session">
+              Session name — the words the two of you agreed on
+            </label>
+            <input
+              id="knetwork-session"
+              className="knetwork-name"
+              type="text"
+              spellCheck={false}
+              value={session.sessionName}
+              placeholder="lucky-orange-lantern"
+              onChange={(event) => session.setSessionName(event.target.value)}
+            />
+          </>
+        ) : (
+          manualSteps
+        )}
       </section>
 
-      {/* In the order the exchange happens: the invite makes your code, you
-          send it, you paste the answer, you say what the other computer may
-          do, and only then is there a connection to complete. */}
-      {hasMachine ? (
+      {session.signalling ? (
         <>
-          {localCodeSection}
-          {remoteCodeSection}
-          {grantSection}
+          {/* The grant precedes hosting for the same reason it precedes
+              completing: joining sends the machine's whole state, so the
+              owner says what the other computer may do before the name is
+              hosted and the connection completes by itself. */}
+          {hasMachine && grantSection}
           <section className="knetwork-section">
             <div className="knetwork-steps">
+              {/* The same one-side-each split as the manual exchange: the
+                  computer with a machine hosts the name, the empty one joins
+                  it. */}
               <button
                 type="button"
                 className="knetwork-button"
-                onClick={session.completeConnection}
+                onClick={hasMachine ? session.hostSession : session.joinSession}
               >
-                Complete connection
+                {hasMachine ? "Host this session" : "Join this session"}
               </button>
             </div>
           </section>
         </>
       ) : (
-        <>
-          {remoteCodeSection}
-          {localCodeSection}
-        </>
+        manualExchange
       )}
 
       {session.status !== "" && (
