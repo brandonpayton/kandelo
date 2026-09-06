@@ -399,6 +399,7 @@ export const WPK_FORK_REQUIRED_IMPORTS = [
   { module: "env", name: "__wpk_fork_ref_gc_provenance_end", params: ["i32"], results: [] },
   { module: "env", name: "__wpk_fork_ref_gc_provenance_ref", params: ["i32", "i32", "i32"], results: [] },
   { module: "env", name: "__wpk_fork_ref_gc_route", params: ["i32", "i32"], results: ["i32"] },
+  { module: "env", name: "__wpk_fork_ref_provenance_externref", params: ["externref"], results: ["externref"] },
   { module: "env", name: "__wpk_fork_ref_scratch_release", params: ["ptr", "ptr"], results: [] },
   { module: "env", name: "__wpk_fork_ref_scratch_reserve", params: ["ptr"], results: ["ptr"] },
   { module: "env", name: "__wpk_fork_ref_vector_append", params: ["i32", "i32"], results: [] },

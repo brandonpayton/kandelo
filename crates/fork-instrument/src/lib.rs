@@ -34,6 +34,7 @@ use wasmparser::{Parser, Payload};
 
 pub mod call_graph;
 pub mod contract_inventory;
+pub mod externref_provenance;
 pub mod instrument;
 pub mod legacy_eh;
 pub mod legacy_dlopen;
@@ -388,6 +389,14 @@ pub fn instrument(input: &[u8], opts: &Options) -> Result<Vec<u8>> {
         reaching.tail_call_landings,
     );
     instrument::validate_activation_state_with_targets(&module, &fork_path, &fork_path_targets)?;
+
+    // N1-F5 Task 1: wrap every externref-returning host-import call site
+    // with a mint-time provenance-recording import (FLOOR-1 capture
+    // primitive; see `externref_provenance` module docs). This must run
+    // before any later pass injects its own imports or local functions, so
+    // it sees only the guest's original import surface and cannot mistake
+    // its own generated wrapper/import for a production site.
+    externref_provenance::inject_provenance_wrappers(&mut module)?;
 
     // The five wpk_fork_* exports prove only that some instrumentation runtime
     // was injected. They do not prove which import seeded the transformed call

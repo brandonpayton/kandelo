@@ -6987,6 +6987,17 @@
         {
           "kind": "func",
           "module": "env",
+          "name": "__wpk_fork_ref_provenance_externref",
+          "params": [
+            "externref"
+          ],
+          "results": [
+            "externref"
+          ]
+        },
+        {
+          "kind": "func",
+          "module": "env",
           "name": "__wpk_fork_ref_scratch_release",
           "params": [
             "ptr",

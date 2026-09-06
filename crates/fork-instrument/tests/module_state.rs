@@ -1476,6 +1476,11 @@ fn node_fresh_instance_restores_no_seed_module_state_and_segment_lifetime() {
           __wpk_fork_ref_gc_provenance_end: () => {},
           __wpk_fork_ref_scratch_reserve: (size) => allocate(Number(size)),
           __wpk_fork_ref_scratch_release: () => {},
+          // N1-F5 T1: pass-through stub. The real host body (later F5 tasks)
+          // records mint-time provenance as a side effect and returns the
+          // same externref unchanged; this test only needs link-time
+          // callability and identity preservation, not provenance recording.
+          __wpk_fork_ref_provenance_externref: (value) => value,
         };
         return new WebAssembly.Instance(module, { env });
       }

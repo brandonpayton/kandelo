@@ -2430,6 +2430,22 @@ pub mod abi {
         "__wpk_fork_ref_gc_provenance_ref";
     pub const WPK_FORK_REFERENCE_IMPORT_GC_ROUTE: &str = "__wpk_fork_ref_gc_route";
     pub const WPK_FORK_REFERENCE_IMPORT_GC_TRANSIT: &str = "__wpk_fork_ref_gc_transit";
+    /// FLOOR-1 externref production-site provenance import (N1-F5).
+    ///
+    /// `wasm-fork-instrument` wraps every call site that invokes a
+    /// declared host-function import whose result includes `externref` so
+    /// the wrapper immediately calls this import with the freshly-minted
+    /// value before handing it to the original caller. The signature is a
+    /// pass-through — `fn(externref) -> externref` — so the host records
+    /// `(externref identity -> handle)` at mint time (the ONLY sound moment
+    /// to observe that association; see
+    /// `docs/plans/2026-09-05-n1-f5-externref-capture-grounding.md`) and
+    /// returns the same value unchanged. Capture-time work then shrinks to a
+    /// lookup against data guaranteed to exist, rather than an attempt to
+    /// derive a handle from an already-live value by inspection (which is
+    /// unsound; see the grounding doc's `§2`).
+    pub const WPK_FORK_REFERENCE_IMPORT_PROVENANCE_EXTERNREF: &str =
+        "__wpk_fork_ref_provenance_externref";
     pub const WPK_FORK_REFERENCE_IMPORT_SCRATCH_RELEASE: &str = "__wpk_fork_ref_scratch_release";
     pub const WPK_FORK_REFERENCE_IMPORT_SCRATCH_RESERVE: &str = "__wpk_fork_ref_scratch_reserve";
     pub const WPK_FORK_REFERENCE_IMPORT_VECTOR_APPEND: &str = "__wpk_fork_ref_vector_append";
@@ -2713,6 +2729,12 @@ pub mod abi {
             name: WPK_FORK_REFERENCE_IMPORT_GC_ROUTE,
             params: &[I32, I32],
             results: &[I32],
+        },
+        ProgramArtifactImport {
+            module: WPK_FORK_REFERENCE_CODEC_IMPORT_MODULE,
+            name: WPK_FORK_REFERENCE_IMPORT_PROVENANCE_EXTERNREF,
+            params: &[ExternRef],
+            results: &[ExternRef],
         },
         ProgramArtifactImport {
             module: WPK_FORK_REFERENCE_CODEC_IMPORT_MODULE,
@@ -3871,7 +3893,7 @@ pub mod abi {
             assert_eq!(wpk_fork_linked_chunk_header_size(16), None);
             assert_eq!(wpk_fork_linked_node_header_size(16), None);
 
-            assert_eq!(WPK_FORK_REQUIRED_IMPORTS.len(), 45);
+            assert_eq!(WPK_FORK_REQUIRED_IMPORTS.len(), 46);
             let mut previous_import = ("", "");
             for requirement in WPK_FORK_REQUIRED_IMPORTS {
                 let current = (requirement.module, requirement.name);
