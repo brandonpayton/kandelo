@@ -2460,6 +2460,86 @@ impl ExternrefProvenance {
     }
 }
 
+/// N1 refcomplete (static root, last gated native kind): the CAPTURE-side
+/// reverse index for a static root — "is this exact harvested `anyref`
+/// identity one of my instance's own canonical static roots, and if so at
+/// what `(module_activation, static_root_ordinal)` coordinate" — see
+/// `docs/plans/2026-09-05-n1-static-root-capture-grounding.md` §3/§4/§5.
+///
+/// A static root is never "reconstructed": replay re-identifies the CHILD's
+/// own freshly re-harvested canonical root by coordinate
+/// (`DRIVE_OP_STATIC_ROOT`/`fm_static_root_slot`); this index is the exact
+/// capture-side inverse — recorded once, at the SAME one-shot
+/// post-instantiation harvest replay already performs (the "Static-root
+/// catalog mirror" block below), not reconstructed or inferred from a
+/// value's shape at capture time. `intern_static_root` in
+/// `fork-codec::ReferenceGraphBuilder` already dedupes by coordinate, so this
+/// index only needs to answer "value -> coordinate", never "coordinate ->
+/// value".
+///
+/// Populated ONCE per guest OS thread (activation 0 only, matching every
+/// other N1-I5 mirror block's current single-activation scope) — NOT reset
+/// per fork, unlike `NativeReferenceCapture::gc_claimed`: a static root's
+/// identity and coordinate are fixed for the whole instantiation's lifetime,
+/// harvested before any guest code — including a `kernel_fork` call — could
+/// run, so the SAME index is valid for every fork this OS thread's guest
+/// performs. This mirrors `ExternrefProvenance`'s own lifetime argument
+/// exactly (`:2401-2415` above), for the identical reason: `Rooted<AnyRef>`/
+/// `OwnedRooted<AnyRef>` has no `Hash`/`Eq`, so a flat `Vec` + `Rooted::
+/// ref_eq` linear scan is the correct, already-precedented pattern here too
+/// (the number of static roots is bounded by the module's own catalog size,
+/// harvested once, so the linear scan is cheap for the whole guest OS
+/// thread's lifetime).
+struct StaticRootProvenance {
+    entries: Vec<(wasmtime::OwnedRooted<AnyRef>, u32 /* activation */, u32 /* ordinal */)>,
+}
+
+impl StaticRootProvenance {
+    fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    /// Record `(value -> (activation, ordinal))` at harvest time. A repeat
+    /// registration of a value already present is a no-op rather than a
+    /// duplicate entry (defensive: the harvest mirror block registers each
+    /// catalog slot exactly once today, but a duplicate registration must
+    /// stay harmless rather than silently prefer whichever entry sorts
+    /// first).
+    fn register(
+        &mut self,
+        mut store: impl wasmtime::AsContextMut,
+        value: wasmtime::Rooted<AnyRef>,
+        activation: u32,
+        ordinal: u32,
+    ) -> wasmtime::Result<()> {
+        if self.lookup(&mut store, value)?.is_some() {
+            return Ok(());
+        }
+        let owned = value.to_owned_rooted(&mut store)?;
+        self.entries.push((owned, activation, ordinal));
+        Ok(())
+    }
+
+    /// Look up the harvest-time-recorded `(activation, ordinal)` coordinate
+    /// for `value`, or `None` when it is not a harvested static root — the
+    /// SOUNDNESS GUARD boundary: an ordinary dynamic Wasm-GC value (including
+    /// one that happens to have the exact same shape/fields as some static
+    /// root, per the grounding's mutability discriminant) correctly reports
+    /// "not a static root" here rather than a fabricated coordinate.
+    fn lookup(
+        &self,
+        mut store: impl wasmtime::AsContextMut,
+        value: wasmtime::Rooted<AnyRef>,
+    ) -> wasmtime::Result<Option<(u32, u32)>> {
+        for (candidate, activation, ordinal) in &self.entries {
+            if wasmtime::Rooted::ref_eq(&mut store, candidate, &value)? {
+                return Ok(Some((*activation, *ordinal)));
+            }
+        }
+        Ok(None)
+    }
+}
+
 /// N1-F6: grow the module-owned anyref transit table (`fm.gc_transit_table`)
 /// so that index `id + 1` is in bounds. Every host import that hands a FRESH
 /// recipe id back to the guest's `encode_anyref` (`gc_claim`, `gc_i31`,
@@ -4342,6 +4422,15 @@ fn spawn_guest_thread(
         // ONE instance per guest OS thread, matching `ExternrefRegistry`'s
         // own per-generation lifetime argument.
         let externref_provenance = Arc::new(Mutex::new(ExternrefProvenance::new()));
+        // N1 refcomplete (static root): mint-time (harvest-time) static-root
+        // PROVENANCE reverse index — see `StaticRootProvenance`'s doc
+        // comment. Populated once, inside the existing "Static-root catalog
+        // mirror" block below, right alongside the existing forward-
+        // direction `fm.static_root_catalog_table` copy; consulted by
+        // `gc_lookup`'s real capture body. ONE instance per guest OS thread,
+        // matching `ExternrefProvenance`'s own per-generation lifetime
+        // argument (harvested once per instantiation, never reset per fork).
+        let static_root_provenance = Arc::new(Mutex::new(StaticRootProvenance::new()));
         // N1-F6 (refcomplete FLOOR-2): mint-time Wasm-GC constructor
         // provenance — see `GcProvenanceRegistry`'s doc comment. Populated
         // by `gc_provenance_begin`/`_ref`/`_end` (wired below, guarded by
@@ -5421,6 +5510,12 @@ fn spawn_guest_thread(
             // because the decode-side gap it was blocked on (directly-held
             // externref transit publish) is fixed in
             // `crates/fork-codec::drive_plan::build_drive_plan`.
+            // N1 refcomplete (static root, last gated native kind): `gc_
+            // lookup` also now checks `StaticRootProvenance` (see its doc
+            // comment and the "Static-root catalog mirror" block below,
+            // which populates it) between the per-fork `gc_claim_lookup`
+            // check and the externref fallback — this replaces what used to
+            // be a hardcoded "no static-root catalog on native yet" miss.
             // N1-F6 (refcomplete FLOOR-2): `gc_lookup` is the anyref-transit
             // dedup entry reached for EVERY anyref-lineage value (a plain
             // externref, a static root, or a typed Wasm-GC struct/array) —
@@ -5445,6 +5540,7 @@ fn spawn_guest_thread(
             if guest_declares(gc_lookup_name) {
                 let capture_for_gc = Arc::clone(&capture);
                 let provenance_for_gc = Arc::clone(&externref_provenance);
+                let static_root_provenance_for_gc = Arc::clone(&static_root_provenance);
                 let gc_transit_table_for_lookup = fm.gc_transit_table;
                 let result = linker.func_wrap(
                     "env",
@@ -5458,6 +5554,31 @@ fn spawn_guest_thread(
                                 capture_for_gc.lock().unwrap().gc_claim_lookup(&mut caller, anyref)?
                             {
                                 return Ok(id as i32);
+                            }
+                            // N1 refcomplete (static root): check the
+                            // harvest-time reverse index BEFORE the
+                            // externref fallback. The two identity spaces
+                            // are disjoint by construction (a static root is
+                            // always an `AnyRef` participating in `ref.eq` —
+                            // struct/array/i31/eq — which the instrumenter's
+                            // static-root catalog builder deliberately
+                            // excludes externref/funcref from, see
+                            // `can_participate_in_ref_eq`), so trying this
+                            // first never shadows a real externref hit.
+                            if let Some((activation, ordinal)) = static_root_provenance_for_gc
+                                .lock()
+                                .unwrap()
+                                .lookup(&mut caller, anyref)?
+                            {
+                                return capture_for_gc
+                                    .lock()
+                                    .unwrap()
+                                    .graph
+                                    .intern_static_root(activation, ordinal)
+                                    .map(|id| id as i32)
+                                    .map_err(|e| {
+                                        wasmtime::Error::msg(format!("intern_static_root failed: {e:?}"))
+                                    });
                             }
                             if let Ok(externref) = ExternRef::convert_any(&mut caller, anyref) {
                                 let handle =
@@ -5475,9 +5596,10 @@ fn spawn_guest_thread(
                                 }
                             }
                             // A genuine miss (not yet claimed, not a known
-                            // externref, no static-root catalog on native
-                            // yet): report "unknown" and let the guest's own
-                            // dispatch proceed.
+                            // static root, not a known externref): report
+                            // "unknown" and let the guest's own dispatch
+                            // proceed (try i31/struct/array construction
+                            // next).
                             return Ok(0);
                         }
                         // The transit slot held something other than a
@@ -6147,6 +6269,28 @@ fn spawn_guest_thread(
                     for i in 0..len {
                         match guest_roots.get(&mut store, i) {
                             Some(v @ Ref::Any(_)) => {
+                                // N1 refcomplete (static root): also index
+                                // this SAME harvested entry (activation 0 —
+                                // single-activation only, matching this
+                                // whole mirror block's existing scope) into
+                                // the capture-side reverse index, for
+                                // `gc_lookup`'s `StaticRootProvenance`
+                                // lookup — see its doc comment. A `Ref::
+                                // Any(None)` (null) entry is not a live
+                                // identity and has nothing to register.
+                                if let Ref::Any(Some(root)) = v {
+                                    if let Err(e) = static_root_provenance.lock().unwrap().register(
+                                        &mut store,
+                                        root,
+                                        0,
+                                        i as u32,
+                                    ) {
+                                        eprintln!(
+                                            "registering static-root provenance[{i}] failed: {e:#}"
+                                        );
+                                        return;
+                                    }
+                                }
                                 if let Err(e) = fm.static_root_catalog_table.set(&mut store, i, v) {
                                     eprintln!(
                                         "populating fork-module static-root catalog[{i}] failed: {e:#}"
