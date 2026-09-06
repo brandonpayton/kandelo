@@ -11,10 +11,13 @@
 //
 // It starts as soon as the link opens, on both sides, because which side is
 // which is already known: the computer holding a machine is the user, and the
-// computer holding none is the viewer. Neither has anything to press, but the
-// viewer keeps a choice: the Network popup offers Watch (the mirror) and Join
-// (the replica), and switching to Watch withdraws the asking or lets a
-// running replica go.
+// computer holding none is the viewer. The one choice is the user's. Joining
+// starts by sending the viewer the machine's whole state, and that is the
+// owner's disclosure to make, so the Network popup asks the person holding
+// the machine whether the other computer may Join (the replica) or only
+// Watch (the mirror). The grant crosses the wire, and the viewer follows it:
+// granted the replica it asks, granted the mirror it lets a running replica
+// go and stops asking.
 //
 // A viewer holds a machine while it replicates, but it is not a second machine
 // to take: it is a copy of the user's, and the log is what keeps it one. So a
@@ -46,6 +49,7 @@ import {
   LocalReplicationLog,
   type PreviewCursor,
   type PreviewScroll,
+  type ReplicationGrant,
 } from "@host/replication/log-local";
 import {
   ReplicationLogQueueWriter,
@@ -88,20 +92,6 @@ const RETRY_AFTER_MS = 15_000;
 
 const pause = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
-
-/**
- * The two ways a viewer follows the other computer's machine.
- *
- * Watching is the mirror: the user's pixels cross the wire and this computer
- * runs nothing. Joining is the replica: this computer restores the user's
- * checkpoint and runs the machine itself. Joining is the default because it is
- * what a viewer is owed when it can be had, and watching is what every join
- * attempt falls back to anyway — a viewer that is asking, or was refused, is
- * looking at the mirror the whole time. The choice exists for the person who
- * wants only the mirror: a join freezes the user's machine to read it, and a
- * viewer on a weak computer may not want to run a copy at all.
- */
-export type ViewerMode = "watch" | "join";
 
 export interface MachineReplication {
   /** True while this machine's decisions are being sent to the viewer. */
@@ -155,14 +145,22 @@ export interface MachineReplication {
   readonly replicating: boolean;
   /** Why replication is not running, or null when nothing refused it. */
   readonly failure: string | null;
-  /** How this viewer follows the machine. Meaningful only on the viewer. */
-  readonly mode: ViewerMode;
   /**
-   * Choose how to follow. Switching to "watch" withdraws a pending join and
-   * lets go of a replica already running, back to the mirror; switching to
-   * "join" starts asking again.
+   * How the machine on this page may be followed.
+   *
+   * On the computer holding the machine it is the grant that person set; on
+   * the viewer it is the grant last heard on the wire. "join" is the default,
+   * because a replica is what the demo is for; a person who does not want
+   * their machine's state to leave this computer switches to "watch".
    */
-  readonly setMode: (mode: ViewerMode) => void;
+  readonly grant: ReplicationGrant;
+  /**
+   * Set the grant. Meaningful on the computer holding the machine — the
+   * popup offers it to no one else. Switching to "watch" stops serving joins
+   * and ends a recording already running, which sends the viewer back to the
+   * mirror; switching to "join" serves the next ask.
+   */
+  readonly setGrant: (grant: ReplicationGrant) => void;
 }
 
 const IDLE: MachineReplication = {
@@ -170,8 +168,8 @@ const IDLE: MachineReplication = {
   joining: false,
   replicating: false,
   failure: null,
-  mode: "join",
-  setMode: () => {},
+  grant: "join",
+  setGrant: () => {},
   navigation: { publish: () => {}, viewerPath: null },
   cursor: { publish: () => {}, viewerCursor: null },
   scroll: { publish: () => {}, viewerScroll: null },
@@ -192,19 +190,21 @@ export function useMachineReplication(
   const [viewerScroll, setViewerScroll] = React.useState<PreviewScroll | null>(
     null,
   );
-  const [mode, setModeState] = React.useState<ViewerMode>("join");
-  // The join loop below outlives renders, so it reads the mode from a ref and
-  // is nudged through a listener the current viewer stint registers; state
-  // alone would leave it parked on a value from the render it started in.
-  const modeRef = React.useRef<ViewerMode>("join");
-  const modeChangedRef = React.useRef<((mode: ViewerMode) => void) | null>(
-    null,
-  );
-  const setMode = React.useCallback((next: ViewerMode) => {
-    if (modeRef.current === next) return;
-    modeRef.current = next;
-    setModeState(next);
-    modeChangedRef.current?.(next);
+  const [grant, setGrantState] = React.useState<ReplicationGrant>("join");
+  // The loops below outlive renders, so each side reads the grant from a
+  // ref: the user's stint registers a listener that carries a change onto
+  // the wire, and the viewer's writes what it hears back into the ref. One
+  // ref on purpose — a viewer that takes the machine over becomes the user
+  // holding the grant the pair was already living under.
+  const grantRef = React.useRef<ReplicationGrant>("join");
+  const grantChangedRef = React.useRef<
+    ((grant: ReplicationGrant) => void) | null
+  >(null);
+  const setGrant = React.useCallback((next: ReplicationGrant) => {
+    if (grantRef.current === next) return;
+    grantRef.current = next;
+    setGrantState(next);
+    grantChangedRef.current?.(next);
   }, []);
   // The wire outlives renders; a publish callback that closed over one
   // render's wire would post into a link that was already replaced.
@@ -229,10 +229,6 @@ export function useMachineReplication(
     setViewerPath(null);
     setViewerCursor(null);
     setViewerScroll(null);
-    // Each link starts joining: the mode is a choice about this pair, and the
-    // person who made it for the last pair has not made it for this one.
-    modeRef.current = "join";
-    setModeState("join");
     if (!link) return;
     // The transport wraps the link's channel; the link owns and closes it, so
     // dropping a transport here must not close the channel underneath it.
@@ -248,26 +244,46 @@ export function useMachineReplication(
 
     const becomeUser = () => {
       role = "user";
-      const stopServing = wire.serve(async (publish) => {
-        const joined = await host.captureMachineForViewer((entries) => {
-          publish(entries as readonly ReplicationLogEntry[]);
+      const grantOnWire = wire.publishGrant(grantRef.current);
+      let stopServing: (() => void) | null = null;
+      const serve = () => {
+        stopServing = wire.serve(async (publish) => {
+          const joined = await host.captureMachineForViewer((entries) => {
+            publish(entries as readonly ReplicationLogEntry[]);
+          });
+          if (joined === null) return null;
+          setPublishing(true);
+          return {
+            machine: joined.machine,
+            stop: async () => {
+              setPublishing(false);
+              await joined.stop();
+            },
+          };
         });
-        if (joined === null) return null;
-        setPublishing(true);
-        return {
-          machine: joined.machine,
-          stop: async () => {
-            setPublishing(false);
-            await joined.stop();
-          },
-        };
-      });
+      };
+      // A machine granted only the mirror serves no join at all: what leaves
+      // this computer is enforced here, not by the viewer's manners.
+      if (grantRef.current === "join") serve();
+      grantChangedRef.current = (next) => {
+        grantOnWire.set(next);
+        if (next === "watch") {
+          // Ends a recording already running, which tells the viewer; its
+          // page lets the replica go and falls back to the mirror.
+          stopServing?.();
+          stopServing = null;
+          return;
+        }
+        serve();
+      };
       const stopServingMisses = wire.onMiss((key) => {
         serveMissedRequest(host, key);
       });
       leaveRole = () => {
-        stopServing();
+        grantChangedRef.current = null;
+        stopServing?.();
         stopServingMisses();
+        grantOnWire.stop();
         setPublishing(false);
       };
     };
@@ -317,33 +333,36 @@ export function useMachineReplication(
         setViewerCursor(null);
         void host.stopReplicatingMachine();
       };
-      // Parked when the person chose to watch; resolved to look again.
-      let modeChanged: () => void = () => {};
-      modeChangedRef.current = (next) => {
-        if (next === "join") {
-          modeChanged();
+      // Parked while the user grants only the mirror; resolved to ask again.
+      let grantChanged: () => void = () => {};
+      const stopGrants = wire.onGrant((granted) => {
+        if (grantRef.current === granted) return;
+        grantRef.current = granted;
+        setGrantState(granted);
+        if (granted === "join") {
+          grantChanged();
           return;
         }
-        // Watch: withdraw the question, and let go of a replica already
-        // running. Neither is a failure — the person asked for the mirror.
+        // The mirror only: withdraw the question, and let go of a replica
+        // already running. Neither is a failure — it is the user's answer.
         setJoining(false);
         setFailure(null);
         endAttempt();
         dropReplica();
-      };
+      });
       leaveRole = () => {
         left = true;
         setJoining(false);
         endAttempt();
         dropReplica();
-        modeChangedRef.current = null;
-        modeChanged();
+        stopGrants();
+        grantChanged();
       };
       void (async () => {
         while (!gone && !left) {
-          if (modeRef.current !== "join") {
+          if (grantRef.current !== "join") {
             await new Promise<void>((resolve) => {
-              modeChanged = resolve;
+              grantChanged = resolve;
             });
             continue;
           }
@@ -406,9 +425,10 @@ export function useMachineReplication(
           try {
             const machine = await wire.join(JOIN_TIMEOUT_MS, withdraw.signal);
             if (gone || left) return;
-            if (modeRef.current !== "join") {
-              // Watch was chosen while the question was out, and the answer
-              // beat the withdrawal here. The machine is not booted.
+            if (grantRef.current !== "join") {
+              // The grant moved to the mirror while the question was out, and
+              // the answer beat the withdrawal here. The machine is not
+              // booted.
               setJoining(false);
               continue;
             }
@@ -429,9 +449,10 @@ export function useMachineReplication(
               bootingReplica = false;
             }
             if (gone || left) return;
-            if (modeRef.current !== "join") {
-              // Watch was chosen while the replica was booting. A copy that
-              // arrived after the person stopped asking is let go, not kept.
+            if (grantRef.current !== "join") {
+              // The grant moved to the mirror while the replica was booting.
+              // A copy that arrived after it was taken back is let go, not
+              // kept.
               replica = true;
               dropReplica();
               setJoining(false);
@@ -448,9 +469,10 @@ export function useMachineReplication(
           } catch (error) {
             if (gone || left) return;
             endAttempt();
-            if (modeRef.current !== "join") {
-              // The person chose to watch mid-attempt; the withdrawal threw
-              // here, and it is their answer, not a failure to report.
+            if (grantRef.current !== "join") {
+              // The grant moved to the mirror mid-attempt; the withdrawal
+              // threw here, and it is the user's answer, not a failure to
+              // report.
               setJoining(false);
               continue;
             }
@@ -494,14 +516,16 @@ export function useMachineReplication(
     };
   }, [host, link]);
 
-  if (!link) return IDLE;
+  // The grant stays live without a link: it is this page's policy, and the
+  // person completing a connection sets it before the link exists.
+  if (!link) return { ...IDLE, grant, setGrant };
   return {
     publishing,
     joining,
     replicating,
     failure,
-    mode,
-    setMode,
+    grant,
+    setGrant,
     navigation: { publish: publishNavigation, viewerPath },
     cursor: { publish: publishCursor, viewerCursor },
     scroll: { publish: publishScroll, viewerScroll },

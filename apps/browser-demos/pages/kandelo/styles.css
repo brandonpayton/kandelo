@@ -4822,7 +4822,7 @@
   opacity: 0.6;
 }
 
-.knetwork-mode[aria-pressed="true"] {
+.knetwork-grant[aria-pressed="true"] {
   background: var(--kdock-active-fill);
   color: var(--kdock-active-text);
   border-color: transparent;
@@ -4845,7 +4845,7 @@
 
 .knetwork-status,
 .knetwork-take-note,
-.knetwork-mode-note,
+.knetwork-grant-note,
 .knetwork-replication-note {
   color: var(--k-text-muted);
   font-size: 12px;

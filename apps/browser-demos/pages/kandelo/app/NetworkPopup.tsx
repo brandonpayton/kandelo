@@ -178,6 +178,38 @@ export const NetworkPopup: React.FC<{
   const connected = session.link !== null;
   const note = takeNote(handover);
 
+  // The grant is the machine owner's: joining starts by sending the machine's
+  // whole state to the other computer, so the person holding it decides how
+  // it may be followed — before completing the connection, and at any time
+  // after.
+  const grantSection = (
+    <section className="knetwork-section">
+      <div className="knetwork-label">They can</div>
+      <div className="knetwork-link-controls">
+        <button
+          type="button"
+          className="knetwork-button knetwork-grant"
+          aria-pressed={replication.grant === "watch"}
+          onClick={() => replication.setGrant("watch")}
+        >
+          Watch
+        </button>
+        <button
+          type="button"
+          className="knetwork-button knetwork-grant"
+          aria-pressed={replication.grant === "join"}
+          onClick={() => replication.setGrant("join")}
+        >
+          Join
+        </button>
+      </div>
+      <div className="knetwork-grant-note">
+        Watch shares this screen only; Join lets the other computer run a copy
+        of this machine.
+      </div>
+    </section>
+  );
+
   const localCodeSection = (
     <section className="knetwork-section">
       <label className="knetwork-label" htmlFor="knetwork-local">
@@ -235,37 +267,10 @@ export const NetworkPopup: React.FC<{
           </div>
         )}
 
-        {/* The choice belongs to the watcher alone: the person holding the
-            machine shares whichever way the viewer follows, and a pair with
-            no machine between them has nothing to follow either way. */}
-        {(!hasMachine || replication.replicating)
-          && handover.peerHasMachine && (
-          <section className="knetwork-section">
-            <div className="knetwork-label">How to follow it</div>
-            <div className="knetwork-link-controls">
-              <button
-                type="button"
-                className="knetwork-button knetwork-mode"
-                aria-pressed={replication.mode === "watch"}
-                onClick={() => replication.setMode("watch")}
-              >
-                Watch
-              </button>
-              <button
-                type="button"
-                className="knetwork-button knetwork-mode"
-                aria-pressed={replication.mode === "join"}
-                onClick={() => replication.setMode("join")}
-              >
-                Join
-              </button>
-            </div>
-            <div className="knetwork-mode-note">
-              Watch mirrors the other computer&apos;s screen here; Join runs a
-              copy of the machine on this computer.
-            </div>
-          </section>
-        )}
+        {/* A replicating page holds a machine and is still the watcher, so
+            holding one is not enough — the grant is offered to the page the
+            machine is actually running on. */}
+        {hasMachine && !replication.replicating && grantSection}
 
         <section className="knetwork-section">
           <div className="knetwork-link-controls">
@@ -308,22 +313,13 @@ export const NetworkPopup: React.FC<{
               both sides to either computer offers two ways to start and makes
               the pair agree by hand on which of them is which. */}
           {hasMachine ? (
-            <>
-              <button
-                type="button"
-                className="knetwork-button"
-                onClick={session.createInvite}
-              >
-                Create invite code
-              </button>
-              <button
-                type="button"
-                className="knetwork-button"
-                onClick={session.completeConnection}
-              >
-                Complete connection
-              </button>
-            </>
+            <button
+              type="button"
+              className="knetwork-button"
+              onClick={session.createInvite}
+            >
+              Create invite code
+            </button>
           ) : (
             <button
               type="button"
@@ -335,6 +331,21 @@ export const NetworkPopup: React.FC<{
           )}
         </div>
       </section>
+
+      {hasMachine && grantSection}
+      {hasMachine && (
+        <section className="knetwork-section">
+          <div className="knetwork-steps">
+            <button
+              type="button"
+              className="knetwork-button"
+              onClick={session.completeConnection}
+            >
+              Complete connection
+            </button>
+          </div>
+        </section>
+      )}
 
       {hasMachine ? localCodeSection : remoteCodeSection}
       {hasMachine ? remoteCodeSection : localCodeSection}

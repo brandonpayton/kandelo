@@ -290,6 +290,39 @@ describe("local replication log", () => {
     }
   });
 
+  it("tells a watcher what it is granted, and again when it says hello", async () => {
+    const channel = `replication-test-${crypto.randomUUID()}`;
+    const machine = new LocalReplicationLog(channel);
+    const early = new LocalReplicationLog(channel);
+    const late = new LocalReplicationLog(channel);
+    const heardEarly: string[] = [];
+    const heardLate: string[] = [];
+    const stopEarly = early.onGrant((grant) => void heardEarly.push(grant));
+    const grant = machine.publishGrant("watch");
+    try {
+      await vi.waitFor(() => expect(heardEarly).toEqual(["watch"]));
+      grant.set("join");
+      await vi.waitFor(() => expect(heardEarly).toEqual(["watch", "join"]));
+
+      // A viewer that arrives late says hello when it starts watching, and
+      // the grant is what parks its join loop — one that never heard it
+      // would ask a machine that serves no joins and wait out its whole
+      // timeout.
+      const stopLate = late.onGrant((heard) => void heardLate.push(heard));
+      const sink = fakeSink();
+      const stopWatch = late.watch(sink.sink);
+      await vi.waitFor(() => expect(heardLate).toEqual(["join"]));
+      stopWatch();
+      stopLate();
+    } finally {
+      grant.stop();
+      stopEarly();
+      machine.close();
+      early.close();
+      late.close();
+    }
+  });
+
   it("loses no entry to a wire that holds its bytes", async () => {
     const [near, far] = FakeDataChannel.pair({ auto: false });
     const publisher = new LocalReplicationLog(new ChunkedMessageChannel(near));

@@ -99,6 +99,16 @@ export interface ReplicationLogSink {
   scrolled?(position: PreviewScroll): void;
 }
 
+/**
+ * How the computer holding the machine lets the other one follow it.
+ *
+ * "watch" is the mirror only: pixels cross the wire and nothing else. "join"
+ * lets the other computer run a replica, which starts by sending it the
+ * machine's whole state. That is the owner's disclosure to make, so the grant
+ * is published by the machine's side and a viewer only hears it.
+ */
+export type ReplicationGrant = "watch" | "join";
+
 /** A pointer position as fractions of the web preview surface, 0..1. */
 export interface PreviewCursor {
   readonly x: number;
@@ -118,6 +128,7 @@ type LocalReplicationMessage<TMachine> =
   | { readonly kind: "cursor"; readonly position: PreviewCursor | null }
   | { readonly kind: "scrolled"; readonly position: PreviewScroll }
   | { readonly kind: "miss"; readonly key: string }
+  | { readonly kind: "granted"; readonly grant: ReplicationGrant }
   | { readonly kind: "ended" }
   | { readonly kind: "join"; readonly joinId: string }
   | { readonly kind: "withdrawn"; readonly joinId: string }
@@ -427,6 +438,50 @@ export class LocalReplicationLog<TMachine = never> {
    */
   reportMiss(key: string): void {
     this.#post({ kind: "miss", key });
+  }
+
+  /**
+   * Publish how this machine may be followed.
+   *
+   * Posted immediately, on every change, and again for every watcher that
+   * says hello — the grant is what parks a viewer's join loop, and a viewer
+   * that never heard it would ask a machine that does not serve joins and
+   * wait out its whole timeout instead. Returns the grant's controls: `set`
+   * to change it, `stop` when this computer no longer holds the machine.
+   */
+  publishGrant(initial: ReplicationGrant): {
+    set: (grant: ReplicationGrant) => void;
+    stop: () => void;
+  } {
+    let grant = initial;
+    const post = () => this.#post({ kind: "granted", grant });
+    const listener = (event: MessageEvent) => {
+      const message = event.data as LocalReplicationMessage<TMachine>;
+      if (message.kind === "hello") post();
+    };
+    this.#channel.addEventListener("message", listener);
+    post();
+    return {
+      set: (next) => {
+        if (next === grant) return;
+        grant = next;
+        post();
+      },
+      stop: () => this.#channel.removeEventListener("message", listener),
+    };
+  }
+
+  /**
+   * Hear how the machine on this channel may be followed. Returns an
+   * unsubscribe.
+   */
+  onGrant(handler: (grant: ReplicationGrant) => void): () => void {
+    const listener = (event: MessageEvent) => {
+      const message = event.data as LocalReplicationMessage<TMachine>;
+      if (message.kind === "granted") handler(message.grant);
+    };
+    this.#channel.addEventListener("message", listener);
+    return () => this.#channel.removeEventListener("message", listener);
   }
 
   /**
