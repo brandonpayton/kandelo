@@ -375,8 +375,14 @@ download completed. Both views reset when the kernel is replaced; neither is
 persisted as a machine snapshot.
 
 Cross-origin browser fetches are routed through `public/service-worker.js`,
-which defaults to `https://wordpress-playground-cors-proxy.net/?`. Override it
-with `VITE_CORS_PROXY_URL` when testing another proxy:
+which defaults to `https://wordpress-playground-cors-proxy.net/?`. Only GET
+and HEAD requests are wrapped in the proxy: the proxy exists to make
+CORS-less read-only resources readable under COEP, and its only POST
+authority is the reviewed `git-upload-pack` boundary, which targets the proxy
+URL deliberately. A page-level request with any other method goes directly to
+its target, so that server must grant CORS itself — the signalling piplet
+(`apps/signalling/piplet.php`) does. Override the proxy with
+`VITE_CORS_PROXY_URL` when testing another proxy:
 
 ```bash
 cd apps/browser-demos

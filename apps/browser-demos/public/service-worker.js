@@ -1782,8 +1782,16 @@ if (typeof window !== "undefined") {
       });
     }
 
-    // If we have a CORS proxy, route through it
-    if (normalizedCorsProxyConfig()) {
+    // If we have a CORS proxy, route reads through it. The proxy exists to
+    // make CORS-less GET/HEAD subresources readable under COEP; its only POST
+    // authority is the reviewed git-upload-pack boundary, and that traffic
+    // targets the proxy URL deliberately. A body-bearing page request belongs
+    // to a server that speaks CORS itself — the signalling piplet, for one —
+    // so wrapping it turns a working direct request into a relay refusal.
+    if (
+      normalizedCorsProxyConfig() &&
+      (request.method === "GET" || request.method === "HEAD")
+    ) {
       var proxyUrl = corsProxyFetchUrl(targetUrl);
       return projectCorsProxyRequest(request, proxyUrl, targetUrl).then(function (projected) {
         if (projected instanceof Response) return projected;

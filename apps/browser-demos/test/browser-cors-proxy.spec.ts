@@ -119,6 +119,23 @@ function constrainedProxyFixture(observed: ProxyRequest[]): Server {
   });
 }
 
+function corsOpenTargetFixture(observed: ProxyRequest[]): Server {
+  return createServer(async (request, response) => {
+    observed.push({
+      method: request.method ?? "",
+      url: request.url ?? "",
+      headers: request.headers,
+      body: await requestBody(request),
+    });
+    response.writeHead(200, {
+      "Access-Control-Allow-Origin": "*",
+      "Content-Type": "text/plain",
+      "Cross-Origin-Resource-Policy": "cross-origin",
+    });
+    response.end("cors-open target response\n");
+  });
+}
+
 test("Vite serves a service worker with the complete proxy profile", async ({
   request,
 }) => {
@@ -140,6 +157,9 @@ test("service worker projects both configured proxy boundaries", async ({
   const observed: ProxyRequest[] = [];
   const proxy = constrainedProxyFixture(observed);
   const proxyRoot = await listen(proxy);
+  const directObserved: ProxyRequest[] = [];
+  const directTarget = corsOpenTargetFixture(directObserved);
+  const directRoot = await listen(directTarget);
   const rawServiceWorker = await readFile(serviceWorkerPath, "utf8");
   const config = {
     url: `${proxyRoot}/?`,
@@ -185,7 +205,7 @@ test("service worker projects both configured proxy boundaries", async ({
       () => (window as Window & { ready?: boolean }).ready === true,
     );
     const results = await page.evaluate(
-      async ({ proxyUrl }) => {
+      async ({ proxyUrl, directUrl }) => {
         async function outcome(url: string, init: RequestInit) {
           const response = await fetch(url, init);
           return { status: response.status, body: await response.text() };
@@ -221,15 +241,22 @@ test("service worker projects both configured proxy boundaries", async ({
           headers: { "X-Arbitrary-Metadata": "reject" },
           body: "state change",
         });
+        // A body-bearing request to a CORS-open server — the signalling
+        // piplet's shape — must reach it directly, never the proxy.
+        const directPost = await outcome(`${directUrl}/session`, {
+          method: "POST",
+          body: "kandelo1:offer",
+        });
         return {
           browserOwned,
           alreadyWrapped,
           allowedPost,
           rejected,
           beforeRejected,
+          directPost,
         };
       },
-      { proxyUrl: proxyRoot },
+      { proxyUrl: proxyRoot, directUrl: directRoot },
     );
 
     expect(results.browserOwned).toEqual({
@@ -245,6 +272,13 @@ test("service worker projects both configured proxy boundaries", async ({
       body: "constrained proxy response\n",
     });
     expect(results.rejected.status).toBe(502);
+    expect(results.directPost).toEqual({
+      status: 200,
+      body: "cors-open target response\n",
+    });
+    expect(directObserved).toMatchObject([
+      { method: "POST", url: "/session", body: "kandelo1:offer" },
+    ]);
     const actual = observed.filter(({ method }) => method !== "OPTIONS");
     expect(actual).toHaveLength(4);
     expect(actual[0]?.headers["git-protocol"]).toBe("version=2");
@@ -269,7 +303,7 @@ test("service worker projects both configured proxy boundaries", async ({
     ).toBe(true);
     expect(corsErrors).toEqual([]);
   } finally {
-    await Promise.all([close(app), close(proxy)]);
+    await Promise.all([close(app), close(proxy), close(directTarget)]);
   }
 });
 
