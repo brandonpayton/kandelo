@@ -57,6 +57,32 @@ convenient illusion.
    under subtyping). Both are ABI epochs (rebuild fork packages).
    Capability-ahead-of-demand is intentional (completeness over YAGNI). This
    REPLACES the old B2/B3/M2/M3 framing below (references) with I5b→F5→F6.
+
+   **2a. Capture↔Replay symmetry — the ORGANIZING LENS for all remaining
+   reference-type work (user, 2026-09-05; preserve this framing every step).**
+   For every reference kind, the replay/decode side is already built, shared,
+   and frozen — and it IS the spec for capture. Capture is the inverse encoder
+   that must produce exactly the recipe replay consumes. So frame each kind's
+   remaining work as "invert the existing replay," which cleanly separates the
+   cheap half from the real work:
+   - **The mechanical half (often already built):** the wire WRITER is the
+     bit-for-bit inverse of the decoder and frequently already exists in
+     `fork_codec` (e.g. `ReferenceGraphBuilder::intern_externref` mirrors the
+     externref decoder). Emitting the recipe node is essentially free.
+   - **The one place symmetry BREAKS (the real work + the ABI floor):** replay
+     is `handle/recipe → value` (a pure function of data already in the
+     recipe); capture needs `live value → handle/recipe` (a relation replay
+     never had to compute). That inverse CANNOT be recovered by inspection
+     (that was the deleted unsound reverse-lookup) — it must be RECORDED at the
+     value's PRODUCTION SITE via re-instrumentation (the "floor" for that kind).
+   Per kind: **funcref** (done, I5b) — ordinal from the catalog. **externref**
+   (F5) — handle recorded at the mint/host-import site. **GC struct/array/i31**
+   (F6) — the host cannot introspect a live GC object at all, so provenance is
+   recorded at construction. **static-root** (F6). Size each step by this split:
+   the mechanical inverse is cheap; the provenance recording is the work and the
+   reason each floor is an ABI epoch. Every F5/F6 grounding + plan MUST carry a
+   "Replay↔Capture symmetry (<kind>)" section making the inverse explicit and
+   pinpointing exactly where it breaks.
 3. **Batch validation runs once, at campaign completion**, when all three hosts
    test the finished result on the same `kernel.wasm` (Node Vitest + browser
    Playwright + libc/posix/sortix). No interleaved cross-host validation.
