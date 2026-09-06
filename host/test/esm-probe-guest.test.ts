@@ -139,6 +139,20 @@ const FIXTURES: Record<string, string> = {
     'export const b="B";const A=import.meta.require("/app/liveA.mjs");export function readALate(){return A.late;}',
   "mainlive.cjs":
     '(()=>{try{const nsA=require("/app/liveA.mjs");const nsB=nsA.getB();console.log("LIVE",nsB.readALate());}catch(e){console.log("LIVEERR",(e&&e.name)||"",(e&&e.message)||e);}})();',
+  // Link-time cycle (patch 0019): during alink's evaluation it require()s blink,
+  // which STATICALLY imports alink. Linking blink recurses into alink, which is
+  // already `Evaluating` -> before the fix InnerModuleLinking threw "module
+  // record has unexpected status: Evaluating". Now it early-returns (an
+  // evaluating module is already linked), so blink links + evaluates and reads
+  // alink.a (already initialized) -> "LINKCYC A A". This is the shape that
+  // blocks `claude -p` (incremental require/import during evaluation with a
+  // static back-reference to an evaluating module).
+  "alink.mjs":
+    'export const a="A";const B=import.meta.require("/app/blink.mjs");export function getFromB(){return B.usesA;}',
+  "blink.mjs":
+    'import{a}from"/app/alink.mjs";export const usesA=a;',
+  "mainlinkcyc.cjs":
+    '(()=>{try{const A=require("/app/alink.mjs");console.log("LINKCYC",A.a,A.getFromB());}catch(e){console.log("LINKCYCERR",(e&&e.name)||"",(e&&e.message)||e);}})();',
 };
 
 function stageFixtures(): string {
@@ -354,5 +368,13 @@ describe("spidermonkey-node ESM probe", () => {
     console.log("LIVE OUT:", JSON.stringify(r.stdout.trim()), "ERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
     // liveB captured liveA's ns while late was TDZ; reads "LATE" after the cycle settles.
     expect(r.stdout).toContain("LIVE LATE");
+  }, 90_000);
+
+  it.runIf(ready)("link-time cycle: linking a module whose dep is Evaluating does not throw", async () => {
+    const r = await runOne("/app/mainlinkcyc.cjs");
+    // eslint-disable-next-line no-console
+    console.log("LINKCYC OUT:", JSON.stringify(r.stdout.trim()), "ERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
+    expect(r.stdout).toContain("LINKCYC A A");
+    expect(r.stdout).not.toContain("LINKCYCERR");
   }, 90_000);
 });

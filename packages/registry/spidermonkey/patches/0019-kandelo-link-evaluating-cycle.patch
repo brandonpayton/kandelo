@@ -1,0 +1,23 @@
+--- a/js/src/vm/Modules.cpp
++++ b/js/src/vm/Modules.cpp
+@@ -1375,8 +1375,20 @@
+ 
+   // Step 2. If module.[[Status]] is linking, linked, evaluating-async, or
+   //         evaluated, then:
++  //
++  // Kandelo: also early-return for `evaluating`. The ES spec omits it because
++  // it assumes the whole module graph is linked before any evaluation begins,
++  // so a dependency can never be mid-evaluation during linking. Kandelo's
++  // node-compat loads modules incrementally (each require()/import() during
++  // evaluation links a fresh sub-graph), so linking a newly loaded module can
++  // legitimately recurse into an already-evaluating module reached through a
++  // dependency cycle. Such a module is already fully linked (its environment
++  // and bindings were resolved before evaluation started), so treat it like
++  // linked/evaluated and skip re-linking instead of throwing
++  // "module record has unexpected status: Evaluating".
+   if (module->status() == ModuleStatus::Linking ||
+       module->status() == ModuleStatus::Linked ||
++      module->status() == ModuleStatus::Evaluating ||
+       module->status() == ModuleStatus::EvaluatingAsync ||
+       module->status() == ModuleStatus::Evaluated) {
+     // Step 2.a. Return index.
