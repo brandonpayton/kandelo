@@ -36,7 +36,9 @@ function describeError(error: unknown): string {
 export function usePeerSession(): PeerSession {
   const [localCode, setLocalCode] = React.useState("");
   const [remoteCode, setRemoteCode] = React.useState("");
-  const [status, setStatus] = React.useState("Not connected.");
+  // Empty while nothing is happening: the connect steps already say there is
+  // no connection, so the status only ever reports progress or a failure.
+  const [status, setStatus] = React.useState("");
   const [link, setLink] = React.useState<PeerLink | null>(null);
   const pendingInviteRef = React.useRef<PeerInvite | null>(null);
   // Every attempt supersedes the one before it. Without this, a superseded
@@ -141,7 +143,7 @@ export function usePeerSession(): PeerSession {
     setLink(null);
     setLocalCode("");
     setRemoteCode("");
-    setStatus("Not connected.");
+    setStatus("");
   }, []);
 
   return {

@@ -332,25 +332,36 @@ export const NetworkPopup: React.FC<{
         </div>
       </section>
 
-      {hasMachine && grantSection}
-      {hasMachine && (
-        <section className="knetwork-section">
-          <div className="knetwork-steps">
-            <button
-              type="button"
-              className="knetwork-button"
-              onClick={session.completeConnection}
-            >
-              Complete connection
-            </button>
-          </div>
-        </section>
+      {/* In the order the exchange happens: the invite makes your code, you
+          send it, you paste the answer, you say what the other computer may
+          do, and only then is there a connection to complete. */}
+      {hasMachine ? (
+        <>
+          {localCodeSection}
+          {remoteCodeSection}
+          {grantSection}
+          <section className="knetwork-section">
+            <div className="knetwork-steps">
+              <button
+                type="button"
+                className="knetwork-button"
+                onClick={session.completeConnection}
+              >
+                Complete connection
+              </button>
+            </div>
+          </section>
+        </>
+      ) : (
+        <>
+          {remoteCodeSection}
+          {localCodeSection}
+        </>
       )}
 
-      {hasMachine ? localCodeSection : remoteCodeSection}
-      {hasMachine ? remoteCodeSection : localCodeSection}
-
-      <div className="knetwork-status" role="status">{session.status}</div>
+      {session.status !== "" && (
+        <div className="knetwork-status" role="status">{session.status}</div>
+      )}
     </div>
   );
 };

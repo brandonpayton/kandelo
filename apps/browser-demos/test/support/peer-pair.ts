@@ -76,6 +76,11 @@ export async function connectPeers(
   await openNetworkPopover(sharer);
   await openNetworkPopover(viewer);
 
+  // An idle popup reports nothing: the status line exists only while an
+  // attempt is in progress or has failed.
+  await expect(sharer.locator(".knetwork-status")).toHaveCount(0);
+  await expect(viewer.locator(".knetwork-status")).toHaveCount(0);
+
   let invite = "";
   let answer = "";
   let linked = false;
