@@ -58,6 +58,31 @@ convenient illusion.
    Capability-ahead-of-demand is intentional (completeness over YAGNI). This
    REPLACES the old B2/B3/M2/M3 framing below (references) with I5b→F5→F6.
 
+   **MERGED 2026-09-05 (F5+F6 → one substrate-first reference-completeness
+   increment):** F5 (externref) and F6 (GC) are NOT separable at the machinery
+   level — verified: fork-instrument's `emit_externref_bridge` delegates
+   externref through the anyref/GC bridge, so a plain externref's capture gate
+   is the SHARED `gc_lookup` and its decode is the SHARED `build_drive_plan`
+   (the raw `__wpk_fork_ref_encode/decode_externref` host imports are never
+   declared — dead). Also verified a real REPLAY gap: `build_drive_plan`
+   (`crates/fork-codec/src/drive_plan.rs`, doc :405) schedules
+   `DRIVE_OP_EXTERNREF_TRANSIT` only for GC/exnref-reachable externrefs, NOT
+   directly-held (frame-vector) ones — so replay was NOT fully built for the
+   directly-held case. Therefore do ONE increment touching the shared
+   substrate once (one ABI-44 snapshot regen, one fork-package rebuild),
+   executed SUBSTRATE-FIRST for bisectability: (1) complete replay's drive-plan
+   for directly-held Externref + re-apply the prototyped `gc_lookup` capture
+   short-circuit + fix the pre-existing I5b gate hang (`fm_build_gc_plan` errno
+   22) + un-gate externref (validate the shared substrate on the SIMPLE case,
+   tests green); (2) layer FLOOR-2 GC-constructor provenance (struct=appended-
+   field / array=wrapper-struct, field reindexing under subtyping — the hard
+   whole-program transform) on the known-good substrate + un-gate
+   struct/array/i31/static-root; per-host + docs + package rebuild. Batch
+   validation still once at campaign end (Decision 3), so nothing ships between
+   (1) and (2) regardless — which is why merging costs no shippable checkpoint.
+   The `extern.internalize` externref case resolves naturally in (2) (it is a
+   GC value). This SUPERSEDES the separate F5/F6 split above.
+
    **2a. Capture↔Replay symmetry — the ORGANIZING LENS for all remaining
    reference-type work (user, 2026-09-05; preserve this framing every step).**
    For every reference kind, the replay/decode side is already built, shared,
