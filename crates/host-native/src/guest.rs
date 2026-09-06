@@ -7903,18 +7903,68 @@ fn spawn_worker_thread(
     tls_ptr: u32,
     fn_ptr: u32,
     arg: u32,
+    layout: ProcessLayout,
+    use_fork_module: bool,
+    fork_format: Option<Arc<GuestForkFormat>>,
+    fork_proof_of_use: Arc<Mutex<ForkProofOfUse>>,
 ) -> thread::JoinHandle<()> {
     let engine = engine.clone();
     let module = module.clone();
     thread::spawn(move || {
         if let Err(e) = run_worker_thread(
             &engine, &module, &guest_mem, channel_offset, tls_offset, stack_ptr, tls_ptr, fn_ptr, arg,
+            layout, use_fork_module, fork_format, fork_proof_of_use,
         ) {
             eprintln!("worker thread (channel {channel_offset:#x}) failed: {e:?}");
         }
     })
 }
 
+/// N1 residual #4a (non-main-thread `fork()`): a worker (pthread) thread that
+/// can itself call a REAL, fork-instrumented `fork()` — not just run to
+/// completion or trap. Before this task, `kernel.kernel_fork` was never wired
+/// on a worker thread's own `Store` at all (`define_unknown_imports_as_traps`
+/// stubbed it, along with every other `kernel.*` import); a guest calling
+/// `fork()` from a pthread hit an unknown-import trap that silently ended the
+/// OS thread with no POSIX-shaped error, hanging any `pthread_join` on it
+/// forever. This function instead mirrors [`spawn_guest_thread`]'s own
+/// `kernel_fork` wiring (fork-module instantiation, frame-capture imports,
+/// the Idle/Replaying coordinator dance) closed over THIS thread's own
+/// channel offset — never the process's main one — and drives an entry loop
+/// shaped like [`run_fork_capable_entry`] (lexical call, catch a fork-unwind
+/// escape exactly once, seal/launch the child, replay via the module's
+/// uniform `wpk_fork_resume_start` dispatcher) starting from the pthread's
+/// own indirect-table entry function rather than `_start`.
+///
+/// A worker thread is never itself a fork CHILD (`ForkEntry` does not apply
+/// here — a plain `pthread_create` launch is always the "lexical, from the
+/// top" shape [`ForkEntry::Normal`] already names), so only the
+/// fork-CAPTURE half of the coordinator is reachable from this function.
+///
+/// Only `fork()`/`_Fork()` (`mode != MODE_VFORK`) is serviced from a
+/// non-main channel — `handle_fork`'s vfork-is-main-thread-only invariant is
+/// unchanged by this task (a `vfork()`'d child borrows the WHOLE process
+/// address space and only one such borrow can be in flight per process,
+/// tracked by a single per-process `GuestProcess::vfork_awaiting_child`
+/// flag — extending that to multiple concurrent worker-thread borrowers is
+/// out of this task's scope). A `vfork()` call on this thread gets a
+/// truthful, immediate `-ENOSYS` instead of ever touching the channel:
+/// `run_pump`'s dispatch has no path for a non-main `SYS_VFORK` request, so
+/// posting one here would simply hang until the pump's 30s hard cap.
+///
+/// Known limitation (documented, not fixed by this task): this reuses the
+/// SAME `layout`-derived fork-module memory region every guest OS thread of
+/// this process (including the main thread) uses — safe as long as at most
+/// one thread of a process is mid-fork-capture/replay at any instant (the
+/// same assumption `GuestProcess::vfork_awaiting_child`'s doc comment makes
+/// for vfork). Two threads of the SAME process calling `fork()`
+/// *concurrently* is not race-safe under this design; POSIX programs that do
+/// this are already on thin ice (a forked child inherits only the calling
+/// thread, so any lock held by another thread never releases in the child),
+/// so this is treated as an accepted, narrow, documented residual rather
+/// than a wall — giving every worker thread its OWN, disjoint fork-module
+/// region would need new address-space layout (ABI-adjacent), out of scope
+/// here.
 #[allow(clippy::too_many_arguments)]
 fn run_worker_thread(
     engine: &Engine,
@@ -7926,6 +7976,10 @@ fn run_worker_thread(
     tls_ptr: u32,
     fn_ptr: u32,
     arg: u32,
+    layout: ProcessLayout,
+    use_fork_module: bool,
+    fork_format: Option<Arc<GuestForkFormat>>,
+    fork_proof_of_use: Arc<Mutex<ForkProofOfUse>>,
 ) -> anyhow::Result<()> {
     let mut store = Store::new(engine, ());
     let mut linker: Linker<()> = Linker::new(engine);
@@ -7936,8 +7990,186 @@ fn run_worker_thread(
         Val::I32(channel_offset as i32),
     )?;
     linker.define(&mut store, "env", "__channel_base", channel_base)?;
-    // The worker reaches the kernel through the syscall glue (its own channel),
-    // not through the kernel.* imports, so every kernel.* import can trap.
+
+    // N1 residual #4a: give THIS thread its own co-resident fork-module +
+    // frame-capture imports + `kernel_fork` wiring, closed over its own
+    // channel — mirrors `spawn_guest_thread`'s identically-shaped
+    // (main-channel) wiring; see this function's doc comment for what
+    // differs (channel identity, no `ForkEntry`, vfork rejected outright).
+    let mut fork_module: Option<ForkModule> = None;
+    let coord = ForkCoordState::new();
+    let capture = Arc::new(Mutex::new(NativeReferenceCapture::new()));
+    if use_fork_module {
+        let externref_registry = Arc::new(Mutex::new(ExternrefRegistry::new()));
+        let fm = instantiate_fork_module(
+            engine,
+            &mut store,
+            guest_mem,
+            &layout,
+            externref_registry,
+            // Never re-seed the process's persistent module-state (reference
+            // graph) arena from a worker thread's own launch: this thread is
+            // not a fresh process launch (the process's OWN main-thread
+            // launch already did that exactly once, via `ForkEntry::
+            // Normal`); re-seeding here on every `pthread_create` would
+            // silently clobber a graph a PRIOR fork on a different thread
+            // already populated — the exact bug class `instantiate_fork_
+            // module`'s `seed_empty_module_state_arena` doc comment
+            // describes for a fork child.
+            false,
+            fork_format.as_ref().and_then(|f| f.gc_codec_descriptor.as_deref()),
+        )
+        .map_err(|e| anyhow::anyhow!("instantiate_fork_module failed: {e:#}"))?;
+
+        const FRAME_IMPORT_NAMES: [&str; 5] = [
+            "__wpk_fork_frame_reserve",
+            "__wpk_fork_frame_commit",
+            "__wpk_fork_frame_peek",
+            "__wpk_fork_frame_next",
+            "__wpk_fork_resume_peek",
+        ];
+        for name in FRAME_IMPORT_NAMES {
+            let f = fm
+                .instance
+                .get_func(&mut store, name)
+                .ok_or_else(|| anyhow::anyhow!("fork-module missing expected export {name}"))?;
+            linker.define(&mut store, "env", name, f)?;
+        }
+        if let Some(import) = module.imports().find(|i| {
+            i.module() == wasm_posix_shared::abi::WPK_FORK_UNWIND_TAG_IMPORT_MODULE
+                && i.name() == wasm_posix_shared::abi::WPK_FORK_UNWIND_TAG_IMPORT_NAME
+        }) {
+            let tag_ty = match import.ty() {
+                ExternType::Tag(t) => t,
+                other => anyhow::bail!(
+                    "guest env.{} is a {other:?}, not a tag",
+                    wasm_posix_shared::abi::WPK_FORK_UNWIND_TAG_IMPORT_NAME
+                ),
+            };
+            let tag = wasmtime::Tag::new(&mut store, &tag_ty)?;
+            linker.define(
+                &mut store,
+                wasm_posix_shared::abi::WPK_FORK_UNWIND_TAG_IMPORT_MODULE,
+                wasm_posix_shared::abi::WPK_FORK_UNWIND_TAG_IMPORT_NAME,
+                tag,
+            )?;
+        }
+        if let Some(fmt) = fork_format.as_ref() {
+            fm.fm_set_format.call(&mut store, (4, fmt.fixed_prefix_size))?;
+            let errno = fm.fm_last_errno.call(&mut store, ())?;
+            anyhow::ensure!(errno == 0, "fm_set_format failed: errno {errno}");
+            if !fmt.catalog_ordinals.is_empty() {
+                let mut buf = Vec::with_capacity(fmt.catalog_ordinals.len() * 4);
+                for ordinal in &fmt.catalog_ordinals {
+                    buf.extend_from_slice(&ordinal.to_le_bytes());
+                }
+                unsafe { write_bytes(guest_mem, fm.catalog_scratch_base, &buf) };
+                fm.fm_set_resume_catalog.call(
+                    &mut store,
+                    (fm.catalog_scratch_base as u32, fmt.catalog_ordinals.len() as u32),
+                )?;
+                let errno = fm.fm_last_errno.call(&mut store, ())?;
+                anyhow::ensure!(errno == 0, "fm_set_resume_catalog failed: errno {errno}");
+            }
+        }
+        fork_module = Some(fm);
+    }
+
+    // `kernel_fork` (N1 residual #4a): mirrors `spawn_guest_thread`'s own
+    // import byte-for-byte, except closed over THIS thread's `channel_offset`
+    // and its own, freshly-created `coord`/`capture` above — see this
+    // function's doc comment for the `vfork` restriction.
+    {
+        let mem = guest_mem.clone();
+        let ch = channel_offset;
+        let fm_for_import = fork_module.clone();
+        let has_format = fork_format.is_some();
+        let coord = Arc::clone(&coord);
+        let capture_for_fork = Arc::clone(&capture);
+        linker.func_wrap(
+            "kernel",
+            "kernel_fork",
+            move |mut caller: Caller<'_, ()>, mode: i32| -> wasmtime::Result<i32> {
+                if mode as u32 == MODE_VFORK {
+                    // vfork is main-thread-only — see this function's doc
+                    // comment. A truthful, immediate failure, never posted to
+                    // the channel (the pump has no dispatch for a non-main
+                    // SYS_VFORK request, so posting one would hang until its
+                    // 30s hard cap).
+                    return Ok(-(libc_errno::ENOSYS));
+                }
+                let Some(fm) = (if has_format { fm_for_import.as_ref() } else { None }) else {
+                    unsafe {
+                        write_bytes(&mem, ch + SYSCALL_OFFSET, &SYS_FORK.to_le_bytes());
+                        write_bytes(&mem, ch + ARGS_OFFSET, &(mode as i64).to_le_bytes());
+                        for i in 1..6 {
+                            write_bytes(&mem, ch + ARGS_OFFSET + i * ARG_SIZE, &0i64.to_le_bytes());
+                        }
+                        write_bytes(&mem, ch + REQUEST_FLAGS_OFFSET, &0u32.to_le_bytes());
+                        atomic_u32(&mem, ch + STATUS_OFFSET).store(STATUS_PENDING, Ordering::SeqCst);
+                    }
+                    let _ = mem.atomic_notify((ch + STATUS_OFFSET) as u64, 1);
+                    loop {
+                        let s = unsafe { atomic_u32(&mem, ch + STATUS_OFFSET) }.load(Ordering::SeqCst);
+                        if s != STATUS_PENDING {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_micros(200));
+                    }
+                    let (ret, errno) = unsafe {
+                        (read_i64(&mem, ch + RETURN_OFFSET), read_u32(&mem, ch + ERRNO_OFFSET))
+                    };
+                    unsafe {
+                        atomic_u32(&mem, ch + STATUS_OFFSET).store(STATUS_IDLE, Ordering::SeqCst);
+                    }
+                    return Ok(if ret < 0 { -(errno as i32) } else { ret as i32 });
+                };
+
+                match coord.phase() {
+                    ForkCoordPhase::Idle => {
+                        capture_for_fork.lock().unwrap().reset();
+                        coord.set_mode(mode as u32);
+                        let root = fm.fm_begin_unwind.call(&mut caller, (0, ch as u32))?;
+                        let errno = fm.fm_last_errno.call(&mut caller, ())?;
+                        if errno != 0 {
+                            return Ok(-(errno));
+                        }
+                        let unwind_begin: wasmtime::TypedFunc<u32, ()> = caller_export_typed(
+                            &mut caller,
+                            wasm_posix_shared::abi::WPK_FORK_EXPORT_UNWIND_BEGIN,
+                        )?;
+                        unwind_begin.call(&mut caller, root)?;
+                        coord.set_root(root);
+                        Ok(0) // ignored by the caller while unwinding
+                    }
+                    ForkCoordPhase::Replaying => {
+                        let rewind_end: wasmtime::TypedFunc<(), ()> = caller_export_typed(
+                            &mut caller,
+                            wasm_posix_shared::abi::WPK_FORK_EXPORT_REWIND_END,
+                        )?;
+                        rewind_end.call(&mut caller, ())?;
+                        fm.fm_finish_replay.call(&mut caller, ())?;
+                        let errno = fm.fm_last_errno.call(&mut caller, ())?;
+                        if errno != 0 {
+                            return Err(wasmtime::Error::msg(format!(
+                                "fm_finish_replay failed: errno {errno}"
+                            )));
+                        }
+                        coord.set_phase(ForkCoordPhase::Idle);
+                        Ok(coord.fork_result())
+                    }
+                }
+            },
+        )?;
+    }
+
+    // The worker reaches the kernel through the syscall glue (its own
+    // channel), not through the remaining kernel.* imports (kernel_clone,
+    // kernel_wait4, kernel_exit, kernel_get_argc, ...), so every OTHER
+    // kernel.* import can still trap — unchanged from before this task.
+    // Nested `pthread_create`/`kernel_clone` FROM a worker thread is a
+    // separate, pre-existing, out-of-scope gap (the SAME "import not wired
+    // on this Store" shape this task fixes for `kernel_fork` alone).
     linker.define_unknown_imports_as_traps(module)?;
 
     let instance = linker.instantiate(&mut store, module)?;
@@ -7956,6 +8188,26 @@ fn run_worker_thread(
         thread_init.call(&mut store, tls_ptr as i32)?;
     }
 
+    // N1 residual #4a: a fork-instrumented guest converts every active
+    // element segment to passive and defers their init into an exported
+    // bootstrap function (see `run_fork_capable_entry`'s doc comment) — this
+    // fresh, per-thread `Instance`'s own `__indirect_function_table` needs
+    // the SAME table-only re-init a fork child's fresh instance gets
+    // (`WPK_FORK_EXPORT_MODULE_THREAD_BOOTSTRAP`): this thread's memory is
+    // the process's own SHARED memory (already correctly populated by the
+    // main thread's own full bootstrap at process launch), so only the
+    // per-instance TABLE needs populating here, never a re-copy of
+    // `.data`/`.rodata` (which would wrongly reset already-live globals back
+    // to their initial values). A non-instrumented guest exports no such
+    // name, so `get_typed_func(...).ok()` finds nothing and this is a
+    // byte-for-byte no-op for it, exactly like every pre-existing,
+    // non-instrumented worker-thread test.
+    if let Ok(bootstrap) = instance
+        .get_typed_func::<(), ()>(&mut store, wasm_posix_shared::abi::WPK_FORK_EXPORT_MODULE_THREAD_BOOTSTRAP)
+    {
+        bootstrap.call(&mut store, ())?;
+    }
+
     // Call the thread entry via the indirect function table with its argument.
     let table = instance
         .get_table(&mut store, "__indirect_function_table")
@@ -7967,22 +8219,122 @@ fn run_worker_thread(
         Ref::Func(Some(f)) => f,
         _ => anyhow::bail!("thread entry {fn_ptr} is not a function"),
     };
-    let results_len = func.ty(&store).results().len();
-    let mut results = vec![Val::I32(0); results_len];
-    match func.call(&mut store, &[Val::I32(arg as i32)], &mut results) {
-        // musl's detached-thread exit (__unmapself) issues SYS_munmap + SYS_exit
-        // — which the pump routes to kernel_thread_exit — then executes
-        // `unreachable` to halt the thread. That trap is the expected, clean end
-        // of the thread, exactly like the process exit trap on the main thread.
-        Err(e) if is_unreachable_trap(&e) => Ok(()),
-        Err(e) => Err(e.into()),
-        // A thread entry that returns without self-exiting is unusual (musl
-        // always exits via __pthread_exit); post the exit ourselves as a fallback.
-        Ok(()) => {
-            post_thread_exit(guest_mem, channel_offset);
-            Ok(())
+
+    // N1 residual #4a: mirrors `run_fork_capable_entry`'s own loop shape — a
+    // lexical call (here, the pthread's real entry function via the
+    // indirect table, exactly like the pre-existing code did) that may
+    // escape as a THROWN `__wpk_fork_unwind` exception exactly once (a fresh
+    // `fork()` call capturing this thread's own live call stack), after
+    // which this drives the SAME capture/seal/launch-child sequence
+    // (`drive_fork_capture_seal_and_launch_child`, already generic over
+    // "which channel") and re-enters via the module's `wpk_fork_resume_
+    // start` export — a uniform `() -> ()` dispatcher that replays back down
+    // to the ORIGINAL `fork()` call site regardless of what kind of function
+    // (`_start`, or here, a pthread entry point) originally led there.
+    let resume_start = instance
+        .get_typed_func::<(), ()>(&mut store, wasm_posix_shared::abi::WPK_FORK_EXPORT_RESUME_START)
+        .ok();
+    let mut entry_is_lexical = true;
+    let result = loop {
+        let step = if entry_is_lexical {
+            let results_len = func.ty(&store).results().len();
+            let mut results = vec![Val::I32(0); results_len];
+            func.call(&mut store, &[Val::I32(arg as i32)], &mut results)
+        } else {
+            match resume_start.as_ref() {
+                Some(f) => f.call(&mut store, ()),
+                None => {
+                    break Err(anyhow::anyhow!(
+                        "guest is missing {} for a required fork replay",
+                        wasm_posix_shared::abi::WPK_FORK_EXPORT_RESUME_START
+                    ));
+                }
+            }
+        };
+        match step {
+            // musl's detached-thread exit (__unmapself) issues SYS_munmap + SYS_exit
+            // — which the pump routes to kernel_thread_exit — then executes
+            // `unreachable` to halt the thread. That trap is the expected, clean end
+            // of the thread, exactly like the process exit trap on the main thread.
+            Err(e) if is_unreachable_trap(&e) => break Ok(()),
+            Err(e) if is_thrown_exception_escape(&e) => {
+                // Only valid straight after the LEXICAL entry captured a
+                // fresh fork; an exception escaping during a replay/resume
+                // call is a genuine bug or a foreign (non-fork) exception
+                // this loop does not understand — mirrors `run_fork_
+                // capable_entry`'s identical guard.
+                if !entry_is_lexical {
+                    break Err(anyhow::anyhow!(
+                        "unexpected exception escape during fork replay: {e:#}"
+                    ));
+                }
+                if store.take_pending_exception().is_none() {
+                    eprintln!(
+                        "is_thrown_exception_escape matched but the store has no pending \
+                         exception to take — this should not happen"
+                    );
+                }
+                let Some(fm) = fork_module.as_ref() else {
+                    break Err(anyhow::anyhow!("fork-unwind exception escaped with no fork-module"));
+                };
+                if !drive_fork_capture_seal_and_launch_child(
+                    &mut store,
+                    &instance,
+                    guest_mem,
+                    channel_offset,
+                    fm,
+                    &coord,
+                    &capture,
+                ) {
+                    break Err(anyhow::anyhow!("fork-capture seal/launch-child failed (see stderr)"));
+                }
+                entry_is_lexical = false;
+            }
+            Err(e) => break Err(e.into()),
+            // A thread entry that returns without self-exiting is unusual
+            // (musl always exits via __pthread_exit); post the exit
+            // ourselves as a fallback — applies equally whether this is the
+            // thread's very first (lexical) return or a REPLAYED program
+            // reaching the same natural end past its own `fork()` call.
+            Ok(()) => {
+                post_thread_exit(guest_mem, channel_offset);
+                break Ok(());
+            }
+        }
+    };
+
+    // Fold this thread's own fork-module proof-of-use counters into the
+    // shared accumulator — mirrors `spawn_guest_thread`'s identical,
+    // best-effort, additive fold (see that call site's doc comment).
+    if let Some(fm) = fork_module.as_ref() {
+        let mut acc = fork_proof_of_use.lock().unwrap();
+        if let Ok(v) = fm.fm_frames_committed.call(&mut store, ()) {
+            acc.frames_committed += v;
+        }
+        if let Ok(v) = fm.fm_frames_replayed.call(&mut store, ()) {
+            acc.frames_replayed += v;
+        }
+        if let Ok(v) = fm.fm_references_reconstructed.call(&mut store, ()) {
+            acc.references_reconstructed += v;
+        }
+        if let Ok(v) = fm.fm_externrefs_resolved.call(&mut store, ()) {
+            acc.externrefs_resolved += v;
+        }
+        if let Ok(v) = fm.fm_exnrefs_reconstructed.call(&mut store, ()) {
+            acc.exnrefs_reconstructed += v;
+        }
+        if let Ok(v) = fm.fm_gc_nodes_reconstructed.call(&mut store, ()) {
+            acc.gc_nodes_reconstructed += v;
+        }
+        if let Ok(v) = fm.fm_static_roots_published.call(&mut store, ()) {
+            acc.static_roots_published += v;
+        }
+        if let Ok(v) = fm.fm_drive_steps_executed.call(&mut store, ()) {
+            acc.drive_steps_executed += v;
         }
     }
+
+    result
 }
 
 /// Whether a Wasmtime error is a guest `unreachable` trap (the expected halt at
@@ -8761,6 +9113,10 @@ fn run_pump(
                         tls_ptr,
                         fn_ptr,
                         arg,
+                        layout,
+                        use_fork_module,
+                        processes[pi].fork_format.clone(),
+                        Arc::clone(fork_proof_of_use),
                     );
                     processes[pi].channels.push(PumpChannel {
                         offset: thread_channel_offset,
@@ -8821,7 +9177,15 @@ fn run_pump(
                     ci += 1;
                     continue;
                 }
-                if ch.is_main && (syscall_nr == SYS_FORK || syscall_nr == SYS_VFORK) {
+                // N1 residual #4a: `fork()`/`_Fork()` (never `vfork()` — see
+                // `run_worker_thread`'s doc comment for why that stays
+                // main-channel-only) is now serviced from ANY channel, not
+                // just the process's main one — `handle_fork` already reads
+                // `ch.tid` generically (it never assumed "main thread"), so
+                // this is the only pump-side gate that needed relaxing.
+                // `SYS_VFORK` keeps the original `ch.is_main` restriction
+                // unchanged.
+                if syscall_nr == SYS_FORK || (ch.is_main && syscall_nr == SYS_VFORK) {
                     handle_fork(
                         kernel_store, engine, kernel_mem, processes, pi, ch, syscall_nr, &args,
                         fork_process, remove_process, alloc_scratch, set_brk_base, set_mmap_base,
