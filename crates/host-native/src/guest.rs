@@ -2379,6 +2379,87 @@ impl ExternrefRegistry {
     }
 }
 
+/// N1-F5 Task 2: mint-time externref PROVENANCE index — `(live externref
+/// identity -> handle)`, populated exclusively by
+/// `__wpk_fork_ref_provenance_externref` (bound in `spawn_guest_thread`,
+/// guarded by `guest_declares`) at the exact instant `wasm-fork-instrument`'s
+/// new production-site wrapper pass (`crates/fork-instrument/src/
+/// externref_provenance.rs`) routes a freshly-minted externref through it —
+/// never derived later by inspecting an already-live value. This is the
+/// primitive `docs/plans/2026-09-05-n1-f5-externref-capture-grounding.md` §2
+/// calls out as the ONLY sound way to close the capture-side gap: recording
+/// at production, not reconstructing at capture.
+///
+/// Deliberately NOT folded into [`ExternrefRegistry`]: that map is
+/// handle-keyed (forward, for `resolve_externref`); this one needs the
+/// OPPOSITE direction (value -> handle) and the two have different write
+/// sites (`resolve_externref`'s own body vs. the provenance import's body),
+/// so a sibling structure keeps each map's invariants easy to state
+/// independently — exactly the "sibling identity-keyed index" the plan
+/// calls for rather than widening the existing struct.
+///
+/// Stored as a flat `Vec<(OwnedRooted<ExternRef>, u32)>`, not a `HashMap`:
+/// `wasmtime::Rooted<ExternRef>`/`OwnedRooted<ExternRef>` has no `Hash`/`Eq`
+/// impl usable as a map key, and `ExternRef::to_raw`'s raw `u32` encoding is
+/// explicitly NOT a stable cross-time identity (its own doc comment: the
+/// value is "only valid ... if a GC doesn't happen between when the value is
+/// produced and when it's passed into the store"), so hashing on it would
+/// risk silent aliasing across a collection. A linear scan comparing
+/// `Rooted::ref_eq` has no such risk (every registered entry is kept alive
+/// as an `OwnedRooted`, so identity comparisons stay meaningful for the
+/// whole capture) and is cheap enough for the bounded number of externrefs
+/// actually live during one fork generation. This mirrors option (a) in
+/// grounding §2 ("iterate the whole map comparing `Rooted::ref_eq`"), which
+/// the grounding calls sound for exactly the values that already passed
+/// through a registration point — which, by construction, is every entry
+/// this index ever holds.
+struct ExternrefProvenance {
+    entries: Vec<(wasmtime::OwnedRooted<ExternRef>, u32)>,
+}
+
+impl ExternrefProvenance {
+    fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    /// Record `(value -> handle)` at mint time. A repeat registration of a
+    /// value already present (e.g. `resolve_externref`'s own
+    /// idempotent-per-handle cache handing back the same `OwnedRooted` for a
+    /// repeat ask) is a no-op rather than a duplicate entry.
+    fn register(
+        &mut self,
+        mut store: impl wasmtime::AsContextMut,
+        value: wasmtime::Rooted<ExternRef>,
+        handle: u32,
+    ) -> wasmtime::Result<()> {
+        if self.lookup(&mut store, value)?.is_some() {
+            return Ok(());
+        }
+        let owned = value.to_owned_rooted(&mut store)?;
+        self.entries.push((owned, handle));
+        Ok(())
+    }
+
+    /// Look up the mint-time-recorded handle for `value`, or `None` when it
+    /// was never registered — the SOUNDNESS GUARD boundary: a
+    /// `call_indirect`/`call_ref` residual production site the
+    /// instrumenter's static pass could not identify, or a
+    /// guest-internalized externref (F6), both correctly report "no
+    /// provenance" here rather than a fabricated handle.
+    fn lookup(
+        &self,
+        mut store: impl wasmtime::AsContextMut,
+        value: wasmtime::Rooted<ExternRef>,
+    ) -> wasmtime::Result<Option<u32>> {
+        for (candidate, handle) in &self.entries {
+            if wasmtime::Rooted::ref_eq(&mut store, candidate, &value)? {
+                return Ok(Some(*handle));
+            }
+        }
+        Ok(None)
+    }
+}
+
 /// Define `env.resolve_externref(handle: i32) -> externref` (nullable
 /// externref, matching the fork-module's declared import type — see
 /// `crates/fork-module-inject/src/main.rs`'s `import_resolve_externref`) as a
@@ -3793,6 +3874,15 @@ fn spawn_guest_thread(
         // by the guest's own per-frame commits, sealed at
         // `drive_fork_capture_seal_and_launch_child`.
         let capture = Arc::new(Mutex::new(NativeReferenceCapture::new()));
+        // N1-F5 Task 2: mint-time externref PROVENANCE index — see
+        // `ExternrefProvenance`'s doc comment. Populated by
+        // `__wpk_fork_ref_provenance_externref` (wired below, guarded by
+        // `guest_declares`) at the exact moment `wasm-fork-instrument`'s
+        // production-site wrapper pass routes a freshly-minted externref
+        // through it; consulted by `encode_externref`'s real capture body.
+        // ONE instance per guest OS thread, matching `ExternrefRegistry`'s
+        // own per-generation lifetime argument.
+        let externref_provenance = Arc::new(Mutex::new(ExternrefProvenance::new()));
         // N1-I5b Task 1: raw `Func::to_raw` pointer -> this guest's own
         // funcref-catalog ordinal (activation 0 — single-activation only,
         // matching the REPLAY-side funcref-catalog mirror below), populated
@@ -4704,42 +4794,115 @@ fn spawn_guest_thread(
                 }
             }
 
-            // N1-I5b Task 2: GATE-and-placeholder stubs for the remaining
-            // capture-side imports — `encode_externref` plus the 9 typed-GC
-            // capture imports. Ports of `fork-activation-registry.ts:477-658`
-            // essentially line-for-line: each records the gated kind
-            // (`NativeReferenceCapture::mark_unsupported`) and returns a
-            // benign, non-trapping placeholder
-            // (`NativeReferenceCapture::gated_placeholder`) or no-ops for the
-            // void imports, instead of running a real encoder — so the
-            // guest's own save walk (module-state save + every per-frame
-            // commit) completes WITHOUT trapping even though this fork will
-            // be aborted. `drive_fork_capture_seal_and_launch_child` reads
-            // the marker right after seal and aborts the fork with
-            // `EOPNOTSUPP` — no child is ever spawned, so the placeholder
-            // graph is discarded unread, exactly like the JS gate's own doc
-            // comment. Must run BEFORE the blanket `define_unknown_imports_
-            // as_traps` call below, same as every other conditional wire in
-            // this block.
+            // N1-F5 Task 2: `__wpk_fork_ref_provenance_externref(v) -> v` —
+            // the production-site provenance-recording import
+            // `wasm-fork-instrument`'s new pass (`crates/fork-instrument/
+            // src/externref_provenance.rs`) routes every externref-returning
+            // host-import call site through, immediately after the real
+            // import returns and BEFORE the value reaches the original
+            // caller. Pass-through signature: records `(identity -> handle)`
+            // in `externref_provenance` (see its doc comment) and returns
+            // the SAME value unchanged. This — not a capture-time reverse
+            // map — is the sound half of F5's design (grounding §2); must
+            // run BEFORE the blanket `define_unknown_imports_as_traps` call
+            // below, same as every other conditional wire in this block.
+            let provenance_externref_name =
+                wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_PROVENANCE_EXTERNREF;
+            if guest_declares(provenance_externref_name) {
+                let provenance_for_mint = Arc::clone(&externref_provenance);
+                let result = linker.func_wrap(
+                    "env",
+                    provenance_externref_name,
+                    move |mut caller: Caller<'_, ()>,
+                          value: Option<wasmtime::Rooted<ExternRef>>|
+                          -> wasmtime::Result<Option<wasmtime::Rooted<ExternRef>>> {
+                        if let Some(v) = value {
+                            // Native's only externref production site today
+                            // is `env.resolve_externref`, whose backing Rust
+                            // data IS the raw wire handle by construction
+                            // (`ExternrefRegistry::resolve`,
+                            // `ExternRef::new(&mut store, handle: u32)`).
+                            // Reading it back here is sound because this
+                            // call happens synchronously, at the exact
+                            // production site the fork-instrument wrapper
+                            // inserted, immediately after the real import
+                            // returned — not a later inspection of an
+                            // already-live, arbitrarily-obtained value
+                            // (grounding §2's unsound half). A future
+                            // externref-producing host import with no
+                            // self-describing `u32` payload simply has no
+                            // handle to register here; `encode_externref`'s
+                            // soundness guard below (a no-provenance lookup
+                            // gates rather than mis-captures) covers that
+                            // case without this needing to generalize
+                            // further today.
+                            if let Some(&handle) =
+                                v.data(&caller)?.and_then(|data| data.downcast_ref::<u32>())
+                            {
+                                provenance_for_mint.lock().unwrap().register(&mut caller, v, handle)?;
+                            }
+                        }
+                        Ok(value)
+                    },
+                );
+                if let Err(e) = result {
+                    eprintln!("wiring env.{provenance_externref_name} failed: {e:#}");
+                    return;
+                }
+            }
+
+            // N1-F5 Task 2: `encode_externref`'s REAL capture body — lifted
+            // from the I5b gate stub. Mirrors `encode_funcref`'s null
+            // convention exactly (`fork-reference-transaction.ts:283`: `if
+            // (value === null) return 0`): a null externref is always recipe
+            // 0, the canonical null node every graph seeds at `begin()`,
+            // with no provenance lookup involved. A non-null value is looked
+            // up in `externref_provenance` (populated at mint time by the
+            // provenance import above) and interned via
+            // `fork_codec::ReferenceGraphBuilder::intern_externref`, the
+            // wire-writer that already exists and is the byte-for-byte
+            // inverse of the decoder (grounding §1).
+            //
+            // SOUNDNESS GUARD: if `value` has NO recorded provenance — a
+            // `call_indirect`/`call_ref`-to-import residual the
+            // instrumenter's static pass could not identify, or a
+            // guest-internalized externref (both out of F5 scope per the
+            // plan's SCOPING RULING; F6's problem) — this MUST NOT
+            // fabricate a handle. It falls back to the exact same
+            // gate-and-placeholder path every other still-gated kind uses
+            // (`NativeReferenceCapture::mark_unsupported` +
+            // `gated_placeholder`), so the fork cleanly aborts with
+            // `EOPNOTSUPP` instead of ever mis-capturing.
             let encode_externref_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_ENCODE_EXTERNREF;
             if guest_declares(encode_externref_name) {
                 let capture_for_externref = Arc::clone(&capture);
+                let provenance_for_encode = Arc::clone(&externref_provenance);
                 let result = linker.func_wrap(
                     "env",
                     encode_externref_name,
-                    move |_caller: Caller<'_, ()>,
-                          _value: Option<wasmtime::Rooted<ExternRef>>|
+                    move |mut caller: Caller<'_, ()>,
+                          value: Option<wasmtime::Rooted<ExternRef>>|
                           -> wasmtime::Result<i32> {
-                        // A live externref has no linear-memory
-                        // representation and cannot be faithfully
-                        // reconstructed in a fresh child today — mirrors
-                        // `fork-activation-registry.ts:477-482` (no
-                        // null-value special case there either: EVERY call,
-                        // including a null externref, marks the kind and
-                        // reserves a placeholder).
-                        let mut capture = capture_for_externref.lock().unwrap();
-                        capture.mark_unsupported("externref");
-                        capture.gated_placeholder().map(|id| id as i32)
+                        let Some(v) = value else {
+                            // Canonical null recipe — see the doc comment
+                            // above.
+                            return Ok(0);
+                        };
+                        let handle = provenance_for_encode.lock().unwrap().lookup(&mut caller, v)?;
+                        match handle {
+                            Some(handle) => capture_for_externref
+                                .lock()
+                                .unwrap()
+                                .graph
+                                .intern_externref(handle)
+                                .map(|id| id as i32)
+                                .map_err(|e| wasmtime::Error::msg(format!("intern_externref failed: {e:?}"))),
+                            None => {
+                                let mut capture = capture_for_externref.lock().unwrap();
+                                capture.mark_unsupported("externref (no recorded provenance)");
+                                capture.gated_placeholder().map(|id| id as i32)
+                            }
+                        }
                     },
                 );
                 if let Err(e) = result {
