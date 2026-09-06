@@ -1368,7 +1368,39 @@ describe("file/POSIX MAP_SHARED page cache", () => {
     expect(backing.sizeValid).toBe(true);
   });
 
-  it("rejects shared memfd mappings deliberately without affecting private mmap", () => {
+  it("maps a writable kernel-owned regular file through the fd-writeback bridge", () => {
+    const h = createFileHarness();
+    // hostHandle === null models a kernel-owned regular file (in-kernel tmpfs
+    // or memfd): fstat completes inside the kernel, so there is no persistent
+    // host handle to anchor a host byte-store backing. A *writable* MAP_SHARED
+    // of such a file used to be rejected outright with ENOTSUP. It now maps
+    // through the fd-writeback bridge: the region is populated via the guest
+    // fd (pread) and its writes flush back to the same kernel-owned file via
+    // the guest fd (pwrite) at msync/munmap/exec/teardown. The kernel-owned
+    // file itself is the shared backing store, so no host handle is retained.
+    h.getFdStatForSharedMapping.mockReturnValue({
+      kind: "ok",
+      value: {
+        dev: 0n,
+        ino: 1n,
+        size: h.logicalSize(),
+        mode: REGULAR_MODE,
+        hostHandle: null,
+      },
+    });
+    expect(h.mapResult(h.pids[0], 4, 0x1000)).toEqual({ kind: "mapped" });
+    // No host handle is retained: writeback rides the guest fd, not host I/O.
+    expect(h.retainHostFileHandle).not.toHaveBeenCalled();
+    const pidMap = (h.kw as any).sharedMappings.get(h.pids[0]);
+    expect(pidMap?.size).toBe(1);
+    const mapping = pidMap.get(0x1000);
+    expect(mapping.writable).toBe(true);
+    expect(mapping.fd).toBe(4);
+    // A bare fd-tracked mapping: no host byte-store backing key.
+    expect(mapping.backingKey).toBeUndefined();
+  });
+
+  it("still rejects a writable kernel-owned mapping without an O_RDWR fd", () => {
     const h = createFileHarness();
     h.getFdStatForSharedMapping.mockReturnValue({
       kind: "ok",
@@ -1380,12 +1412,11 @@ describe("file/POSIX MAP_SHARED page cache", () => {
         hostHandle: null,
       },
     });
+    // O_RDONLY (0): a writable MAP_SHARED requires a read+write descriptor.
+    h.getFdAccessModeForSharedMapping.mockReturnValue({ kind: "ok", value: 0 });
     expect(h.mapResult(h.pids[0], 4, 0x1000))
-      .toEqual({ kind: "error", errno: 95 });
-    expect(h.retainHostFileHandle).not.toHaveBeenCalled();
+      .toEqual({ kind: "error", errno: 13 });
     expect((h.kw as any).sharedMappings.size).toBe(0);
-    // The _handleSyscallInner preflight is gated on MAP_SHARED; MAP_PRIVATE
-    // still uses the existing fd-pread population path.
   });
 
   it("rejects a backend that cannot promise stable file identity", () => {
