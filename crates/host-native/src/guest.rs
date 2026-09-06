@@ -31,7 +31,7 @@
 //! HOST-ONLY: build/test with an explicit host target (see `Cargo.toml`).
 
 use std::cell::UnsafeCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write as _};
 use std::os::unix::fs::{DirEntryExt, FileExt, MetadataExt, OpenOptionsExt};
@@ -2897,11 +2897,43 @@ struct NativeReferenceCapture {
     /// page, backing `scratch_reserve`/`_release`. Reset to `0` alongside
     /// `graph` at the start of every capture.
     scratch_cursor: u32,
+    /// N1-I5b Task 2: the first GATED reference kind (`externref`, `gc`,
+    /// `i31`, `struct/array`, ...) this capture observed, or `None` when the
+    /// fork carries only supported kinds. Mirrors `ForkActivationRegistry`'s
+    /// `unsupportedReferenceKind` field (`host/src/fork-activation-
+    /// registry.ts:702-714`): a raw error here cannot unwind through the
+    /// guest's own fork save walk (that walk is driven by the GUEST's wasm
+    /// bytecode calling back into these host imports — there is no host-side
+    /// call frame to unwind an `Err` through without trapping the whole
+    /// store), so the gate-stub bodies below RECORD the kind (first
+    /// observation wins) and return a benign placeholder instead. Read via
+    /// `take_unsupported_kind` (read-and-clear) once the guest's unwind
+    /// fully completes, by `drive_fork_capture_seal_and_launch_child` —
+    /// mirroring the JS run loop's post-`sealCapture` check
+    /// (`worker-main.ts:5109-5139`).
+    unsupported_kind: Option<&'static str>,
+    /// N1-I5b Task 2: recipe ids `gated_placeholder` minted — an id in this
+    /// set names a benign leaf node (a canonical `i31` value, NOT real
+    /// reference data) rather than a faithfully captured reference. Consulted
+    /// by the `__wpk_fork_ref_decode_externref` bypass wrapper
+    /// (`spawn_guest_thread`) during a gated fork's own abort-replay so it
+    /// never asks the co-resident module to decode a node whose WIRE KIND
+    /// (`I31`) does not match the WASM TYPE (`externref`) the guest's
+    /// generated rewind code expects there — `fm_externref_handle` "TRAPS on
+    /// any inconsistency" (its own doc comment in `crates/fork-module/src/
+    /// lib.rs`), so this bypass, not a real decode, is what keeps a gated
+    /// fork's PARENT alive through its own resume. Reset alongside `graph`.
+    gated_ids: BTreeSet<u32>,
 }
 
 impl NativeReferenceCapture {
     fn new() -> Self {
-        Self { graph: fork_codec::ReferenceGraphBuilder::begin(), scratch_cursor: 0 }
+        Self {
+            graph: fork_codec::ReferenceGraphBuilder::begin(),
+            scratch_cursor: 0,
+            unsupported_kind: None,
+            gated_ids: BTreeSet::new(),
+        }
     }
 
     /// Begin a fresh capture, discarding whatever the PREVIOUS fork's
@@ -2911,6 +2943,57 @@ impl NativeReferenceCapture {
     fn reset(&mut self) {
         self.graph = fork_codec::ReferenceGraphBuilder::begin();
         self.scratch_cursor = 0;
+        // A partially-consumed marker from an aborted prior capture must
+        // never gate THIS fork — mirrors `beginCapture`'s own defensive
+        // `this.unsupportedReferenceKind = null` (`fork-activation-
+        // registry.ts:1199`). `take_unsupported_kind`'s read-and-clear is the
+        // primary owner; this is the same defense-in-depth belt-and-braces.
+        self.unsupported_kind = None;
+        self.gated_ids.clear();
+    }
+
+    /// `markUnsupportedReferenceKind` port: record that the active capture
+    /// reached a gated reference kind. First observation wins, so the parent
+    /// run loop reports the first kind the guest's save walk actually
+    /// reached. Never fails — see [`Self::unsupported_kind`]'s doc comment
+    /// for why a gate-stub body cannot throw instead.
+    fn mark_unsupported(&mut self, kind: &'static str) {
+        self.unsupported_kind.get_or_insert(kind);
+    }
+
+    /// `takeUnsupportedReferenceKind` port: read and clear the gated kind
+    /// observed during the just-finished capture. Read-and-clear so a gated
+    /// kind can never leak into a subsequent, supported fork.
+    fn take_unsupported_kind(&mut self) -> Option<&'static str> {
+        self.unsupported_kind.take()
+    }
+
+    /// `reserveGatedPlaceholder` port: reserve (or reuse) a self-contained,
+    /// non-null leaf node — a canonical `i31` value — for a GATED capture
+    /// kind. Unlike `reserveGatedPlaceholder`'s JS implementation (which
+    /// pushes a FRESH node per call, since it separately keeps the live
+    /// value for a faithful parent-side identity restore), this dedupes via
+    /// `intern_i31` because native does NOT attempt any identity-preserving
+    /// restore for a gated kind (`docs/plans/2026-09-05-n1-i5b-reference-
+    /// capture-grounding.md` §0: "Do NOT attempt to reconstruct externref/GC
+    /// — that is F5/F6"). Every gate stub sharing one placeholder id is
+    /// harmless: the fork ALWAYS aborts before any child reads this graph
+    /// (`drive_fork_capture_seal_and_launch_child`), so the graph's content
+    /// past "validates cleanly and is admissible" is otherwise unobserved —
+    /// mirrors the JS doc comment's own "sealed graph is discarded unread."
+    fn gated_placeholder(&mut self) -> wasmtime::Result<u32> {
+        let id = self
+            .graph
+            .intern_i31(0)
+            .map_err(|e| wasmtime::Error::msg(format!("gated placeholder intern failed: {e:?}")))?;
+        self.gated_ids.insert(id);
+        Ok(id)
+    }
+
+    /// True when `recipe_id` names a [`Self::gated_placeholder`] rather than
+    /// real reference data — see [`Self::gated_ids`]'s doc comment.
+    fn is_gated_id(&self, recipe_id: u32) -> bool {
+        self.gated_ids.contains(&recipe_id)
     }
 
     /// `__wpk_fork_ref_scratch_reserve(size) -> ptr|0`: a bump allocator over
@@ -4332,14 +4415,16 @@ fn spawn_guest_thread(
             // module's matching exports. `TypedFunc::func()` hands back the
             // same `Func` handle already bound into `ForkModule` above (no
             // second lookup for the seven `fm_ref_*` exports).
-            let flips: [(&str, wasmtime::Func); 9] = [
+            //
+            // N1-I5b Task 2: `DECODE_EXTERNREF` is deliberately NOT in this
+            // array — it gets its own wrapped binding below (`decode_
+            // externref_typed`) that bypasses this real module export for a
+            // gated fork's own placeholder recipe ids, then falls through to
+            // exactly this same `decode_funcref` export for everything else.
+            let flips: [(&str, wasmtime::Func); 8] = [
                 (
                     wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_DECODE_FUNCREF,
                     decode_funcref,
-                ),
-                (
-                    wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_DECODE_EXTERNREF,
-                    decode_externref,
                 ),
                 (wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_VECTOR_GET, *fm.fm_ref_vector_get.func()),
                 (wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_ROUTE, *fm.fm_ref_gc_route.func()),
@@ -4359,6 +4444,62 @@ fn spawn_guest_thread(
                 if guest_declares(name) {
                     if let Err(e) = linker.define(&mut store, "env", name, f) {
                         eprintln!("wiring env.{name} failed: {e:#}");
+                        return;
+                    }
+                }
+            }
+
+            // N1-I5b Task 2: `DECODE_EXTERNREF` gets a WRAPPED binding, not a
+            // plain flip like the rest of `flips` above. A gated fork's own
+            // abort-replay (`drive_fork_capture_seal_and_launch_child`) still
+            // rewinds the PARENT's frames — including whichever frame held
+            // the gated externref-typed local — through the SAME resume
+            // machinery a supported fork uses, so this import IS reached even
+            // though the fork carried no real reference data for it. The
+            // sealed graph's entry at that recipe id is `NativeReferenceCapture
+            // ::gated_placeholder`'s canonical `i31` node, NOT a real
+            // `Externref` node — calling the module's real
+            // `__wpk_fork_ref_decode_externref` (which resolves to
+            // `fm_externref_handle`, documented to "TRAP on any
+            // inconsistency") on that id would trap the whole store. This
+            // wrapper checks `NativeReferenceCapture::is_gated_id` FIRST and
+            // short-circuits to a benign `null` externref for exactly those
+            // ids, falling through to the real module export for everything
+            // else (a supported fork's real funcref-adjacent externref
+            // decode, if that ever exists, is unaffected). Converted to a
+            // `TypedFunc` once here (not per-call) purely for a cleaner call
+            // site than the untyped `Val` array API.
+            let decode_externref_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_DECODE_EXTERNREF;
+            if guest_declares(decode_externref_name) {
+                let typed_result = decode_externref
+                    .typed::<u32, Option<wasmtime::Rooted<ExternRef>>>(&store);
+                match typed_result {
+                    Ok(decode_externref_typed) => {
+                        let capture_for_decode = Arc::clone(&capture);
+                        let result = linker.func_wrap(
+                            "env",
+                            decode_externref_name,
+                            move |mut caller: Caller<'_, ()>,
+                                  recipe_id: i32|
+                                  -> wasmtime::Result<Option<wasmtime::Rooted<ExternRef>>> {
+                                let gated =
+                                    capture_for_decode.lock().unwrap().is_gated_id(recipe_id as u32);
+                                if gated {
+                                    return Ok(None);
+                                }
+                                decode_externref_typed.call(&mut caller, recipe_id as u32)
+                            },
+                        );
+                        if let Err(e) = result {
+                            eprintln!("wiring env.{decode_externref_name} failed: {e:#}");
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "fork-module export __wpk_fork_ref_decode_externref has an \
+                             unexpected signature: {e:#}"
+                        );
                         return;
                     }
                 }
@@ -4402,13 +4543,10 @@ fn spawn_guest_thread(
             // `docs/plans/2026-09-05-n1-i5b-reference-capture-grounding.md`
             // §1/§2/§4). Must run BEFORE the blanket `define_unknown_
             // imports_as_traps` call below, exactly like every other
-            // conditional wire in this block. The remaining 10 capture-side
-            // imports (`encode_externref` + the 9 typed-GC family) are OUT
-            // OF SCOPE for this task — N1-I5b Task 2 gates them to
-            // `EOPNOTSUPP`; until then they are left trapping via that same
-            // blanket call, unchanged from before this task, so a fork whose
-            // capture never reaches one of them (every funcref-only fixture)
-            // is unaffected.
+            // conditional wire in this block. N1-I5b Task 2 (below) adds the
+            // remaining 10 capture-side imports (`encode_externref` + the 9
+            // typed-GC family) as GATE stubs — real capture for those kinds
+            // stays out of scope (`docs/fork-reference-support.md`).
             let encode_funcref_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_ENCODE_FUNCREF;
             if guest_declares(encode_funcref_name) {
                 let capture_for_encode = Arc::clone(&capture);
@@ -4562,6 +4700,250 @@ fn spawn_guest_thread(
                 );
                 if let Err(e) = result {
                     eprintln!("wiring env.{scratch_release_name} failed: {e:#}");
+                    return;
+                }
+            }
+
+            // N1-I5b Task 2: GATE-and-placeholder stubs for the remaining
+            // capture-side imports — `encode_externref` plus the 9 typed-GC
+            // capture imports. Ports of `fork-activation-registry.ts:477-658`
+            // essentially line-for-line: each records the gated kind
+            // (`NativeReferenceCapture::mark_unsupported`) and returns a
+            // benign, non-trapping placeholder
+            // (`NativeReferenceCapture::gated_placeholder`) or no-ops for the
+            // void imports, instead of running a real encoder — so the
+            // guest's own save walk (module-state save + every per-frame
+            // commit) completes WITHOUT trapping even though this fork will
+            // be aborted. `drive_fork_capture_seal_and_launch_child` reads
+            // the marker right after seal and aborts the fork with
+            // `EOPNOTSUPP` — no child is ever spawned, so the placeholder
+            // graph is discarded unread, exactly like the JS gate's own doc
+            // comment. Must run BEFORE the blanket `define_unknown_imports_
+            // as_traps` call below, same as every other conditional wire in
+            // this block.
+            let encode_externref_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_ENCODE_EXTERNREF;
+            if guest_declares(encode_externref_name) {
+                let capture_for_externref = Arc::clone(&capture);
+                let result = linker.func_wrap(
+                    "env",
+                    encode_externref_name,
+                    move |_caller: Caller<'_, ()>,
+                          _value: Option<wasmtime::Rooted<ExternRef>>|
+                          -> wasmtime::Result<i32> {
+                        // A live externref has no linear-memory
+                        // representation and cannot be faithfully
+                        // reconstructed in a fresh child today — mirrors
+                        // `fork-activation-registry.ts:477-482` (no
+                        // null-value special case there either: EVERY call,
+                        // including a null externref, marks the kind and
+                        // reserves a placeholder).
+                        let mut capture = capture_for_externref.lock().unwrap();
+                        capture.mark_unsupported("externref");
+                        capture.gated_placeholder().map(|id| id as i32)
+                    },
+                );
+                if let Err(e) = result {
+                    eprintln!("wiring env.{encode_externref_name} failed: {e:#}");
+                    return;
+                }
+            }
+
+            let gc_lookup_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_LOOKUP;
+            if guest_declares(gc_lookup_name) {
+                let capture_for_gc = Arc::clone(&capture);
+                let result = linker.func_wrap(
+                    "env",
+                    gc_lookup_name,
+                    move |_caller: Caller<'_, ()>, _slot: i32| -> wasmtime::Result<i32> {
+                        // `gc_lookup` is the anyref-transit dedup entry
+                        // reached for EVERY anyref-lineage value (a plain
+                        // externref, a static root, or a typed Wasm-GC
+                        // struct/array/i31) — see `fork-activation-
+                        // registry.ts:528-543`'s "cannot honestly claim 'gc'"
+                        // note. Report the same undistinguished umbrella.
+                        let mut capture = capture_for_gc.lock().unwrap();
+                        capture.mark_unsupported("externref or Wasm-GC (anyref)");
+                        capture.gated_placeholder().map(|id| id as i32)
+                    },
+                );
+                if let Err(e) = result {
+                    eprintln!("wiring env.{gc_lookup_name} failed: {e:#}");
+                    return;
+                }
+            }
+
+            let gc_claim_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_CLAIM;
+            if guest_declares(gc_claim_name) {
+                let capture_for_gc = Arc::clone(&capture);
+                let result = linker.func_wrap(
+                    "env",
+                    gc_claim_name,
+                    move |_caller: Caller<'_, ()>, _slot: i32| -> wasmtime::Result<i32> {
+                        let mut capture = capture_for_gc.lock().unwrap();
+                        capture.mark_unsupported("gc");
+                        capture.gated_placeholder().map(|id| id as i32)
+                    },
+                );
+                if let Err(e) = result {
+                    eprintln!("wiring env.{gc_claim_name} failed: {e:#}");
+                    return;
+                }
+            }
+
+            let gc_i31_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_I31;
+            if guest_declares(gc_i31_name) {
+                let capture_for_gc = Arc::clone(&capture);
+                let result = linker.func_wrap(
+                    "env",
+                    gc_i31_name,
+                    move |_caller: Caller<'_, ()>, _value: i32| -> wasmtime::Result<i32> {
+                        let mut capture = capture_for_gc.lock().unwrap();
+                        capture.mark_unsupported("i31");
+                        capture.gated_placeholder().map(|id| id as i32)
+                    },
+                );
+                if let Err(e) = result {
+                    eprintln!("wiring env.{gc_i31_name} failed: {e:#}");
+                    return;
+                }
+            }
+
+            let gc_broker_encode_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_BROKER_ENCODE;
+            if guest_declares(gc_broker_encode_name) {
+                let capture_for_gc = Arc::clone(&capture);
+                let result = linker.func_wrap(
+                    "env",
+                    gc_broker_encode_name,
+                    move |_caller: Caller<'_, ()>, _slot: i32| -> wasmtime::Result<i32> {
+                        let mut capture = capture_for_gc.lock().unwrap();
+                        capture.mark_unsupported("gc");
+                        capture.gated_placeholder().map(|id| id as i32)
+                    },
+                );
+                if let Err(e) = result {
+                    eprintln!("wiring env.{gc_broker_encode_name} failed: {e:#}");
+                    return;
+                }
+            }
+
+            let gc_define_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_DEFINE;
+            if guest_declares(gc_define_name) {
+                let capture_for_gc = Arc::clone(&capture);
+                let result = linker.func_wrap(
+                    "env",
+                    gc_define_name,
+                    move |_caller: Caller<'_, ()>,
+                          _recipe_id: i32,
+                          _record_activation_id: i32,
+                          _type_ordinal: i32,
+                          _layout_id: i32,
+                          _kind: i32,
+                          _scalar_pointer: i32,
+                          _scalar_byte_length: i32,
+                          _reference_vector_ordinal: i32|
+                          -> wasmtime::Result<()> {
+                        // A void gate stub: no graph mutation needed, since a
+                        // gated `gc_lookup`/`gc_claim` already returned a
+                        // non-null alias, so the guest never recurses into
+                        // the struct/array field walk that would otherwise
+                        // reach `gc_define` — mirrors `fork-activation-
+                        // registry.ts:556-567`.
+                        capture_for_gc.lock().unwrap().mark_unsupported("struct/array");
+                        Ok(())
+                    },
+                );
+                if let Err(e) = result {
+                    eprintln!("wiring env.{gc_define_name} failed: {e:#}");
+                    return;
+                }
+            }
+
+            let gc_capture_layout_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_CAPTURE_LAYOUT;
+            if guest_declares(gc_capture_layout_name) {
+                let capture_for_gc = Arc::clone(&capture);
+                let result = linker.func_wrap(
+                    "env",
+                    gc_capture_layout_name,
+                    move |_caller: Caller<'_, ()>,
+                          _slot: i32,
+                          _record_activation_id: i32,
+                          base_layout_id: i32|
+                          -> wasmtime::Result<i32> {
+                        // The guest only threads this value back into the
+                        // gated (no-op) `gc_define` as metadata; the base
+                        // layout id it already holds is the survivable
+                        // identity choice and never drives a memory or field
+                        // read — mirrors `fork-activation-registry.
+                        // ts:616-632`.
+                        capture_for_gc.lock().unwrap().mark_unsupported("struct/array");
+                        Ok(base_layout_id)
+                    },
+                );
+                if let Err(e) = result {
+                    eprintln!("wiring env.{gc_capture_layout_name} failed: {e:#}");
+                    return;
+                }
+            }
+
+            let gc_provenance_begin_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_PROVENANCE_BEGIN;
+            if guest_declares(gc_provenance_begin_name) {
+                let capture_for_gc = Arc::clone(&capture);
+                let result = linker.func_wrap(
+                    "env",
+                    gc_provenance_begin_name,
+                    move |_caller: Caller<'_, ()>,
+                          _slot: i32,
+                          _record_activation_id: i32,
+                          _base_layout_id: i32,
+                          _specialized_layout_id: i32,
+                          _scalar_lo: i64,
+                          _scalar_hi: i64,
+                          _reference_count: i32|
+                          -> wasmtime::Result<i32> {
+                        // A provenance token only names the pending record
+                        // consumed by the gated (no-op) provenance ref/end
+                        // imports below, so any stable value survives —
+                        // mirrors `fork-activation-registry.ts:633-646`.
+                        capture_for_gc.lock().unwrap().mark_unsupported("gc");
+                        Ok(0)
+                    },
+                );
+                if let Err(e) = result {
+                    eprintln!("wiring env.{gc_provenance_begin_name} failed: {e:#}");
+                    return;
+                }
+            }
+
+            let gc_provenance_ref_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_PROVENANCE_REF;
+            if guest_declares(gc_provenance_ref_name) {
+                let capture_for_gc = Arc::clone(&capture);
+                let result = linker.func_wrap(
+                    "env",
+                    gc_provenance_ref_name,
+                    move |_caller: Caller<'_, ()>, _token: i32, _index: i32, _slot: i32| -> wasmtime::Result<()> {
+                        capture_for_gc.lock().unwrap().mark_unsupported("gc");
+                        Ok(())
+                    },
+                );
+                if let Err(e) = result {
+                    eprintln!("wiring env.{gc_provenance_ref_name} failed: {e:#}");
+                    return;
+                }
+            }
+
+            let gc_provenance_end_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_PROVENANCE_END;
+            if guest_declares(gc_provenance_end_name) {
+                let capture_for_gc = Arc::clone(&capture);
+                let result = linker.func_wrap(
+                    "env",
+                    gc_provenance_end_name,
+                    move |_caller: Caller<'_, ()>, _token: i32| -> wasmtime::Result<()> {
+                        capture_for_gc.lock().unwrap().mark_unsupported("gc");
+                        Ok(())
+                    },
+                );
+                if let Err(e) = result {
+                    eprintln!("wiring env.{gc_provenance_end_name} failed: {e:#}");
                     return;
                 }
             }
@@ -5375,6 +5757,81 @@ fn drive_fork_capture_seal_and_launch_child(
             return false;
         }
     }
+
+    // N1-I5b Task 2: read-and-clear the first GATED reference kind this
+    // capture observed, right after seal — mirrors `worker-main.ts:5109-
+    // 5139`'s post-`sealCapture` check. A supported-only fork (funcref, the
+    // common case) never sets this, so this adds nothing to that path.
+    let unsupported_kind = capture.lock().unwrap().take_unsupported_kind();
+    if let Some(kind) = unsupported_kind {
+        // Make the platform boundary VISIBLE to a developer (Platform
+        // Values: truthful failure over silent illusion) — mirrors the JS
+        // run loop's own `console.warn` at the same call site.
+        eprintln!(
+            "[host-native] fork aborted with EOPNOTSUPP — carried a live '{kind}' \
+             reference across the fork boundary, which the platform cannot \
+             reconstruct in a fresh child yet. No child was spawned; the \
+             parent continues. See docs/fork-reference-support.md."
+        );
+        coord.set_fork_result(-(wasm_posix_shared::Errno::EOPNOTSUPP as i32));
+        // Skip the real SYS_FORK/SYS_VFORK channel post entirely — NO child
+        // is ever spawned for a gated fork (`fm_serialize_journal_alloc`'s
+        // KFRE image is purely for a prospective CHILD's benefit; the
+        // PARENT's own `fm_begin_replay` below needs none of it, since it
+        // rewinds the SAME module's still-live in-memory journal, not a
+        // deserialized copy). Still drives the PARENT's own frame rewind —
+        // its call stack was already unwound above, exactly like the
+        // supported/rejected-fork paths, so it must still be replayed to
+        // resume at the `fork()` call site, just with the FORCED errno
+        // instead of a channel reply.
+        if let Err(e) = fm.fm_begin_replay.call(&mut *store, ()) {
+            eprintln!("fm_begin_replay (gated fork abort) failed: {e:#}");
+            return false;
+        }
+        match fm.fm_last_errno.call(&mut *store, ()) {
+            Ok(0) => {}
+            Ok(errno) => {
+                eprintln!("fm_begin_replay (gated fork abort) failed: errno {errno}");
+                return false;
+            }
+            Err(e) => {
+                eprintln!("fm_last_errno after fm_begin_replay (gated fork abort) failed: {e:#}");
+                return false;
+            }
+        }
+        // Drive the SAME reference-replay sub-sequence a supported fork
+        // uses (`fm_begin_reference_replay` + the GC drive plan) against the
+        // sealed placeholder-only graph — safe because every wire node kind
+        // (including the canonical `i31` `gated_placeholder` this capture
+        // wrote) is module-ADMISSIBLE (`ReferenceReplayDriver::
+        // all_nodes_module_admissible`; struct/array/i31 are all in that
+        // allow-list — the PLATFORM gate is a host-policy decision about
+        // fresh-CHILD reconstruction fidelity, not an engine limitation) and
+        // an `i31` leaf needs no GC drive step. The per-frame
+        // `__wpk_fork_ref_decode_externref` bypass wired in
+        // `spawn_guest_thread` is what keeps this safe for the specific
+        // frame that held the gated value: it short-circuits on `is_gated_id`
+        // instead of asking the module to decode an `i31` node as if it were
+        // a real `Externref` (which would trap).
+        if !drive_reference_replay(&mut *store, fm, guest_mem) {
+            return false;
+        }
+        let Some(rewind_begin) = get_guest_export_typed::<u32, ()>(
+            &mut *store,
+            instance,
+            wasm_posix_shared::abi::WPK_FORK_EXPORT_REWIND_BEGIN,
+        ) else {
+            return false;
+        };
+        let root = coord.root();
+        if let Err(e) = rewind_begin.call(&mut *store, root) {
+            eprintln!("wpk_fork_rewind_begin (gated fork abort) failed: {e:#}");
+            return false;
+        }
+        coord.set_phase(ForkCoordPhase::Replaying);
+        return true;
+    }
+
     let image_ptr = match fm.fm_serialize_journal_alloc.call(&mut *store, ch as u32) {
         Ok(p) => p,
         Err(e) => {
