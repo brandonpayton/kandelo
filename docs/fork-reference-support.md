@@ -13,9 +13,13 @@ over convenient illusion").
 During `fork()`, the host and kernel reconstruct the child's live
 program state, including every Wasm reference reachable from the
 forking activation: table entries, globals, locals, and exception
-payloads. Some reference kinds are reconstructed; the rest are an
-explicit, loud, unsupported boundary rather than something silently
-patched together by host JS.
+payloads. Every reference kind Wasm can express — `null`, `funcref`,
+`exnref`, `externref`, typed Wasm-GC (`struct`/`array`/`i31`), and
+static-root references — is reconstructed, on every host (native,
+Node, and browser). One narrow residual case (an anyref-lineage value
+with no recoverable production-site identity) remains an explicit,
+loud, unsupported boundary rather than something silently patched
+together by host JS; see "One remaining gated boundary" below.
 
 ## Supported across fork
 
@@ -35,106 +39,101 @@ patched together by host JS.
   supported reference kinds above; see `docs/fork-instrumentation.md`
   for how reconstruction fits into the broader replay design.
 
-## Unsupported (gated) across fork
+## Supported across fork (externref, GC, static-root)
 
-The remaining Wasm reference kinds — `externref`, `struct`, `array`,
-`i31`, and static-root references — are an explicit unsupported fork
-boundary as of this change:
+`externref`, typed Wasm-GC (`struct`/`array`/`i31`), and static-root
+references are also reconstructed across fork, on every host (native,
+Node, and browser):
 
-- A fork that would carry a live value of one of these kinds across
-  the boundary fails with `EOPNOTSUPP` (`ForkReferenceUnsupportedError`,
-  errno 95; see `host/src/fork-reference-unsupported.ts`).
-- The failure is detected on the **parent** side, during capture, not
-  after a child has been spawned.
-- In the default configuration (`WASM_POSIX_FORK_MODULE` unset), this
-  surfaces as a clean fork-abort (`beginAbortReplay`): the fork
-  syscall returns `-EOPNOTSUPP`, no child process is created, and the
-  parent continues running. There is no crash and no partially
-  constructed child.
+- **A plain host externref with recorded provenance.** Every
+  externref-returning host-import call site is wrapped by
+  `wasm-fork-instrument` (`crates/fork-instrument/src/externref_provenance.rs`)
+  to record `(value -> handle)` at the exact moment the import produces
+  the value — the only sound moment to observe that association. Fork
+  capture (the anyref-transit `gc_lookup`/`GC_LOOKUP` seam; native:
+  `crates/host-native/src/guest.rs`, Node/browser:
+  `ForkReferenceTransaction.lookupGcSlot` in
+  `host/src/fork-reference-transaction.ts`) looks the value up in that
+  provenance record — never mints a handle by inspecting an
+  already-live value — and interns it as a real `externref` recipe
+  node on a hit.
+- **Static roots.** An immutable Wasm-GC global/local/table entry
+  reachable from module-level `elem`/`global` initializers is recorded
+  by a harvest-time reverse index (`ForkStaticRootCatalog`/
+  `StaticRootProvenance`) and reconstructed via the same `gc_lookup`
+  seam.
+- **Typed Wasm-GC struct/array/i31.** A genuinely new (not dedup, not
+  static-root, not externref-provenance) anyref-lineage value falls
+  through to real construction: the guest's generated GC codec walks
+  its fields, and the host's `claimGcSlot`/`defineGc`/`encodeI31`
+  (Node/browser) or equivalent native methods build the real recipe
+  node, restored in the child via the injected codec's
+  allocate/fill drive.
 
-### Why this is safe
+The Node/browser and native hosts share the same capture-time
+layering: dedup, then static-root, then externref-provenance, then a
+genuine miss recurses into real struct/array/i31 construction instead
+of gating. See
+`docs/plans/2026-09-05-n1-nodebrowser-reference-parity-grounding.md`
+for the Node/browser parity work and its test coverage.
 
-A census of all 113 built package programs in the registry found
-**zero** packages that produce these reference kinds across a fork:
+### One remaining gated boundary
 
-- The fork instrumenter's own computed sections for these kinds
-  (`gc_codec`, `static_root_catalog`) are empty for every program in
-  the census.
-- Host/syscall imports are scalar — no externref is ever passed into
-  a guest through the syscall boundary.
-- Guest C++ exception handling in the package set is tag-based, so no
-  package exercises a first-class `exnref` carrying one of the gated
-  kinds as payload.
-
-Only synthetic test fixtures built specifically to exercise these
-reconstruction paths hit this boundary today. Every real workload
-that forks — WordPress/PHP via `dlopen`, LXDE, and the language
-interpreters (Python, Ruby, Node, Perl) — falls entirely within the
-supported set above.
+A single case still gates cleanly with `EOPNOTSUPP`
+(`ForkReferenceUnsupportedError`, errno 95;
+`host/src/fork-reference-unsupported.ts`), on every host: an
+anyref-lineage value that is **not** a dedup hit, **not** a static
+root, and **not** a plain externref with recorded provenance — i.e. a
+Wasm-GC-internalized value produced by `any.convert_extern` with no
+production-site provenance to recover (a `call_indirect`/`call_ref`
+landing on an externref-returning host import that the instrumenter's
+static pass could not identify, or a genuinely engine-internalized
+value). Fabricating a handle for this case would be the unsound
+capture-time reverse lookup this design deliberately avoids, so it
+gates instead of mis-capturing. This is detected on the **parent**
+side during capture, before any child is spawned; in the default
+configuration (`WASM_POSIX_FORK_MODULE` unset) it surfaces as a clean
+fork-abort (`beginAbortReplay`) with no crash and no partially
+constructed child.
 
 ## Known gaps and residuals
 
-These are documented, intentional limitations of this slice, not
-hidden defects:
-
-- **Module-mode abort is deferred to M8.** With
-  `WASM_POSIX_FORK_MODULE=1` set (an opt-in mode, not the default), a
-  gated fork does **not** yet abort cleanly. `beginAbortReplay`
-  (`host/src/fork-process-continuation.ts`) has no module-mode branch
-  equivalent to the one `beginParentReplay` has, and the co-resident
-  fork module was designed without an abort path. This also affects a
-  **pre-existing, unrelated** case: a kernel-rejected fork
-  (`childPid < 0`, e.g. `EAGAIN`/`ENOMEM`) already crashes the parent
-  in module mode today, independent of this change. Implementing
-  module-mode abort-replay — a `beginModuleAbortReplay` mirror, a
-  matching backend, likely a Rust fork-module abort drive, and fork
-  conformance validation — is deferred to milestone M8, when the
-  module path becomes the default.
+- **Module-mode abort for the one remaining gated case.** With
+  `WASM_POSIX_FORK_MODULE=1` set (an opt-in mode, not the default),
+  whether the co-resident fork module's own continuation journal can
+  abort cleanly for the one still-gated case above (rather than the
+  JS `beginAbortReplay` path) was not re-verified as part of the N1
+  Node/browser parity work — all of that work's own module-enabled
+  (`forkModuleEnabled: true`) test coverage exercises fixtures that
+  now succeed rather than gate. A previously-documented "module-mode
+  abort-replay deferred to M8" limitation applied when every one of
+  these kinds was gated; re-confirm before relying on a clean
+  module-mode abort for the residual case.
 - **Host-exception externref payloads remain a narrow, synthetic-only
   path.** A raw host (JS `JSTag`) exception whose payload is an
-  externref still reconstructs, ungated, through the retained
-  exception machinery. Only synthetic fixtures exercise this; no real
-  package hits it.
-- **The GC/static-root codec files are retained.** The gated
-  reconstruction *logic* built on top of them is deleted, but
-  `host/src/fork-gc-codec.ts` and `host/src/fork-static-root-catalog.ts`
-  stay in the tree. `fork-static-root-catalog.ts` is a structural
-  dependency of `fork-reference-recipes.ts` — the `StaticRoot` recipe
-  node kind appears in every fork's wire format, gated or not — and
-  both files remain wired into the still-supported `exnref`
-  reconstruction path. Keeping them is a host-surface-minimization
-  residual, not a correctness gap.
-- **The child-side reference provider retains parallel GC/externref
-  reconstruction.** `host/src/fork-early-reference-provider.ts` still
-  carries the restore-side JS reconstruction for the gated kinds
-  (`decodeExternref`, `loadGc`, `replayGcVectors`, and the
-  `forkReferenceVectorFrom` GC-vector rebuild). This slice gated the
-  gated kinds on the **capture** side (the fork aborts before a child
-  exists), so on a flag-off abort this code is unreachable for those
-  kinds — no child ever calls it. It was not deleted because it is
-  structurally shared with the still-supported reconstruction paths and
-  will be the natural home for the future in-child reconstruction (see
-  "Future work" below). This is an incomplete-deletion residual, not a
-  correctness gap.
+  externref reconstructs through the retained exception machinery
+  (`ForkReferenceTransaction.materializeHostException`), independent of
+  the `GC_LOOKUP`/provenance path above. Only synthetic fixtures
+  exercise this; no real package hits it.
+- **A host-import-returned externref that is not object-shaped has no
+  handle to record.** The provenance table is keyed by JS object
+  identity (`WeakMap`); a hypothetical future host import that returns
+  a primitive (number/string/boolean) as an externref has no key to
+  register against. No current or near-term host import does this
+  (checked against `host/src/fork-externref-import-mailbox.ts`'s
+  import descriptor shapes); native has the identical limitation.
 
-## Future work: re-enabling the gated kinds
+## Package-level validation
 
-The gated kinds become supported again by moving reconstruction out
-of host JS and into module-owned Wasm (referred to as the "E1
-floors" in planning docs). Each floor is only worth building once a
-real workload needs it — today none do:
-
-- **FLOOR-1 (funcref/externref provenance).** Record the ordinal or
-  handle at each reference *production* site instead of recovering it
-  later via a host reverse-lookup. This requires re-instrumenting
-  every fork-capable program, which is an ABI epoch. Hard cases
-  include dynamically created funcrefs and host-imported externrefs.
-- **FLOOR-2 (GC provenance).** Carry provenance inline with the GC
-  object itself: structs via an appended field (which forces
-  module-wide field reindexing under subtyping), arrays via a wrapper
-  struct (a Wasm array cannot hold an extra field directly).
-
-Both floors are heavy, whole-program transforms that require an ABI
-epoch and full both-host (Node and browser) conformance validation.
-They are deferred until a real wasm-GC or externref-across-fork guest
-program appears in the package set.
+A census of all 113 built package programs in the registry found
+**zero** packages that produce `externref`/GC/static-root references
+across a fork: the fork instrumenter's own computed sections for these
+kinds are empty for every program in the census, host/syscall imports
+are scalar, and guest C++ exception handling in the package set is
+tag-based. Real workloads that fork — WordPress/PHP via `dlopen`,
+LXDE, and the language interpreters (Python, Ruby, Node, Perl) — fall
+entirely within the funcref/exnref set that was already supported
+before this reconstruction work, so this document's history is not a
+correctness concern for any package validated to date; it does mean
+the reconstruction paths above are proven only by synthetic test
+fixtures, not a real package, as of this writing.

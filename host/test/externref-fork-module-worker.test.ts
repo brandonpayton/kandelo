@@ -102,26 +102,17 @@ describe("externref fork through the co-resident module (Phase 6 D6.5)", () => {
     if (workDir) rmSync(workDir, { recursive: true, force: true });
   });
 
-  it("aborts a carried host externref fork cleanly with EOPNOTSUPP (flag off)", async () => {
-    // GATED KIND: a live host externref has no linear-memory representation and
-    // cannot be faithfully reconstructed in a fresh child today, so the fork is
-    // aborted cleanly with -EOPNOTSUPP on the CAPTURE side (the record-stub for
-    // ENCODE_EXTERNREF in fork-activation-registry.ts marks the kind; the parent
-    // run loop calls beginAbortReplay(EOPNOTSUPP) after seal). No child is
-    // spawned and nothing is reconstructed.
-    //
-    // The fixture guest does not branch on a negative fork() return, so
-    // -EOPNOTSUPP (-95) drives it into its parent path. Before the never-reaped
-    // wait, the PARENT re-checks its carried externref: it asserts the reference
-    // survived the aborted capture/restore intact (still non-null and still the
-    // SAME owner-minted host identity through the broker), exiting 96/97 on
-    // divergence. Only when the parent's reference is intact does it fall
-    // through to the wait path, which fails to reap the never-spawned child and
-    // exits 92 — so an exit of 92 proves BOTH the clean abort AND that the
-    // parent continued unaffected. The load-bearing signals are that the gate is
-    // CLEAN: no worker crash (stderr empty) and no reconstruction (the externref
-    // proof-of-use is null — neither the JS path nor the module ran a
-    // reconstruction).
+  it("reconstructs a carried host externref fork through the JS reference path (flag off)", async () => {
+    // N1 Node/browser parity: a plain host externref with recorded provenance
+    // (this fixture's `get_ext` import, routed through the broker) is un-gated
+    // (`GC_LOOKUP`'s third branch, see
+    // `docs/plans/2026-09-05-n1-nodebrowser-reference-parity-grounding.md`).
+    // The fresh child re-roots the SAME broker identity and its `check_ext`
+    // call confirms it, so it exits 0 with empty stderr. No co-resident module
+    // is enabled here, so nothing drove the restore THROUGH the module — the
+    // externref proof-of-use stays null (that diagnostic specifically proves
+    // module participation, not JS-path success; see
+    // `fork-module-reference-proof.ts`).
     const result = await runCentralizedProgram({
       programPath,
       argv: ["externref-local-fork-fresh-worker"],
@@ -132,21 +123,20 @@ describe("externref fork through the co-resident module (Phase 6 D6.5)", () => {
     expect(
       result.exitCode,
       `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
-    ).toBe(92);
+    ).toBe(0);
     expect(result.stderr).toBe("");
     expect(
       moduleReferenceProof(result.hostDiagnostics, "externref"),
     ).toBeNull();
   });
 
-  // F1 (module abort-replay): with the co-resident fork-module ENABLED, a gated
-  // fork now aborts cleanly through the module's own `fm_begin_abort`/
-  // `fm_finish_abort` path (see `beginModuleAbortReplay`/`finishModuleTransaction`
-  // in `host/src/fork-process-continuation.ts`) instead of throwing
-  // "fork-module path does not own abort replay" and crashing the worker. This
-  // is the primary end-to-end proof of F1: the flag-on path now reaches the SAME
-  // clean-abort outcome as the flag-off test above.
-  it("aborts a carried host externref fork cleanly with EOPNOTSUPP (flag on)", async () => {
+  // F1 (module abort-replay) + N1 Node/browser parity: with the co-resident
+  // fork-module ENABLED, the carried externref is now reconstructed for real
+  // (not gated) through the module's `host_resolve_externref` engine-floor
+  // seam, exactly as the fixture's own header comment describes. This is the
+  // primary end-to-end proof that externref capture/restore work identically
+  // under both flags.
+  it("reconstructs the same carried host externref fork through the co-resident module (flag on)", async () => {
     const result = await runCentralizedProgram({
       programPath,
       argv: ["externref-local-fork-fresh-worker"],
@@ -154,18 +144,26 @@ describe("externref fork through the co-resident module (Phase 6 D6.5)", () => {
       forkModuleEnabled: true,
       forkHostImportRegistrar: registerHostReferenceImports,
     });
-    // The flag-on path reaches the SAME clean-abort outcome as the flag-off
-    // test above — a gated externref is not reconstructed under either flag.
-    // No child is spawned, so the guest exits 92; the gate is clean (stderr
-    // empty) and nothing reconstructed the reference (the externref
-    // proof-of-use is null).
+    // (a) CORRECTNESS/PARITY: the child's `check_ext` confirms the SAME host
+    // identity survived the fork and it exits 0, exactly as the flag-off (JS
+    // reference path) run does.
     expect(
       result.exitCode,
       `flag-on externref fork exited unexpectedly\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
-    ).toBe(92);
+    ).toBe(0);
     expect(result.stderr).toBe("");
+    // (b) PROOF OF USE: the co-resident module re-rooted the carried externref
+    // through the broker seam (`externrefs_resolved` > 0), not a silent JS
+    // fallback.
+    const externrefsResolved = moduleReferenceProof(
+      result.hostDiagnostics,
+      "externref",
+    );
     expect(
-      moduleReferenceProof(result.hostDiagnostics, "externref"),
-    ).toBeNull();
+      externrefsResolved,
+      "expected a fork-module externref proof-of-use diagnostic; the module " +
+        "did not resolve the carried externref",
+    ).not.toBeNull();
+    expect(externrefsResolved!).toBeGreaterThan(0);
   });
 });

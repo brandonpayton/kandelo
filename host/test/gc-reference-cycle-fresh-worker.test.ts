@@ -60,18 +60,13 @@ describe("Multi-node Wasm GC reference cycle in a fresh process Worker", () => {
     if (workDir) rmSync(workDir, { recursive: true, force: true });
   });
 
-  it("aborts a multi-node Wasm-GC cycle fork cleanly with EOPNOTSUPP (flag off)", async () => {
-    // GATED KIND: typed Wasm-GC struct/array references are engine-internal and
-    // cannot be faithfully reconstructed in a fresh child today, so the fork is
-    // aborted cleanly with -EOPNOTSUPP on the CAPTURE side (the GC record-stubs
-    // in fork-activation-registry.ts mark the kind; the parent run loop calls
-    // beginAbortReplay(EOPNOTSUPP) after seal). No child is spawned and nothing
-    // is reconstructed.
-    //
-    // The fixture guest does not branch on a negative fork() return, so
-    // -EOPNOTSUPP (-95) drives it into its parent/wait path and it exits 92. The
-    // load-bearing signal is that the gate is CLEAN: no worker crash (stderr
-    // empty).
+  it("reconstructs a multi-node Wasm-GC cycle fork through a fresh child (flag off)", async () => {
+    // N1 Node/browser parity: typed Wasm-GC struct/array/i31 capture is
+    // un-gated (mirrors native's already-shipped `gc_lookup`/`gc_claim`
+    // layering). The fresh child now genuinely reconstructs the struct<->array
+    // cycle, alias carryover, and scalar field through the JS reference path
+    // (this is the flag-off / `forkModuleEnabled: false` run) and exits 0 with
+    // empty stderr, instead of the old capture-side EOPNOTSUPP gate.
     const result = await runCentralizedProgram({
       programPath,
       argv: ["gc-reference-cycle-fresh-worker"],
@@ -82,18 +77,11 @@ describe("Multi-node Wasm GC reference cycle in a fresh process Worker", () => {
     expect(
       result.exitCode,
       `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
-    ).toBe(92);
+    ).toBe(0);
     expect(result.stderr).toBe("");
   });
 
-  // SKIPPED: module-mode (WASM_POSIX_FORK_MODULE=1) fork abort-replay is a known
-  // gap deferred to M8 — see docs/fork-reference-support.md. With the co-resident
-  // fork-module enabled, a gated fork cannot yet abort cleanly: the module owns
-  // its own continuation journal (the JS replay-event journal stays idle) and has
-  // no abort-replay path, so beginAbortReplay would crash the worker. The
-  // flag-off test above proves the capture-side EOPNOTSUPP gate; this case is
-  // re-enabled once module-mode abort-replay lands.
-  it.skip("aborts the same multi-node Wasm-GC cycle fork cleanly with EOPNOTSUPP (flag on)", async () => {
+  it("reconstructs the same multi-node Wasm-GC cycle fork through the co-resident module (flag on)", async () => {
     // EQUIVALENCE + DRIVE PROOF (Phase 6 item 3c production flip): with the
     // co-resident fork-module ENABLED, the child's ref.eq alias checks + the
     // cyclic array element + the scalar struct field + the i31 leaf value all
