@@ -2802,6 +2802,44 @@ impl GcProvenanceRegistry {
         Ok(None)
     }
 
+    /// The declared `provenance_scalar_length` for `layout_id`, straight
+    /// from [`Self::provenance_scalar_lengths`], or `None` if `layout_id` is
+    /// missing from the GC-codec descriptor entirely — a build defect
+    /// distinct from an ordinary provenance MISS (`find` returning `None`
+    /// for a specific live object), which is what
+    /// [`Self::provenance_length_mismatches`] checks.
+    fn declared_provenance_scalar_length(&self, layout_id: u32) -> Option<u32> {
+        self.provenance_scalar_lengths.get(&layout_id).copied()
+    }
+
+    /// Review fix (increment-review.md MEDIUM-1 / "Finding 2"): `true` when
+    /// `record`'s scalar byte length does not match `layout_id`'s declared
+    /// `provenance_scalar_length` — the exact soundness gap `gc_define`'s
+    /// wiring must gate on rather than silently storing corrupt bytes.
+    /// `record: None` (an ordinary provenance MISS — the concrete failure
+    /// scenario the review describes: a `provenance_scalar_length > 0`
+    /// array constructed through a production site the instrumenter's
+    /// provenance-wrapper pass never wrapped) is always compared against
+    /// actual length `0`, so a nonzero declared length correctly reports a
+    /// mismatch. Returns `None` (no verdict possible) when `layout_id` is
+    /// missing from the descriptor entirely — that is a separate, louder
+    /// failure the caller already surfaces via
+    /// [`Self::declared_provenance_scalar_length`]'s own doc comment.
+    ///
+    /// Mirrors the TS `defineGc`'s `provenance.record.scalars.byteLength
+    /// !== layout.provenanceScalarLength` cross-check
+    /// (`host/src/fork-reference-transaction.ts:536-537`), which native had
+    /// never ported — this closes that gap.
+    fn provenance_length_mismatches(
+        &self,
+        layout_id: u32,
+        record: Option<&GcConstructorRecord>,
+    ) -> Option<bool> {
+        let declared = self.declared_provenance_scalar_length(layout_id)?;
+        let actual = record.map(|r| r.scalars.len()).unwrap_or(0) as u32;
+        Some(declared != actual)
+    }
+
     /// Drop a half-finished transaction. Called defensively before every
     /// `begin` and on any error mid-sequence (a trap between `begin` and
     /// `end` must never leave a stale pending record around).
@@ -5986,6 +6024,43 @@ fn spawn_guest_thread(
                             Some(value) => provenance_for_gc.lock().unwrap().find(&mut caller, value)?,
                             None => None,
                         };
+
+                        // Review fix (increment-review.md MEDIUM-1 /
+                        // "Finding 2"): a provenance MISS (or a
+                        // stale/mismatched HIT) for a layout that declares a
+                        // nonzero `provenance_scalar_length` must never
+                        // silently store fewer (or more) provenance bytes
+                        // than the layout expects -- the DECODER splits the
+                        // assembled `scalars` buffer back apart by the
+                        // LAYOUT's declared length, not by what was actually
+                        // supplied here, so a mismatch would silently
+                        // misread real field bytes as a fake provenance seed
+                        // (or vice versa) without ever trapping. Gate
+                        // cleanly instead of proceeding as if nothing were
+                        // wrong; the assembly below still runs afterward
+                        // (mirroring every other gate stub in this file) so
+                        // the pending GC claim is completed either way -- a
+                        // gated fork's sealed graph content is discarded
+                        // unread regardless of what it holds.
+                        match provenance_for_gc
+                            .lock()
+                            .unwrap()
+                            .provenance_length_mismatches(layout_id as u32, record.as_ref())
+                        {
+                            Some(true) => {
+                                capture_for_gc.lock().unwrap().mark_unsupported(
+                                    "gc: constructor provenance scalar length does not match \
+                                     its layout's declared length",
+                                );
+                            }
+                            Some(false) => {}
+                            None => {
+                                return Err(wasmtime::Error::msg(format!(
+                                    "gc_define: layout {layout_id} is missing from the GC-codec \
+                                     descriptor"
+                                )));
+                            }
+                        }
 
                         let mut provenance_ids: Vec<u32> = Vec::new();
                         let mut provenance_scalars: Vec<u8> = Vec::new();
@@ -10198,5 +10273,68 @@ mod fork_module_tests {
         std::fs::write(&out_path, &wasm)
             .unwrap_or_else(|e| panic!("write {}: {e}", out_path.display()));
         eprintln!("wrote {} ({} bytes)", out_path.display(), wasm.len());
+    }
+
+    /// Review fix (increment-review.md MEDIUM-1 / "Finding 2"): a provenance
+    /// MISS for an array layout that declares a nonzero `provenance_scalar_
+    /// length` must be flagged as a cross-check mismatch, not silently
+    /// treated as "0 provenance bytes is fine" — `gc_define`'s wiring gates
+    /// the whole fork on exactly this condition instead of storing corrupt
+    /// scalar bytes (see that call site's own doc comment).
+    ///
+    /// This is a UNIT-level test, not an end-to-end fixture: the concrete
+    /// failure scenario (a `provenance_scalar_length > 0` array constructed
+    /// through a production site the instrumenter's provenance-wrapper pass
+    /// never wrapped) requires a wrapper-COVERAGE gap the current
+    /// instrumenter does not have — see the review's own "Concrete failure
+    /// scenario" paragraph. Exercised instead against the REAL cross-
+    /// language GC-codec descriptor fixture (`crates/fork-codec/testdata/
+    /// gc-codec-wasm32.bin`, the SAME bytes `fork_codec::gc_codec`'s own
+    /// `decodes_real_encoder_fixture_field_for_field` test decodes
+    /// field-for-field), whose layout 6 is exactly the review's own cited
+    /// example: an `array.new_data` specialization declaring `provenance_
+    /// scalar_length == 8`.
+    #[test]
+    fn gc_provenance_registry_flags_a_declared_length_mismatch() {
+        const GC_CODEC_FIXTURE: &[u8] = include_bytes!("../../fork-codec/testdata/gc-codec-wasm32.bin");
+        let format = GuestForkFormat {
+            fixed_prefix_size: 0,
+            catalog_ordinals: Vec::new(),
+            catalog_local_slots: Vec::new(),
+            gc_codec_descriptor: Some(GC_CODEC_FIXTURE.to_vec()),
+        };
+        let registry = GcProvenanceRegistry::new(Some(&format));
+
+        // Layout 6 (the review's own cited example) declares 8 provenance
+        // scalar bytes.
+        assert_eq!(registry.declared_provenance_scalar_length(6), Some(8));
+
+        // A genuine provenance MISS (`find` never located a record for this
+        // object — the concrete failure scenario: an uninstrumented
+        // production site) must be reported as a mismatch against a
+        // nonzero declared length, not silently treated as "0 bytes is
+        // fine".
+        assert_eq!(registry.provenance_length_mismatches(6, None), Some(true));
+
+        // A record whose actual scalar length DOES match is not a mismatch.
+        let matching =
+            GcConstructorRecord { layout_id: 6, scalars: vec![0u8; 8], references: Vec::new() };
+        assert_eq!(registry.provenance_length_mismatches(6, Some(&matching)), Some(false));
+
+        // A record with a WRONG (but nonzero) length is also correctly
+        // flagged — not just the "collapsed to 0" miss case above.
+        let wrong_length =
+            GcConstructorRecord { layout_id: 6, scalars: vec![0u8; 3], references: Vec::new() };
+        assert_eq!(registry.provenance_length_mismatches(6, Some(&wrong_length)), Some(true));
+
+        // Layout 1 (the same fixture's plain struct) declares NO
+        // provenance scalar bytes — a miss there is correctly NOT a
+        // mismatch (0 declared, 0 actual).
+        assert_eq!(registry.declared_provenance_scalar_length(1), Some(0));
+        assert_eq!(registry.provenance_length_mismatches(1, None), Some(false));
+
+        // A layout id absent from the descriptor entirely is a build
+        // defect, not an ordinary miss — `None`, not `Some(false)`.
+        assert_eq!(registry.provenance_length_mismatches(999, None), None);
     }
 }
