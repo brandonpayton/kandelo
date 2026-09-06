@@ -44,7 +44,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use wasmtime::{
-    Caller, Engine, ExternRef, ExternType, Global, GlobalType, Linker, MemoryType, Module,
+    AnyRef, Caller, Engine, ExternRef, ExternType, Global, GlobalType, Linker, MemoryType, Module,
     Mutability, Ref, SharedMemory, Store, Table, Val, ValType,
 };
 
@@ -2460,6 +2460,214 @@ impl ExternrefProvenance {
     }
 }
 
+/// N1-F6: grow the module-owned anyref transit table (`fm.gc_transit_table`)
+/// so that index `id + 1` is in bounds. Every host import that hands a FRESH
+/// recipe id back to the guest's `encode_anyref` (`gc_claim`, `gc_i31`,
+/// `gc_broker_encode` — including their GATED fallbacks, since the wasm
+/// call site's own `TableSet(transit, recipe+1, value)` runs unconditionally
+/// after the call, whatever the import returned) must call this BEFORE
+/// returning: `module_gc_codec.rs`'s own doc comment on the claim call site
+/// states the contract directly ("Claim grows the process-owned transit
+/// table through recipe+1 before returning") but, until this task, capture
+/// never actually did it because `gc_claim`/`gc_i31` stayed gated and
+/// `gc_lookup`'s OWN gate never reached a subsequent `TableSet` (a gate
+/// returned there is read by the wasm code as an "already known" HIT,
+/// which skips the `TableSet` entirely — see `gc_lookup`'s doc comment).
+/// `gc_lookup` itself never needs this call for the same reason. Mirrors
+/// the identical growth idiom already used, per-replay, in
+/// `drive_reference_replay`.
+fn ensure_gc_transit_capacity(
+    table: Table,
+    mut store: impl wasmtime::AsContextMut,
+    id: u32,
+) -> wasmtime::Result<()> {
+    let needed = u64::from(id) + 2;
+    let current = table.size(&mut store);
+    if needed > current {
+        table.grow(&mut store, needed - current, wasmtime::Ref::Any(None))?;
+    }
+    Ok(())
+}
+
+/// N1-F6 (refcomplete FLOOR-2): one finalized constructor-time provenance
+/// record for a Wasm-GC struct/array — "what value(s) this exact
+/// `struct.new $T`/`array.new*` call used as its mutable-non-null-internal-
+/// reference constructor argument(s)", NOT the value's CURRENT field
+/// contents (`gc_define`'s doc comment explains why the two are stitched
+/// together into one recipe rather than either alone being sufficient —
+/// see `docs/plans/2026-09-05-n1-f6-gc-provenance-grounding.md` §2.2).
+/// `layout_id` is the SPECIALIZED constructor-site layout recorded at
+/// `gc_provenance_begin` time (e.g. a particular `ArrayFixed{len}` shape),
+/// not necessarily the base layout id `gc_capture_layout` was asked about
+/// (that comparison is TS's `captureGcLayout` descriptor cross-validation,
+/// deliberately not ported here — see `gc_define`'s doc comment on the
+/// scope this native increment covers without a GC-codec-descriptor
+/// decode).
+#[derive(Clone)]
+struct GcConstructorRecord {
+    layout_id: u32,
+    /// Constructor-only scalar bytes. Always empty for a STRUCT: `crates/
+    /// fork-codec/src/gc_codec.rs`'s `validate_layout_payload` rejects a
+    /// struct layout whose `provenance_scalar_length != 0` — a struct
+    /// constructor's only provenance-worthy arguments are its reference
+    /// fields — so no GC-codec-descriptor decode is needed on native to
+    /// know the correct truncation length for that case. An ARRAY layout
+    /// (`ArrayData`/`ArrayElement`) CAN carry exactly 8 provenance scalar
+    /// bytes (a segment offset+length seed); native does not yet decode
+    /// that descriptor to disambiguate an 8-byte-real case from a 0-byte
+    /// one, so `gc_define` keeps ARRAY gated rather than guess — see its
+    /// own doc comment.
+    scalars: Vec<u8>,
+    /// Constructor-time reference-typed arguments, in canonical order.
+    /// `None` is a null seed (e.g. a zero-length nullable-array-of-refs
+    /// constructor operand).
+    references: Vec<Option<wasmtime::OwnedRooted<AnyRef>>>,
+}
+
+/// An in-flight `gc_provenance_begin` .. `gc_provenance_ref`* .. `gc_
+/// provenance_end` transaction. See [`GcProvenanceRegistry`]'s doc comment
+/// for why a HALF-FINISHED transaction (a trap between `begin` and `end`)
+/// must never leak into a later, unrelated construction.
+struct PendingGcProvenance {
+    token: i32,
+    object: wasmtime::OwnedRooted<AnyRef>,
+    layout_id: u32,
+    scalars: Vec<u8>,
+    expected_reference_count: u32,
+    references: Vec<Option<wasmtime::OwnedRooted<AnyRef>>>,
+}
+
+/// N1-F6: native's Wasm-GC analogue of [`ExternrefProvenance`] — see that
+/// struct's doc comment for the shared "flat `Vec` + `Rooted::ref_eq`"
+/// rationale (`Rooted<AnyRef>`/`OwnedRooted<AnyRef>` have the same "no
+/// `Hash`/`Eq`, unstable raw `to_raw` id" shape `ExternRef` does; wasmtime's
+/// GC-rooting API is uniform across GC reference types).
+///
+/// Populated at ORDINARY GUEST RUNTIME — whenever a provenance-wrapped
+/// `struct.new $T`/`array.new*` call site executes (`inject_provenance_
+/// wrappers`, `crates/fork-instrument/src/module_gc_codec.rs:397-619`), not
+/// only during a fork's capture walk — so, like `ExternrefProvenance`, this
+/// lives for the WHOLE guest OS thread (one `Store` == one fork generation
+/// of activity), not reset per capture. Read at fork-CAPTURE time by
+/// `gc_capture_layout`/`gc_define` to recover constructor-time evidence a
+/// live object's CURRENT state cannot answer for a mutable, non-nullable,
+/// internal-GC-typed field (see the grounding doc §2.2's "why this is
+/// needed at all").
+struct GcProvenanceRegistry {
+    finalized: Vec<(wasmtime::OwnedRooted<AnyRef>, GcConstructorRecord)>,
+    pending: Option<PendingGcProvenance>,
+    next_token: i32,
+}
+
+impl GcProvenanceRegistry {
+    fn new() -> Self {
+        Self { finalized: Vec::new(), pending: None, next_token: 1 }
+    }
+
+    /// `ForkGcProvenanceRegistry::begin` port (`host/src/fork-gc-codec.ts:
+    /// 693-772`). Starts a provenance transaction for a freshly constructed
+    /// `object`. Defensively aborts any stale pending transaction first —
+    /// mirrors the TS registry's own `abortPending()` guard — so a trap
+    /// between a PRIOR `begin` and its `end` can never poison this one.
+    fn begin(
+        &mut self,
+        mut store: impl wasmtime::AsContextMut,
+        object: wasmtime::Rooted<AnyRef>,
+        layout_id: u32,
+        scalars: Vec<u8>,
+        reference_count: u32,
+    ) -> wasmtime::Result<i32> {
+        self.abort_pending();
+        let owned = object.to_owned_rooted(&mut store)?;
+        let token = self.next_token;
+        self.next_token = self.next_token.checked_add(1).unwrap_or(1);
+        self.pending = Some(PendingGcProvenance {
+            token,
+            object: owned,
+            layout_id,
+            scalars,
+            expected_reference_count: reference_count,
+            references: Vec::with_capacity(reference_count as usize),
+        });
+        Ok(token)
+    }
+
+    /// `ForkGcProvenanceRegistry::appendReference` port. `index` must name
+    /// the next canonical slot (mirrors the TS's out-of-order rejection); a
+    /// violation aborts the pending transaction fail-closed rather than
+    /// leaving a half-built record around.
+    fn append_reference(
+        &mut self,
+        token: i32,
+        index: u32,
+        value: Option<wasmtime::OwnedRooted<AnyRef>>,
+    ) -> wasmtime::Result<()> {
+        let ok = self.pending.as_ref().is_some_and(|p| {
+            p.token == token
+                && index as usize == p.references.len()
+                && index < p.expected_reference_count
+        });
+        if !ok {
+            self.abort_pending();
+            return Err(wasmtime::Error::msg(format!(
+                "GC provenance reference {index} for token {token} is out of canonical order"
+            )));
+        }
+        self.pending.as_mut().unwrap().references.push(value);
+        Ok(())
+    }
+
+    /// `ForkGcProvenanceRegistry::end` port: finalize a fully-populated
+    /// pending transaction into [`Self::finalized`], keyed by the
+    /// constructed object's own identity.
+    fn end(&mut self, token: i32) -> wasmtime::Result<()> {
+        let matches = self.pending.as_ref().is_some_and(|p| p.token == token);
+        if !matches {
+            return Err(wasmtime::Error::msg(format!("GC provenance token {token} is not active")));
+        }
+        let pending = self.pending.take().unwrap();
+        if pending.references.len() as u32 != pending.expected_reference_count {
+            return Err(wasmtime::Error::msg(format!(
+                "GC provenance registration {token} has {} references; expected {}",
+                pending.references.len(),
+                pending.expected_reference_count,
+            )));
+        }
+        let record = GcConstructorRecord {
+            layout_id: pending.layout_id,
+            scalars: pending.scalars,
+            references: pending.references,
+        };
+        self.finalized.push((pending.object, record));
+        Ok(())
+    }
+
+    /// Look up the finalized provenance for `object`, or `None` if it was
+    /// never constructed through a provenance-wrapped call site — the
+    /// SOUNDNESS GUARD boundary, mirroring `ExternrefProvenance::lookup`'s
+    /// analogous doc comment: never fabricate constructor evidence for a
+    /// value this registry never recorded.
+    fn find(
+        &self,
+        mut store: impl wasmtime::AsContextMut,
+        object: wasmtime::Rooted<AnyRef>,
+    ) -> wasmtime::Result<Option<GcConstructorRecord>> {
+        for (candidate, record) in &self.finalized {
+            if wasmtime::Rooted::ref_eq(&mut store, candidate, &object)? {
+                return Ok(Some(record.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Drop a half-finished transaction. Called defensively before every
+    /// `begin` and on any error mid-sequence (a trap between `begin` and
+    /// `end` must never leave a stale pending record around).
+    fn abort_pending(&mut self) {
+        self.pending = None;
+    }
+}
+
 /// Define `env.resolve_externref(handle: i32) -> externref` (nullable
 /// externref, matching the fork-module's declared import type — see
 /// `crates/fork-module-inject/src/main.rs`'s `import_resolve_externref`) as a
@@ -3005,6 +3213,22 @@ struct NativeReferenceCapture {
     /// lib.rs`), so this bypass, not a real decode, is what keeps a gated
     /// fork's PARENT alive through its own resume. Reset alongside `graph`.
     gated_ids: BTreeSet<u32>,
+    /// N1-F6: per-CAPTURE identity dedup for a live Wasm-GC value already
+    /// assigned a recipe id THIS capture — the native analogue of the TS
+    /// `ForkReferenceTransaction`'s per-capture `objectIds`/`capturedValues`
+    /// (`host/src/fork-reference-transaction.ts:196-201`). `gc_claim`
+    /// publishes `(value, id)` here BEFORE recursing into the value's own
+    /// fields (mirrors `claimGcSlot`'s doc comment: "publishing the id first
+    /// lets a field edge close a cycle back onto this node"), and
+    /// `gc_lookup`/`gc_define` both read it back — `gc_lookup` to terminate
+    /// aliases/cycles, `gc_define` to recover "what live object claimed
+    /// THIS recipe id" (mirrors `capturedGcValue(recipeId)`) so constructor
+    /// provenance can be looked up by that object's identity. Reset every
+    /// capture alongside `graph` — UNLIKE `GcProvenanceRegistry`, whose
+    /// records persist for the whole guest OS thread, this answers "have I
+    /// already interned exactly this live value in THIS fork's graph", not
+    /// "what constructed it".
+    gc_claimed: Vec<(wasmtime::OwnedRooted<AnyRef>, u32)>,
 }
 
 impl NativeReferenceCapture {
@@ -3014,7 +3238,52 @@ impl NativeReferenceCapture {
             scratch_cursor: 0,
             unsupported_kind: None,
             gated_ids: BTreeSet::new(),
+            gc_claimed: Vec::new(),
         }
+    }
+
+    /// Record that live value `value` was just claimed as recipe `id` THIS
+    /// capture. See [`Self::gc_claimed`]'s doc comment.
+    fn gc_claim_remember(
+        &mut self,
+        mut store: impl wasmtime::AsContextMut,
+        value: wasmtime::Rooted<AnyRef>,
+        id: u32,
+    ) -> wasmtime::Result<()> {
+        let owned = value.to_owned_rooted(&mut store)?;
+        self.gc_claimed.push((owned, id));
+        Ok(())
+    }
+
+    /// The recipe id `value` was already claimed as THIS capture, or `None`
+    /// if it has not been seen yet. See [`Self::gc_claimed`]'s doc comment.
+    fn gc_claim_lookup(
+        &self,
+        mut store: impl wasmtime::AsContextMut,
+        value: wasmtime::Rooted<AnyRef>,
+    ) -> wasmtime::Result<Option<u32>> {
+        for (candidate, id) in &self.gc_claimed {
+            if wasmtime::Rooted::ref_eq(&mut store, candidate, &value)? {
+                return Ok(Some(*id));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The live value that was claimed as recipe `id` THIS capture, or
+    /// `None` if `id` does not name a claimed Wasm-GC identity. Mirrors
+    /// `capturedGcValue(recipeId)`.
+    fn gc_claimed_value(
+        &self,
+        mut store: impl wasmtime::AsContextMut,
+        id: u32,
+    ) -> wasmtime::Result<Option<wasmtime::Rooted<AnyRef>>> {
+        for (candidate, candidate_id) in &self.gc_claimed {
+            if *candidate_id == id {
+                return Ok(Some(candidate.to_rooted(&mut store)));
+            }
+        }
+        Ok(None)
     }
 
     /// Begin a fresh capture, discarding whatever the PREVIOUS fork's
@@ -3024,6 +3293,7 @@ impl NativeReferenceCapture {
     fn reset(&mut self) {
         self.graph = fork_codec::ReferenceGraphBuilder::begin();
         self.scratch_cursor = 0;
+        self.gc_claimed.clear();
         // A partially-consumed marker from an aborted prior capture must
         // never gate THIS fork — mirrors `beginCapture`'s own defensive
         // `this.unsupportedReferenceKind = null` (`fork-activation-
@@ -3883,6 +4153,15 @@ fn spawn_guest_thread(
         // ONE instance per guest OS thread, matching `ExternrefRegistry`'s
         // own per-generation lifetime argument.
         let externref_provenance = Arc::new(Mutex::new(ExternrefProvenance::new()));
+        // N1-F6 (refcomplete FLOOR-2): mint-time Wasm-GC constructor
+        // provenance — see `GcProvenanceRegistry`'s doc comment. Populated
+        // by `gc_provenance_begin`/`_ref`/`_end` (wired below, guarded by
+        // `guest_declares`) at the exact moment `inject_provenance_
+        // wrappers`'s constructor-call-site rewrite runs; consulted by
+        // `gc_capture_layout`/`gc_define`'s real capture bodies. ONE
+        // instance per guest OS thread, matching `ExternrefProvenance`'s own
+        // per-generation lifetime argument.
+        let gc_provenance = Arc::new(Mutex::new(GcProvenanceRegistry::new()));
         // N1-I5b Task 1: raw `Func::to_raw` pointer -> this guest's own
         // funcref-catalog ordinal (activation 0 — single-activation only,
         // matching the REPLAY-side funcref-catalog mirror below), populated
@@ -4951,6 +5230,26 @@ fn spawn_guest_thread(
             // because the decode-side gap it was blocked on (directly-held
             // externref transit publish) is fixed in
             // `crates/fork-codec::drive_plan::build_drive_plan`.
+            // N1-F6 (refcomplete FLOOR-2): `gc_lookup` is the anyref-transit
+            // dedup entry reached for EVERY anyref-lineage value (a plain
+            // externref, a static root, or a typed Wasm-GC struct/array) —
+            // see `fork-activation-registry.ts:528-543`'s "cannot honestly
+            // claim 'gc'" note. It answers exactly one question: "is this
+            // EXACT live value already assigned a recipe id?" — checking (1)
+            // THIS capture's own struct/array dedup (`gc_claim_lookup` — a
+            // cycle/alias back onto an already-claimed node) and (2) a plain
+            // host externref with mint-time-recorded provenance (unchanged
+            // from the N1-F5/F6-substrate prototype below). A miss now
+            // returns `0` (real "unknown"), NOT an immediate gate: `0` is
+            // never a valid non-null recipe id (node 0 is the canonical
+            // null, and this import is only ever reached for an
+            // already-non-null value — see `emit_encode_anyref`'s `RefIsNull`
+            // check ahead of every `lookup` call), so the guest's own
+            // dispatch correctly reads it as "try i31/struct/array
+            // construction next" (`encode_anyref`'s `existing`/`fresh`
+            // branch). THIS is the gate LIFT for struct/array/i31: previously
+            // every miss here unconditionally gated the fork before the
+            // guest ever got a chance to try `gc_claim`.
             let gc_lookup_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_LOOKUP;
             if guest_declares(gc_lookup_name) {
                 let capture_for_gc = Arc::clone(&capture);
@@ -4960,16 +5259,15 @@ fn spawn_guest_thread(
                     "env",
                     gc_lookup_name,
                     move |mut caller: Caller<'_, ()>, slot: i32| -> wasmtime::Result<i32> {
-                        // `gc_lookup` is the anyref-transit dedup entry
-                        // reached for EVERY anyref-lineage value (a plain
-                        // externref, a static root, or a typed Wasm-GC
-                        // struct/array/i31) — see `fork-activation-
-                        // registry.ts:528-543`'s "cannot honestly claim 'gc'"
-                        // note.
                         let slot_index = i64::from(slot).max(0) as u64;
                         if let Some(wasmtime::Ref::Any(Some(anyref))) =
                             gc_transit_table_for_lookup.get(&mut caller, slot_index)
                         {
+                            if let Some(id) =
+                                capture_for_gc.lock().unwrap().gc_claim_lookup(&mut caller, anyref)?
+                            {
+                                return Ok(id as i32);
+                            }
                             if let Ok(externref) = ExternRef::convert_any(&mut caller, anyref) {
                                 let handle =
                                     provenance_for_gc.lock().unwrap().lookup(&mut caller, externref)?;
@@ -4985,12 +5283,18 @@ fn spawn_guest_thread(
                                         });
                                 }
                             }
+                            // A genuine miss (not yet claimed, not a known
+                            // externref, no static-root catalog on native
+                            // yet): report "unknown" and let the guest's own
+                            // dispatch proceed.
+                            return Ok(0);
                         }
-                        // No provenance hit: report the same undistinguished
-                        // umbrella every other still-gated anyref-lineage
-                        // kind uses.
+                        // The transit slot held something other than a
+                        // non-null anyref — should not happen given the
+                        // codec's own publish-before-call contract, but stay
+                        // fail-closed rather than fabricate an identity.
                         let mut capture = capture_for_gc.lock().unwrap();
-                        capture.mark_unsupported("externref or Wasm-GC (anyref)");
+                        capture.mark_unsupported("externref or Wasm-GC (anyref): missing transit slot");
                         capture.gated_placeholder().map(|id| id as i32)
                     },
                 );
@@ -5000,16 +5304,47 @@ fn spawn_guest_thread(
                 }
             }
 
+            // `gc_claim` is reached only after a `gc_lookup` MISS, right
+            // when the guest's own `ref.test` dispatch has already confirmed
+            // the value matches one of its locally declared struct/array
+            // layouts (`emit_encode_anyref`'s `dispatch_layouts` loop) —
+            // publish a fresh placeholder recipe id BEFORE the guest recurses
+            // into the value's fields, exactly mirroring `claimGcSlot`'s "publish
+            // the id first" contract (`fork-reference-transaction.ts:342-369`)
+            // that already terminates funcref/externref cycles elsewhere in
+            // this codec.
             let gc_claim_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_CLAIM;
             if guest_declares(gc_claim_name) {
                 let capture_for_gc = Arc::clone(&capture);
+                let gc_transit_table_for_claim = fm.gc_transit_table;
                 let result = linker.func_wrap(
                     "env",
                     gc_claim_name,
-                    move |_caller: Caller<'_, ()>, _slot: i32| -> wasmtime::Result<i32> {
-                        let mut capture = capture_for_gc.lock().unwrap();
-                        capture.mark_unsupported("gc");
-                        capture.gated_placeholder().map(|id| id as i32)
+                    move |mut caller: Caller<'_, ()>, slot: i32| -> wasmtime::Result<i32> {
+                        let slot_index = i64::from(slot).max(0) as u64;
+                        let Some(wasmtime::Ref::Any(Some(anyref))) =
+                            gc_transit_table_for_claim.get(&mut caller, slot_index)
+                        else {
+                            let mut capture = capture_for_gc.lock().unwrap();
+                            capture.mark_unsupported("gc: missing transit slot at claim");
+                            let id = capture.gated_placeholder()?;
+                            drop(capture);
+                            ensure_gc_transit_capacity(gc_transit_table_for_claim, &mut caller, id)?;
+                            return Ok(id as i32);
+                        };
+                        let id = capture_for_gc
+                            .lock()
+                            .unwrap()
+                            .graph
+                            .claim_gc()
+                            .map_err(|e| wasmtime::Error::msg(format!("claim_gc failed: {e:?}")))?;
+                        capture_for_gc.lock().unwrap().gc_claim_remember(&mut caller, anyref, id)?;
+                        // The wasm call site publishes `value` into `transit[id
+                        // + 1]` unconditionally right after this import returns
+                        // (`emit_encode_layout`'s "Claim grows ... through
+                        // recipe+1 before returning" contract) — grow now.
+                        ensure_gc_transit_capacity(gc_transit_table_for_claim, &mut caller, id)?;
+                        Ok(id as i32)
                     },
                 );
                 if let Err(e) = result {
@@ -5018,16 +5353,30 @@ fn spawn_guest_thread(
                 }
             }
 
+            // i31 identity is its own 31-bit payload; `intern_i31` dedupes by
+            // raw value, so no transit-slot identity lookup is needed here at
+            // all (the value never occupied a live GC heap slot to begin
+            // with).
             let gc_i31_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_I31;
             if guest_declares(gc_i31_name) {
                 let capture_for_gc = Arc::clone(&capture);
+                let gc_transit_table_for_i31 = fm.gc_transit_table;
                 let result = linker.func_wrap(
                     "env",
                     gc_i31_name,
-                    move |_caller: Caller<'_, ()>, _value: i32| -> wasmtime::Result<i32> {
-                        let mut capture = capture_for_gc.lock().unwrap();
-                        capture.mark_unsupported("i31");
-                        capture.gated_placeholder().map(|id| id as i32)
+                    move |mut caller: Caller<'_, ()>, value: i32| -> wasmtime::Result<i32> {
+                        let id = capture_for_gc
+                            .lock()
+                            .unwrap()
+                            .graph
+                            .intern_i31(value)
+                            .map_err(|e| wasmtime::Error::msg(format!("intern_i31 failed: {e:?}")))?;
+                        // The wasm i31 branch publishes the value into
+                        // `transit[id + 1]` unconditionally right after this
+                        // import returns (`emit_encode_anyref`'s i31 branch) —
+                        // grow now.
+                        ensure_gc_transit_capacity(gc_transit_table_for_i31, &mut caller, id)?;
+                        Ok(id as i32)
                     },
                 );
                 if let Err(e) = result {
@@ -5036,16 +5385,33 @@ fn spawn_guest_thread(
                 }
             }
 
+            // `broker_encode` is the LAST-resort fallback `encode_anyref`
+            // reaches once a value matched neither i31 nor any locally
+            // declared struct/array layout (a genuinely foreign anyref, or a
+            // cross-activation GC value — the multi-activation case is out of
+            // scope for native's current single-activation model). Native has
+            // no generic "arbitrary anyref identity" registry beyond what
+            // `GcProvenanceRegistry`/`ExternrefProvenance` specifically
+            // record, so fabricating a handle here would violate the
+            // SOUNDNESS GUARD (`ExternrefProvenance::lookup`'s doc comment) —
+            // stays gated.
             let gc_broker_encode_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_BROKER_ENCODE;
             if guest_declares(gc_broker_encode_name) {
                 let capture_for_gc = Arc::clone(&capture);
+                let gc_transit_table_for_broker = fm.gc_transit_table;
                 let result = linker.func_wrap(
                     "env",
                     gc_broker_encode_name,
-                    move |_caller: Caller<'_, ()>, _slot: i32| -> wasmtime::Result<i32> {
+                    move |mut caller: Caller<'_, ()>, _slot: i32| -> wasmtime::Result<i32> {
                         let mut capture = capture_for_gc.lock().unwrap();
-                        capture.mark_unsupported("gc");
-                        capture.gated_placeholder().map(|id| id as i32)
+                        capture.mark_unsupported("gc: foreign/cross-activation anyref");
+                        let id = capture.gated_placeholder()?;
+                        drop(capture);
+                        // `emit_encode_anyref`'s tail unconditionally publishes
+                        // into `transit[id + 1]` right after this import
+                        // returns — grow now.
+                        ensure_gc_transit_capacity(gc_transit_table_for_broker, &mut caller, id)?;
+                        Ok(id as i32)
                     },
                 );
                 if let Err(e) = result {
@@ -5054,56 +5420,44 @@ fn spawn_guest_thread(
                 }
             }
 
-            let gc_define_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_DEFINE;
-            if guest_declares(gc_define_name) {
-                let capture_for_gc = Arc::clone(&capture);
-                let result = linker.func_wrap(
-                    "env",
-                    gc_define_name,
-                    move |_caller: Caller<'_, ()>,
-                          _recipe_id: i32,
-                          _record_activation_id: i32,
-                          _type_ordinal: i32,
-                          _layout_id: i32,
-                          _kind: i32,
-                          _scalar_pointer: i32,
-                          _scalar_byte_length: i32,
-                          _reference_vector_ordinal: i32|
-                          -> wasmtime::Result<()> {
-                        // A void gate stub: no graph mutation needed, since a
-                        // gated `gc_lookup`/`gc_claim` already returned a
-                        // non-null alias, so the guest never recurses into
-                        // the struct/array field walk that would otherwise
-                        // reach `gc_define` — mirrors `fork-activation-
-                        // registry.ts:556-567`.
-                        capture_for_gc.lock().unwrap().mark_unsupported("struct/array");
-                        Ok(())
-                    },
-                );
-                if let Err(e) = result {
-                    eprintln!("wiring env.{gc_define_name} failed: {e:#}");
-                    return;
-                }
-            }
-
+            // `gc_capture_layout` selects, among a base type's possibly
+            // several concrete constructor layouts (relevant for ARRAY —
+            // `ArrayFixed{len}` vs `ArrayData{seg}` vs generic mutable
+            // `ArrayNew`; a STRUCT has exactly one constructor form, so
+            // `base_layout_id` is already its only answer), which SPECIFIC
+            // layout built this exact live object. `gc_provenance_begin`
+            // already recorded that exact specialized layout id at
+            // CONSTRUCTOR time (`specialized_layout_id`, a compile-time
+            // constant baked into that call site's wrapper) — so recovering
+            // it here is a pure identity lookup, needing no GC-codec-
+            // descriptor decode: mirrors `captureGcLayout`'s `if (provenance)
+            // return provenance.layoutId` happy path (`fork-activation-
+            // registry.ts:1181-1203`) without the TS's additional descriptor
+            // cross-validation.
             let gc_capture_layout_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_CAPTURE_LAYOUT;
             if guest_declares(gc_capture_layout_name) {
-                let capture_for_gc = Arc::clone(&capture);
+                let capture_for_layout = Arc::clone(&capture);
+                let provenance_for_layout = Arc::clone(&gc_provenance);
+                let gc_transit_table_for_layout = fm.gc_transit_table;
                 let result = linker.func_wrap(
                     "env",
                     gc_capture_layout_name,
-                    move |_caller: Caller<'_, ()>,
-                          _slot: i32,
+                    move |mut caller: Caller<'_, ()>,
+                          slot: i32,
                           _record_activation_id: i32,
                           base_layout_id: i32|
                           -> wasmtime::Result<i32> {
-                        // The guest only threads this value back into the
-                        // gated (no-op) `gc_define` as metadata; the base
-                        // layout id it already holds is the survivable
-                        // identity choice and never drives a memory or field
-                        // read — mirrors `fork-activation-registry.
-                        // ts:616-632`.
-                        capture_for_gc.lock().unwrap().mark_unsupported("struct/array");
+                        let slot_index = i64::from(slot).max(0) as u64;
+                        if let Some(wasmtime::Ref::Any(Some(anyref))) =
+                            gc_transit_table_for_layout.get(&mut caller, slot_index)
+                        {
+                            if let Some(record) =
+                                provenance_for_layout.lock().unwrap().find(&mut caller, anyref)?
+                            {
+                                return Ok(record.layout_id as i32);
+                            }
+                        }
+                        let _ = &capture_for_layout;
                         Ok(base_layout_id)
                     },
                 );
@@ -5113,27 +5467,225 @@ fn spawn_guest_thread(
                 }
             }
 
+            // `gc_define` completes a claimed struct/array placeholder into
+            // its final aggregate recipe — the capture-side inverse of
+            // `DRIVE_OP_FILL`'s replay (see the grounding doc's "Capture ↔
+            // Replay symmetry" table). Two byte spans are concatenated into
+            // one scalar buffer, in order: (1) constructor-time provenance
+            // scalars (`GcConstructorRecord::scalars` — the "seed" a
+            // mutable, non-nullable internal-reference field needed at
+            // `struct.new`/`array.new*` time; always empty for a STRUCT, see
+            // that field's doc comment) then (2) the live field snapshot
+            // (`scalar_pointer`/`scalar_byte_length`, read straight out of
+            // guest linear memory — `emit_encode_struct_payload`/`_array_
+            // payload` write every field's CURRENT value there via `struct.
+            // get`/`array.get` on the original, unmodified type — see the
+            // grounding §2.1). The edge vector is built the same way:
+            // provenance reference ids first, then the plain field/element
+            // vector (`reference_vector_ordinal`, already interned by
+            // `graph.begin_vector`/`append_vector`/`finish_vector`).
+            //
+            // Each provenance reference is a RAW live value recorded at
+            // constructor time, not yet a recipe id (`gc_provenance_ref`'s
+            // own doc comment) — resolving it here checks THIS capture's
+            // dedup (`gc_claim_lookup`) first, and only if that misses
+            // (the seed was never independently reached by the ordinary
+            // frame-reference walk) reenters the guest's OWN exported
+            // `__wpk_fork_ref_gc_encode_slot` dispatch (publishing the value
+            // into transit slot 0 first, the codec's own staging-slot
+            // convention) to run the real struct/array/i31 dispatch that only
+            // WASM instructions (`ref.test`/`struct.get`) can perform. No
+            // lock is held across that reentrant call — it recursively
+            // invokes these SAME host imports (`gc_lookup`/`gc_claim`/
+            // `gc_define`, ...) for the seed's own definition, and a
+            // `std::sync::Mutex` held on this thread across a call that
+            // re-locks it would deadlock.
+            //
+            // ARRAY stays GATED here even though it reaches this far: an
+            // `ArrayData`/`ArrayElement` provenance record carries exactly 8
+            // real scalar seed bytes that only the GC-codec descriptor (not
+            // yet decoded on native) can distinguish from the 0 bytes every
+            // other array constructor's provenance carries — see
+            // `GcConstructorRecord::scalars`'s doc comment. The node is still
+            // fully DEFINED (never left dangling in `pending_gc` —
+            // `ReferenceGraphBuilder::validate` rejects that) so an
+            // interspersed array capture in the same fork as a supported
+            // struct/i31 stays internally consistent; `mark_unsupported`
+            // still forces the WHOLE fork to gate before any child ever
+            // reads this graph, so the array's best-effort (possibly
+            // mis-truncated) scalars are never actually used to reconstruct
+            // anything.
+            let gc_define_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_DEFINE;
+            if guest_declares(gc_define_name) {
+                const KIND_STRUCT: i32 = 1;
+                const KIND_ARRAY: i32 = 2;
+                let capture_for_gc = Arc::clone(&capture);
+                let provenance_for_gc = Arc::clone(&gc_provenance);
+                let gc_transit_table_for_define = fm.gc_transit_table;
+                let guest_mem_for_gc = guest_mem.clone();
+                let result = linker.func_wrap(
+                    "env",
+                    gc_define_name,
+                    move |mut caller: Caller<'_, ()>,
+                          recipe_id: i32,
+                          record_activation_id: i32,
+                          type_ordinal: i32,
+                          layout_id: i32,
+                          kind: i32,
+                          scalar_pointer: i32,
+                          scalar_byte_length: i32,
+                          reference_vector_ordinal: i32|
+                          -> wasmtime::Result<()> {
+                        let recipe_id = recipe_id as u32;
+                        let claimed_value =
+                            capture_for_gc.lock().unwrap().gc_claimed_value(&mut caller, recipe_id)?;
+                        let record = match claimed_value {
+                            Some(value) => provenance_for_gc.lock().unwrap().find(&mut caller, value)?,
+                            None => None,
+                        };
+
+                        let mut provenance_ids: Vec<u32> = Vec::new();
+                        let mut provenance_scalars: Vec<u8> = Vec::new();
+                        if let Some(record) = &record {
+                            if kind == KIND_ARRAY {
+                                provenance_scalars.clone_from(&record.scalars);
+                            }
+                            for reference in &record.references {
+                                let id = match reference {
+                                    None => 0,
+                                    Some(owned) => {
+                                        let rooted = owned.to_rooted(&mut caller);
+                                        let existing = capture_for_gc
+                                            .lock()
+                                            .unwrap()
+                                            .gc_claim_lookup(&mut caller, rooted)?;
+                                        match existing {
+                                            Some(id) => id,
+                                            None => {
+                                                gc_transit_table_for_define.set(
+                                                    &mut caller,
+                                                    0,
+                                                    wasmtime::Ref::Any(Some(rooted)),
+                                                )?;
+                                                let encode_slot: wasmtime::TypedFunc<i32, i32> =
+                                                    caller_export_typed(
+                                                        &mut caller,
+                                                        wasm_posix_shared::abi::WPK_FORK_REFERENCE_EXPORT_GC_ENCODE_SLOT,
+                                                    )?;
+                                                encode_slot.call(&mut caller, 0)? as u32
+                                            }
+                                        }
+                                    }
+                                };
+                                provenance_ids.push(id);
+                            }
+                        }
+
+                        if kind == KIND_ARRAY {
+                            capture_for_gc
+                                .lock()
+                                .unwrap()
+                                .mark_unsupported("struct/array: array provenance scalar length");
+                        }
+
+                        let snapshot = if scalar_byte_length > 0 {
+                            unsafe {
+                                read_bytes(&guest_mem_for_gc, scalar_pointer as usize, scalar_byte_length as usize)
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        let mut scalars = provenance_scalars;
+                        scalars.extend_from_slice(&snapshot);
+
+                        let field_vector: Vec<u32> = {
+                            let capture = capture_for_gc.lock().unwrap();
+                            capture
+                                .graph
+                                .vectors()
+                                .get(reference_vector_ordinal as usize)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    wasmtime::Error::msg("gc_define: unknown reference vector ordinal")
+                                })?
+                        };
+                        let provenance_param = record
+                            .as_ref()
+                            .map(|_| fork_codec::GcProvenance { reference_ids: provenance_ids.clone() });
+                        let mut edges = provenance_ids;
+                        edges.extend_from_slice(&field_vector);
+
+                        let kind_enum = match kind {
+                            KIND_STRUCT => fork_codec::AggregateKind::Struct,
+                            KIND_ARRAY => fork_codec::AggregateKind::Array,
+                            other => {
+                                return Err(wasmtime::Error::msg(format!("gc_define: unknown kind {other}")))
+                            }
+                        };
+                        capture_for_gc
+                            .lock()
+                            .unwrap()
+                            .graph
+                            .define_gc(
+                                recipe_id,
+                                record_activation_id as u32,
+                                type_ordinal as u32,
+                                layout_id as u32,
+                                kind_enum,
+                                &scalars,
+                                &edges,
+                                provenance_param,
+                            )
+                            .map_err(|e| wasmtime::Error::msg(format!("define_gc failed: {e:?}")))
+                    },
+                );
+                if let Err(e) = result {
+                    eprintln!("wiring env.{gc_define_name} failed: {e:#}");
+                    return;
+                }
+            }
+
+            // The `gc_provenance_begin`/`_ref`/`_end` transaction records
+            // constructor-time evidence for a mutable, non-nullable,
+            // internal-GC-typed field — see `GcProvenanceRegistry`'s doc
+            // comment. This runs at ORDINARY GUEST RUNTIME (whenever a
+            // provenance-wrapped `struct.new`/`array.new*` executes), not
+            // only during a fork's capture walk.
             let gc_provenance_begin_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_PROVENANCE_BEGIN;
             if guest_declares(gc_provenance_begin_name) {
-                let capture_for_gc = Arc::clone(&capture);
+                let provenance_for_gc = Arc::clone(&gc_provenance);
+                let gc_transit_table_for_begin = fm.gc_transit_table;
                 let result = linker.func_wrap(
                     "env",
                     gc_provenance_begin_name,
-                    move |_caller: Caller<'_, ()>,
-                          _slot: i32,
+                    move |mut caller: Caller<'_, ()>,
+                          slot: i32,
                           _record_activation_id: i32,
                           _base_layout_id: i32,
-                          _specialized_layout_id: i32,
-                          _scalar_lo: i64,
-                          _scalar_hi: i64,
-                          _reference_count: i32|
+                          specialized_layout_id: i32,
+                          scalar_lo: i64,
+                          scalar_hi: i64,
+                          reference_count: i32|
                           -> wasmtime::Result<i32> {
-                        // A provenance token only names the pending record
-                        // consumed by the gated (no-op) provenance ref/end
-                        // imports below, so any stable value survives —
-                        // mirrors `fork-activation-registry.ts:633-646`.
-                        capture_for_gc.lock().unwrap().mark_unsupported("gc");
-                        Ok(0)
+                        let slot_index = i64::from(slot).max(0) as u64;
+                        let Some(wasmtime::Ref::Any(Some(anyref))) =
+                            gc_transit_table_for_begin.get(&mut caller, slot_index)
+                        else {
+                            return Err(wasmtime::Error::msg(
+                                "gc_provenance_begin: missing transit slot",
+                            ));
+                        };
+                        let mut scalars = Vec::with_capacity(16);
+                        scalars.extend_from_slice(&scalar_lo.to_le_bytes());
+                        scalars.extend_from_slice(&scalar_hi.to_le_bytes());
+                        let reference_count = u32::try_from(reference_count).unwrap_or(0);
+                        provenance_for_gc.lock().unwrap().begin(
+                            &mut caller,
+                            anyref,
+                            specialized_layout_id as u32,
+                            scalars,
+                            reference_count,
+                        )
                     },
                 );
                 if let Err(e) = result {
@@ -5144,13 +5696,19 @@ fn spawn_guest_thread(
 
             let gc_provenance_ref_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_PROVENANCE_REF;
             if guest_declares(gc_provenance_ref_name) {
-                let capture_for_gc = Arc::clone(&capture);
+                let provenance_for_gc = Arc::clone(&gc_provenance);
+                let gc_transit_table_for_ref = fm.gc_transit_table;
                 let result = linker.func_wrap(
                     "env",
                     gc_provenance_ref_name,
-                    move |_caller: Caller<'_, ()>, _token: i32, _index: i32, _slot: i32| -> wasmtime::Result<()> {
-                        capture_for_gc.lock().unwrap().mark_unsupported("gc");
-                        Ok(())
+                    move |mut caller: Caller<'_, ()>, token: i32, index: i32, slot: i32| -> wasmtime::Result<()> {
+                        let slot_index = i64::from(slot).max(0) as u64;
+                        let value = match gc_transit_table_for_ref.get(&mut caller, slot_index) {
+                            Some(wasmtime::Ref::Any(Some(anyref))) => Some(anyref.to_owned_rooted(&mut caller)?),
+                            _ => None,
+                        };
+                        let index = u32::try_from(index).unwrap_or(u32::MAX);
+                        provenance_for_gc.lock().unwrap().append_reference(token, index, value)
                     },
                 );
                 if let Err(e) = result {
@@ -5161,13 +5719,12 @@ fn spawn_guest_thread(
 
             let gc_provenance_end_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_PROVENANCE_END;
             if guest_declares(gc_provenance_end_name) {
-                let capture_for_gc = Arc::clone(&capture);
+                let provenance_for_gc = Arc::clone(&gc_provenance);
                 let result = linker.func_wrap(
                     "env",
                     gc_provenance_end_name,
-                    move |_caller: Caller<'_, ()>, _token: i32| -> wasmtime::Result<()> {
-                        capture_for_gc.lock().unwrap().mark_unsupported("gc");
-                        Ok(())
+                    move |_caller: Caller<'_, ()>, token: i32| -> wasmtime::Result<()> {
+                        provenance_for_gc.lock().unwrap().end(token)
                     },
                 );
                 if let Err(e) = result {
