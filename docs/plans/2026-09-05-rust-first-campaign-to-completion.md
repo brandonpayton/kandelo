@@ -74,10 +74,28 @@ convenient illusion.
    for directly-held Externref + re-apply the prototyped `gc_lookup` capture
    short-circuit + fix the pre-existing I5b gate hang (`fm_build_gc_plan` errno
    22) + un-gate externref (validate the shared substrate on the SIMPLE case,
-   tests green); (2) layer FLOOR-2 GC-constructor provenance (struct=appended-
-   field / array=wrapper-struct, field reindexing under subtyping — the hard
-   whole-program transform) on the known-good substrate + un-gate
-   struct/array/i31/static-root; per-host + docs + package rebuild. Batch
+   tests green); (2) GC capture (struct/array/i31/static-root) + un-gate.
+   CORRECTED 2026-09-05 (grounding 2026-09-05-n1-f6-gc-provenance-grounding.md,
+   verified): FLOOR-2 is NOT a hard whole-program transform. The "struct=
+   appended-field / array=wrapper-struct / field reindexing under subtyping"
+   framing does NOT match the code. The GC capture machinery
+   (`crates/fork-instrument/src/module_gc_codec.rs`, stable since 2026-07-25)
+   reads live GC values via ordinary `struct.get`/`array.get` on UNMODIFIED
+   types (WasmGC field resolution handles subtyping) with only bounded
+   constructor-call-site provenance interposition; NO type-graph rewrite, NO
+   reindexing, NO ABI epoch (all GC imports already in ABI 44). Validated
+   end-to-end by the un-ignored Node round-trip test
+   `crates/fork-instrument/tests/module_gc_codec_node.rs`
+   (`fresh_node_instance_reconstructs_gc_cycle_and_identity`, controller-run
+   PASS: cyclic mutable struct + externref-via-anyref + two-generation
+   re-fork). Remaining work is HOST-SIDE only: (a) native — wire the GC
+   capture host bodies (`gc_lookup`/`gc_claim`/`gc_define`/`gc_i31`/
+   `provenance_*`) to consume recorded provenance with `Rooted<AnyRef>`
+   identity handling (linear-scan `Vec`+`ref_eq`, mirroring the landed
+   `ExternrefProvenance`), un-gate struct/array/i31/static-root; (b)
+   Node/browser — revive the deleted GC capture TS (`74c1c373b^`), un-gate;
+   (c) settling experiment: a two-object mutual cycle (the one case reading
+   couldn't settle) before trusting the lift; per-host + docs. Batch
    validation still once at campaign end (Decision 3), so nothing ships between
    (1) and (2) regardless — which is why merging costs no shippable checkpoint.
    The `extern.internalize` externref case resolves naturally in (2) (it is a
