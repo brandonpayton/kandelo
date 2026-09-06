@@ -78,6 +78,35 @@ kernel's ABI, and re-running step 2 after any `crates/fork-instrument` change
 picks up the current instrumentation tool automatically (see
 `scripts/run-wasm-fork-instrument.sh`'s own input-hash rebuild check).
 
+## `native_vfork.instrumented.wasm` / `native_vfork_exec.instrumented.wasm`
+
+`smoke_vfork_exit_shares_memory_and_blocks_parent`'s and `smoke_vfork_
+execve_releases_parent`'s fixtures (real vfork, N1 residual): the vfork
+analogues of `native_fork.instrumented.wasm`. `native_vfork.c`'s child
+writes a genuinely SHARED global (`shared_marker`) then `_exit`s; the parent
+checks that write is visible after `vfork()` returns — the proof that this
+host's `vfork()` borrows the parent's own memory rather than cloning it, as
+plain `fork()` does. `native_vfork_exec.c`'s child instead `execve`s the
+existing `native_exec_target.wasm` fixture, proving the parent stays
+suspended all the way to a successful exec commit, not just to a `_exit`.
+
+Regenerate both from within the dev shell, same recipe as `native_fork.
+instrumented.wasm`:
+
+```sh
+SYSROOT=<repo>/sysroot scripts/dev-shell.sh bash crates/host-native/fixtures/build-fixtures.sh
+
+scripts/dev-shell.sh bash -lc '
+  cd crates/host-native/fixtures
+  <repo>/scripts/run-wasm-fork-instrument.sh \
+    native_vfork.wasm -o native_vfork.instrumented.wasm --entry kernel.kernel_fork
+  <repo>/scripts/run-wasm-fork-instrument.sh \
+    native_vfork_exec.wasm -o native_vfork_exec.instrumented.wasm --entry kernel.kernel_fork
+'
+```
+
+Like every other fixture, `__abi_version` must match the kernel's ABI.
+
 ## `native_fork_refs.instrumented.wasm`
 
 `smoke_fork_reconstructs_references`'s fixture (N1-I5 Task 3, currently

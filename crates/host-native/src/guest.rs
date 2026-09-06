@@ -4664,6 +4664,7 @@ fn launch_process(
         thread_handles,
         fork_format,
         vfork_parent_release: None,
+        vfork_awaiting_child: false,
     })
 }
 
@@ -4760,6 +4761,7 @@ fn launch_vfork_borrowed_child(
         thread_handles,
         fork_format,
         vfork_parent_release: None,
+        vfork_awaiting_child: false,
     })
 }
 
@@ -8079,6 +8081,21 @@ struct GuestProcess {
     /// contract. `None` for every ordinary process (including an ordinary
     /// COW fork child, which never defers its parent's completion).
     vfork_parent_release: Option<VforkParentRelease>,
+    /// Real vfork (N1 residual): `true` on a PARENT process for exactly as
+    /// long as one of its own `vfork()` calls is genuinely parked (its
+    /// `SYS_FORK`/`SYS_VFORK` channel deliberately left `STATUS_PENDING` —
+    /// see `handle_fork`'s `MODE_VFORK` branch). Without this guard, the
+    /// pump's own scan loop would see that SAME still-`STATUS_PENDING`
+    /// request on every later iteration and call `handle_fork` again —
+    /// launching a second, third, ... child from the identical request (a
+    /// self-sustaining fork bomb; this is not hypothetical, it is exactly
+    /// what happened before this field existed). Only one `vfork()` can
+    /// ever be in flight per process at a time (native's own "fork/vfork is
+    /// main-thread-only" restriction — see `kernel_fork`'s doc comment — and
+    /// a single OS thread cannot issue a second synchronous call while the
+    /// first has not returned), so a bare `bool` is enough; cleared by
+    /// `resolve_vfork_parent_release`.
+    vfork_awaiting_child: bool,
 }
 
 /// A blocking syscall parked awaiting readiness (or its timeout deadline). The
@@ -8279,6 +8296,13 @@ fn complete_channel(
 /// contract that the parent stays suspended for exactly that long.
 struct VforkParentRelease {
     parent_mem: SharedMemory,
+    /// Index into the pump's `processes` vec owning the parked parent
+    /// channel — stable for a pid's whole lifetime (`processes` entries are
+    /// only ever appended or replaced in place via `std::mem::replace`,
+    /// never removed/reordered), so this stays valid from `handle_fork`'s
+    /// `MODE_VFORK` branch (where it is recorded as `pi`) until whichever
+    /// release call site runs, however much later that is.
+    parent_process_index: usize,
     scratch_ptr: usize,
     ch: PumpChannel,
     syscall_nr: u32,
@@ -8286,13 +8310,20 @@ struct VforkParentRelease {
     child_pid: u32,
 }
 
-/// Resolve a still-parked vfork parent's channel with its child's real pid.
-/// The two call sites (child `_exit`, child `execve`/`execveat` success) are
-/// the ONLY two ways a real vfork's borrow window ends.
+/// Resolve a still-parked vfork parent's channel with its child's real pid,
+/// and clear the parent's own [`GuestProcess::vfork_awaiting_child`] guard
+/// so the pump's scan loop can service that channel (or a LATER `vfork()`
+/// from the same process) normally again. The two call sites (child
+/// `_exit`, child `execve`/`execveat` success) are the ONLY two ways a real
+/// vfork's borrow window ends.
 fn resolve_vfork_parent_release(
     kernel_mem: &SharedMemory,
+    processes: &mut [GuestProcess],
     release: VforkParentRelease,
 ) -> anyhow::Result<()> {
+    if let Some(parent) = processes.get_mut(release.parent_process_index) {
+        parent.vfork_awaiting_child = false;
+    }
     complete_channel(
         &release.parent_mem,
         kernel_mem,
@@ -8639,7 +8670,7 @@ fn run_pump(
                     // window may end (see `VforkParentRelease`'s doc
                     // comment); `None` for every ordinary process.
                     if let Some(release) = processes[pi].vfork_parent_release.take() {
-                        resolve_vfork_parent_release(kernel_mem, release)?;
+                        resolve_vfork_parent_release(kernel_mem, processes, release)?;
                     }
                     // No one reads a response to this final syscall (whether
                     // this is the boot process or a spawned child), so drop
@@ -8774,6 +8805,22 @@ fn run_pump(
                 // private-memory-copy + co-resident-module sequence, and why
                 // the child never executes any of its copied program in this
                 // increment (that is Task 3's job).
+                if ch.is_main
+                    && (syscall_nr == SYS_FORK || syscall_nr == SYS_VFORK)
+                    && processes[pi].vfork_awaiting_child
+                {
+                    // Real vfork (N1 residual): this request is a `vfork()`
+                    // ALREADY serviced by `handle_fork`, which deliberately
+                    // left `ch` at `STATUS_PENDING` to keep the calling OS
+                    // thread parked — see `GuestProcess::vfork_awaiting_
+                    // child`'s doc comment. Do NOT call `handle_fork` again
+                    // (it would launch a second child from the identical,
+                    // still-posted request); leave it for `resolve_vfork_
+                    // parent_release` to complete once the borrowed child
+                    // reaches `_exit`/`execve`.
+                    ci += 1;
+                    continue;
+                }
                 if ch.is_main && (syscall_nr == SYS_FORK || syscall_nr == SYS_VFORK) {
                     handle_fork(
                         kernel_store, engine, kernel_mem, processes, pi, ch, syscall_nr, &args,
@@ -9552,12 +9599,14 @@ fn handle_fork(
             };
             child.vfork_parent_release = Some(VforkParentRelease {
                 parent_mem: guest_mem.clone(),
+                parent_process_index: pi,
                 scratch_ptr,
                 ch,
                 syscall_nr,
                 args: *args,
                 child_pid,
             });
+            processes[pi].vfork_awaiting_child = true;
             processes.push(child);
             // Deliberately do NOT `complete_channel(ch, ...)` here — see this
             // block's doc comment. The parent's calling OS thread stays
@@ -10013,7 +10062,7 @@ fn handle_exec_common(
     // private `SharedMemory`, never shared with anyone) by this point, so
     // the borrow is truly over regardless of when the parent wakes up.
     if let Some(release) = processes[pi].vfork_parent_release.take() {
-        resolve_vfork_parent_release(kernel_mem, release)?;
+        resolve_vfork_parent_release(kernel_mem, processes, release)?;
     }
     let old_proc = std::mem::replace(&mut processes[pi], new_proc);
     reclaim_all_channels(old_proc);
@@ -10132,7 +10181,7 @@ fn terminate_process_after_failed_exec_commit(
     // the parent wakes with this dead child's real pid, exactly like the
     // ordinary `_exit`/`execve` release sites.
     if let Some(release) = processes[pi].vfork_parent_release.take() {
-        if let Err(e) = resolve_vfork_parent_release(kernel_mem, release) {
+        if let Err(e) = resolve_vfork_parent_release(kernel_mem, processes, release) {
             eprintln!(
                 "[host-native] resolving a vfork parent after a post-commit {stage} failure \
                  failed: {e:#}"

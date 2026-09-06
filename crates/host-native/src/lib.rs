@@ -1796,6 +1796,149 @@ mod tests {
         Ok(())
     }
 
+    /// Real vfork (N1 residual): the vfork analogue of `smoke_fork_parent_
+    /// child`, proving this host's `vfork()` is genuinely REAL — a borrowed
+    /// child sharing the parent's own `SharedMemory`, and a parent
+    /// genuinely suspended until the child reaches `_exit` — not merely
+    /// POSIX-permissible-but-weak plain-COW-fork behavior.
+    ///
+    /// Fixture: `native_vfork.instrumented.wasm` (`native_vfork.c`). The
+    /// CHILD writes `shared_marker = 99` then `_exit(marker == 42 ? 3 : 9)`;
+    /// the PARENT's `vfork()` call does not return until that happens, then
+    /// it `waitpid`s (reaping the already-recorded exit — real vfork means
+    /// the child is already gone by the time `vfork()` itself returns),
+    /// checks `shared_marker == 99`, and propagates the child's real
+    /// `WEXITSTATUS`.
+    ///
+    /// This is a STRONGER proof than an ordering check: it is causally
+    /// impossible for the parent to observe the child's write unless the
+    /// two literally share memory — an ordinary COW fork (what this host's
+    /// `vfork()` did before this fix, and what a non-instrumented guest's
+    /// `vfork()` still falls back to today) gives the child a PRIVATE copy,
+    /// so the parent would read `shared_marker`'s untouched initial value
+    /// (`0`) and this fixture would exit `21` instead of `3` — this is
+    /// exactly the RED state this test was confirmed to reproduce before
+    /// `crates/host-native/src/guest.rs`'s `MODE_VFORK` branch in
+    /// `handle_fork` existed (verified empirically: reverting that branch
+    /// while keeping this test reproduces `exit_code == 21`).
+    #[test]
+    fn smoke_vfork_exit_shares_memory_and_blocks_parent() -> anyhow::Result<()> {
+        let Some(path) = kernel_path_or_skip() else {
+            return Ok(());
+        };
+        let Some(_fork_module_path) = fork_module_path_or_skip() else {
+            return Ok(());
+        };
+        let guest_wasm = include_bytes!("../fixtures/native_vfork.instrumented.wasm");
+
+        let options = guest::GuestOptions { enable_fork_module: true, ..Default::default() };
+        let outcome = guest::run_guest(&path, guest_wasm, &options)?;
+
+        assert_ne!(
+            outcome.exit_code, 21,
+            "the child's write to `shared_marker` was NOT visible to the parent after \
+             vfork() returned — this is plain COW-fork behavior (a private memory copy), \
+             not real vfork (a genuinely SHARED, borrowed address space) \
+             (stdout: {:?}, stderr: {:?}, trace: {:?}, proof: {:?})",
+            String::from_utf8_lossy(&outcome.stdout),
+            String::from_utf8_lossy(&outcome.stderr),
+            outcome.syscall_trace,
+            outcome.fork_proof_of_use,
+        );
+        assert_eq!(
+            outcome.exit_code, 3,
+            "the parent's reaped WEXITSTATUS must be the child's REAL _exit(3) \
+             (stdout: {:?}, stderr: {:?}, trace: {:?}, proof: {:?})",
+            String::from_utf8_lossy(&outcome.stdout),
+            String::from_utf8_lossy(&outcome.stderr),
+            outcome.syscall_trace,
+            outcome.fork_proof_of_use,
+        );
+        let stdout = String::from_utf8_lossy(&outcome.stdout);
+        assert!(
+            stdout.contains("child\n"),
+            "expected the borrowed child to run its copied program and print \
+             \"child\\n\": {stdout:?}"
+        );
+        assert!(
+            stdout.contains("parent\n"),
+            "expected the parent to resume after vfork() and print \"parent\\n\": {stdout:?}"
+        );
+        assert!(
+            outcome.syscall_trace.contains(&wasm_posix_shared::abi::host_intercepted::SYS_VFORK),
+            "expected the SYS_VFORK sentinel in the syscall trace: {:?}",
+            outcome.syscall_trace
+        );
+        Ok(())
+    }
+
+    /// Real vfork (N1 residual), execve variant: proves the parent's own
+    /// channel is deferred all the way to a successful `execve` COMMIT, not
+    /// merely to the child's launch (today's plain-COW-fork behavior) and
+    /// not merely to a subsequent `_exit` (already covered by
+    /// `smoke_vfork_exit_shares_memory_and_blocks_parent`).
+    ///
+    /// Fixture: `native_vfork_exec.instrumented.wasm` — the CHILD `vfork()`s
+    /// then `execve`s `/bin/exectarget` (the SAME target fixture
+    /// `smoke_execve_replaces_image` uses, `native_exec_target.c`: writes
+    /// "exec ok\n" then `_exit(9)`), placed in the `BaseImage` exactly like
+    /// that test. Once `execve` commits, the child runs a brand-new,
+    /// private (never shared) image under the SAME pid — real vfork's own
+    /// contract that the borrow ends at exec — and the parent's own LATER
+    /// `waitpid` reaps that image's real exit status through the ordinary,
+    /// ordinary wait4 path (unrelated to the vfork machinery itself).
+    #[test]
+    fn smoke_vfork_execve_releases_parent() -> anyhow::Result<()> {
+        let Some(path) = kernel_path_or_skip() else {
+            return Ok(());
+        };
+        let Some(_fork_module_path) = fork_module_path_or_skip() else {
+            return Ok(());
+        };
+        let parent = include_bytes!("../fixtures/native_vfork_exec.instrumented.wasm");
+        let target = include_bytes!("../fixtures/native_exec_target.wasm");
+
+        let base_image = guest::build_base_image(&[
+            guest::BaseEntrySpec::dir("/", 1, 0o755),
+            guest::BaseEntrySpec::dir("/bin", 2, 0o755),
+            guest::BaseEntrySpec::file("/bin/exectarget", 3, 0o755, target.to_vec()),
+        ]);
+        let options = guest::GuestOptions {
+            enable_fork_module: true,
+            base_image: Some(base_image),
+            ..Default::default()
+        };
+        let outcome = guest::run_guest(&path, parent, &options)?;
+
+        let stdout = String::from_utf8_lossy(&outcome.stdout);
+        assert!(
+            !stdout.contains("vfork child execve failed"),
+            "the vfork child's execve must succeed: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("exec ok\n"),
+            "expected the exec'd target's stdout line to appear: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("parent\n"),
+            "expected the parent to resume (after the child's execve committed) and print \
+             \"parent\\n\": {stdout:?}"
+        );
+        assert_eq!(
+            outcome.exit_code, 9,
+            "process exit code must be the EXEC'D target's real exit (9), reaped by the \
+             parent's own waitpid (stdout: {stdout:?}, stderr: {:?}, trace: {:?})",
+            String::from_utf8_lossy(&outcome.stderr),
+            outcome.syscall_trace,
+        );
+        assert!(
+            outcome.syscall_trace.contains(&wasm_posix_shared::abi::host_intercepted::SYS_VFORK),
+            "expected the SYS_VFORK sentinel in the syscall trace: {:?}",
+            outcome.syscall_trace
+        );
+        Ok(())
+    }
+
     /// N1-I4 Task 3: a fork of a program with no captured references (the
     /// SAME `native_fork.instrumented.wasm` fixture — its `fork()` call site
     /// carries only scalar locals, no funcref/externref/exnref/GC state)
