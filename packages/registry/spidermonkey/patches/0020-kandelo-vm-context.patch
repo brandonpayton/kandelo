@@ -1,0 +1,462 @@
+--- a/js/src/shell/js.cpp
++++ b/js/src/shell/js.cpp
+@@ -1444,8 +1444,448 @@
+     return false;
+   }
+   return sc->moduleLoader->requireModuleNamespace(cx, path, args.rval());
++}
++
++// ---------------------------------------------------------------------------
++// Kandelo: node-compat `vm` module context isolation.
++//
++// A sandbox-backed global object gives Node's vm module real, isolated
++// execution contexts. The custom JSClass installs property ops that delegate
++// through to a user-supplied sandbox object:
++//   - resolve      : read-through (copy-on-first-access from the sandbox)
++//   - addProperty  : write-through (globals assigned by run code hit the sandbox)
++//   - delProperty  : delete-through
++//   - newEnumerate : enumerate-through
++// codeGeneration:{strings:false}/{wasm:false} is enforced per-realm through a
++// content-security-policy eval checker installed with JS_SetSecurityCallbacks,
++// keyed on a reserved-slot bitmask and scoped by the current global.
++//
++// Read liveness is copy-on-first-access, not fully-live-per-access: ESR 140's
++// JSClassOps has no get/set interceptors (removed upstream), so the read-side
++// hook (`resolve`) fires once per missing name and must define the value onto
++// the global, after which the global's own copy shadows the sandbox. This is a
++// documented engine boundary (see docs/posix-status.md).
++//
++// This seam precedes the ShellPrincipals definition and the shell's own
++// sandbox_class/SetStandardRealmOptions, so it is fully self-contained: it
++// defines its own JSClass/JSClassOps and installs the CSP hook via
++// JS_Get/SetSecurityCallbacks rather than referencing ShellPrincipals.
++// ---------------------------------------------------------------------------
++
++static constexpr uint32_t KANDELO_VM_SANDBOX_SLOT = JSCLASS_GLOBAL_SLOT_COUNT;
++static constexpr uint32_t KANDELO_VM_CODEGEN_SLOT =
++    JSCLASS_GLOBAL_SLOT_COUNT + 1;
++static constexpr uint32_t KANDELO_VM_CONTEXTIFY_SLOTS = 2;
++
++static bool KandeloVmContextifyResolve(JSContext* cx, JS::HandleObject obj,
++                                       JS::HandleId id, bool* resolvedp) {
++  if (!JS_ResolveStandardClass(cx, obj, id, resolvedp)) {
++    return false;
++  }
++  if (*resolvedp) {
++    return true;
++  }
++  JS::Value s = JS::GetReservedSlot(obj, KANDELO_VM_SANDBOX_SLOT);
++  if (!s.isObject()) {
++    return true;
++  }
++  RootedObject sandbox(cx, &s.toObject());
++  bool has = false;
++  if (!JS_HasPropertyById(cx, sandbox, id, &has)) {
++    return false;
++  }
++  if (!has) {
++    return true;
++  }
++  RootedValue val(cx);
++  if (!JS_GetPropertyById(cx, sandbox, id, &val)) {
++    return false;
++  }
++  if (!JS_DefinePropertyById(cx, obj, id, val, JSPROP_ENUMERATE)) {
++    return false;
++  }
++  *resolvedp = true;
++  return true;
++}
++
++static bool KandeloVmContextifyAddProperty(JSContext* cx, JS::HandleObject obj,
++                                           JS::HandleId id,
++                                           JS::HandleValue v) {
++  JS::Value s = JS::GetReservedSlot(obj, KANDELO_VM_SANDBOX_SLOT);
++  if (!s.isObject()) {
++    return true;
++  }
++  RootedObject sandbox(cx, &s.toObject());
++  return JS_SetPropertyById(cx, sandbox, id, v);
++}
++
++static bool KandeloVmContextifyDelProperty(JSContext* cx, JS::HandleObject obj,
++                                           JS::HandleId id,
++                                           JS::ObjectOpResult& result) {
++  JS::Value s = JS::GetReservedSlot(obj, KANDELO_VM_SANDBOX_SLOT);
++  if (s.isObject()) {
++    RootedObject sandbox(cx, &s.toObject());
++    if (!JS_DeletePropertyById(cx, sandbox, id, result)) {
++      return false;
++    }
++    return true;
++  }
++  return result.succeed();
++}
++
++static bool KandeloVmContextifyNewEnumerate(JSContext* cx, JS::HandleObject obj,
++                                            JS::MutableHandleIdVector properties,
++                                            bool enumerableOnly) {
++  if (!JS_NewEnumerateStandardClasses(cx, obj, properties, enumerableOnly)) {
++    return false;
++  }
++  JS::Value s = JS::GetReservedSlot(obj, KANDELO_VM_SANDBOX_SLOT);
++  if (!s.isObject()) {
++    return true;
++  }
++  RootedObject sandbox(cx, &s.toObject());
++  JS::Rooted<JS::IdVector> ids(cx, JS::IdVector(cx));
++  if (!JS_Enumerate(cx, sandbox, &ids)) {
++    return false;
++  }
++  for (size_t i = 0; i < ids.length(); i++) {
++    if (!properties.append(ids[i])) {
++      return false;
++    }
++  }
++  return true;
++}
++
++static const JSClassOps gKandeloVmContextifyClassOps = {
++    KandeloVmContextifyAddProperty,   // addProperty
++    KandeloVmContextifyDelProperty,   // delProperty
++    nullptr,                          // enumerate
++    KandeloVmContextifyNewEnumerate,  // newEnumerate
++    KandeloVmContextifyResolve,       // resolve
++    nullptr,                          // mayResolve
++    nullptr,                          // finalize
++    nullptr,                          // call
++    nullptr,                          // construct
++    JS_GlobalObjectTraceHook,         // trace
++};
++
++static const JSClass gKandeloVmContextifyClass = {
++    "KandeloVmContext",
++    JSCLASS_GLOBAL_FLAGS_WITH_SLOTS(KANDELO_VM_CONTEXTIFY_SLOTS),
++    &gKandeloVmContextifyClassOps,
++};
++
++static JSSecurityCallbacks gKandeloVmSecurityCallbacks;
++static bool gKandeloVmSecurityInstalled = false;
++
++static bool KandeloVmCSPAllows(
++    JSContext* cx, JS::RuntimeCode kind, JS::Handle<JSString*> codeString,
++    JS::CompilationType compilationType,
++    JS::Handle<JS::StackGCVector<JSString*>> parameterStrings,
++    JS::Handle<JSString*> bodyString,
++    JS::Handle<JS::StackGCVector<JS::Value>> parameterArgs,
++    JS::Handle<JS::Value> bodyArg, bool* outCanCompileStrings) {
++  JSObject* g = JS::CurrentGlobalOrNull(cx);
++  if (g && JS::GetClass(g) == &gKandeloVmContextifyClass) {
++    JS::Value flag = JS::GetReservedSlot(g, KANDELO_VM_CODEGEN_SLOT);
++    int32_t mask = flag.isInt32() ? flag.toInt32() : 0;
++    bool blocked =
++        (kind == JS::RuntimeCode::WASM) ? (mask & 2) != 0 : (mask & 1) != 0;
++    if (blocked) {
++      *outCanCompileStrings = false;
++      return true;
++    }
++  }
++  *outCanCompileStrings = true;
++  return true;
++}
++
++static void EnsureKandeloVmSecurityCallbacks(JSContext* cx) {
++  if (gKandeloVmSecurityInstalled) {
++    return;
++  }
++  const JSSecurityCallbacks* existing = JS_GetSecurityCallbacks(cx);
++  if (existing) {
++    gKandeloVmSecurityCallbacks = *existing;
++  }
++  gKandeloVmSecurityCallbacks.contentSecurityPolicyAllows = KandeloVmCSPAllows;
++  JS_SetSecurityCallbacks(cx, &gKandeloVmSecurityCallbacks);
++  gKandeloVmSecurityInstalled = true;
++}
++
++// __kandeloVmMakeContext(sandbox, { strings, wasm }) -> contextified global.
++static bool KandeloVmMakeContext(JSContext* cx, unsigned argc, Value* vp) {
++  CallArgs args = CallArgsFromVp(argc, vp);
++  RootedObject sandbox(cx);
++  if (args.length() >= 1 && args[0].isObject()) {
++    sandbox = &args[0].toObject();
++  } else {
++    sandbox = JS_NewPlainObject(cx);
++    if (!sandbox) {
++      return false;
++    }
++  }
++
++  int32_t codegenMask = 0;
++  if (args.length() >= 2 && args[1].isObject()) {
++    RootedObject opts(cx, &args[1].toObject());
++    RootedValue v(cx);
++    if (!JS_GetProperty(cx, opts, "strings", &v)) {
++      return false;
++    }
++    if (v.isBoolean() && !v.toBoolean()) {
++      codegenMask |= 1;
++    }
++    if (!JS_GetProperty(cx, opts, "wasm", &v)) {
++      return false;
++    }
++    if (v.isBoolean() && !v.toBoolean()) {
++      codegenMask |= 2;
++    }
++  }
++
++  EnsureKandeloVmSecurityCallbacks(cx);
++
++  JS::RealmOptions options;
++  options.creationOptions()
++      .setNewCompartmentAndZone()
++      .setSharedMemoryAndAtomicsEnabled(false);
++
++  RootedObject global(cx,
++                      JS_NewGlobalObject(cx, &gKandeloVmContextifyClass, nullptr,
++                                         JS::DontFireOnNewGlobalHook, options));
++  if (!global) {
++    return false;
++  }
++
++  {
++    JSAutoRealm ar(cx, global);
++    if (!JS::InitRealmStandardClasses(cx)) {
++      return false;
++    }
++    JS_FireOnNewGlobalObject(cx, global);
++
++    // Attach the sandbox only after standard-class + global setup completes so
++    // the write-through addProperty hook does not mirror engine internals onto
++    // the sandbox (the hook no-ops while the slot is unset).
++    RootedObject wrappedSandbox(cx, sandbox);
++    if (!JS_WrapObject(cx, &wrappedSandbox)) {
++      return false;
++    }
++    JS::SetReservedSlot(global, KANDELO_VM_SANDBOX_SLOT,
++                        JS::ObjectValue(*wrappedSandbox));
++    JS::SetReservedSlot(global, KANDELO_VM_CODEGEN_SLOT,
++                        JS::Int32Value(codegenMask));
++  }
++
++  RootedObject result(cx, global);
++  if (!cx->compartment()->wrap(cx, &result)) {
++    return false;
++  }
++  args.rval().setObject(*result);
++  return true;
+ }
+ 
++// __kandeloVmIsContext(obj) -> bool.
++static bool KandeloVmIsContext(JSContext* cx, unsigned argc, Value* vp) {
++  CallArgs args = CallArgsFromVp(argc, vp);
++  bool result = false;
++  if (args.length() >= 1 && args[0].isObject()) {
++    JSObject* o = js::UncheckedUnwrap(&args[0].toObject());
++    result = o && JS::GetClass(o) == &gKandeloVmContextifyClass;
++  }
++  args.rval().setBoolean(result);
++  return true;
++}
++
++// __kandeloVmCompile(code, { filename, lineOffset }) -> opaque script handle.
++// Compiles to a realm-independent Stencil so one handle can run in many
++// contexts (Node's vm.Script reused across contexts).
++static bool KandeloVmCompile(JSContext* cx, unsigned argc, Value* vp) {
++  CallArgs args = CallArgsFromVp(argc, vp);
++  if (args.length() < 1 || !args[0].isString()) {
++    JS_ReportErrorASCII(cx, "__kandeloVmCompile(code, opts)");
++    return false;
++  }
++  RootedString code(cx, args[0].toString());
++
++  RootedString filenameStr(cx);
++  int32_t lineOffset = 0;
++  if (args.length() >= 2 && args[1].isObject()) {
++    RootedObject o(cx, &args[1].toObject());
++    RootedValue v(cx);
++    if (!JS_GetProperty(cx, o, "filename", &v)) {
++      return false;
++    }
++    if (v.isString()) {
++      filenameStr = v.toString();
++    }
++    if (!JS_GetProperty(cx, o, "lineOffset", &v)) {
++      return false;
++    }
++    if (v.isInt32()) {
++      lineOffset = v.toInt32();
++    }
++  }
++  UniqueChars filenameBytes;
++  const char* filename = "evalmachine.<anonymous>";
++  if (filenameStr) {
++    filenameBytes = JS_EncodeStringToUTF8(cx, filenameStr);
++    if (!filenameBytes) {
++      return false;
++    }
++    filename = filenameBytes.get();
++  }
++
++  JS::CompileOptions compileOptions(cx);
++  compileOptions.setFileAndLine(filename, 1 + lineOffset);
++
++  AutoStableStringChars stable(cx);
++  if (!stable.initTwoByte(cx, code)) {
++    return false;
++  }
++  JS::SourceText<char16_t> srcBuf;
++  if (!srcBuf.initMaybeBorrowed(cx, stable)) {
++    return false;
++  }
++
++  RefPtr<JS::Stencil> stencil =
++      JS::CompileGlobalScriptToStencil(cx, compileOptions, srcBuf);
++  if (!stencil) {
++    return false;
++  }
++  RootedObject handle(cx, js::StencilObject::create(cx, std::move(stencil)));
++  if (!handle) {
++    return false;
++  }
++  args.rval().setObject(*handle);
++  return true;
++}
++
++// __kandeloVmRunInContext(codeOrScriptHandle, ctx,
++//                         { filename, lineOffset }) -> result.
++// Enters ctx's realm, compiles (string) or instantiates (handle), executes,
++// and marshals the result — or a thrown value — back to the caller realm.
++static bool KandeloVmRunInContext(JSContext* cx, unsigned argc, Value* vp) {
++  CallArgs args = CallArgsFromVp(argc, vp);
++  if (args.length() < 2) {
++    JS_ReportErrorASCII(cx, "__kandeloVmRunInContext(code, ctx, opts)");
++    return false;
++  }
++  if (!args[1].isObject()) {
++    JS_ReportErrorASCII(cx, "vm context must be an object");
++    return false;
++  }
++  RootedObject target(cx, UncheckedUnwrap(&args[1].toObject(), true));
++  target = ToWindowIfWindowProxy(target);
++  if (!target || !JS_IsGlobalObject(target)) {
++    JS_ReportErrorASCII(cx, "invalid vm context");
++    return false;
++  }
++
++  RootedString codeStr(cx);
++  Rooted<js::StencilObject*> stencilObj(cx);
++  if (args[0].isString()) {
++    codeStr = args[0].toString();
++  } else if (args[0].isObject()) {
++    stencilObj = args[0].toObject().maybeUnwrapIf<js::StencilObject>();
++    if (!stencilObj) {
++      JS_ReportErrorASCII(cx, "invalid compiled script handle");
++      return false;
++    }
++  } else {
++    JS_ReportErrorASCII(cx, "vm code must be a string or compiled script");
++    return false;
++  }
++
++  RootedString filenameStr(cx);
++  int32_t lineOffset = 0;
++  if (args.length() >= 3 && args[2].isObject()) {
++    RootedObject o(cx, &args[2].toObject());
++    RootedValue v(cx);
++    if (!JS_GetProperty(cx, o, "filename", &v)) {
++      return false;
++    }
++    if (v.isString()) {
++      filenameStr = v.toString();
++    }
++    if (!JS_GetProperty(cx, o, "lineOffset", &v)) {
++      return false;
++    }
++    if (v.isInt32()) {
++      lineOffset = v.toInt32();
++    }
++  }
++  UniqueChars filenameBytes;
++  const char* filename = "evalmachine.<anonymous>";
++  if (filenameStr) {
++    filenameBytes = JS_EncodeStringToUTF8(cx, filenameStr);
++    if (!filenameBytes) {
++      return false;
++    }
++    filename = filenameBytes.get();
++  }
++
++  // Flatten source chars in the caller realm; the borrowed range is consumed
++  // inside the target realm below (mirrors EvalInContext).
++  AutoStableStringChars stable(cx);
++  if (codeStr) {
++    if (!stable.initTwoByte(cx, codeStr)) {
++      return false;
++    }
++  }
++
++  RootedValue rval(cx);
++  bool ok = false;
++  {
++    JSAutoRealm ar(cx, target);
++
++    JS::CompileOptions compileOptions(cx);
++    compileOptions.setFileAndLine(filename, 1 + lineOffset);
++
++    RootedScript script(cx);
++    if (codeStr) {
++      JS::SourceText<char16_t> srcBuf;
++      if (!srcBuf.init(cx, stable.twoByteRange().begin().get(),
++                       stable.twoByteRange().length(),
++                       JS::SourceOwnership::Borrowed)) {
++        return false;
++      }
++      script = JS::Compile(cx, compileOptions, srcBuf);
++    } else {
++      JS::InstantiateOptions instantiateOptions(compileOptions);
++      script = JS::InstantiateGlobalStencil(cx, instantiateOptions,
++                                            stencilObj->stencil());
++    }
++
++    if (script) {
++      ok = JS_ExecuteScript(cx, script, &rval);
++    }
++  }
++
++  if (ok) {
++    if (!cx->compartment()->wrap(cx, &rval)) {
++      return false;
++    }
++    args.rval().set(rval);
++    return true;
++  }
++
++  // Marshal a thrown value back to the caller realm rather than leaving it in
++  // the target realm.
++  if (JS_IsExceptionPending(cx)) {
++    RootedValue exc(cx);
++    if (JS_GetPendingException(cx, &exc)) {
++      JS_ClearPendingException(cx);
++      if (!cx->compartment()->wrap(cx, &exc)) {
++        return false;
++      }
++      JS_SetPendingException(cx, exc);
++    }
++  }
++  return false;
++}
++
+ static bool DefineKandeloNodeNative(JSContext* cx) {
+   RootedObject native(cx, JS_NewPlainObject(cx));
+   if (!native) {
+@@ -1454,6 +1894,10 @@
+   const JSFunctionSpec funcs[] = {
+       JS_FN("evalScriptAsFunction", KandeloNativeEvalScriptAsFunction, 2, 0),
+       JS_FN("__kandeloRequireModule", KandeloNativeRequireModule, 1, 0),
++      JS_FN("__kandeloVmMakeContext", KandeloVmMakeContext, 2, 0),
++      JS_FN("__kandeloVmIsContext", KandeloVmIsContext, 1, 0),
++      JS_FN("__kandeloVmRunInContext", KandeloVmRunInContext, 3, 0),
++      JS_FN("__kandeloVmCompile", KandeloVmCompile, 2, 0),
+       JS_FN("createHash", KandeloNativeCreateHash, 1, 0),
+       JS_FN("createHmac", KandeloNativeCreateHmac, 2, 0),
+       JS_FN("createDeflate", KandeloNativeCreateDeflate, 1, 0),

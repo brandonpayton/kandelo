@@ -4258,11 +4258,61 @@ const _builtinModules = {
             return { heap_size_limit: 256 * 1024 * 1024 };
         },
     },
-    'vm': {
-        runInThisContext(code) { return eval(code); },
-        createContext(sandbox) { return sandbox || {}; },
-        Script: class Script { constructor(code) { this.code = code; } runInThisContext() { return eval(this.code); } },
-    },
+    'vm': (() => {
+        const N = _nodeNative;
+        function checkTimeout(o) {
+            // Interrupt callbacks are unavailable on spidermonkey-node, so a
+            // timeout cannot be honored. Fail loudly rather than silently
+            // ignore it (see docs/posix-status.md).
+            if (o && o.timeout != null) {
+                throw new Error('vm timeout is not supported on spidermonkey-node');
+            }
+        }
+        function normOpts(o) {
+            if (typeof o === 'string') o = { filename: o };
+            o = o || {};
+            checkTimeout(o);
+            return { filename: o.filename, lineOffset: o.lineOffset | 0,
+                     columnOffset: o.columnOffset | 0,
+                     displayErrors: o.displayErrors !== false };
+        }
+        function cgFlags(o) {
+            const cg = (o && o.codeGeneration) || {};
+            return { strings: cg.strings, wasm: cg.wasm };
+        }
+        function createContext(sandbox, options) {
+            return N.__kandeloVmMakeContext(sandbox || {}, cgFlags(options));
+        }
+        function isContext(obj) { return N.__kandeloVmIsContext(obj); }
+        function runInContext(code, ctx, options) {
+            return N.__kandeloVmRunInContext(String(code), ctx, normOpts(options));
+        }
+        function runInNewContext(code, sandbox, options) {
+            const ctx = createContext(sandbox, options);
+            return runInContext(code, ctx, options);
+        }
+        function runInThisContext(code, options) {
+            // Real top-level compile+eval in the caller realm (not bare eval),
+            // so filenames/stack frames are faithful.
+            const o = normOpts(options);
+            const h = N.__kandeloVmCompile(String(code), o);
+            return N.__kandeloVmRunInContext(h, globalThis, o);
+        }
+        class Script {
+            constructor(code, options) { this._h = N.__kandeloVmCompile(String(code), normOpts(options)); }
+            runInContext(ctx, options) { return N.__kandeloVmRunInContext(this._h, ctx, normOpts(options)); }
+            runInNewContext(sandbox, options) { return this.runInContext(createContext(sandbox, options), options); }
+            runInThisContext(options) { return N.__kandeloVmRunInContext(this._h, globalThis, normOpts(options)); }
+        }
+        function compileFunction(code, params, options) {
+            const o = options || {};
+            const body = '(function(' + ((params || []).join(',')) + '){' + String(code) + '})';
+            const ctx = o.parsingContext && isContext(o.parsingContext) ? o.parsingContext : globalThis;
+            return N.__kandeloVmRunInContext(body, ctx, normOpts(o));
+        }
+        return { createContext, isContext, runInContext, runInNewContext,
+                 runInThisContext, Script, compileFunction };
+    })(),
     // Minimal stubs — undici/file-type/anthropic-sdk import these at module
     // init even when their stream code paths aren't exercised by the agent's
     // actual HTTP transport (which goes through our native socket/tls shim).

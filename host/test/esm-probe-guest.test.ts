@@ -153,6 +153,15 @@ const FIXTURES: Record<string, string> = {
     'import{a}from"/app/alink.mjs";export const usesA=a;',
   "mainlinkcyc.cjs":
     '(()=>{try{const A=require("/app/alink.mjs");console.log("LINKCYC",A.a,A.getFromB());}catch(e){console.log("LINKCYCERR",(e&&e.name)||"",(e&&e.message)||e);}})();',
+  // node-compat `vm` module: real context isolation (M2 Phase H). Backs the
+  // Claude Code sandbox; before this the module threw
+  // "Vt.runInContext is not a function".
+  "mainvmiso.cjs": '(()=>{try{const vm=require("vm");const ctx=vm.createContext({seed:41});globalThis.__vmOuter=9;const a=vm.runInContext("seed+1",ctx);const b=vm.runInContext("typeof __vmOuter",ctx);console.log("VMISO",a,b);}catch(e){console.log("VMISOERR",(e&&e.name)||"",(e&&e.message)||e);}})();',
+  "mainvmctxfy.cjs": '(()=>{try{const vm=require("vm");const sb={};const c=vm.createContext(sb);vm.runInContext("globalThis.made=7",c);console.log("VMCTXFY",sb.made,vm.isContext(c),vm.isContext({}));}catch(e){console.log("VMCTXFYERR",(e&&e.name)||"",(e&&e.message)||e);}})();',
+  "mainvmcodegen.cjs": '(()=>{try{const vm=require("vm");const c=vm.createContext({},{codeGeneration:{strings:false}});let r;try{vm.runInContext("eval(\'1\')",c);r="ALLOWED";}catch(e){r="BLOCKED";}console.log("VMCODEGEN",r);}catch(e){console.log("VMCODEGENERR",(e&&e.name)||"",(e&&e.message)||e);}})();',
+  "mainvmcb.cjs": '(()=>{try{const vm=require("vm");let got=0;const c=vm.createContext({log:(v)=>{got=v;}});vm.runInContext("log(42)",c);console.log("VMCB",got);}catch(e){console.log("VMCBERR",(e&&e.name)||"",(e&&e.message)||e);}})();',
+  "mainvmscript.cjs": '(()=>{try{const vm=require("vm");const s=new vm.Script("base+1");const a=s.runInContext(vm.createContext({base:10}));const b=s.runInContext(vm.createContext({base:20}));console.log("VMSCRIPT",a,b);}catch(e){console.log("VMSCRIPTERR",(e&&e.name)||"",(e&&e.message)||e);}})();',
+  "mainvmthrow.cjs": '(()=>{try{const vm=require("vm");let m="";try{vm.runInContext("throw new Error(\'boom\')",vm.createContext({}));}catch(e){m=e.message;}console.log("VMTHROW",m);}catch(e){console.log("VMTHROWERR",(e&&e.name)||"",(e&&e.message)||e);}})();',
 };
 
 function stageFixtures(): string {
@@ -376,5 +385,42 @@ describe("spidermonkey-node ESM probe", () => {
     console.log("LINKCYC OUT:", JSON.stringify(r.stdout.trim()), "ERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
     expect(r.stdout).toContain("LINKCYC A A");
     expect(r.stdout).not.toContain("LINKCYCERR");
+  }, 90_000);
+
+  it.runIf(ready)("vm: real isolation + reads sandbox", async () => {
+    const r = await runOne("/app/mainvmiso.cjs");
+    // eslint-disable-next-line no-console
+    console.log("VMISO OUT:", JSON.stringify(r.stdout.trim()), "ERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
+    expect(r.stdout).toContain("VMISO 42 undefined");
+  }, 90_000);
+  it.runIf(ready)("vm: contextify mirrors globals to sandbox + isContext", async () => {
+    const r = await runOne("/app/mainvmctxfy.cjs");
+    // eslint-disable-next-line no-console
+    console.log("VMCTXFY OUT:", JSON.stringify(r.stdout.trim()), "ERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
+    expect(r.stdout).toContain("VMCTXFY 7 true false");
+  }, 90_000);
+  it.runIf(ready)("vm: codeGeneration:false blocks eval inside", async () => {
+    const r = await runOne("/app/mainvmcodegen.cjs");
+    // eslint-disable-next-line no-console
+    console.log("VMCODEGEN OUT:", JSON.stringify(r.stdout.trim()), "ERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
+    expect(r.stdout).toContain("VMCODEGEN BLOCKED");
+  }, 90_000);
+  it.runIf(ready)("vm: run code calls a sandbox callback", async () => {
+    const r = await runOne("/app/mainvmcb.cjs");
+    // eslint-disable-next-line no-console
+    console.log("VMCB OUT:", JSON.stringify(r.stdout.trim()), "ERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
+    expect(r.stdout).toContain("VMCB 42");
+  }, 90_000);
+  it.runIf(ready)("vm: one Script reused across two contexts", async () => {
+    const r = await runOne("/app/mainvmscript.cjs");
+    // eslint-disable-next-line no-console
+    console.log("VMSCRIPT OUT:", JSON.stringify(r.stdout.trim()), "ERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
+    expect(r.stdout).toContain("VMSCRIPT 11 21");
+  }, 90_000);
+  it.runIf(ready)("vm: thrown error propagates to caller", async () => {
+    const r = await runOne("/app/mainvmthrow.cjs");
+    // eslint-disable-next-line no-console
+    console.log("VMTHROW OUT:", JSON.stringify(r.stdout.trim()), "ERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
+    expect(r.stdout).toContain("VMTHROW boom");
   }, 90_000);
 });

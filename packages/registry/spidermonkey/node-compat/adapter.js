@@ -375,6 +375,19 @@
             }
             return native.__kandeloRequireModule(path);
         },
+        __kandeloVmMakeContext(sandbox, opts) {
+            if (typeof native.__kandeloVmMakeContext !== 'function') throw new Error('native __kandeloVmMakeContext is unavailable');
+            return native.__kandeloVmMakeContext(sandbox, opts);
+        },
+        __kandeloVmIsContext(obj) { return typeof native.__kandeloVmIsContext === 'function' && native.__kandeloVmIsContext(obj); },
+        __kandeloVmRunInContext(codeOrScript, ctx, opts) {
+            if (typeof native.__kandeloVmRunInContext !== 'function') throw new Error('native __kandeloVmRunInContext is unavailable');
+            return native.__kandeloVmRunInContext(codeOrScript, ctx, opts);
+        },
+        __kandeloVmCompile(code, opts) {
+            if (typeof native.__kandeloVmCompile !== 'function') throw new Error('native __kandeloVmCompile is unavailable');
+            return native.__kandeloVmCompile(code, opts);
+        },
         setRawMode(fd, raw) { if (typeof native.setRawMode === 'function') return native.setRawMode(fd, raw); },
         createHash(algorithm) { return native.createHash(algorithm); },
         createHmac(algorithm, key) { return native.createHmac(algorithm, key); },
