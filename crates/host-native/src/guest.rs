@@ -9857,4 +9857,22 @@ mod fork_module_tests {
             .unwrap_or_else(|e| panic!("write {}: {e}", out_path.display()));
         eprintln!("wrote {} ({} bytes)", out_path.display(), wasm.len());
     }
+
+    /// N1-F6 Task 5 (array un-gate): regenerates
+    /// `native_fork_gc_array_cycle.wasm` from the reviewed `.wat` source.
+    /// See [`regenerate_native_fork_gc_struct_cycle_fixture`]'s doc comment
+    /// for why a Rust generator, not WABT.
+    #[test]
+    #[ignore = "writes crates/host-native/fixtures/native_fork_gc_array_cycle.wasm"]
+    fn regenerate_native_fork_gc_array_cycle_fixture() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let wat_path = dir.join("native_fork_gc_array_cycle.wat");
+        let wat_src = std::fs::read_to_string(&wat_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", wat_path.display()));
+        let wasm = wat::parse_str(&wat_src).expect("compile native_fork_gc_array_cycle.wat");
+        let out_path = dir.join("native_fork_gc_array_cycle.wasm");
+        std::fs::write(&out_path, &wasm)
+            .unwrap_or_else(|e| panic!("write {}: {e}", out_path.display()));
+        eprintln!("wrote {} ({} bytes)", out_path.display(), wasm.len());
+    }
 }

@@ -2215,6 +2215,65 @@ mod tests {
         Ok(())
     }
 
+    /// N1-F6 Task 5 (refcomplete FLOOR-2, array un-gate): three real
+    /// Wasm-GC ARRAYS (`array.new_fixed` over scalars, `array.new` over
+    /// scalars with a nonzero fill value, `array.new_fixed` over internal-
+    /// GC-reference elements) held live across a native `kernel_fork`,
+    /// reconstructed with correct element contents in the CHILD, and
+    /// re-verified unaffected in the PARENT afterward — see `fixtures/
+    /// native_fork_gc_array_cycle.wat`'s own doc comment for the exact
+    /// constructor-provenance branch each array exercises and the exit-code
+    /// contract. Proves the fix in this task: `GcProvenanceRegistry::begin`
+    /// now truncates a constructor's provenance scalar bytes to exactly
+    /// what the guest's own GC-codec descriptor declares
+    /// (`provenance_scalar_length`) instead of unconditionally gating every
+    /// array capture — `$scalars_new`'s `array.new` (nonzero 4-byte
+    /// provenance) is the case that would have been silently WRONG under a
+    /// naive "just stop gating" change without the descriptor decode.
+    #[test]
+    fn smoke_fork_gc_array_reconstructs() -> anyhow::Result<()> {
+        let Some(path) = kernel_path_or_skip() else {
+            return Ok(());
+        };
+        let Some(_fork_module_path) = fork_module_path_or_skip() else {
+            return Ok(());
+        };
+        let guest_wasm = include_bytes!("../fixtures/native_fork_gc_array_cycle.instrumented.wasm");
+
+        let options = guest::GuestOptions { enable_fork_module: true, ..Default::default() };
+        let outcome = guest::run_guest(&path, guest_wasm, &options)?;
+
+        assert_eq!(
+            outcome.exit_code, 0,
+            "expected all three reconstructed CHILD arrays (and the \
+             PARENT's own post-fork arrays) to verify (stdout: {:?}, \
+             stderr: {:?}, trace: {:?}, proof: {:?})",
+            String::from_utf8_lossy(&outcome.stdout),
+            String::from_utf8_lossy(&outcome.stderr),
+            outcome.syscall_trace,
+            outcome.fork_proof_of_use,
+        );
+        assert!(
+            outcome.syscall_trace.contains(&wasm_posix_shared::abi::host_intercepted::SYS_FORK),
+            "expected the SYS_FORK sentinel in the syscall trace: {:?}",
+            outcome.syscall_trace
+        );
+
+        // `gc_nodes_reconstructed` (`fm_gc_nodes_reconstructed`), NOT
+        // `references_reconstructed` (which only ever advances for
+        // funcref/null reconstruction — see `smoke_fork_externref_
+        // reconstructs`'s own doc comment on the analogous externref
+        // counter), is the proof-of-use counter for the GC struct/array/i31
+        // path.
+        let proof = outcome.fork_proof_of_use;
+        assert!(
+            proof.gc_nodes_reconstructed > 0,
+            "the module must have driven a real GC reconstruction (not a \
+             silent fallback): {proof:?}"
+        );
+        Ok(())
+    }
+
     /// Wasmtime 35 -> 48 upgrade acceptance test (the reason for the
     /// upgrade): a *fork-instrumented* guest module — the exact artifact
     /// shape `scripts/run-wasm-fork-instrument.sh` produces for every
