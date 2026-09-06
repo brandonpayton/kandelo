@@ -18,9 +18,11 @@ import { expect, test, type Page } from "@playwright/test";
  * computer holds a machine, which one may type, and what each is told it is
  * looking at.
  *
- * Replication starts on its own, as soon as the link opens. There is nothing
- * to press because there is nothing to decide: the computer holding a machine
- * is the user, and the computer holding none is the viewer.
+ * Replication starts on its own, as soon as the link opens: the computer
+ * holding a machine is the user, and the computer holding none is the viewer.
+ * The viewer keeps the one choice there is — the Network popup's Watch and
+ * Join buttons pick between the mirror and the replica, and switching is
+ * allowed at any point in either direction.
  *
  * Chromium only, for the same reason as `kandelo-network-share.spec.ts`: only
  * headless Chromium forms a loopback ICE pair.
@@ -247,6 +249,71 @@ test("follows the user to the demo they launch next", async ({
       timeout: 180_000,
       intervals: [1_000, 2_000, 3_000],
     }).toBeGreaterThan(4);
+  } finally {
+    await viewerContext.close();
+    await userContext.close();
+  }
+});
+
+test("lets the viewer choose the mirror, and the replica again", async ({
+  browser,
+  baseURL,
+  browserName,
+}) => {
+  test.skip(
+    browserName !== "chromium",
+    "only headless Chromium can form a loopback ICE pair",
+  );
+  test.setTimeout(420_000);
+  expect(baseURL).toBeTruthy();
+
+  const userContext = await browser.newContext();
+  const viewerContext = await browser.newContext();
+  const user = await userContext.newPage();
+  const viewer = await viewerContext.newPage();
+  try {
+    await user.goto(appUrl("/?demo=shell"), { waitUntil: "domcontentloaded" });
+    await viewer.goto(appUrl("/"), { waitUntil: "domcontentloaded" });
+    await openShell(user);
+    await connectPeers(user, viewer, (reason) => test.skip(true, reason));
+    await expectReplica(viewer);
+
+    // Watch lets the replica go. The copy this computer was running is
+    // dropped, the mirror pane comes back, and this computer is a viewer
+    // holding nothing — not a failure state, the state it asked for.
+    await openNetworkPopover(viewer);
+    const watch = viewer.getByRole("button", { name: "Watch", exact: true });
+    const join = viewer.getByRole("button", { name: "Join", exact: true });
+    await expect(join).toHaveAttribute("aria-pressed", "true");
+    await watch.click();
+    await expect(viewer.locator(".kshared-machine"))
+      .toHaveCount(1, { timeout: 120_000 });
+    // Letting the replica go changed what this page runs, which closes the
+    // popup; the choice outlives it.
+    await openNetworkPopover(viewer);
+    await expect(watch).toHaveAttribute("aria-pressed", "true");
+
+    // And the mirror is live: a line typed on the user's machine reaches the
+    // viewer as pixels, with no machine running here to compute it.
+    const mirrored = `kandelo-mirrored-${Date.now().toString(36)}`;
+    await closeDockPopovers([user, viewer]);
+    await typeIntoTerminal(user, ".kshell-host", `echo ${mirrored}`);
+    await expect
+      .poll(() => terminalText(viewer, ".kshell-host"), { timeout: 120_000 })
+      .toContain(mirrored);
+
+    // Join asks again, and the machine that arrives is still the user's: the
+    // line typed while this computer was only watching is in its state.
+    await openNetworkPopover(viewer);
+    await viewer.getByRole("button", { name: "Join", exact: true }).click();
+    await closeDockPopovers([user, viewer]);
+    // The read freezes the machine at a syscall, so an untouched shell at its
+    // prompt refuses it; typing is what lets the join land.
+    await typeIntoTerminal(user, ".kshell-host", "true");
+    await expectReplica(viewer);
+    await expect
+      .poll(() => terminalText(viewer, ".kshell-host"), { timeout: 120_000 })
+      .toContain(mirrored);
   } finally {
     await viewerContext.close();
     await userContext.close();

@@ -253,6 +253,43 @@ describe("local replication log", () => {
     }
   });
 
+  it("frees the recording when the asker that joined lets its replica go", async () => {
+    const channel = `replication-test-${crypto.randomUUID()}`;
+    const computer = new LocalReplicationLog<string>(channel);
+    const replica = new LocalReplicationLog<string>(channel);
+    const recorder = new ReplicationLogRecorder();
+    let stops = 0;
+    const stopServing = computer.serve(async (publish) => {
+      const stopRecord = recorder.onRecord((entry) => publish([entry]));
+      return {
+        machine: "the machine",
+        stop: async () => {
+          stops += 1;
+          stopRecord();
+        },
+      };
+    });
+    try {
+      // Aborted after the answer, not before: the person chose the mirror
+      // once their replica was already running, so the question was long
+      // answered when the attempt ended.
+      const leave = new AbortController();
+      await expect(replica.join(5_000, leave.signal)).resolves
+        .toBe("the machine");
+      leave.abort();
+
+      // A machine records for one replica at a time. A recording still held
+      // in the name of the asker that left would refuse every later join,
+      // and this viewer would watch pixels for the rest of the session.
+      await vi.waitFor(() => expect(stops).toBe(1));
+      await expect(replica.join(5_000)).resolves.toBe("the machine");
+    } finally {
+      stopServing();
+      computer.close();
+      replica.close();
+    }
+  });
+
   it("loses no entry to a wire that holds its bytes", async () => {
     const [near, far] = FakeDataChannel.pair({ auto: false });
     const publisher = new LocalReplicationLog(new ChunkedMessageChannel(near));

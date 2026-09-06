@@ -320,6 +320,14 @@ export class LocalReplicationLog<TMachine = never> {
    * abandoned attempt that cannot withdraw goes on competing with the live
    * one, wins the machine's single recording, and leaves it replicating for
    * nobody while every real join is refused.
+   *
+   * The signal outlives the answer for the same reason. Once the machine said
+   * `joined` it is recording for this asker, and an asker that lets its
+   * replica go — the person chose the mirror, the role ended — has to free
+   * that recording or every later join is refused. Aborting after the answer
+   * posts the same withdrawal, so the attempt's one signal is the whole
+   * story: abort it, and the machine serves the next asker whether the answer
+   * had arrived or not.
    */
   join(timeoutMs: number, signal?: AbortSignal): Promise<TMachine> {
     const joinId = crypto.randomUUID();
@@ -356,7 +364,10 @@ export class LocalReplicationLog<TMachine = never> {
           return;
         }
         if (message.kind !== "joined" || message.joinId !== joinId) return;
-        finish();
+        // Everything but the abort hook. The machine is recording for this
+        // asker now, and the hook is how letting the replica go reaches it.
+        clearTimeout(timer);
+        this.#channel.removeEventListener("message", listener);
         resolve(message.machine);
       };
       const finish = () => {

@@ -11,7 +11,10 @@
 //
 // It starts as soon as the link opens, on both sides, because which side is
 // which is already known: the computer holding a machine is the user, and the
-// computer holding none is the viewer. Neither has anything to press.
+// computer holding none is the viewer. Neither has anything to press, but the
+// viewer keeps a choice: the Network popup offers Watch (the mirror) and Join
+// (the replica), and switching to Watch withdraws the asking or lets a
+// running replica go.
 //
 // A viewer holds a machine while it replicates, but it is not a second machine
 // to take: it is a copy of the user's, and the log is what keeps it one. So a
@@ -86,6 +89,20 @@ const RETRY_AFTER_MS = 15_000;
 const pause = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * The two ways a viewer follows the other computer's machine.
+ *
+ * Watching is the mirror: the user's pixels cross the wire and this computer
+ * runs nothing. Joining is the replica: this computer restores the user's
+ * checkpoint and runs the machine itself. Joining is the default because it is
+ * what a viewer is owed when it can be had, and watching is what every join
+ * attempt falls back to anyway — a viewer that is asking, or was refused, is
+ * looking at the mirror the whole time. The choice exists for the person who
+ * wants only the mirror: a join freezes the user's machine to read it, and a
+ * viewer on a weak computer may not want to run a copy at all.
+ */
+export type ViewerMode = "watch" | "join";
+
 export interface MachineReplication {
   /** True while this machine's decisions are being sent to the viewer. */
   readonly publishing: boolean;
@@ -138,6 +155,14 @@ export interface MachineReplication {
   readonly replicating: boolean;
   /** Why replication is not running, or null when nothing refused it. */
   readonly failure: string | null;
+  /** How this viewer follows the machine. Meaningful only on the viewer. */
+  readonly mode: ViewerMode;
+  /**
+   * Choose how to follow. Switching to "watch" withdraws a pending join and
+   * lets go of a replica already running, back to the mirror; switching to
+   * "join" starts asking again.
+   */
+  readonly setMode: (mode: ViewerMode) => void;
 }
 
 const IDLE: MachineReplication = {
@@ -145,6 +170,8 @@ const IDLE: MachineReplication = {
   joining: false,
   replicating: false,
   failure: null,
+  mode: "join",
+  setMode: () => {},
   navigation: { publish: () => {}, viewerPath: null },
   cursor: { publish: () => {}, viewerCursor: null },
   scroll: { publish: () => {}, viewerScroll: null },
@@ -165,6 +192,20 @@ export function useMachineReplication(
   const [viewerScroll, setViewerScroll] = React.useState<PreviewScroll | null>(
     null,
   );
+  const [mode, setModeState] = React.useState<ViewerMode>("join");
+  // The join loop below outlives renders, so it reads the mode from a ref and
+  // is nudged through a listener the current viewer stint registers; state
+  // alone would leave it parked on a value from the render it started in.
+  const modeRef = React.useRef<ViewerMode>("join");
+  const modeChangedRef = React.useRef<((mode: ViewerMode) => void) | null>(
+    null,
+  );
+  const setMode = React.useCallback((next: ViewerMode) => {
+    if (modeRef.current === next) return;
+    modeRef.current = next;
+    setModeState(next);
+    modeChangedRef.current?.(next);
+  }, []);
   // The wire outlives renders; a publish callback that closed over one
   // render's wire would post into a link that was already replaced.
   const wireRef = React.useRef<LocalReplicationLog<CapturedMachine> | null>(
@@ -188,6 +229,10 @@ export function useMachineReplication(
     setViewerPath(null);
     setViewerCursor(null);
     setViewerScroll(null);
+    // Each link starts joining: the mode is a choice about this pair, and the
+    // person who made it for the last pair has not made it for this one.
+    modeRef.current = "join";
+    setModeState("join");
     if (!link) return;
     // The transport wraps the link's channel; the link owns and closes it, so
     // dropping a transport here must not close the channel underneath it.
@@ -272,14 +317,36 @@ export function useMachineReplication(
         setViewerCursor(null);
         void host.stopReplicatingMachine();
       };
+      // Parked when the person chose to watch; resolved to look again.
+      let modeChanged: () => void = () => {};
+      modeChangedRef.current = (next) => {
+        if (next === "join") {
+          modeChanged();
+          return;
+        }
+        // Watch: withdraw the question, and let go of a replica already
+        // running. Neither is a failure — the person asked for the mirror.
+        setJoining(false);
+        setFailure(null);
+        endAttempt();
+        dropReplica();
+      };
       leaveRole = () => {
         left = true;
         setJoining(false);
         endAttempt();
         dropReplica();
+        modeChangedRef.current = null;
+        modeChanged();
       };
       void (async () => {
         while (!gone && !left) {
+          if (modeRef.current !== "join") {
+            await new Promise<void>((resolve) => {
+              modeChanged = resolve;
+            });
+            continue;
+          }
           setJoining(true);
           // A fresh queue per attempt. A publisher that stops recording ends
           // the one it was feeding, and a replica handed an ended queue would
@@ -339,6 +406,12 @@ export function useMachineReplication(
           try {
             const machine = await wire.join(JOIN_TIMEOUT_MS, withdraw.signal);
             if (gone || left) return;
+            if (modeRef.current !== "join") {
+              // Watch was chosen while the question was out, and the answer
+              // beat the withdrawal here. The machine is not booted.
+              setJoining(false);
+              continue;
+            }
             // The user's descriptor and terminals are another computer's
             // input. Check the descriptor exactly as a take does before this
             // page boots an image it names; `replicateMachine` checks the
@@ -356,6 +429,14 @@ export function useMachineReplication(
               bootingReplica = false;
             }
             if (gone || left) return;
+            if (modeRef.current !== "join") {
+              // Watch was chosen while the replica was booting. A copy that
+              // arrived after the person stopped asking is let go, not kept.
+              replica = true;
+              dropReplica();
+              setJoining(false);
+              continue;
+            }
             replica = true;
             stopMisses = host.subscribeReplicationHttpMisses((key) => {
               wire.reportMiss(key);
@@ -367,6 +448,12 @@ export function useMachineReplication(
           } catch (error) {
             if (gone || left) return;
             endAttempt();
+            if (modeRef.current !== "join") {
+              // The person chose to watch mid-attempt; the withdrawal threw
+              // here, and it is their answer, not a failure to report.
+              setJoining(false);
+              continue;
+            }
             // Reported and then retried, not reported instead of retried. The
             // person watching is owed the reason their computer is not
             // running the machine yet, and the next attempt is what makes it
@@ -413,6 +500,8 @@ export function useMachineReplication(
     joining,
     replicating,
     failure,
+    mode,
+    setMode,
     navigation: { publish: publishNavigation, viewerPath },
     cursor: { publish: publishCursor, viewerCursor },
     scroll: { publish: publishScroll, viewerScroll },

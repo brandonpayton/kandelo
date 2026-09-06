@@ -235,6 +235,38 @@ export const NetworkPopup: React.FC<{
           </div>
         )}
 
+        {/* The choice belongs to the watcher alone: the person holding the
+            machine shares whichever way the viewer follows, and a pair with
+            no machine between them has nothing to follow either way. */}
+        {(!hasMachine || replication.replicating)
+          && handover.peerHasMachine && (
+          <section className="knetwork-section">
+            <div className="knetwork-label">How to follow it</div>
+            <div className="knetwork-link-controls">
+              <button
+                type="button"
+                className="knetwork-button knetwork-mode"
+                aria-pressed={replication.mode === "watch"}
+                onClick={() => replication.setMode("watch")}
+              >
+                Watch
+              </button>
+              <button
+                type="button"
+                className="knetwork-button knetwork-mode"
+                aria-pressed={replication.mode === "join"}
+                onClick={() => replication.setMode("join")}
+              >
+                Join
+              </button>
+            </div>
+            <div className="knetwork-mode-note">
+              Watch mirrors the other computer&apos;s screen here; Join runs a
+              copy of the machine on this computer.
+            </div>
+          </section>
+        )}
+
         <section className="knetwork-section">
           <div className="knetwork-link-controls">
             <button
