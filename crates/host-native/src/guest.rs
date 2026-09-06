@@ -2413,19 +2413,80 @@ impl ExternrefRegistry {
 /// the grounding calls sound for exactly the values that already passed
 /// through a registration point — which, by construction, is every entry
 /// this index ever holds.
+///
+/// Review finding (increment-review.md HIGH-1 / "Finding 1"): every entry
+/// here is an `OwnedRooted`, a STRONG GC root by Wasmtime's own design (see
+/// `PROVENANCE_REGISTRY_CAP`'s doc comment) — so this index, like
+/// [`GcProvenanceRegistry::finalized`], grows for the whole guest OS
+/// thread's lifetime and pins every tracked value permanently, unlike the
+/// TS `ExternrefProvenance`'s `WeakMap` (`host/src/fork-externref-
+/// provenance.ts:25`), which lets a tracked value die once nothing else
+/// references it. [`Self::register`] now caps growth at
+/// [`PROVENANCE_REGISTRY_CAP`] — see that constant's doc comment for the
+/// full residual-risk ruling (wasmtime 48 has no weak-GC-reference
+/// primitive to port the `WeakMap` design to) and why a cap is a sound,
+/// truthful-failure-preserving bound rather than an unsound prune.
 struct ExternrefProvenance {
     entries: Vec<(wasmtime::OwnedRooted<ExternRef>, u32)>,
+    /// Set once [`Self::register`] first hits [`PROVENANCE_REGISTRY_CAP`],
+    /// so the loud diagnostic fires exactly once per guest OS thread rather
+    /// than once per subsequent mint.
+    capped_warned: bool,
 }
+
+/// Review fix (increment-review.md HIGH-1 / "Finding 1"): a hard ceiling on
+/// how many mint-time provenance entries [`ExternrefProvenance`] and
+/// [`GcProvenanceRegistry`] will each retain for one guest OS thread.
+///
+/// INVESTIGATED: wasmtime 48.0.1's GC rooting API
+/// (`wasmtime::runtime::gc::enabled::rooting`) offers exactly two
+/// cross-call-persistence primitives, `Rooted<T>` (scope-bound, unrooted the
+/// instant its `RootScope`/call returns — unusable here, since both
+/// registries must survive past the call that populated them) and
+/// `OwnedRooted<T>` (the ONLY primitive that survives past a single call,
+/// which is why both registries use it) — and `OwnedRooted<T>` is
+/// deliberately a STRONG root: it has no `Drop` impl of its own precisely
+/// because HOLDING one is what keeps its GC object alive (dropping the
+/// `OwnedRooted` value lets Wasmtime's own opportunistic `trim_gc_liveness_
+/// flags` reclaim the root slot, but that requires US to decide the value is
+/// no longer needed — there is nothing to query the other way). No `Weak`,
+/// finalizer, or "check if this GC value would still be alive" primitive
+/// exists anywhere in that module; a `WeakMap`-equivalent genuinely is not
+/// expressible against this Wasmtime version.
+///
+/// Given no sound weak reference exists, this does NOT attempt an unsound
+/// prune (e.g. guessing a value is "probably dead"). Instead it bounds
+/// growth to a known constant and degrades gracefully once reached: a mint
+/// beyond the cap is simply not registered, so a LATER fork carrying that
+/// SPECIFIC value falls through the existing SOUNDNESS GUARD ("no recorded
+/// provenance" → `mark_unsupported` + a clean `EOPNOTSUPP` gate, exactly
+/// like a `call_indirect`-minted externref today) instead of growing
+/// further — a truthful failure, not silent corruption, and not a
+/// regression versus today's unbounded behavior for any guest that stays
+/// under the cap. `4096` is chosen generously against every existing
+/// native fork fixture/test (each mints at most a handful of distinct
+/// externref/GC identities) while still turning an unbounded leak into a
+/// bounded one; native is the forcing-function host exercising this
+/// machinery, not a production target — see
+/// `increment-review.md`'s HIGH-1 disposition for the full ruling this
+/// mirrors.
+const PROVENANCE_REGISTRY_CAP: usize = 4096;
 
 impl ExternrefProvenance {
     fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self { entries: Vec::new(), capped_warned: false }
     }
 
     /// Record `(value -> handle)` at mint time. A repeat registration of a
     /// value already present (e.g. `resolve_externref`'s own
     /// idempotent-per-handle cache handing back the same `OwnedRooted` for a
     /// repeat ask) is a no-op rather than a duplicate entry.
+    ///
+    /// Review fix (Finding 1): once `entries` reaches
+    /// [`PROVENANCE_REGISTRY_CAP`], a genuinely NEW value is no longer
+    /// registered — see that constant's doc comment for why this is a
+    /// sound, truthful-failure-preserving bound (a fork later carrying that
+    /// specific value gates cleanly) rather than an unsound prune.
     fn register(
         &mut self,
         mut store: impl wasmtime::AsContextMut,
@@ -2433,6 +2494,19 @@ impl ExternrefProvenance {
         handle: u32,
     ) -> wasmtime::Result<()> {
         if self.lookup(&mut store, value)?.is_some() {
+            return Ok(());
+        }
+        if self.entries.len() >= PROVENANCE_REGISTRY_CAP {
+            if !self.capped_warned {
+                self.capped_warned = true;
+                eprintln!(
+                    "[host-native] externref mint-time provenance registry reached its cap \
+                     ({PROVENANCE_REGISTRY_CAP} entries) for this guest OS thread; further \
+                     distinct externref mints will not be tracked and will cleanly gate \
+                     (EOPNOTSUPP) any fork that later carries them live — see \
+                     increment-review.md HIGH-1."
+                );
+            }
             return Ok(());
         }
         let owned = value.to_owned_rooted(&mut store)?;
@@ -2639,6 +2713,13 @@ struct GcProvenanceRegistry {
     finalized: Vec<(wasmtime::OwnedRooted<AnyRef>, GcConstructorRecord)>,
     pending: Option<PendingGcProvenance>,
     next_token: i32,
+    /// Review fix (increment-review.md HIGH-1 / "Finding 1"): [`Self::end`]
+    /// stops growing `finalized` once it reaches [`PROVENANCE_REGISTRY_CAP`]
+    /// — see that constant's doc comment (right above
+    /// [`ExternrefProvenance`], which has the exact same shape) for the full
+    /// ruling. Set once the cap first fires, so the loud diagnostic prints
+    /// exactly once per guest OS thread.
+    capped_warned: bool,
     /// N1-F6 Task 5 (array un-gate): per-SPECIALIZED-layout provenance
     /// scalar byte length (`GcLayoutDescriptor::provenance_scalar_length`,
     /// 0..=16), decoded once from the guest's own `kandelo.wpk_fork.gc_codec`
@@ -2677,7 +2758,13 @@ impl GcProvenanceRegistry {
                     .collect()
             })
             .unwrap_or_default();
-        Self { finalized: Vec::new(), pending: None, next_token: 1, provenance_scalar_lengths }
+        Self {
+            finalized: Vec::new(),
+            pending: None,
+            next_token: 1,
+            capped_warned: false,
+            provenance_scalar_lengths,
+        }
     }
 
     /// `ForkGcProvenanceRegistry::begin` port (`host/src/fork-gc-codec.ts:
@@ -2774,6 +2861,27 @@ impl GcProvenanceRegistry {
                 pending.references.len(),
                 pending.expected_reference_count,
             )));
+        }
+        // Review fix (Finding 1): once `finalized` reaches
+        // `PROVENANCE_REGISTRY_CAP`, a genuinely NEW construction's evidence
+        // is discarded here rather than retained forever — see that
+        // constant's doc comment for why this is a sound bound (a later
+        // `gc_define` for this object correctly gates via
+        // `provenance_length_mismatches`/the ordinary provenance-miss path)
+        // rather than an unsound prune. The pending transaction was already
+        // consumed by `self.pending.take()` above either way.
+        if self.finalized.len() >= PROVENANCE_REGISTRY_CAP {
+            if !self.capped_warned {
+                self.capped_warned = true;
+                eprintln!(
+                    "[host-native] Wasm-GC constructor provenance registry reached its cap \
+                     ({PROVENANCE_REGISTRY_CAP} entries) for this guest OS thread; further \
+                     distinct GC constructions will not be tracked and will cleanly gate \
+                     (EOPNOTSUPP) any fork that later needs their constructor evidence — see \
+                     increment-review.md HIGH-1."
+                );
+            }
+            return Ok(());
         }
         let record = GcConstructorRecord {
             layout_id: pending.layout_id,
@@ -5544,6 +5652,24 @@ fn spawn_guest_thread(
                             // gates rather than mis-captures) covers that
                             // case without this needing to generalize
                             // further today.
+                            //
+                            // Review finding (increment-review.md LOW-1 /
+                            // "Finding 4", documented not code-fixed —
+                            // scoped as a LOW, structural-duck-type
+                            // assumption): this match is SHAPE-based (any
+                            // externref whose backing data downcasts to
+                            // `u32` is treated as a `resolve_externref`
+                            // handle), not source-tagged. It is sound TODAY
+                            // only because `resolve_externref` is the ONLY
+                            // externref producer with a bare `u32` backing
+                            // value anywhere in this file. If a SECOND host
+                            // import is ever added that also backs its
+                            // externref with a raw `u32` (for a different
+                            // meaning), this would silently register a
+                            // wrong `(value -> handle)` pair instead of
+                            // gating — revisit with a source-specific
+                            // newtype/marker on the backing data before
+                            // adding such an import.
                             if let Some(&handle) =
                                 v.data(&caller)?.and_then(|data| data.downcast_ref::<u32>())
                             {
