@@ -44,19 +44,28 @@
 ;;      — never `0` (would mean a child actually ran) and never a positive
 ;;      pid (would mean a real child was spawned despite the gate).
 ;;   4. PARENT: touches the (now-gated) externref local through the native
-;;      test probe `native_test_externref_payload`, just to prove the
-;;      resume path completed without trapping or hanging. The result is
-;;      NOT asserted against the original handle — a gated capture does not
-;;      preserve identity across the aborted fork's unwind/rewind.
+;;      test probe `native_test_externref_payload`, and (review fix,
+;;      increment-review.md MEDIUM-2 / "Finding 3", 2026-09-06) NOW ASSERTS
+;;      the result is EXACTLY the original handle (42) — a `fork()` failure
+;;      (`EOPNOTSUPP`) must leave the parent's own state completely
+;;      unaffected, so the parent's local must resolve to its ORIGINAL live
+;;      value, not `null` (which the probe reports as `-1`), across the
+;;      aborted fork's unwind/rewind.
 ;;
 ;; Exit codes (parent-observed; there is never a child to reap):
 ;;   0  = success (fork cleanly EOPNOTSUPP'd, no child spawned, parent
-;;        resumed and ran to completion without hanging)
+;;        resumed and ran to completion without hanging, its externref local
+;;        still resolves to the original handle 42)
 ;;   90 = fork() returned something other than exactly -95 (either it looks
 ;;        like a child (`0`) or a real child pid (positive) — the gate did
 ;;        not fire, or fired with the wrong errno)
 ;;   93 = touching the parent's own (gated) externref local after resume
 ;;        trapped or otherwise misbehaved instead of completing cleanly
+;;   94 = the parent's own (gated) externref local no longer resolves to the
+;;        original handle 42 after resume — the parent WAS corrupted by the
+;;        gated fork (this is the exact defect Finding 3 fixes: a null or
+;;        otherwise wrong value here means `fork()` failure clobbered the
+;;        parent's own state instead of leaving it alone)
 ;;
 ;; Regenerate (from within `scripts/dev-shell.sh`):
 ;;   wat2wasm --enable-exceptions --enable-threads \
@@ -196,14 +205,21 @@
     end
 
     ;; PARENT continues: touch its own (now-gated) externref local through
-    ;; the native test probe, just to prove the resume path completed
-    ;; without trapping OR hanging (the gate-hang fix under test). The
-    ;; result is deliberately NOT asserted against the original handle (42)
-    ;; — a gated capture does not preserve identity across the aborted
-    ;; fork's unwind/rewind.
+    ;; the native test probe, both to prove the resume path completed
+    ;; without trapping OR hanging (the gate-hang fix under test) AND
+    ;; (review fix, Finding 3) to assert the local still resolves to the
+    ;; ORIGINAL handle (42) — a gated fork's `EOPNOTSUPP` failure must leave
+    ;; the parent's own state completely unaffected, not silently substitute
+    ;; `null` (reported as `-1` by this probe) for the local's pre-fork
+    ;; value.
     local.get $externref_local
     call $native_test_externref_payload
-    drop)
+    i32.const 42
+    i32.ne
+    if
+      i32.const 94
+      call $exit_group
+    end)
 
   (func (export "_start")
     call $test_gate

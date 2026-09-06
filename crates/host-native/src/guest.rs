@@ -3324,6 +3324,24 @@ impl ForkCoordState {
 /// accumulated graph into the KFMS scratch arena via [`write_module_state_
 /// arena`], mirroring `sealCapture()`'s `references.sealInto(arena)` +
 /// `arena.seal()`.
+
+/// Review fix (increment-review.md MEDIUM-2 / "Finding 3"): the pre-fork live
+/// value a gated reference-typed local held, preserved so a gated fork's
+/// PARENT-side abort-replay can hand the SAME identity back instead of a
+/// fabricated `null` — mirrors TS `reserveGatedPlaceholder`'s `capturedValues`
+/// retention (`host/src/fork-reference-transaction.ts:301-331`: "keeping the
+/// LIVE captured value so the PARENT still resumes faithfully"). Two variants
+/// because the two live gate call sites that DO have a real value in hand
+/// observe it through different Wasmtime reference types (a plain externref
+/// at `encode_externref`'s no-provenance gate, an anyref-lineage value at
+/// `gc_broker_encode`'s foreign/cross-activation gate); both convert
+/// losslessly to the other via `AnyRef::convert_extern`/`ExternRef::
+/// convert_any`, so either variant can satisfy either decode path below.
+enum GatedOriginal {
+    Externref(wasmtime::OwnedRooted<ExternRef>),
+    Any(wasmtime::OwnedRooted<AnyRef>),
+}
+
 struct NativeReferenceCapture {
     /// The native port of `ForkReferenceTransaction`'s node/vector tables —
     /// see `fork_codec::ReferenceGraphBuilder`'s own doc comment for why
@@ -3366,6 +3384,26 @@ struct NativeReferenceCapture {
     /// lib.rs`), so this bypass, not a real decode, is what keeps a gated
     /// fork's PARENT alive through its own resume. Reset alongside `graph`.
     gated_ids: BTreeSet<u32>,
+    /// Review fix (Finding 3): `(recipe id -> preserved live value)` for
+    /// every [`Self::gated_placeholder`] call this capture made. `None`
+    /// stores for the two "should never happen" DEFENSIVE gate paths
+    /// (`gc_lookup`/`gc_claim`'s "missing transit slot" checks) where the
+    /// transit slot itself held no valid value to preserve in the first
+    /// place — a genuine invariant violation elsewhere, not a normal gated
+    /// kind, so there is no live identity to hand back regardless of this
+    /// fix. Looked up by [`Self::gated_original`] from the PARENT's own
+    /// abort-replay decode paths. Reset alongside `graph`.
+    gated_originals: Vec<(u32, Option<GatedOriginal>)>,
+    /// Synthetic i31 payload counter backing [`Self::gated_placeholder`]'s
+    /// per-call dedup avoidance. Starts at i31's own minimum representable
+    /// value and counts UP (still deep in negative territory even after
+    /// thousands of calls) — see `gated_placeholder`'s doc comment for why a
+    /// fresh, non-deduped node per call is required for this fix and why a
+    /// counter anchored far from typical small guest-chosen i31 payloads
+    /// (array indices, small tags, ...) keeps the collision risk with a
+    /// REAL i31 value negligible without requiring a `fork-codec` API
+    /// change. Reset alongside `graph`.
+    next_gated_payload: i32,
     /// N1-F6: per-CAPTURE identity dedup for a live Wasm-GC value already
     /// assigned a recipe id THIS capture — the native analogue of the TS
     /// `ForkReferenceTransaction`'s per-capture `objectIds`/`capturedValues`
@@ -3384,6 +3422,11 @@ struct NativeReferenceCapture {
     gc_claimed: Vec<(wasmtime::OwnedRooted<AnyRef>, u32)>,
 }
 
+/// Mirrors `fork_codec::reference_graph_builder`'s own private `MIN_I31`
+/// (`-0x4000_0000`, i31's minimum representable signed 31-bit payload) — see
+/// [`NativeReferenceCapture::next_gated_payload`]'s doc comment.
+const GATED_PLACEHOLDER_MIN_PAYLOAD: i32 = -0x4000_0000;
+
 impl NativeReferenceCapture {
     fn new() -> Self {
         Self {
@@ -3391,6 +3434,8 @@ impl NativeReferenceCapture {
             scratch_cursor: 0,
             unsupported_kind: None,
             gated_ids: BTreeSet::new(),
+            gated_originals: Vec::new(),
+            next_gated_payload: GATED_PLACEHOLDER_MIN_PAYLOAD,
             gc_claimed: Vec::new(),
         }
     }
@@ -3454,6 +3499,8 @@ impl NativeReferenceCapture {
         // primary owner; this is the same defense-in-depth belt-and-braces.
         self.unsupported_kind = None;
         self.gated_ids.clear();
+        self.gated_originals.clear();
+        self.next_gated_payload = GATED_PLACEHOLDER_MIN_PAYLOAD;
     }
 
     /// `markUnsupportedReferenceKind` port: record that the active capture
@@ -3472,25 +3519,42 @@ impl NativeReferenceCapture {
         self.unsupported_kind.take()
     }
 
-    /// `reserveGatedPlaceholder` port: reserve (or reuse) a self-contained,
-    /// non-null leaf node — a canonical `i31` value — for a GATED capture
-    /// kind. Unlike `reserveGatedPlaceholder`'s JS implementation (which
-    /// pushes a FRESH node per call, since it separately keeps the live
-    /// value for a faithful parent-side identity restore), this dedupes via
-    /// `intern_i31` because native does NOT attempt any identity-preserving
-    /// restore for a gated kind (`docs/plans/2026-09-05-n1-i5b-reference-
-    /// capture-grounding.md` §0: "Do NOT attempt to reconstruct externref/GC
-    /// — that is F5/F6"). Every gate stub sharing one placeholder id is
-    /// harmless: the fork ALWAYS aborts before any child reads this graph
-    /// (`drive_fork_capture_seal_and_launch_child`), so the graph's content
-    /// past "validates cleanly and is admissible" is otherwise unobserved —
-    /// mirrors the JS doc comment's own "sealed graph is discarded unread."
-    fn gated_placeholder(&mut self) -> wasmtime::Result<u32> {
+    /// `reserveGatedPlaceholder` port: reserve a self-contained, non-null
+    /// leaf node — a canonical `i31` value — for a GATED capture kind, and
+    /// (review fix, Finding 3) preserve `original`'s live value so the
+    /// PARENT's own abort-replay can hand back the SAME identity instead of
+    /// a fabricated `null`.
+    ///
+    /// UPDATED from the prior "shared placeholder" design: this now mirrors
+    /// `reserveGatedPlaceholder`'s JS implementation exactly — a FRESH node
+    /// per call, via a synthetic i31 payload ([`Self::next_gated_payload`])
+    /// rather than `intern_i31`'s always-`0`, value-keyed dedup cache. A
+    /// shared id was sound only so long as the sealed graph's content was
+    /// truly "discarded unread" (still true for a CHILD, since a gated fork
+    /// never spawns one) — but the PARENT's own frame rewind DOES read
+    /// through these ids, one per originally-gated local, and two different
+    /// locals sharing one id could only ever restore ONE of their original
+    /// values correctly. A distinct id per call is required for the PARENT
+    /// restore to be correct for every gated local in the same fork, not
+    /// just the first.
+    fn gated_placeholder(&mut self, original: Option<GatedOriginal>) -> wasmtime::Result<u32> {
+        let payload = self.next_gated_payload;
+        // Stay deep in i31's negative range — see `next_gated_payload`'s doc
+        // comment. Exhausting this (billions of gated calls in one capture)
+        // is not a realistic scenario; fail closed rather than wrap back
+        // into a range a real guest payload could plausibly use.
+        if payload >= 0 {
+            return Err(wasmtime::Error::msg(
+                "gated placeholder payload counter exhausted its reserved negative range",
+            ));
+        }
+        self.next_gated_payload = payload + 1;
         let id = self
             .graph
-            .intern_i31(0)
+            .intern_i31(payload)
             .map_err(|e| wasmtime::Error::msg(format!("gated placeholder intern failed: {e:?}")))?;
         self.gated_ids.insert(id);
+        self.gated_originals.push((id, original));
         Ok(id)
     }
 
@@ -3498,6 +3562,28 @@ impl NativeReferenceCapture {
     /// real reference data — see [`Self::gated_ids`]'s doc comment.
     fn is_gated_id(&self, recipe_id: u32) -> bool {
         self.gated_ids.contains(&recipe_id)
+    }
+
+    /// The live value preserved for a [`Self::gated_placeholder`] call that
+    /// minted `recipe_id`, or `None` if `recipe_id` is not a gated id, or if
+    /// it is one of the "should never happen" defensive gates that had no
+    /// live value to preserve — see [`Self::gated_originals`]'s doc comment.
+    fn gated_original(&self, recipe_id: u32) -> Option<&GatedOriginal> {
+        self.gated_originals
+            .iter()
+            .find(|(id, _)| *id == recipe_id)
+            .and_then(|(_, original)| original.as_ref())
+    }
+
+    /// Every `(recipe id, live value)` this capture actually preserved —
+    /// i.e. every [`Self::gated_originals`] entry that is `Some`, skipping
+    /// the "should never happen" defensive gates that had none. Used by the
+    /// gated-abort anyref transit restore in
+    /// `drive_fork_capture_seal_and_launch_child`.
+    fn gated_originals_iter(&self) -> impl Iterator<Item = (u32, &GatedOriginal)> {
+        self.gated_originals
+            .iter()
+            .filter_map(|(id, original)| original.as_ref().map(|value| (*id, value)))
     }
 
     /// `__wpk_fork_ref_scratch_reserve(size) -> ptr|0`: a bump allocator over
@@ -5112,12 +5198,23 @@ fn spawn_guest_thread(
             // `fm_externref_handle`, documented to "TRAP on any
             // inconsistency") on that id would trap the whole store. This
             // wrapper checks `NativeReferenceCapture::is_gated_id` FIRST and
-            // short-circuits to a benign `null` externref for exactly those
-            // ids, falling through to the real module export for everything
-            // else (a supported fork's real funcref-adjacent externref
-            // decode, if that ever exists, is unaffected). Converted to a
-            // `TypedFunc` once here (not per-call) purely for a cleaner call
-            // site than the untyped `Val` array API.
+            // short-circuits for exactly those ids, falling through to the
+            // real module export for everything else (a supported fork's
+            // real funcref-adjacent externref decode, if that ever exists,
+            // is unaffected). Converted to a `TypedFunc` once here (not
+            // per-call) purely for a cleaner call site than the untyped
+            // `Val` array API.
+            //
+            // Review fix (increment-review.md MEDIUM-2 / "Finding 3"): the
+            // short-circuit used to unconditionally return `null`, silently
+            // overwriting the PARENT's own live pre-fork value at this local
+            // — a `fork()` failure (`EOPNOTSUPP`) must leave the parent's
+            // state completely unaffected. It now returns the ORIGINAL live
+            // value `NativeReferenceCapture::gated_placeholder` preserved at
+            // capture time (`gated_original`), falling back to `null` only
+            // when no such value was ever recorded (the "should never
+            // happen" defensive gates, which had no live value to begin
+            // with regardless of this fix).
             let decode_externref_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_DECODE_EXTERNREF;
             if guest_declares(decode_externref_name) {
                 let typed_result = decode_externref
@@ -5134,7 +5231,21 @@ fn spawn_guest_thread(
                                 let gated =
                                     capture_for_decode.lock().unwrap().is_gated_id(recipe_id as u32);
                                 if gated {
-                                    return Ok(None);
+                                    let restored = {
+                                        let guard = capture_for_decode.lock().unwrap();
+                                        match guard.gated_original(recipe_id as u32) {
+                                            Some(GatedOriginal::Externref(owned)) => {
+                                                Some(owned.to_rooted(&mut caller))
+                                            }
+                                            Some(GatedOriginal::Any(owned)) => {
+                                                let anyref = owned.to_rooted(&mut caller);
+                                                drop(guard);
+                                                ExternRef::convert_any(&mut caller, anyref).ok()
+                                            }
+                                            None => None,
+                                        }
+                                    };
+                                    return Ok(restored);
                                 }
                                 decode_externref_typed.call(&mut caller, recipe_id as u32)
                             },
@@ -5457,9 +5568,15 @@ fn spawn_guest_thread(
                                 .map(|id| id as i32)
                                 .map_err(|e| wasmtime::Error::msg(format!("intern_externref failed: {e:?}"))),
                             None => {
+                                // Review fix (Finding 3): preserve `v` itself
+                                // so the PARENT's own abort-replay hands this
+                                // exact externref back, not `null`.
+                                let original = v.to_owned_rooted(&mut caller)?;
                                 let mut capture = capture_for_externref.lock().unwrap();
                                 capture.mark_unsupported("externref (no recorded provenance)");
-                                capture.gated_placeholder().map(|id| id as i32)
+                                capture
+                                    .gated_placeholder(Some(GatedOriginal::Externref(original)))
+                                    .map(|id| id as i32)
                             }
                         }
                     },
@@ -5605,10 +5722,13 @@ fn spawn_guest_thread(
                         // The transit slot held something other than a
                         // non-null anyref — should not happen given the
                         // codec's own publish-before-call contract, but stay
-                        // fail-closed rather than fabricate an identity.
+                        // fail-closed rather than fabricate an identity. No
+                        // live value to preserve here: the slot itself was
+                        // never valid, a genuine invariant violation
+                        // elsewhere, not a normal gated kind.
                         let mut capture = capture_for_gc.lock().unwrap();
                         capture.mark_unsupported("externref or Wasm-GC (anyref): missing transit slot");
-                        capture.gated_placeholder().map(|id| id as i32)
+                        capture.gated_placeholder(None).map(|id| id as i32)
                     },
                 );
                 if let Err(e) = result {
@@ -5638,9 +5758,12 @@ fn spawn_guest_thread(
                         let Some(wasmtime::Ref::Any(Some(anyref))) =
                             gc_transit_table_for_claim.get(&mut caller, slot_index)
                         else {
+                            // No live value to preserve here either — see
+                            // the identical defensive gate in `gc_lookup`
+                            // above.
                             let mut capture = capture_for_gc.lock().unwrap();
                             capture.mark_unsupported("gc: missing transit slot at claim");
-                            let id = capture.gated_placeholder()?;
+                            let id = capture.gated_placeholder(None)?;
                             drop(capture);
                             ensure_gc_transit_capacity(gc_transit_table_for_claim, &mut caller, id)?;
                             return Ok(id as i32);
@@ -5715,10 +5838,23 @@ fn spawn_guest_thread(
                 let result = linker.func_wrap(
                     "env",
                     gc_broker_encode_name,
-                    move |mut caller: Caller<'_, ()>, _slot: i32| -> wasmtime::Result<i32> {
+                    move |mut caller: Caller<'_, ()>, slot: i32| -> wasmtime::Result<i32> {
+                        // Review fix (Finding 3): peek the SAME staging slot
+                        // `gc_lookup` reads (mirrors that binding's own
+                        // `slot_index` convention) to preserve the real
+                        // foreign/cross-activation anyref so the PARENT's own
+                        // abort-replay can hand this exact identity back
+                        // rather than `null`.
+                        let slot_index = i64::from(slot).max(0) as u64;
+                        let original = match gc_transit_table_for_broker.get(&mut caller, slot_index) {
+                            Some(wasmtime::Ref::Any(Some(anyref))) => {
+                                Some(GatedOriginal::Any(anyref.to_owned_rooted(&mut caller)?))
+                            }
+                            _ => None,
+                        };
                         let mut capture = capture_for_gc.lock().unwrap();
                         capture.mark_unsupported("gc: foreign/cross-activation anyref");
-                        let id = capture.gated_placeholder()?;
+                        let id = capture.gated_placeholder(original)?;
                         drop(capture);
                         // `emit_encode_anyref`'s tail unconditionally publishes
                         // into `transit[id + 1]` right after this import
@@ -7062,11 +7198,10 @@ fn drive_fork_capture_seal_and_launch_child(
         // `drive_reference_replay`'s own growth step guards (see there for
         // the general rationale). There is no drive PLAN to read recipe ids
         // out of here (that machinery is exactly what this branch skips), so
-        // size from the CAPTURE-side graph directly: `gated_placeholder`
-        // dedupes to ONE shared `i31` node regardless of how many gated
-        // values this fork observed (`intern_i31` dedupes by value, always
-        // `0`), so the sealed graph's own node count is already the exact
-        // upper bound — no plan-shaped data needed.
+        // size from the CAPTURE-side graph directly: every `gated_placeholder`
+        // call (review fix, Finding 3: now a FRESH node per call, not a
+        // shared dedup) is already reflected in the graph's own node count,
+        // so it remains the exact upper bound — no plan-shaped data needed.
         {
             let node_count = capture.lock().unwrap().graph.nodes().len();
             let Ok(needed) = u64::try_from(node_count).map(|n| n + 1) else {
@@ -7084,6 +7219,51 @@ fn drive_fork_capture_seal_and_launch_child(
                     return false;
                 }
             }
+            // Review fix (increment-review.md MEDIUM-2 / "Finding 3"): the
+            // struct/array/i31/broker-gated call sites already publish their
+            // ORIGINAL live anyref back into `transit[id + 1]` themselves,
+            // right after their own host import call returns (the guest's
+            // own generated code does this unconditionally — see e.g.
+            // `emit_encode_layout`/`emit_encode_anyref`'s tail — so the
+            // `grow` above, which only fills entirely NEW slots with `null`,
+            // does not disturb an already-populated one). But that guest-side
+            // publish is not the only way a slot for a gated id can end up
+            // here: re-set every preserved original explicitly so the
+            // PARENT's own `decode_anyref` (`table.get(transit, recipe+1)`)
+            // is correct regardless of which call path produced this gated
+            // id, matching the externref decode bypass's identical restore
+            // just above in the sibling `decode_externref` wrapper.
+            let capture_guard = capture.lock().unwrap();
+            for (id, original) in capture_guard.gated_originals_iter() {
+                let value = match original {
+                    GatedOriginal::Any(owned) => owned.to_rooted(&mut *store),
+                    GatedOriginal::Externref(owned) => {
+                        let externref = owned.to_rooted(&mut *store);
+                        match wasmtime::AnyRef::convert_extern(&mut *store, externref) {
+                            Ok(anyref) => anyref,
+                            Err(e) => {
+                                eprintln!(
+                                    "restoring gated fork-module transit slot for recipe {id} \
+                                     (gated fork abort) failed to convert its externref to an \
+                                     anyref: {e:#}"
+                                );
+                                return false;
+                            }
+                        }
+                    }
+                };
+                let slot = u64::from(id) + 1;
+                if let Err(e) =
+                    fm.gc_transit_table.set(&mut *store, slot, wasmtime::Ref::Any(Some(value)))
+                {
+                    eprintln!(
+                        "restoring gated fork-module transit slot {slot} (gated fork abort) \
+                         failed: {e:#}"
+                    );
+                    return false;
+                }
+            }
+            drop(capture_guard);
         }
         if !begin_reference_replay_only(&mut *store, fm) {
             return false;
