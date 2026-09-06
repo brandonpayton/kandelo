@@ -11015,9 +11015,23 @@ export class CentralizedKernelWorker {
         requestFlags
         & CHANNEL_REQUEST_FLAG_CANCELLATION_WAKE_ALLOWED
       ) !== 0;
+    // A RAW syscall (HOST_RAW_SYSCALLS) never legitimately carries
+    // REQUEST_FLAG_OPAQUE_RECORD: that bit means the guest self-marshalled its
+    // pointer arguments into an opaque record, which only the non-RAW
+    // marshalling path produces. This combination is therefore just another
+    // malformed-identity request, exactly like an unknown flag bit or
+    // cancellation-wake without a cancellation point — reject it here, at the
+    // same early identity gate, with EINVAL. (A correctly generated guest
+    // never reaches this: `#handleSyscallInner`'s later RAW/record fast-path
+    // still asserts the invariant as defense in depth for any caller that
+    // bypasses this gate.)
+    const opaqueRecordOnRawSyscall =
+      (requestFlags & CHANNEL_REQUEST_FLAG_OPAQUE_RECORD) !== 0
+      && HOST_RAW_SYSCALLS.has(syscallNr);
     if (
       (requestFlags & ~CHANNEL_REQUEST_FLAGS_KNOWN_MASK) !== 0
       || (cancellationWakeAllowed && !cancellationPoint)
+      || opaqueRecordOnRawSyscall
     ) {
       this.completeChannelRawAndRelisten(channel, -1, EINVAL, entry);
       return null;
