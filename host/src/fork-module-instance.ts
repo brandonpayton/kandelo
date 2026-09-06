@@ -272,25 +272,10 @@ export interface InstantiateForkModuleOptions {
    */
   staticRootCatalog?: WebAssembly.Table;
   /**
-   * Real engine-floor `wpk_fork_host.*` import bodies for the capabilities the
-   * co-resident module still routes as opaque `u32` ordinals — exception-tag
-   * minting, unwind-transport recognition, and child instantiate/spawn
-   * (`crates/fork-module/src/host_capabilities.rs`). Since M2, externref
-   * reconstruction is NOT one of these: it is the single reference-returning
-   * `env.resolve_externref` import (see `resolveExternref` below), because the
-   * injected binder can call a reference-typed import directly and a Rust
-   * function cannot itself return an `externref`. When a name here is omitted
-   * (frame-only / funcref-only forks, and tests) it defaults to an inert
-   * `() => 0` stub, which fits every remaining `wpk_fork_host` signature (all
-   * return i32/u32) and is never called unless that capability is exercised, so
-   * the inert default keeps flag-off byte-identical.
-   */
-  hostCapabilities?: Readonly<Record<string, (...args: number[]) => number>>;
-  /**
    * The `env.resolve_externref(handle: i32) -> externref` body (M2). The
-   * module DECLARES this as a plain (non-`wpk_fork_host`) import because it
-   * returns a live reference, which the `wpk_fork_host` stub loop below cannot
-   * express (every stub there returns `i32`). The injected
+   * module DECLARES this as a plain `env` import (not the deleted
+   * `wpk_fork_host.*` seam, H3, 2026-09-06) because it returns a live
+   * reference. The injected
    * `__wpk_fork_ref_decode_externref` export and the externref-transit drive
    * step both call it directly with `fm_externref_handle(recipe)`; production
    * backs it with `createForkModuleHostCapabilities` (a `ForkExternrefTokenCache`
@@ -488,20 +473,9 @@ export function instantiateForkModule(
   const staticRootCatalog =
     options.staticRootCatalog ?? new ForkAnyrefTransitTable().table;
 
-  // The module DECLARES the `wpk_fork_host.*` engine-floor seam imports (Phase 6
-  // D6, `crates/fork-module/src/host_capabilities.rs`). For the externref path
-  // (D6.2) the caller supplies REAL bodies via `hostCapabilities`; otherwise
-  // (frame-only / funcref-only forks, and tests) each import gets an inert
-  // `() => 0` stub, which fits every signature (all return i32/u32) and is never
-  // called because a funcref/null graph opens no host generation.
-  const forkHostStubs: Record<string, (...args: number[]) => number> = {};
-  for (const imp of WebAssembly.Module.imports(module)) {
-    if (imp.module !== "wpk_fork_host") continue;
-    forkHostStubs[imp.name] = options.hostCapabilities?.[imp.name] ?? (() => 0);
-  }
-
-  // `env.resolve_externref` (M2): a plain `env` import, not a `wpk_fork_host`
-  // ordinal stub, because it returns a live reference. Default to a body that
+  // `env.resolve_externref` (M2): a plain `env` import, not the deleted
+  // `wpk_fork_host.*` seam (H3, 2026-09-06), because it returns a live
+  // reference. Default to a body that
   // fails loud if actually invoked — a funcref/null-only fork never decodes an
   // externref, so the default is inert (never called) on that path, and any
   // path that DOES reach it without a real body is a genuine caller bug, not a
@@ -527,7 +501,6 @@ export function instantiateForkModule(
       __stack_pointer: stackPointerGlobal,
       resolve_externref: resolveExternref,
     },
-    wpk_fork_host: forkHostStubs,
   };
 
   // Synchronous instantiation runs the module's start (data-reloc / passive

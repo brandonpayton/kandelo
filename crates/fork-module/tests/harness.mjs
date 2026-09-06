@@ -110,24 +110,17 @@ for (const need of [
 ]) {
   assert.ok(imports.includes(need), `module must import ${need}, got ${imports}`);
 }
-// The engine-floor host-capability seam (Phase 6 D6, ADDITIVE): the module now
-// DECLARES the `wpk_fork_host.*` imports (see src/host_capabilities.rs). Assert
-// the whole seam is exposed so the artifact carries the eventual host API
-// surface, even though this harness — which exercises only the reference-free
-// frame/continuation path — never calls them. Item 5 (funcref/static-root/
-// ref-global-install are wasm `table.get`/`table.set`, not host calls) and M2
-// (begin_generation/resolve_externref/transit_publish/transit_read/
-// release_generation collapsed into the injected binder calling the single
-// residual `resolve_externref` import directly) shrank this list; see the
-// NOTE on the extern block in `src/host_capabilities.rs`.
-for (const need of [
-  "wpk_fork_host.host_mint_exception_tag",
-  "wpk_fork_host.host_provide_unwind_transport_tag",
-  "wpk_fork_host.host_recognize_unwind_transport",
-  "wpk_fork_host.host_last_errno",
-]) {
-  assert.ok(imports.includes(need), `module must import ${need}, got ${imports}`);
-}
+// H3 (host-surface minimization, 2026-09-06): the engine-floor host-capability
+// seam (Phase 6 D6, `wpk_fork_host.*`) that used to be asserted present here
+// was DELETED — it was never wired to any guest on any host (the module's
+// `hostCapabilities` option was never passed a real body by any caller), and
+// the completed F5/F6 reference-completeness work bypassed it entirely.
+// Assert the ABSENCE instead, so a future regression that reintroduces the
+// seam surfaces here.
+assert.ok(
+  !imports.some((i) => i.startsWith("wpk_fork_host.")),
+  `module must not import from wpk_fork_host (deleted seam), got ${imports}`,
+);
 
 const exportNames = new Set(WebAssembly.Module.exports(module).map((e) => e.name));
 for (const name of [
@@ -160,49 +153,9 @@ for (const name of [
   "fm_exnrefs_reconstructed",
   // Phase 6 D6.4a typed-GC (struct/array/i31) reconstruction proof-of-use counter.
   "fm_gc_nodes_reconstructed",
-  "fm_host_capabilities_probe",
 ]) {
   assert.ok(exportNames.has(name), `module must export ${name}`);
 }
-
-// REAL (not inert) engine-floor host-capability bodies. The frame/continuation
-// path under test never calls these, but the `fm_host_capabilities_probe`
-// retention anchor drives the WHOLE (post-M2, shrunk) seam once, so give it
-// functioning bodies. This proves, in a real engine, that the module's
-// `WpkForkHost` routes the seam's opaque `u32` ordinals across the import
-// boundary end to end. Every handle-returning body returns a NON-ZERO ordinal
-// (0 == failure). `hostCalls` records that the drive actually invoked the
-// tag/lifecycle imports (M2 retired resolve_externref/transit_publish/
-// transit_read/begin_generation/release_generation from this Rust seam — the
-// injected binder calls the single residual `resolve_externref` import
-// directly, validated in Task 3/6, not here).
-const hostCalls = { mintExceptionTag: 0, provideUnwindTransportTag: 0, recognizeUnwindTransport: 0 };
-const hostState = { nextTag: 0 };
-const forkHostStubs = {
-  host_mint_exception_tag: () => {
-    hostCalls.mintExceptionTag += 1;
-    hostState.nextTag += 1;
-    return hostState.nextTag;
-  },
-  host_provide_unwind_transport_tag: () => {
-    hostCalls.provideUnwindTransportTag += 1;
-    return 0xffffffff;
-  },
-  host_recognize_unwind_transport: () => {
-    hostCalls.recognizeUnwindTransport += 1;
-    return 1;
-  },
-  host_instantiate_child: () => 1,
-  host_spawn_thread: () => 1,
-  host_last_errno: () => 0,
-};
-// Any import we did not name above (future additions) stays inert.
-for (const imp of WebAssembly.Module.imports(module)) {
-  if (imp.module === "wpk_fork_host" && !(imp.name in forkHostStubs)) {
-    forkHostStubs[imp.name] = () => 0;
-  }
-}
-importObject["wpk_fork_host"] = forkHostStubs;
 
 const instance = new WebAssembly.Instance(module, importObject);
 const x = instance.exports;
@@ -215,26 +168,6 @@ const readU32 = (off) => view().getUint32(off, true);
 const writeU32 = (off, val) => view().setUint32(off, val >>> 0, true);
 const readByte = (off) => u8()[off];
 const errno = () => x.fm_last_errno();
-
-// -- Drive the (post-M2, shrunk) engine-floor seam end to end via the anchor ---
-//
-// `fm_host_capabilities_probe` exercises every remaining `WpkForkHost` method
-// once (mint/provide/recognize the exception + unwind-transport tags, plus the
-// lifecycle instantiate/spawn pair). With the REAL host bodies above, driving
-// it proves the module routes the seam across the wasm→JS import boundary end
-// to end (not optimized out).
-{
-  const acc = x.fm_host_capabilities_probe(0x1234);
-  assert.equal(typeof acc, "bigint", "probe returns an i64");
-  assert.ok(hostCalls.mintExceptionTag > 0, "seam drove host_mint_exception_tag");
-  assert.ok(hostCalls.provideUnwindTransportTag > 0, "seam drove host_provide_unwind_transport_tag");
-  assert.ok(hostCalls.recognizeUnwindTransport > 0, "seam drove host_recognize_unwind_transport");
-  console.log(
-    `  ok: engine-floor seam driven — mint_exception_tag x${hostCalls.mintExceptionTag}, `
-      + `provide_unwind_transport_tag x${hostCalls.provideUnwindTransportTag}, `
-      + `recognize_unwind_transport x${hostCalls.recognizeUnwindTransport}`,
-  );
-}
 
 // -- M2: fm_externref_handle traps outside a seeded reference replay -----------
 //
@@ -677,8 +610,6 @@ function instantiateAt(mem, moduleBase, stackTop) {
       __table_base: new WebAssembly.Global({ value: "i32", mutable: false }, 0),
       resolve_externref: (_handle) => ({}),
     },
-    // Inert engine-floor stubs (never called by the reference-free frame path).
-    wpk_fork_host: forkHostStubs,
   }).exports;
 }
 

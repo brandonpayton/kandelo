@@ -28,7 +28,9 @@
 //   (b) PROOF OF USE — `fm_exnrefs_reconstructed` advanced by the exnref-node
 //       count (bookkeeping, from `fm_begin_reference_replay`) and the drive plan
 //       actually resolved the payload exactly once through the host seam.
-//   (c) MINT INERT — `host_mint_exception_tag` was not called.
+//   (c) MINT INERT — no exception tag is minted (the deleted `wpk_fork_host.*`
+//       `host_mint_exception_tag` seam, H3, is gone — the module no longer
+//       even declares the import).
 //   (d) R1 GUARD IS LOAD-BEARING — when the host loses the reachable payload's
 //       identity (`resolve_externref` returns null for it), the injected
 //       non-null check TRAPS the drive rather than silently rooting a null/wrong
@@ -151,7 +153,6 @@ const MODULE = new WebAssembly.Module(
 function instantiate(
   memory: WebAssembly.Memory,
   resolveExternref: (handle: number) => unknown,
-  hostCapabilities?: Readonly<Record<string, (...args: number[]) => number>>,
 ) {
   const reserveBase = 8 * 1024 * 1024;
   const fm = instantiateForkModule({
@@ -161,7 +162,6 @@ function instantiate(
     reserve: () => reserveBase,
     label: "exnref-replay-test",
     resolveExternref,
-    hostCapabilities,
   });
   return { fm, x: fm.exports as unknown as ForkModuleRefExports };
 }
@@ -197,21 +197,8 @@ describe("fork-module exnref reference reconstruction + transit into production 
     const tokens = new ForkExternrefTokenCache(GENERATION_ID);
     const hostCapabilities = createForkModuleHostCapabilities({ tokens });
 
-    // Spy on `host_mint_exception_tag` (inert stub in production for this seam)
-    // to prove the drive never mints an exception tag: the guest export owns it.
-    let mintCalls = 0;
-
     const root = buildExnrefArena(memory);
-    const { fm, x } = instantiate(
-      memory,
-      hostCapabilities.imports.resolve_externref,
-      {
-        host_mint_exception_tag: () => {
-          mintCalls += 1;
-          return 0;
-        },
-      },
-    );
+    const { fm, x } = instantiate(memory, hostCapabilities.imports.resolve_externref);
 
     x.fm_set_format(PTR_WIDTH, 0);
     expect(x.fm_last_errno()).toBe(0);
@@ -250,8 +237,12 @@ describe("fork-module exnref reference reconstruction + transit into production 
     // The EXN step actually ran (the guest's exception_materialize order code).
     expect(guest.order()).toBe(3);
 
-    // (c) MINT INERT — the drive never minted an exception tag.
-    expect(mintCalls).toBe(0);
+    // (c) MINT INERT — the drive never mints an exception tag: the guest
+    // export owns exception materialization. This used to be proven by
+    // spying on a `host_mint_exception_tag` stub (`wpk_fork_host.*` seam);
+    // that seam was deleted (H3, 2026-09-06) because it was never wired to
+    // any guest, so the proof is now structural: the module no longer even
+    // declares the import.
   });
 
   it("R1 GUARD (wasm-level): a resolved-but-lost externref payload TRAPS the drive, never silently mis-roots the exnref's identity", () => {

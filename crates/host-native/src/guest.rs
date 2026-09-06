@@ -2289,12 +2289,13 @@ fn compute_guest_memory(engine: &Engine, guest_module: &Module) -> anyhow::Resul
 //
 // N1-I5 Task 2: `env.resolve_externref` is no longer part of that inert-trap
 // set — [`define_resolve_externref`] below defines it as a REAL `Func` before
-// `define_unknown_imports_as_traps` runs. The `wpk_fork_host.*` imports stay
-// trapped: native's `ForkHostCapabilities` primitives
-// (`crate::fork_host_capabilities::NativeForkHostCapabilities`) are direct
-// Rust-to-Wasmtime calls, not Wasm imports the module invokes (see that
-// module's doc comment), so those names are never actually reached by this
-// path.
+// `define_unknown_imports_as_traps` runs.
+//
+// H3 (host-surface minimization, 2026-09-06): the `wpk_fork_host.*` seam
+// (`crate::fork_host_capabilities::NativeForkHostCapabilities`) this comment
+// used to describe was deleted — it was never called from this path (or any
+// other). The fork-module artifact no longer declares those imports, so
+// there is nothing left for `define_unknown_imports_as_traps` to catch here.
 
 /// Byte size of the fork-module's own shadow stack, appended above its
 /// static/BSS footprint when reserving its host-owned region. Mirrors
@@ -4428,16 +4429,15 @@ pub(crate) fn instantiate_fork_module(
     // (not a fresh one per definition) is required for identity.
     define_resolve_externref(&mut linker, externref_registry)?;
 
-    // Every remaining function import is the exception-path seam
-    // (`wpk_fork_host.host_last_errno`/`host_mint_exception_tag`/
+    // H3 (host-surface minimization, 2026-09-06): the `wpk_fork_host.*`
+    // exception-path seam this comment used to describe
+    // (`host_last_errno`/`host_mint_exception_tag`/
     // `host_recognize_unwind_transport`/`host_provide_unwind_transport_tag`/
-    // `host_spawn_thread`/`host_instantiate_child`) — this frames-only path
-    // never calls any of them, and native's `ForkHostCapabilities` primitives
-    // are direct Rust calls (`crate::fork_host_capabilities`), not Wasm
-    // imports the module reaches. `define_unknown_imports_as_traps` reads
-    // each remaining import's EXACT declared `FuncType` and defines a stub
-    // with that signature that traps when called, so a real (buggy) call
-    // surfaces loudly instead of silently returning a wrong-typed default.
+    // `host_spawn_thread`/`host_instantiate_child`) is deleted; the
+    // fork-module artifact no longer declares those imports. Any future
+    // import this frames-only path does not know about still needs a
+    // truthful stub rather than a silent wrong-typed default, so the
+    // catch-all trap pass stays.
     linker.define_unknown_imports_as_traps(&module)?;
 
     let instance = linker.instantiate(&mut *store, &module)?;

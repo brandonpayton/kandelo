@@ -51,16 +51,16 @@ wasmtime = "48"
 # never hand-copied magic numbers.
 wasm-posix-shared = { path = "../shared" }
 
-# N1-I5 Task 2: the portable, `no_std`, wasmtime-free fork core's engine-floor
-# trait (`ForkHostCapabilities`) — the minimal host API surface a fork backend
-# implements for the tag-identity primitives Wasm cannot express itself (see
-# `crates/fork-codec/src/host_capabilities.rs`). `fork-codec`'s own
-# `native_sketch` module is a documentation-only, no-`wasmtime`-dependency
-# SKETCH (gated behind its `native-sketch` feature, which this crate does NOT
-# enable) — it is not meant to become the real backend. This crate provides
-# the REAL Wasmtime-backed impl instead
-# (`crate::fork_host_capabilities::NativeForkHostCapabilities`), since only a
-# `std` crate that already depends on `wasmtime` can hold a `Tag`.
+# The portable, `no_std`, wasmtime-free fork core: wire decoders, the linked-
+# frame writer, the replay journal, the rewind driver, and the reference/GC
+# graph builder this crate drives directly (`fork_codec::ReferenceGraphBuilder`,
+# `gc_codec`, `drive_plan`, `reference_replay`, etc. throughout `guest.rs`). H3
+# (host-surface minimization, 2026-09-06) deleted the `ForkHostCapabilities`
+# engine-floor trait this dependency used to also carry — it was never wired
+# to any guest on any host (native trapped every `wpk_fork_host.*` import as
+# unreachable) and the completed F5/F6 reference-completeness work bypassed
+# it entirely, so `fork-codec` stays a dependency solely for the live
+# portable core above.
 fork-codec = { path = "../fork-codec" }
 
 # Ergonomic error propagation for the pump (`bail!`, `?` across the many

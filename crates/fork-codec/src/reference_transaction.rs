@@ -33,15 +33,19 @@
 //!     artifact; the reconstruction drive (D6.1+) owns adoption identity.
 //!
 //! This slice is the PURE `&[u8] -> graph` decode only. The LIVE materialization
-//! half is DEFERRED to the reconstruction drive (Phase 6 D6.1+): minting and
-//! publishing real reference identities through `ForkHostCapabilities`
-//! (`host_decode_externref`, `host_gc_transit_publish`/`read`, `host_mint_tag`,
-//! `host_resolve_funcref`, `host_install_reference_global`,
-//! `host_release_ordinals`), the topological drive-order that walks this graph
-//! (`materializeAllTyped`), and the engine-floor identity providers that stay
-//! JS/host callbacks. Here we only decode the bytes into the validated graph the
-//! drive will consume. Every framing or consistency violation yields
-//! `Err(Errno::EINVAL)`; the function never panics.
+//! half is the reconstruction drive (Phase 6 D6.1+, F5/F6, completed): the
+//! injected binder and the pre-existing JS drive-order (`materializeTypedGraph`)
+//! walk this graph and mint/publish real reference identities directly — a
+//! funcref/static-root resolve is a wasm `table.get`, and the externref round
+//! trip collapses into the injected binder calling the single residual host
+//! import `resolve_externref(handle) -> externref` (M2). No separate
+//! `ForkHostCapabilities` engine-floor trait/import seam was needed for this;
+//! an earlier speculative version of that seam existed
+//! (`crates/fork-module/src/host_capabilities.rs`) but was never wired to any
+//! guest on any host and was deleted (H3, 2026-09-06). Here we only decode the
+//! bytes into the validated graph the drive consumes. Every framing or
+//! consistency violation yields `Err(Errno::EINVAL)`; the function never
+//! panics.
 
 use wasm_posix_shared::Errno;
 

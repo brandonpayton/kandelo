@@ -6462,8 +6462,9 @@ export async function centralizedThreadWorkerMain(
     // block, gated identically (flag on, single-activation via `!hasDylinkForkRole`,
     // width match, catalog fits the cap). The pthread parent never reconstructs
     // references (that happens in the child), so `resolve_externref` is wired
-    // (below, for identity parity) but expected to stay idle here; every other
-    // `wpk_fork_host` import instantiates with the inert stub loop.
+    // (below, for identity parity) but expected to stay idle here. (The
+    // `wpk_fork_host.*` seam this comment used to describe was deleted, H3,
+    // 2026-09-06 — the module no longer declares those imports at all.)
     // Flag-off / non-qualifying keeps `threadForkModuleInstance` null and every
     // fork on the byte-identical JS path.
     let threadForkModuleInstance: ForkModuleInstance | null = null;

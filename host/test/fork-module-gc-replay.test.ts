@@ -36,7 +36,9 @@
 //   (b) PROOF OF USE — `fm_gc_nodes_reconstructed` advanced by the struct+array
 //       count (bookkeeping) and the drive plan resolved the reachable leaf
 //       exactly once through the host seam.
-//   (c) MINT INERT — `host_mint_exception_tag` was not called (no exnref).
+//   (c) MINT INERT — no exception tag is minted (no exnref; the deleted
+//       `wpk_fork_host.*` `host_mint_exception_tag` seam, H3, is gone — the
+//       module no longer even declares the import).
 //   (d) R1 GUARD IS LOAD-BEARING — when the host loses the reachable leaf's
 //       identity (`resolve_externref` returns null for it), the injected
 //       non-null check TRAPS the drive rather than silently rooting a null/wrong
@@ -189,7 +191,6 @@ const MODULE = new WebAssembly.Module(
 function instantiate(
   memory: WebAssembly.Memory,
   resolveExternref: (handle: number) => unknown,
-  hostCapabilities?: Readonly<Record<string, (...args: number[]) => number>>,
 ) {
   const reserveBase = 8 * 1024 * 1024;
   const fm = instantiateForkModule({
@@ -199,7 +200,6 @@ function instantiate(
     reserve: () => reserveBase,
     label: "gc-replay-test",
     resolveExternref,
-    hostCapabilities,
   });
   return { fm, x: fm.exports as unknown as ForkModuleRefExports };
 }
@@ -233,22 +233,8 @@ describe("fork-module typed-GC (struct/array/i31) admission + leaf rooting throu
     const tokens = new ForkExternrefTokenCache(GENERATION_ID);
     const hostCapabilities = createForkModuleHostCapabilities({ tokens });
 
-    // Spy on `host_mint_exception_tag` (inert stub for this seam) to prove the
-    // typed-GC drive never mints an exception tag: there is no exnref, and the
-    // module does not throw.
-    let mintCalls = 0;
-
     const { root, codecPtr } = buildGcCycleArena(memory);
-    const { fm, x } = instantiate(
-      memory,
-      hostCapabilities.imports.resolve_externref,
-      {
-        host_mint_exception_tag: () => {
-          mintCalls += 1;
-          return 0;
-        },
-      },
-    );
+    const { fm, x } = instantiate(memory, hostCapabilities.imports.resolve_externref);
 
     x.fm_set_format(PTR_WIDTH, 0);
     x.fm_set_activation_gc_codec(0, codecPtr, GC_CODEC.byteLength);
@@ -294,8 +280,11 @@ describe("fork-module typed-GC (struct/array/i31) admission + leaf rooting throu
     // recipe 1, array recipe 2).
     expect(new Set(published)).toEqual(new Set([1, 2]));
 
-    // (c) MINT INERT — the typed-GC drive never minted an exception tag.
-    expect(mintCalls).toBe(0);
+    // (c) MINT INERT — the typed-GC drive never mints an exception tag. This
+    // used to be proven by spying on a `host_mint_exception_tag` stub
+    // (`wpk_fork_host.*` seam); that seam was deleted (H3, 2026-09-06) because
+    // it was never wired to any guest, so the proof is now structural: the
+    // module no longer even declares the import, so there is nothing to call.
   });
 
   it("R1 GUARD (wasm-level): a resolved-but-lost externref leaf TRAPS the drive, never silently mis-roots the cycle's identity", () => {

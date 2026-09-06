@@ -24,24 +24,33 @@
 extern crate alloc;
 extern crate wasm_posix_shared;
 
+// H3 (host-surface minimization, 2026-09-06): `mod host_capabilities`
+// (the `ForkHostCapabilities`/`ForkLifecycleCapabilities` engine-floor trait
+// and its handle newtypes) and `mod native_sketch` (a feature-gated, never-
+// enabled design sketch of a native backend for that trait) were DELETED.
+// The trait declared a `wpk_fork_host.*` Wasm-import seam
+// (`crates/fork-module/src/host_capabilities.rs`, since deleted) that was
+// never wired to any guest on any host: `hostCapabilities` was never passed
+// by any real caller in `host/src/worker-main.ts`, and native trapped every
+// remaining `wpk_fork_host.*` import as unreachable. The completed F5/F6
+// reference-completeness work bypassed the seam entirely — exnref is handled
+// by a guest-local export and typed-GC reconstruction reuses the
+// pre-existing JS drive-order — so nothing in the portable reference/replay
+// machinery this crate still owns (`reference_graph_builder`, `gc_codec`,
+// `drive_plan`, `reference_replay`, etc.) depended on it.
+
 pub mod catalogs;
 pub mod drive_plan;
 pub mod drive_plan_hints;
 pub mod dylink_archive;
 pub mod exception_codec;
 pub mod gc_codec;
-pub mod host_capabilities;
 pub mod imported_globals;
 pub mod imported_tables;
 pub mod linked_frames;
 pub mod linked_frames_writer;
 pub mod module_state;
 pub mod module_state_records;
-/// Documented native-Wasmtime backend SKETCH for the engine-floor seam. Gated
-/// behind the `native-sketch` feature; adds NO `wasmtime` dependency (stub
-/// bodies + a per-method mapping table). See `host_capabilities`.
-#[cfg(feature = "native-sketch")]
-pub mod native_sketch;
 pub mod reference_feed;
 pub mod reference_graph_builder;
 pub mod reference_recipes;
@@ -67,10 +76,6 @@ pub use exception_codec::{
 };
 pub use drive_plan_hints::{GcCodecHints, FORK_HOST_EXCEPTION_ACTIVATION_ID};
 pub use gc_codec::{decode_gc_codec, GcCodec, GcFieldDescriptor, GcLayoutDescriptor};
-pub use host_capabilities::{
-    ForkHostCapabilities, ForkLifecycleCapabilities, HostGeneration, HostInstance, HostRef,
-    HostTag, HostThread,
-};
 pub use imported_globals::{decode_imported_globals, ImportedGlobal, ImportedGlobals};
 pub use imported_tables::{decode_imported_tables, ImportedTable, ImportedTables};
 pub use linked_frames::{

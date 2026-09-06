@@ -119,12 +119,16 @@
 #[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
 extern crate alloc;
 
-// The Wasm-import-backed backend for the `fork_codec::ForkHostCapabilities`
-// engine-floor seam (Phase 6 D6, ADDITIVE). Declares the `wpk_fork_host` host
-// imports and a zero-cost impl; NOT wired to the guest. Wasm-only: on the host
-// target this crate stays empty (see below).
-#[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
-mod host_capabilities;
+// H3 (host-surface minimization, 2026-09-06): the Wasm-import-backed
+// `wpk_fork_host.*` engine-floor seam (Phase 6 D6, `mod host_capabilities`)
+// was DELETED here. It declared 6 host imports
+// (`host_mint_exception_tag`/`host_provide_unwind_transport_tag`/
+// `host_recognize_unwind_transport`/`host_instantiate_child`/
+// `host_spawn_thread`/`host_last_errno`) but was never wired to the guest on
+// any host, and the completed F5/F6 reference-completeness work bypassed it
+// entirely (exnref is handled by a guest-local export; typed-GC reuses the
+// pre-existing JS drive-order). Deleting it removes those 6 imports from the
+// compiled fork-module artifact on every host.
 
 // On non-wasm targets this crate is intentionally empty: it is a wasm32 cdylib
 // (the exports and linear-memory management are wasm-only). Keeping it empty on

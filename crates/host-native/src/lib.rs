@@ -34,9 +34,11 @@ use wasmtime::{Config, Engine, ExternType, Linker, MemoryType, Module, SharedMem
 pub mod guest;
 pub use guest::{run_guest, run_trivial_guest, GuestOptions, NativeMount, RunOutcome};
 
-/// N1-I5 Task 2: the real Wasmtime-backed `ForkHostCapabilities` impl (tag
-/// mint/recognize primitives). See that module's doc comment for scope.
-pub mod fork_host_capabilities;
+// H3 (host-surface minimization, 2026-09-06): `mod fork_host_capabilities`
+// (the N1-I5 Task 2 real Wasmtime-backed `ForkHostCapabilities` impl) was
+// DELETED here. Native's fork path never called it: every `wpk_fork_host.*`
+// import stays trapped by `define_unknown_imports_as_traps` in `guest.rs`
+// because this frames-only path never reaches those names.
 
 /// ABI version this native host expects the kernel to advertise. Must match
 /// `wasm_posix_shared::ABI_VERSION` (currently 44). A kernel built for a
