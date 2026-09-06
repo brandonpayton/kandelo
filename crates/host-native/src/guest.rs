@@ -2996,6 +2996,17 @@ pub(crate) struct GuestForkFormat {
     /// order, for the `i`-th target — the KFRC section's own file order,
     /// since it is already validated strictly increasing by ordinal).
     pub catalog_local_slots: Vec<u32>,
+    /// N1-F6: the guest's own `kandelo.wpk_fork.gc_codec` custom section
+    /// bytes (verbatim — see [`read_gc_codec_descriptor_section`]), or
+    /// `None` for a guest with no GC codec at all. Read here (piggybacking
+    /// on this struct's existing "computed once from the guest's raw bytes,
+    /// threaded through every `launch_process`/fork-relaunch call via `Arc`"
+    /// contract — see this struct's own doc comment) rather than adding a
+    /// parallel plumbing path, since both are the SAME "read once from raw
+    /// bytes, valid for this guest's whole lifetime" shape. Seeded into the
+    /// co-resident module via `fm_set_activation_gc_codec` at
+    /// [`drive_reference_replay`] time — see that function's doc comment.
+    pub gc_codec_descriptor: Option<Vec<u8>>,
 }
 
 /// Compute [`GuestForkFormat`] from a guest program's raw wasm bytes, or
@@ -3397,7 +3408,13 @@ pub(crate) fn compute_guest_fork_format(wasm_bytes: &[u8]) -> anyhow::Result<Opt
     );
     let catalog_ordinals = records.iter().map(|r| r.function_ordinal).collect();
     let catalog_local_slots = records.iter().map(|r| r.local_catalog_slot).collect();
-    Ok(Some(GuestForkFormat { fixed_prefix_size, catalog_ordinals, catalog_local_slots }))
+    let gc_codec_descriptor = read_gc_codec_descriptor_section(wasm_bytes)?;
+    Ok(Some(GuestForkFormat {
+        fixed_prefix_size,
+        catalog_ordinals,
+        catalog_local_slots,
+        gc_codec_descriptor,
+    }))
 }
 
 /// Read one ULEB128 varint out of `data` starting at `*cursor`, advancing it
@@ -3468,6 +3485,42 @@ fn read_fork_module_mem_info(wasm_bytes: &[u8]) -> anyhow::Result<(usize, usize)
     anyhow::bail!("fork-module is not a PIC side module (no dylink.0 custom section)");
 }
 
+/// N1-F6: read the GUEST's own `kandelo.wpk_fork.gc_codec` custom section
+/// (the structural layout catalog `wasm-fork-instrument`'s `module_gc_codec`
+/// pass emits for every module it instruments with a WasmGC struct/array
+/// type — see `crates/fork-codec/src/gc_codec.rs`'s module doc comment for
+/// the wire format), or `None` for a guest with no GC codec at all (every
+/// funcref/externref/i31-only fixture, and every non-fork-using guest).
+/// Mirrors [`read_fork_module_mem_info`]'s custom-section scan (same
+/// reason: `wasmtime::Module` retains no custom-section accessor), applied
+/// to the GUEST's raw bytes instead of the fork-module's.
+fn read_gc_codec_descriptor_section(wasm_bytes: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+    anyhow::ensure!(
+        wasm_bytes.len() >= 8 && &wasm_bytes[0..4] == b"\0asm",
+        "not a wasm module (bad magic)"
+    );
+    let section_name = wasm_posix_shared::abi::WPK_FORK_GC_CODEC_SECTION.as_bytes();
+    let mut pos = 8usize;
+    while pos < wasm_bytes.len() {
+        let section_id = wasm_bytes[pos];
+        pos += 1;
+        let section_len = read_leb_u32(wasm_bytes, &mut pos)? as usize;
+        let section_end = pos + section_len;
+        anyhow::ensure!(section_end <= wasm_bytes.len(), "section runs past end of module");
+        if section_id == 0 {
+            let name_len = read_leb_u32(wasm_bytes, &mut pos)? as usize;
+            let name_end = pos + name_len;
+            anyhow::ensure!(name_end <= section_end, "custom section name runs past section end");
+            let name = &wasm_bytes[pos..name_end];
+            if name == section_name {
+                return Ok(Some(wasm_bytes[name_end..section_end].to_vec()));
+            }
+        }
+        pos = section_end;
+    }
+    Ok(None)
+}
+
 /// The co-resident fork-module (`crates/fork-module`), instantiated sharing a
 /// guest's linear memory. See this file's "N1-I4 Task 1" section doc comment.
 ///
@@ -3519,6 +3572,13 @@ pub struct ForkModule {
     /// `__wpk_fork_ref_scratch_reserve`/`_release` — see
     /// [`NativeReferenceCapture::scratch_reserve`]'s doc comment.
     pub capture_scratch_base: u32,
+    /// N1-F6: the page-aligned guest address the guest's own GC-codec
+    /// descriptor bytes were staged at before seeding `fm_set_activation_
+    /// gc_codec` — see [`instantiate_fork_module`]'s doc comment on that
+    /// seed call. Valid (holds real descriptor bytes) only when this guest
+    /// declared a GC codec at all; otherwise the page is reserved but
+    /// unwritten.
+    pub gc_codec_scratch_base: u32,
 
     // -- Coordinator (`fm_*`) exports, bound once here so callers never
     // re-look-up a name (a typo would only surface at the FIRST call site,
@@ -3721,6 +3781,7 @@ pub(crate) fn instantiate_fork_module(
     layout: &ProcessLayout,
     externref_registry: Arc<Mutex<ExternrefRegistry>>,
     seed_empty_module_state_arena: bool,
+    gc_codec_descriptor: Option<&[u8]>,
 ) -> anyhow::Result<ForkModule> {
     let fork_module_wasm_path = crate::fork_module_path();
     let wasm_bytes = std::fs::read(&fork_module_wasm_path)
@@ -3785,6 +3846,31 @@ pub(crate) fn instantiate_fork_module(
     let capture_scratch_base = u32::try_from(capture_scratch_base)
         .map_err(|_| anyhow::anyhow!("capture-scratch address {capture_scratch_base:#x} does not fit in wasm32"))?;
 
+    // N1-F6: reserve a THIRD page, immediately after the capture-scratch page
+    // above, to stage the GUEST's own `kandelo.wpk_fork.gc_codec` descriptor
+    // bytes (`gc_codec_descriptor`, read once from the guest's raw wasm bytes
+    // by `compute_guest_fork_format` — see `GuestForkFormat::gc_codec_
+    // descriptor`'s doc comment) before handing them to `fm_set_activation_
+    // gc_codec` below. A dedicated page (not a corner of `capture_scratch_
+    // base`) because this data must OUTLIVE every capture (it is read again
+    // by every later `fm_build_gc_plan` call on this guest OS thread), while
+    // `capture_scratch_base` is explicitly a per-capture bump allocator reset
+    // to empty at the start of every fork (`NativeReferenceCapture::reset`).
+    let gc_codec_scratch_base = capture_scratch_base as usize + WASM_PAGE_SIZE;
+    anyhow::ensure!(
+        gc_codec_scratch_base + WASM_PAGE_SIZE <= memory_base + region_bytes,
+        "fork-module GC-codec-descriptor scratch page does not fit in the module's shadow-stack padding"
+    );
+    let gc_codec_scratch_base = u32::try_from(gc_codec_scratch_base)
+        .map_err(|_| anyhow::anyhow!("GC-codec-descriptor scratch address {gc_codec_scratch_base:#x} does not fit in wasm32"))?;
+    if let Some(descriptor) = gc_codec_descriptor {
+        anyhow::ensure!(
+            descriptor.len() <= WASM_PAGE_SIZE,
+            "guest GC codec descriptor ({} bytes) exceeds the reserved scratch page",
+            descriptor.len()
+        );
+    }
+
     grow_to_cover(guest_mem, memory_base + region_bytes)?;
     // N1-I5b Task 1: this call MUST be skipped for a fork child's own
     // relaunch (`seed_empty_module_state_arena == false`) — `handle_fork`
@@ -3804,6 +3890,9 @@ pub(crate) fn instantiate_fork_module(
     // before that launch's own first possible fork.
     if seed_empty_module_state_arena {
         write_empty_module_state_arena(guest_mem, reference_scratch_base)?;
+    }
+    if let Some(descriptor) = gc_codec_descriptor {
+        unsafe { write_bytes(guest_mem, gc_codec_scratch_base as usize, descriptor) };
     }
 
     let mut linker: Linker<()> = Linker::new(engine);
@@ -3914,7 +4003,7 @@ pub(crate) fn instantiate_fork_module(
         .get_table(&mut *store, "__wpk_fork_ref_gc_transit")
         .ok_or_else(|| anyhow::anyhow!("fork-module missing export __wpk_fork_ref_gc_transit"))?;
 
-    Ok(ForkModule {
+    let fm = ForkModule {
         instance,
         memory_base,
         region_bytes,
@@ -3962,7 +4051,45 @@ pub(crate) fn instantiate_fork_module(
         static_root_catalog_table,
         empty_module_state_root: reference_scratch_base,
         capture_scratch_base,
-    })
+        gc_codec_scratch_base,
+    };
+
+    // N1-F6: seed activation 0's GC-layout catalog EXACTLY ONCE per guest OS
+    // thread (== once per `instantiate_fork_module` call for a genuinely
+    // FRESH launch) — `fm_set_activation_gc_codec`'s own contract rejects a
+    // RE-seeded activation (`crates/fork-module/src/lib.rs`'s `set_
+    // activation_gc_codec_impl`: "Reject a re-seeded activation (each is
+    // seeded once per worker)"), so this cannot be done per-replay-call
+    // (`fm_build_gc_plan`/`fm_begin_reference_replay` DO need to run per
+    // replay — see `drive_reference_replay`'s doc comment — but the layout
+    // CATALOG itself is a property of the guest module, not of any one
+    // fork, and is read back by every later `fm_build_gc_plan` call on this
+    // same instance). Gated on `seed_empty_module_state_arena` for exactly
+    // the same reason [`write_empty_module_state_arena`] above is: a fork
+    // CHILD's `instantiate_fork_module` call runs against a byte-for-byte
+    // `clone_guest_memory` of the PARENT's memory (`handle_fork`), which
+    // ALREADY carries the fork-module's OWN static globals — including
+    // `ACT_GC_CODEC_ACT_COUNT`/`ACT_GC_CODEC_INDEX` — from the PARENT's own
+    // (successful) seed call; re-seeding here would hit that SAME
+    // re-seed-rejection guard and fail `EINVAL` (confirmed empirically: this
+    // task's first attempt called this unconditionally and every
+    // GC-carrying fork failed exactly this way on the child's own launch).
+    // Skipped entirely for a guest with no GC codec at all
+    // (`gc_codec_descriptor.is_none()` — every funcref/externref/i31-only
+    // fixture): there is no catalog to seed, and calling with a fabricated
+    // one would be dishonest, not merely incomplete.
+    if seed_empty_module_state_arena {
+        if let Some(descriptor) = gc_codec_descriptor {
+            fm.fm_set_activation_gc_codec.call(
+                &mut *store,
+                (0, gc_codec_scratch_base, descriptor.len() as u32),
+            )?;
+            let errno = fm.fm_last_errno.call(&mut *store, ())?;
+            anyhow::ensure!(errno == 0, "fm_set_activation_gc_codec failed: errno {errno}");
+        }
+    }
+
+    Ok(fm)
 }
 
 /// Launch one guest process instance and return the [`GuestProcess`] the pump
@@ -4184,6 +4311,7 @@ fn spawn_guest_thread(
                 &layout,
                 Arc::clone(&externref_registry),
                 matches!(fork_entry, ForkEntry::Normal),
+                fork_format.as_ref().and_then(|f| f.gc_codec_descriptor.as_deref()),
             ) {
                 Ok(fm) => {
                     const FRAME_IMPORT_NAMES: [&str; 5] = [
@@ -6135,14 +6263,22 @@ fn is_thrown_exception_escape(e: &wasmtime::Error) -> bool {
 /// replay`-seeded rewind — both callers below drive this identically):
 ///
 ///  1. Seed `fm_set_activation_gc_codec`/`fm_set_host_exception_owner` from
-///     whatever this host has captured for the child, if anything. Native has
-///     no GC-codec-byte capture and no host-exception-owner tracking yet
-///     (module-state (KFMS) capture/restore stays fully inert on native — see
-///     this file's N1-I4 doc comments), so both seed calls are skipped here:
-///     there is no data to seed them with, and calling either with a
-///     fabricated value would be dishonest, not merely incomplete. A future
-///     task that adds native module-state/GC-codec capture adds these calls
-///     here, guarded on that new data actually existing.
+///     whatever this host has captured for the child, if anything. N1-F6:
+///     `fm_set_activation_gc_codec` is now seeded EXACTLY ONCE per guest OS
+///     thread — at [`instantiate_fork_module`] time, not here — because its
+///     own contract rejects a re-seeded activation
+///     (`crates/fork-module/src/lib.rs`'s `set_activation_gc_codec_impl`),
+///     and the layout catalog is a property of the guest MODULE, not of any
+///     one fork's replay, so seeding it once and reading it back on every
+///     `fm_build_gc_plan` call is both sufficient and required (calling it
+///     again here would itself fail `EINVAL`). `fm_set_host_exception_owner`
+///     has no native seed yet (host-exception-owner tracking stays fully
+///     inert on native — see this file's N1-I4 doc comments), so that ONE
+///     seed call is still skipped here: there is no data to seed it with,
+///     and calling it with a fabricated value would be dishonest, not merely
+///     incomplete. A future task that adds native host-exception-owner
+///     tracking adds that call here, guarded on the new data actually
+///     existing.
 ///  2. `fm_begin_reference_replay(module_state_root, pid)` — seeds the
 ///     whole-arena reference graph, BEFORE any module-state restore or rewind
 ///     touches a reference. `module_state_root` here is NOT the continuation
@@ -9557,6 +9693,7 @@ mod fork_module_tests {
             &layout,
             Arc::new(Mutex::new(ExternrefRegistry::new())),
             true,
+            None,
         )?;
 
         assert!(fork_module.region_bytes > 0, "expected a non-empty reserved region");
@@ -9621,5 +9758,50 @@ mod fork_module_tests {
         );
 
         Ok(())
+    }
+
+    /// N1-F6: regenerates `native_fork_gc_struct_cycle.wasm` from the
+    /// reviewed `.wat` source. WHY a Rust generator, not the dev shell's
+    /// WABT `wat2wasm`: WABT does not accept current Wasm-GC syntax even
+    /// with `--enable-gc` (no `ref.i31`, `i31.get_s`) — see
+    /// `host/test/fixtures/gc-reference-cycle-fresh-worker-bytes.ts`'s own
+    /// doc comment for the same constraint on the TypeScript side. The Rust
+    /// `wat` crate (already a dev-dependency here) compiles it fine.
+    /// Regenerate with (from repo root, inside `scripts/dev-shell.sh`):
+    ///   cargo test -p host-native --lib -- --ignored \
+    ///     regenerate_native_fork_gc_struct_cycle_fixture --nocapture
+    /// then run `scripts/run-wasm-fork-instrument.sh` on the written
+    /// `.wasm` — see the `.wat` file's own doc comment for the exact
+    /// command.
+    #[test]
+    #[ignore = "writes crates/host-native/fixtures/native_fork_gc_struct_cycle.wasm"]
+    fn regenerate_native_fork_gc_struct_cycle_fixture() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let wat_path = dir.join("native_fork_gc_struct_cycle.wat");
+        let wat_src = std::fs::read_to_string(&wat_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", wat_path.display()));
+        let wasm = wat::parse_str(&wat_src).expect("compile native_fork_gc_struct_cycle.wat");
+        let out_path = dir.join("native_fork_gc_struct_cycle.wasm");
+        std::fs::write(&out_path, &wasm)
+            .unwrap_or_else(|e| panic!("write {}: {e}", out_path.display()));
+        eprintln!("wrote {} ({} bytes)", out_path.display(), wasm.len());
+    }
+
+    /// N1-F6 SETTLING EXPERIMENT: regenerates
+    /// `native_fork_gc_two_object_cycle.wasm` from the reviewed `.wat`
+    /// source. See [`regenerate_native_fork_gc_struct_cycle_fixture`]'s doc
+    /// comment for why a Rust generator, not WABT.
+    #[test]
+    #[ignore = "writes crates/host-native/fixtures/native_fork_gc_two_object_cycle.wasm"]
+    fn regenerate_native_fork_gc_two_object_cycle_fixture() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let wat_path = dir.join("native_fork_gc_two_object_cycle.wat");
+        let wat_src = std::fs::read_to_string(&wat_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", wat_path.display()));
+        let wasm = wat::parse_str(&wat_src).expect("compile native_fork_gc_two_object_cycle.wat");
+        let out_path = dir.join("native_fork_gc_two_object_cycle.wasm");
+        std::fs::write(&out_path, &wasm)
+            .unwrap_or_else(|e| panic!("write {}: {e}", out_path.display()));
+        eprintln!("wrote {} ({} bytes)", out_path.display(), wasm.len());
     }
 }

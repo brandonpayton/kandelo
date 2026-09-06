@@ -2101,6 +2101,120 @@ mod tests {
         Ok(())
     }
 
+    /// N1-F6 (refcomplete FLOOR-2): a real Wasm-GC STRUCT (scalar + i31 +
+    /// a NULLABLE self-cycle reference field) held live across a native
+    /// `kernel_fork`, reconstructed IDENTITY-PRESERVED (the cycle intact)
+    /// in the child — see `fixtures/native_fork_gc_struct_cycle.wat`'s own
+    /// doc comment for the fixture shape and exit-code contract. This
+    /// exercises the `gc_lookup`/`gc_claim`/`gc_i31`/`gc_define` gate LIFT
+    /// (§6.1/§8 of `docs/plans/2026-09-05-n1-f6-gc-provenance-grounding.md`)
+    /// WITHOUT needing constructor provenance (a nullable field always
+    /// takes the `defaultable_shell` replay path) — see
+    /// `smoke_fork_gc_two_object_cycle` for the provenance-exercising
+    /// sibling.
+    #[test]
+    fn smoke_fork_gc_struct_reconstructs() -> anyhow::Result<()> {
+        let Some(path) = kernel_path_or_skip() else {
+            return Ok(());
+        };
+        let Some(_fork_module_path) = fork_module_path_or_skip() else {
+            return Ok(());
+        };
+        let guest_wasm = include_bytes!("../fixtures/native_fork_gc_struct_cycle.instrumented.wasm");
+
+        let options = guest::GuestOptions { enable_fork_module: true, ..Default::default() };
+        let outcome = guest::run_guest(&path, guest_wasm, &options)?;
+
+        assert_eq!(
+            outcome.exit_code, 0,
+            "expected the reconstructed CHILD's self-cyclic GC struct (and \
+             the PARENT's own post-fork struct) to verify (stdout: {:?}, \
+             stderr: {:?}, trace: {:?}, proof: {:?})",
+            String::from_utf8_lossy(&outcome.stdout),
+            String::from_utf8_lossy(&outcome.stderr),
+            outcome.syscall_trace,
+            outcome.fork_proof_of_use,
+        );
+        assert!(
+            outcome.syscall_trace.contains(&wasm_posix_shared::abi::host_intercepted::SYS_FORK),
+            "expected the SYS_FORK sentinel in the syscall trace: {:?}",
+            outcome.syscall_trace
+        );
+
+        // `gc_nodes_reconstructed` (`fm_gc_nodes_reconstructed`), NOT
+        // `references_reconstructed` (which only ever advances for
+        // funcref/null reconstruction — see `smoke_fork_externref_
+        // reconstructs`'s own doc comment on the analogous externref
+        // counter), is the proof-of-use counter for the GC struct/array/i31
+        // path.
+        let proof = outcome.fork_proof_of_use;
+        assert!(
+            proof.gc_nodes_reconstructed > 0,
+            "the module must have driven a real GC reconstruction (not a \
+             silent fallback): {proof:?}"
+        );
+        Ok(())
+    }
+
+    /// N1-F6 SETTLING EXPERIMENT: two DIFFERENT live Wasm-GC struct
+    /// instances forming a MUTUAL cycle through a mutable, NON-NULLABLE
+    /// internal reference field — the one case
+    /// `docs/plans/2026-09-05-n1-f6-gc-provenance-grounding.md` §3 flagged
+    /// as not settled by reading alone, because it genuinely exercises the
+    /// constructor-provenance transaction (`gc_provenance_begin`/`_ref`/
+    /// `_end`), unlike `smoke_fork_gc_struct_reconstructs`'s nullable
+    /// self-cycle. See `fixtures/native_fork_gc_two_object_cycle.wat`'s own
+    /// doc comment for the fixture shape (a supertype "seed" bootstrap),
+    /// exit-code contract, and why this is the correct way to construct a
+    /// non-nullable-field cycle in valid WebAssembly-GC. Per the task's own
+    /// framing, this MUST pass before the FLOOR-2 gate lift is
+    /// trustworthy — a real failure here would be reported BLOCKED, not
+    /// papered over.
+    #[test]
+    fn smoke_fork_gc_two_object_cycle() -> anyhow::Result<()> {
+        let Some(path) = kernel_path_or_skip() else {
+            return Ok(());
+        };
+        let Some(_fork_module_path) = fork_module_path_or_skip() else {
+            return Ok(());
+        };
+        let guest_wasm =
+            include_bytes!("../fixtures/native_fork_gc_two_object_cycle.instrumented.wasm");
+
+        let options = guest::GuestOptions { enable_fork_module: true, ..Default::default() };
+        let outcome = guest::run_guest(&path, guest_wasm, &options)?;
+
+        assert_eq!(
+            outcome.exit_code, 0,
+            "expected the reconstructed CHILD's mutual two-object GC cycle \
+             (and the PARENT's own post-fork pair) to verify (stdout: {:?}, \
+             stderr: {:?}, trace: {:?}, proof: {:?})",
+            String::from_utf8_lossy(&outcome.stdout),
+            String::from_utf8_lossy(&outcome.stderr),
+            outcome.syscall_trace,
+            outcome.fork_proof_of_use,
+        );
+        assert!(
+            outcome.syscall_trace.contains(&wasm_posix_shared::abi::host_intercepted::SYS_FORK),
+            "expected the SYS_FORK sentinel in the syscall trace: {:?}",
+            outcome.syscall_trace
+        );
+
+        // `gc_nodes_reconstructed` (`fm_gc_nodes_reconstructed`), NOT
+        // `references_reconstructed` (which only ever advances for
+        // funcref/null reconstruction — see `smoke_fork_externref_
+        // reconstructs`'s own doc comment on the analogous externref
+        // counter), is the proof-of-use counter for the GC struct/array/i31
+        // path.
+        let proof = outcome.fork_proof_of_use;
+        assert!(
+            proof.gc_nodes_reconstructed > 0,
+            "the module must have driven a real GC reconstruction (not a \
+             silent fallback): {proof:?}"
+        );
+        Ok(())
+    }
+
     /// Wasmtime 35 -> 48 upgrade acceptance test (the reason for the
     /// upgrade): a *fork-instrumented* guest module — the exact artifact
     /// shape `scripts/run-wasm-fork-instrument.sh` produces for every
