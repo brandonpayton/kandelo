@@ -4911,56 +4911,84 @@ fn spawn_guest_thread(
                 }
             }
 
-            // N1-F5 Task 2 investigation note (see task-2-report.md for the
-            // full writeup): `gc_lookup`, NOT `__wpk_fork_ref_encode_externref`
-            // (the host import wired above), is the ACTUAL capture-time entry
-            // point a plain externref-typed local reaches in the "linked"
-            // co-resident-module architecture `wasm-fork-instrument` always
-            // builds (`crates/fork-instrument/src/module_gc_codec.rs`'s
+            // N1 refcomplete substrate (2026-09-05): `gc_lookup`, NOT
+            // `__wpk_fork_ref_encode_externref` (the host import wired above),
+            // is the ACTUAL capture-time entry point a plain externref-typed
+            // local reaches in the "linked" co-resident-module architecture
+            // `wasm-fork-instrument` always builds
+            // (`crates/fork-instrument/src/module_gc_codec.rs`'s
             // `emit_externref_bridge` gives the encode_externref/
             // decode_externref NAMES to LOCAL wasm functions that
             // unconditionally `any.convert_extern`/delegate through
             // `encode_anyref`/`decode_anyref`; the raw host imports of those
-            // names are consequently never declared at all — confirmed by
-            // disassembling an instrumented fixture's import section and call
-            // graph). A sound, ADDITIVE fix is possible here in principle
-            // (peek the anyref-transit slot via `fm.gc_transit_table`,
-            // recover a host externref via `ExternRef::convert_any`, and
-            // check `externref_provenance` by identity before falling back to
-            // the existing gate) and was prototyped and verified to make
-            // CAPTURE succeed — but the REPLAY side's drive-plan builder
-            // (`crates/fork_codec::drive_plan::build_drive_plan`, frozen/
-            // shared, consumed by `crates/fork-module`) only schedules a
-            // `DRIVE_OP_EXTERNREF_TRANSIT` publish for an externref reachable
-            // from a GC struct/array field or exception payload — NOT one
-            // reachable only from an ordinary frame reference vector (the
-            // "directly held" case `crates/fork-module/src/lib.rs`'s own doc
-            // comment says should decode "lazily via the guest import
-            // `__wpk_fork_ref_decode_externref`" — an import that, per the
-            // paragraph above, is never actually declared in this
-            // architecture). Enabling the encode-side short-circuit without
-            // a working decode companion makes the FORK PROCEED (capture
-            // succeeds, a child is launched) only for BOTH the parent's own
-            // resume and the child's rewind to TRAP reading an unpopulated
-            // transit slot — a regression from today's clean, parent-
-            // survives `EOPNOTSUPP` gate. That decode-side fix lives in
-            // `crates/fork-codec`/`crates/fork-module`/`crates/fork-instrument`,
-            // outside this native-only task's scope, so `gc_lookup` stays the
-            // ORIGINAL, safe, unconditional gate below pending that
-            // companion change.
+            // names are consequently never declared at all).
+            //
+            // `emit_encode_anyref` (`module_gc_codec.rs`) publishes the
+            // about-to-be-looked-up value into `codec.transit` (the SAME
+            // `fm.gc_transit_table` bound above) at slot 0, THEN calls this
+            // import with that slot — so peeking the transit table at `slot`
+            // recovers the exact `anyref` the guest is asking about, before
+            // falling back to the existing gate. `ExternRef::convert_any` is
+            // the identity-preserving type-hierarchy cast WasmGC's own
+            // `extern.convert_any` performs (not a validating conversion — a
+            // real struct/array/i31 anyref "converts" too, but its resulting
+            // pseudo-externref will not `ref_eq`-match any entry in
+            // `externref_provenance`, so it correctly falls through below;
+            // see grounding doc + task-2-report.md's prototype note).
+            //
+            // A hit re-interns the SAME recipe id `encode_externref` would
+            // (or already has, since `intern_externref` dedupes by handle) —
+            // this is the "already interned, return its recipe" contract a
+            // real dedup hit uses in the retired/dead-here layout-dispatch
+            // path (`emit_encode_anyref`'s `existing`/`fresh` branches), so a
+            // non-zero return here correctly short-circuits the guest's own
+            // layout-dispatch / `broker_encode` fallback (both still gated).
+            // A miss (no anyref at the slot, a real typed-GC value, or an
+            // externref with no recorded provenance) falls through UNCHANGED
+            // to the original unconditional gate below — SOUNDNESS GUARD:
+            // never fabricate a handle. This re-applies the prototype from
+            // N1-F5 Task 2 (task-2-report.md concern #2), now safe to land
+            // because the decode-side gap it was blocked on (directly-held
+            // externref transit publish) is fixed in
+            // `crates/fork-codec::drive_plan::build_drive_plan`.
             let gc_lookup_name = wasm_posix_shared::abi::WPK_FORK_REFERENCE_IMPORT_GC_LOOKUP;
             if guest_declares(gc_lookup_name) {
                 let capture_for_gc = Arc::clone(&capture);
+                let provenance_for_gc = Arc::clone(&externref_provenance);
+                let gc_transit_table_for_lookup = fm.gc_transit_table;
                 let result = linker.func_wrap(
                     "env",
                     gc_lookup_name,
-                    move |_caller: Caller<'_, ()>, _slot: i32| -> wasmtime::Result<i32> {
+                    move |mut caller: Caller<'_, ()>, slot: i32| -> wasmtime::Result<i32> {
                         // `gc_lookup` is the anyref-transit dedup entry
                         // reached for EVERY anyref-lineage value (a plain
                         // externref, a static root, or a typed Wasm-GC
                         // struct/array/i31) — see `fork-activation-
                         // registry.ts:528-543`'s "cannot honestly claim 'gc'"
-                        // note. Report the same undistinguished umbrella.
+                        // note.
+                        let slot_index = i64::from(slot).max(0) as u64;
+                        if let Some(wasmtime::Ref::Any(Some(anyref))) =
+                            gc_transit_table_for_lookup.get(&mut caller, slot_index)
+                        {
+                            if let Ok(externref) = ExternRef::convert_any(&mut caller, anyref) {
+                                let handle =
+                                    provenance_for_gc.lock().unwrap().lookup(&mut caller, externref)?;
+                                if let Some(handle) = handle {
+                                    return capture_for_gc
+                                        .lock()
+                                        .unwrap()
+                                        .graph
+                                        .intern_externref(handle)
+                                        .map(|id| id as i32)
+                                        .map_err(|e| {
+                                            wasmtime::Error::msg(format!("intern_externref failed: {e:?}"))
+                                        });
+                                }
+                            }
+                        }
+                        // No provenance hit: report the same undistinguished
+                        // umbrella every other still-gated anyref-lineage
+                        // kind uses.
                         let mut capture = capture_for_gc.lock().unwrap();
                         capture.mark_unsupported("externref or Wasm-GC (anyref)");
                         capture.gated_placeholder().map(|id| id as i32)
@@ -5593,7 +5621,7 @@ fn is_thrown_exception_escape(e: &wasmtime::Error) -> bool {
 /// nonzero errno is a truthful failure — this returns `false` (having
 /// already logged which stage failed) rather than silently continuing into a
 /// rewind whose reference state was never actually seeded.
-fn drive_reference_replay(store: &mut Store<()>, fm: &ForkModule, _guest_mem: &SharedMemory) -> bool {
+fn drive_reference_replay(store: &mut Store<()>, fm: &ForkModule, guest_mem: &SharedMemory) -> bool {
     // Retained in `fm_begin_reference_replay`/`fm_build_gc_plan`'s signatures
     // for the host call site but unused since M2 — see this function's doc
     // comment.
@@ -5652,6 +5680,53 @@ fn drive_reference_replay(store: &mut Store<()>, fm: &ForkModule, _guest_mem: &S
         eprintln!("fm_gc_plan_count returned a negative count {count}");
         return false;
     };
+
+    // N1 refcomplete substrate: size the module-owned anyref transit table
+    // (STORE #2, `fm.gc_transit_table`) to cover every `recipe + 1` slot this
+    // plan's steps are about to `table.get`/`table.set` BEFORE driving it.
+    // `fm_drive_execute`'s injected shim can only access an IN-BOUNDS table
+    // index — unlike `function_catalog_table`/`drive_table`/
+    // `static_root_catalog_table` (grown ONCE at guest instantiation, see the
+    // N1-I5 Task 1 block above), this table's required size is PER-FORK (it
+    // depends on THIS fork's own reference graph), so it must be (re-)grown
+    // here, per replay, before every drive. There is no capture-time growth
+    // call on native today — `gc_claim`'s documented host-side growth
+    // (`module_gc_codec.rs`'s "Claim grows ... through recipe+1 before
+    // returning") is dead here since GC claim stays gated (see this file's
+    // `gc_lookup` doc comment) — so this is the one place a native fork's
+    // transit table ever grows. Reads the plan bytes back out of the SAME
+    // guest memory `fm_build_gc_plan` just serialized them into
+    // (`fork_codec::drive_plan::read_step` is documented as usable by "tests
+    // and the host" for exactly this).
+    if count > 0 {
+        let Some(plan_len) = (count as usize).checked_mul(fork_codec::drive_plan::DRIVE_STEP_SIZE) else {
+            eprintln!("drive plan byte length overflowed (count={count})");
+            return false;
+        };
+        let plan_bytes = unsafe { read_bytes(guest_mem, plan_ptr as usize, plan_len) };
+        let mut max_recipe: u32 = 0;
+        for i in 0..count as usize {
+            match fork_codec::drive_plan::read_step(&plan_bytes, i) {
+                Ok(step) => max_recipe = max_recipe.max(step.recipe),
+                Err(e) => {
+                    eprintln!("read_step({i}) on the just-built drive plan failed: {e:?}");
+                    return false;
+                }
+            }
+        }
+        // `recipe + 1` must be a valid index, so the table needs at least
+        // `max_recipe + 2` elements.
+        let needed = u64::from(max_recipe) + 2;
+        let current = fm.gc_transit_table.size(&mut *store);
+        if needed > current {
+            if let Err(e) =
+                fm.gc_transit_table.grow(&mut *store, needed - current, wasmtime::Ref::Any(None))
+            {
+                eprintln!("growing fork-module __wpk_fork_ref_gc_transit failed: {e:#}");
+                return false;
+            }
+        }
+    }
 
     if let Err(e) = fm.fm_drive_execute.call(&mut *store, (plan_ptr, count)) {
         eprintln!("fm_drive_execute failed: {e:#}");

@@ -323,19 +323,25 @@ impl ReferenceReplayDriver {
             .count() as u32
     }
 
-    /// The recipe ids of externrefs that a typed/exnref consumer reaches — the
-    /// externrefs that MUST be staged in the anyref transit table (at slot
+    /// The recipe ids of externrefs that a typed/exnref consumer REACHES — the
+    /// subset that MUST be staged in the anyref transit table (at slot
     /// `recipe_id + 1`) before the consumer's GC fill / exception materialize
     /// reads them (the R1 rooting hazard). Mirrors the reachable-externref set
     /// `materializeTypedGraph` publishes into the transit
     /// (`fork-early-reference-provider.ts:1252-1255`).
     ///
-    /// EMPTY for a plain externref-in-a-local graph: a bare externref is decoded
-    /// straight through the (still-JS) `__wpk_fork_ref_decode_externref` import
-    /// and never enters the transit. So D6.2's admitted graphs (null / funcref /
-    /// externref, with no aggregate consumer) publish nothing here; the transit
-    /// path is exercised by hand-built graphs now and by real forks once the
-    /// aggregate kinds (D6.3 exnref, D6.4 struct/array) are admitted.
+    /// EMPTY for a plain externref-in-a-local graph (no aggregate consumer names
+    /// it as an edge). Note this is narrower than what
+    /// [`build_drive_plan`](crate::drive_plan::build_drive_plan) actually
+    /// publishes into the transit today: `build_drive_plan`'s Phase 0b publishes
+    /// EVERY `Externref` recipe node unconditionally (a strict superset of this
+    /// reachability walk), because a directly-held externref's decode reads the
+    /// SAME shared transit table as a reachable one does — there is no separate
+    /// lazy per-value host decode path in the built architecture (see the
+    /// 2026-09-05 substrate grounding doc, §1). This method remains useful as the
+    /// narrower "reachable from an aggregate" predicate in its own right (e.g. for
+    /// reasoning about the GC/exnref-only R1 hazard specifically), but it is no
+    /// longer the set `build_drive_plan` iterates for Phase 0b.
     pub fn transit_rooted_recipes(&self) -> Vec<u32> {
         transit_rooted_recipes(&self.transaction.nodes)
     }
@@ -349,16 +355,19 @@ impl ReferenceReplayDriver {
     /// `transit_publish`, `transit_read`) existed ONLY to work around that. That
     /// work is now INJECTED WASM (which can hold an `externref`):
     ///
-    /// * a directly held externref is decoded lazily by the guest import
-    ///   `__wpk_fork_ref_decode_externref` (no plan step), and
-    /// * a GC/exnref-reachable externref is published into the anyref transit at
+    /// * EVERY `Externref` recipe node — directly held (frame-vector-only) and
+    ///   GC/exnref-reachable alike — is published into the anyref transit at
     ///   slot `recipe + 1` by a
     ///   [`DRIVE_OP_EXTERNREF_TRANSIT`](crate::drive_plan::DRIVE_OP_EXTERNREF_TRANSIT)
     ///   step emitted by
     ///   [`build_drive_plan`](crate::drive_plan::build_drive_plan) and executed by
     ///   the injected `fm_drive_execute` shim, which resolves the handle,
     ///   `any.convert_extern`s it, `table.set`s the transit, and asserts non-null
-    ///   (the R1 rooting guard the retired host PHASE-B read-back enforced).
+    ///   (the R1 rooting guard the retired host PHASE-B read-back enforced). The
+    ///   guest's own `decode_anyref`/`decode_externref` local functions then read
+    ///   every externref out of this same transit table unconditionally — there
+    ///   is no separate lazy per-value host decode import in the built
+    ///   architecture (2026-09-05 substrate grounding doc, §1).
     ///
     /// See the M2 design ruling. So this pass keeps only the graph-derived
     /// externref count; the ordering-and-identity work lives in the drive plan.
@@ -410,11 +419,16 @@ impl ReferenceReplayDriver {
 /// several edges is rooted exactly once. This is the set
 /// [`build_drive_plan`](crate::drive_plan::build_drive_plan) turns into
 /// [`DRIVE_OP_EXTERNREF_TRANSIT`](crate::drive_plan::DRIVE_OP_EXTERNREF_TRANSIT)
-/// drive steps.
+/// drive steps for the GC/exnref-reachable subset.
 ///
-/// EMPTY for a plain externref-in-a-local graph: a bare externref is decoded
-/// straight through the lazy `__wpk_fork_ref_decode_externref` guest import and
-/// never enters the transit.
+/// EMPTY for a plain externref-in-a-local graph (no aggregate consumer reaches
+/// it). NOTE: since the 2026-09-05 substrate fix,
+/// [`build_drive_plan`](crate::drive_plan::build_drive_plan)'s Phase 0b no
+/// longer calls this helper — it publishes EVERY `Externref` recipe node
+/// unconditionally (a strict superset), because a directly-held externref's
+/// decode reads the same shared transit table a reachable one does. This
+/// function remains as the narrower "aggregate-reachable" predicate, still used
+/// by [`ReferenceReplayDriver::transit_rooted_recipes`].
 pub(crate) fn transit_rooted_recipes(nodes: &[ReferenceRecipeEntry]) -> Vec<u32> {
     // Seed the reachability walk from every aggregate consumer's edges.
     let mut pending: Vec<u32> = Vec::new();
@@ -731,14 +745,25 @@ mod tests {
     }
 
     #[test]
-    fn plain_externref_graph_emits_no_transit_step_but_counts_each_externref() {
-        // A plain externref graph has no GC/exnref consumer, so no externref
-        // enters the transit: `build_drive_plan` emits NOTHING (each externref is
-        // decoded lazily by the guest import), and `drive_reconstruction` reports
-        // the graph-derived proof-of-use count (two externrefs).
+    fn plain_externref_graph_emits_a_transit_step_per_externref_and_counts_each() {
+        // A plain externref graph has no GC/exnref consumer (so
+        // `transit_rooted_recipes` — the narrower, aggregate-reachable predicate —
+        // is empty for it, per `plain_externref_graph_has_no_transit_rooted_recipes`
+        // above). But `build_drive_plan`'s Phase 0b publishes EVERY `Externref`
+        // node unconditionally, since a directly-held externref's decode reads the
+        // same shared transit table a reachable one does: one
+        // DRIVE_OP_EXTERNREF_TRANSIT step per externref (id order), and
+        // `drive_reconstruction` reports the graph-derived proof-of-use count (two
+        // externrefs).
         let driver = plain_externref();
         let plan = build_drive_plan(&driver.transaction().nodes, &TestHints::default()).unwrap();
-        assert!(plan.is_empty(), "no reachable externref -> no transit step");
+        assert_eq!(
+            plan.iter().map(op_recipe).collect::<Vec<_>>(),
+            vec![
+                (DRIVE_OP_EXTERNREF_TRANSIT, 1),
+                (DRIVE_OP_EXTERNREF_TRANSIT, 2),
+            ]
+        );
         assert_eq!(driver.drive_reconstruction().unwrap().reconstructed(), 2);
     }
 

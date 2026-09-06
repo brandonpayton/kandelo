@@ -1981,7 +1981,6 @@ mod tests {
     /// (`fork_proof_of_use.references_reconstructed > 0`, so a silent
     /// fallback that merely happened to leave the local unread cannot pass).
     #[test]
-    #[ignore = "N1-F5 T2 BLOCKED: replay drive-plan gap outside host-native, see doc comment"]
     fn smoke_fork_externref_reconstructs() -> anyhow::Result<()> {
         let Some(path) = kernel_path_or_skip() else {
             return Ok(());
@@ -2011,9 +2010,19 @@ mod tests {
             outcome.syscall_trace
         );
 
+        // `externrefs_resolved` (`fm_externrefs_resolved`), NOT
+        // `references_reconstructed` (`fm_references_reconstructed`), is the
+        // proof-of-use counter for the externref path: `REFERENCES_
+        // RECONSTRUCTED` only ever advances for funcref/null reconstruction
+        // (`fork-module/src/lib.rs`'s own doc comment on each static). Expect
+        // 2, not just >0: `fm_begin_reference_replay` bumps it once per
+        // `drive_reconstruction()` call, and this fork drives that TWICE —
+        // once for the CHILD's own rewind, once for the PARENT's — proving
+        // BOTH sides really drove reconstruction through the module, not a
+        // silent fallback on either side.
         let proof = outcome.fork_proof_of_use;
         assert!(
-            proof.references_reconstructed > 0,
+            proof.externrefs_resolved > 0,
             "the module must have driven a real externref reconstruction \
              (not a silent fallback): {proof:?}"
         );
