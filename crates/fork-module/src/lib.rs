@@ -765,11 +765,13 @@ mod wasm {
     // replay` bumps this by `drive_reconstruction`'s graph-derived externref-node
     // count — the GRAPH'S expectation of how many externrefs get resolved, not a
     // live host round trip (since M2 no Rust `wpk_fork_host` seam performs that
-    // resolve/publish; it is injected wasm: a directly held externref decodes
-    // lazily via `__wpk_fork_ref_decode_externref`, and a GC/exnref-reachable one
-    // is resolved+published by a `DRIVE_OP_EXTERNREF_TRANSIT` step through
-    // `fm_externref_handle`). A silent JS fallback (the module was never asked to
-    // drive the reference reconstruction) leaves this unchanged. Never resets.
+    // resolve/publish; it is injected wasm). Since the 2026-09-05 substrate fix,
+    // EVERY `Externref` recipe — directly held (frame-vector-only) and
+    // GC/exnref-reachable alike — is resolved+published by a
+    // `DRIVE_OP_EXTERNREF_TRANSIT` step through `fm_externref_handle`; there is
+    // no separate lazy per-value decode import in the built architecture. A
+    // silent JS fallback (the module was never asked to drive the reference
+    // reconstruction) leaves this unchanged. Never resets.
     static EXTERNREFS_RESOLVED: AtomicU64 = AtomicU64::new(0);
 
     // Monotonic count of exnref nodes the module has admitted and driven through
@@ -2291,11 +2293,10 @@ mod wasm {
         // reconstructs. This is now a host-free pass over the decoded graph — it
         // calls no `wpk_fork_host` import and opens no host generation (that seam
         // retired; see `ReconstructionState`'s doc). The actual resolve + transit
-        // publish happen later, in injected wasm: a directly held externref is
-        // decoded lazily by the guest import `__wpk_fork_ref_decode_externref`
-        // (calling the single residual host import `resolve_externref` directly),
-        // and a GC/exnref-reachable externref is published into the anyref
-        // transit by a `DRIVE_OP_EXTERNREF_TRANSIT` drive step (via
+        // publish happen later, in injected wasm: EVERY externref recipe —
+        // directly held (frame-vector-only) and GC/exnref-reachable alike — is
+        // published into the anyref transit by a `DRIVE_OP_EXTERNREF_TRANSIT`
+        // drive step (via
         // `fm_externref_handle`), both driven by the injected `fm_drive_execute`
         // shim (Task 3), not by this function.
         let reconstruction = driver.drive_reconstruction()?;
@@ -2540,9 +2541,10 @@ mod wasm {
     /// externref host seam shrunk to a single `resolve_externref(handle) ->
     /// externref` import). This is NOT a guest-facing import: it is the helper
     /// the injected `fm_drive_execute` shim calls on a DRIVE_OP_EXTERNREF_TRANSIT
-    /// step (and the injected `__wpk_fork_ref_decode_externref` export calls for a
-    /// directly held externref) to get the `u32` handle it passes to the host
-    /// `resolve_externref` import — a Rust function cannot itself return an
+    /// step — emitted for EVERY externref recipe, directly held and
+    /// GC/exnref-reachable alike, since the 2026-09-05 substrate fix — to get
+    /// the `u32` handle it passes to the host `resolve_externref` import — a
+    /// Rust function cannot itself return an
     /// `externref`, exactly why `fm_funcref_ordinal`/`fm_static_root_slot` hand
     /// back an index rather than a `funcref`/`anyref`. Returns the recipe's
     /// captured broker handle (the same handle a live host-import adapter minted
@@ -3232,10 +3234,8 @@ mod wasm {
     /// `ReconstructionState`'s doc).
     ///
     /// On success the guest's `__wpk_fork_ref_decode_funcref` is served by this
-    /// module; a directly held externref is decoded lazily by the guest import
-    /// `__wpk_fork_ref_decode_externref` (calling the single residual host import
-    /// `resolve_externref` directly, injected in Task 3), and a GC/exnref-reachable
-    /// externref is published into the anyref transit by a
+    /// module; EVERY externref recipe — directly held (frame-vector-only) and
+    /// GC/exnref-reachable alike — is published into the anyref transit by a
     /// `DRIVE_OP_EXTERNREF_TRANSIT` drive step (via `fm_externref_handle`) when
     /// `fm_drive_execute` runs the plan `fm_build_gc_plan` built. Failure (check
     /// `fm_last_errno`: `EOPNOTSUPP` for an unadmitted kind, `EINVAL` for a
@@ -3277,12 +3277,13 @@ mod wasm {
     /// externref host seam). This is NOT a guest-facing import: it is the helper
     /// the injected binder calls to get the `u32` handle it passes to the single
     /// residual host import `resolve_externref(handle) -> externref` (an
-    /// `externref` a Rust function cannot itself return), either directly for the
-    /// injected `__wpk_fork_ref_decode_externref` export (a lazily decoded,
-    /// directly held externref) or on a DRIVE_OP_EXTERNREF_TRANSIT step before
-    /// `any.convert_extern` + `table.set`-ing the result into the anyref transit
-    /// at slot `recipe + 1`. Returns a non-negative broker handle and TRAPS on any
-    /// inconsistency. See `externref_handle_impl`.
+    /// `externref` a Rust function cannot itself return) on a
+    /// DRIVE_OP_EXTERNREF_TRANSIT step (emitted for EVERY externref recipe —
+    /// directly held and GC/exnref-reachable alike — since the 2026-09-05
+    /// substrate fix) before `any.convert_extern` + `table.set`-ing the result
+    /// into the anyref transit at slot `recipe + 1`. Returns a non-negative
+    /// broker handle and TRAPS on any inconsistency. See
+    /// `externref_handle_impl`.
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_externref_handle(recipe_id: u32) -> i32 {
         externref_handle_impl(recipe_id)

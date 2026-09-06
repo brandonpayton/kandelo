@@ -2,29 +2,31 @@
 ;; `kernel_fork`, reconstructed IDENTITY-PRESERVED in the child — the
 ;; externref analogue of `native_fork_refs.wat`'s funcref success fixture.
 ;;
-;; STATUS: BLOCKED — see `crates/host-native/src/lib.rs`'s
-;; `smoke_fork_externref_reconstructs` (`#[ignore]`d) and
-;; `.superpowers/sdd/2026-09-05-n1-f5-externref-capture/task-2-report.md`
-;; for the full writeup. Short version: this fixture's CAPTURE half is sound
-;; and was verified to work (mint-time provenance recording via
-;; `__wpk_fork_ref_provenance_externref` + a `gc_lookup`-side identity check
-;; — see `guest.rs`'s doc comment on its `gc_lookup` binding for exactly why
-;; `gc_lookup`, not `__wpk_fork_ref_encode_externref`, is the real capture
-;; entry point a plain externref local reaches). What's NOT sound yet is
-;; DECODE: the frozen/shared replay drive-plan builder
-;; (`crates/fork_codec::drive_plan::build_drive_plan`) only schedules a
-;; transit-publish for an externref reachable from a GC struct/array field
-;; or exception payload, not one reachable only from an ordinary frame
-;; reference vector (this fixture's case) — so lifting the encode-side gate
-;; without a companion fix there makes BOTH the parent's resume and the
-;; child's rewind trap reading an unpopulated transit slot, instead of the
-;; clean, parent-survives `EOPNOTSUPP` `native_fork_externref_gate.wat`
-;; still proves today. That companion fix lives outside `crates/host-native`
-;; (in `crates/fork-codec`/`crates/fork-module`/`crates/fork-instrument`),
-;; so this fixture and its test stay unwired/ignored until it lands.
+;; STATUS: GREEN (N1 refcomplete substrate, 2026-09-05) — see
+;; `crates/host-native/src/lib.rs`'s `smoke_fork_externref_reconstructs` and
+;; `.superpowers/sdd/2026-09-05-n1-f5-externref-capture/task-2-report.md` +
+;; `task-3-substrate-report.md` for the full writeup. Short version: this
+;; fixture's CAPTURE half was already sound (mint-time provenance recording
+;; via `__wpk_fork_ref_provenance_externref` + a `gc_lookup`-side identity
+;; check — see `guest.rs`'s doc comment on its `gc_lookup` binding for
+;; exactly why `gc_lookup`, not `__wpk_fork_ref_encode_externref`, is the
+;; real capture entry point a plain externref local reaches). The DECODE gap
+;; that used to block this is now CLOSED: the frozen/shared replay drive-plan
+;; builder (`crates/fork_codec::drive_plan::build_drive_plan`) used to
+;; schedule a transit-publish only for an externref reachable from a GC
+;; struct/array field or exception payload, not one reachable only from an
+;; ordinary frame reference vector (this fixture's case) — Phase 0b now
+;; publishes EVERY `Externref` recipe node unconditionally, and the transit
+;; table is sized for the plan before it is driven
+;; (`drive_reference_replay`'s own growth step in `guest.rs`). NOTE: the
+;; OLDER `native_fork_externref_gate.wat` fixture, which used to prove the
+;; clean `EOPNOTSUPP` gate for a plain externref, is now SUPERSEDED by THIS
+;; fixture for that specific mint pattern (a direct call, which now records
+;; provenance and reconstructs); the still-gated case (no recorded
+;; provenance) is proven by `native_fork_externref_gate_indirect.wat`.
 ;;
-;; Once the decode-side gap above closes, this fixture is expected to prove:
-;; mint a live externref via `env.resolve_externref` into a local, fork,
+;; This fixture proves: mint a live externref via `env.resolve_externref`
+;; into a local, fork,
 ;; and observe the SAME handle (42) resolve in BOTH the reconstructed CHILD
 ;; and the unaffected PARENT — mirroring `native_fork_refs.wat`'s funcref
 ;; proof shape exactly (fork, branch on child/parent, verify identity via a

@@ -1,3 +1,21 @@
+;; SUPERSEDED (N1 refcomplete substrate, 2026-09-05): this fixture mints its
+;; externref via a DIRECT `call $resolve_externref`. Since the N1-F5 T1
+;; provenance-wrapper pass (`crates/fork-instrument/src/
+;; externref_provenance.rs`) records mint-time provenance for exactly that
+;; call shape, and `crates/host-native/src/guest.rs`'s `gc_lookup` binding
+;; now performs the capture short-circuit against that provenance, this
+;; fixture's fork now actually SUCCEEDS (reconstructs, identity-preserved)
+;; rather than gating — it no longer exercises the behavior described below.
+;; It is kept, unwired from any test, as a historical/regeneration reference.
+;; The reconstruction behavior it USED to gate is now proven by
+;; `native_fork_externref_reconstruct.wat`
+;; (`smoke_fork_externref_reconstructs`); the still-gated case (a genuine
+;; externref with NO recorded provenance) is proven by
+;; `native_fork_externref_gate_indirect.wat`
+;; (`smoke_fork_gated_externref_parent_survives`), which mints via
+;; `call_indirect` specifically so the provenance pass cannot see the
+;; production site — see that fixture's own doc comment.
+;;
 ;; N1-I5b Task 2: a REAL WASM `externref` held LIVE across a native
 ;; `kernel_fork` — the parity-gate analogue of `native_fork_refs.wat`'s
 ;; funcref fixture. `docs/fork-reference-support.md` gates `externref` (and
@@ -5,7 +23,7 @@
 ;; a live value of one of these kinds across the boundary must fail cleanly
 ;; with `EOPNOTSUPP` (errno 95) on the PARENT, during capture, with NO child
 ;; ever spawned, and the parent must keep running afterward. This fixture
-;; proves that end-to-end on native.
+;; proved that end-to-end on native BEFORE the supersession noted above.
 ;;
 ;; Hand-written WAT, not C, for the SAME reason `native_fork_refs.wat` is:
 ;; a genuine WASM `externref` *value* obtained from `resolve_externref` is
@@ -34,18 +52,16 @@
 ;;      F5/F6"), so the probe result is NOT asserted against the original
 ;;      handle — only that calling it does not trap.
 ;;
-;; N1-F5 Task 2 status note: this fixture continues to prove the GATE, not
-;; reconstruction. F5 investigation found the real capture-time entry point
-;; for a plain externref local is `gc_lookup` (not `encode_externref` — see
-;; `guest.rs`'s doc comment above its `gc_lookup` binding), and a sound,
-;; additive capture-side fix is possible there — but lifting it requires a
-;; companion REPLAY-side fix in frozen/shared code
-;; (`crates/fork_codec::drive_plan::build_drive_plan` does not schedule a
-;; transit-publish for an externref reachable only from a frame vector,
-;; outside this native-only task's scope), so `gc_lookup` deliberately stays
-;; the original unconditional gate below. See `native_fork_externref_
-;; reconstruct.wat` for the (currently `#[ignore]`d) success-shaped fixture
-;; this gap blocks.
+;; N1-F5 Task 2 status note (STALE as of the 2026-09-05 substrate fix — see
+;; the SUPERSEDED note at the top of this file): this fixture used to prove
+;; the GATE, not reconstruction, because `gc_lookup` deliberately stayed an
+;; unconditional gate pending a companion REPLAY-side fix in frozen/shared
+;; code. That fix has landed (`crates/fork_codec::drive_plan::
+;; build_drive_plan`'s Phase 0b), `gc_lookup` now performs the capture
+;; short-circuit, and — because THIS fixture's mint site gets real recorded
+;; provenance — its fork now reconstructs instead of gating. See
+;; `native_fork_externref_reconstruct.wat` for the (now GREEN) success-shaped
+;; fixture this used to block.
 ;;
 ;; Exit codes (parent-observed; there is never a child to reap):
 ;;   0  = success (fork cleanly EOPNOTSUPP'd, no child spawned, parent

@@ -5621,12 +5621,39 @@ fn is_thrown_exception_escape(e: &wasmtime::Error) -> bool {
 /// nonzero errno is a truthful failure — this returns `false` (having
 /// already logged which stage failed) rather than silently continuing into a
 /// rewind whose reference state was never actually seeded.
-fn drive_reference_replay(store: &mut Store<()>, fm: &ForkModule, guest_mem: &SharedMemory) -> bool {
-    // Retained in `fm_begin_reference_replay`/`fm_build_gc_plan`'s signatures
-    // for the host call site but unused since M2 — see this function's doc
-    // comment.
-    const PID: u32 = 0;
+// Retained in `fm_begin_reference_replay`/`fm_build_gc_plan`'s signatures for
+// the host call site but unused since M2 — see `drive_reference_replay`'s doc
+// comment.
+const REFERENCE_REPLAY_PID: u32 = 0;
 
+/// Seed the module's resident reference driver (`reference_state()`) from the
+/// sealed KFMS arena — step 2 of [`drive_reference_replay`]'s own doc comment,
+/// factored out so the gated-abort branch of
+/// [`drive_fork_capture_seal_and_launch_child`] can run JUST this step and
+/// skip the GC-plan build/execute that follows it in the full sequence.
+///
+/// This step is NOT gated on the fork's supported/gated-abort status: it only
+/// DECODES the sealed graph (cheap, infallible for any module-admissible
+/// graph — `gated_placeholder`'s synthetic `i31` is module-admissible, see
+/// `ReferenceReplayDriver::all_nodes_module_admissible`) into
+/// `reference_state()`. Frame restore's OTHER per-local decode helpers that DO
+/// consult the module's Rust state (e.g. `fm_funcref_ordinal` for a funcref-
+/// typed local elsewhere in the SAME frame) need `reference_state()` non-`None`
+/// regardless of whether THIS fork's own captured value was gated — skipping
+/// this step entirely (as an earlier version of the gated-abort fix did)
+/// leaves `reference_state()` `None` and traps ANY such helper, not just a
+/// gated one, via a DIFFERENT `unreachable` than the guest's own normal-exit
+/// trap — indistinguishable from it at the `wasmtime::Trap::
+/// UnreachableCodeReached` level, so `run_fork_capable_entry`'s trap
+/// classifier silently treats the guest OS thread as having exited normally
+/// when it actually died mid-resume, before ever posting `SYS_EXIT_GROUP` —
+/// reproducing the exact same "truthful 30s hard-cap" symptom this whole fix
+/// targets, from a different cause. `fm_build_gc_plan`/`fm_drive_execute`
+/// (unlike this step) DO need a real, drivable typed-GC plan and are what
+/// actually fail `EINVAL` on native for a gated fork's placeholder graph (see
+/// this file's substrate-grounding doc §3) — those, not this seed step, are
+/// what the gated-abort branch skips.
+fn begin_reference_replay_only(store: &mut Store<()>, fm: &ForkModule) -> bool {
     // `instantiate_fork_module` already wrote a genuinely-valid KFMS arena
     // (the canonical null-only reference transaction) at this address once,
     // at instantiation time (see `write_empty_module_state_arena` and
@@ -5634,7 +5661,9 @@ fn drive_reference_replay(store: &mut Store<()>, fm: &ForkModule, guest_mem: &Sh
     // rather than re-synthesizing it here.
     let module_state_root = fm.empty_module_state_root;
 
-    if let Err(e) = fm.fm_begin_reference_replay.call(&mut *store, (module_state_root, PID)) {
+    if let Err(e) =
+        fm.fm_begin_reference_replay.call(&mut *store, (module_state_root, REFERENCE_REPLAY_PID))
+    {
         eprintln!("fm_begin_reference_replay failed: {e:#}");
         return false;
     }
@@ -5649,8 +5678,15 @@ fn drive_reference_replay(store: &mut Store<()>, fm: &ForkModule, guest_mem: &Sh
             return false;
         }
     }
+    true
+}
 
-    let plan_ptr = match fm.fm_build_gc_plan.call(&mut *store, PID) {
+fn drive_reference_replay(store: &mut Store<()>, fm: &ForkModule, guest_mem: &SharedMemory) -> bool {
+    if !begin_reference_replay_only(store, fm) {
+        return false;
+    }
+
+    let plan_ptr = match fm.fm_build_gc_plan.call(&mut *store, REFERENCE_REPLAY_PID) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("fm_build_gc_plan failed: {e:#}");
@@ -6074,21 +6110,92 @@ fn drive_fork_capture_seal_and_launch_child(
                 return false;
             }
         }
-        // Drive the SAME reference-replay sub-sequence a supported fork
-        // uses (`fm_begin_reference_replay` + the GC drive plan) against the
-        // sealed placeholder-only graph — safe because every wire node kind
-        // (including the canonical `i31` `gated_placeholder` this capture
-        // wrote) is module-ADMISSIBLE (`ReferenceReplayDriver::
-        // all_nodes_module_admissible`; struct/array/i31 are all in that
-        // allow-list — the PLATFORM gate is a host-policy decision about
-        // fresh-CHILD reconstruction fidelity, not an engine limitation) and
-        // an `i31` leaf needs no GC drive step. The per-frame
-        // `__wpk_fork_ref_decode_externref` bypass wired in
-        // `spawn_guest_thread` is what keeps this safe for the specific
-        // frame that held the gated value: it short-circuits on `is_gated_id`
-        // instead of asking the module to decode an `i31` node as if it were
-        // a real `Externref` (which would trap).
-        if !drive_reference_replay(&mut *store, fm, guest_mem) {
+        // N1 refcomplete substrate (2026-09-05 gate-hang fix): seed
+        // `reference_state()` (`begin_reference_replay_only`) but do NOT
+        // drive `fm_build_gc_plan`/`fm_drive_execute` against the sealed
+        // placeholder-only graph — go straight to `wpk_fork_rewind_begin`
+        // below once the driver is seeded. `gated_placeholder`'s own doc
+        // comment already establishes this graph's content past "validates
+        // cleanly and is admissible" is otherwise UNOBSERVED ("the sealed
+        // graph is discarded unread"): nothing downstream needs the
+        // placeholder's synthetic `i31` node to be a real, drivable GC
+        // recipe, only that SOME node exists in the sealed KFMS arena — but
+        // `reference_state()` itself DOES need to be non-`None`, because
+        // frame restore's OTHER per-local decode helpers (e.g.
+        // `fm_funcref_ordinal` for a funcref-typed local elsewhere in the
+        // SAME frame) consult it regardless of whether THIS fork's own
+        // captured value was gated. See `begin_reference_replay_only`'s doc
+        // comment for the EARLIER, broader version of this fix (skipping
+        // `fm_begin_reference_replay` too) that empirically reproduced this
+        // same hang from a DIFFERENT cause — both traps are
+        // `wasmtime::Trap::UnreachableCodeReached`, indistinguishable from
+        // the guest's own deliberate normal-exit trap at the level
+        // `is_unreachable_trap` checks, so either failure is silently
+        // swallowed as "the thread exited normally" instead of surfacing.
+        //
+        // Root cause this fixes (see the 2026-09-05 substrate grounding doc
+        // §3): `fm_build_gc_plan` -> `GcCodecHints::new` derives `i31_owner`
+        // from `decoded_gc_codecs()`, which is UNCONDITIONALLY EMPTY on
+        // native today (native has no GC-codec-byte capture or host-
+        // exception-owner tracking yet — see this function's OWN doc comment
+        // above, step 1). An empty codec map means `i31_owner() == None`
+        // unconditionally, so `build_drive_plan` fails EVERY graph
+        // containing an i31 node with `Errno::EINVAL` — and
+        // `gated_placeholder`'s synthetic i31 stand-in is exactly such a
+        // node. `drive_reference_replay` then returns `false` on that
+        // EINVAL, this function returned `false` right after it (BEFORE
+        // ever reaching `wpk_fork_rewind_begin` below), and the caller
+        // (`run_fork_capable_entry`'s trampoline loop) ends the guest OS
+        // thread outright on a `false` return — so `wpk_fork_resume_start`
+        // is never called again, the guest never posts `SYS_EXIT_GROUP`, and
+        // `run_pump`'s 30s `hard_cap` was the only thing that ever noticed:
+        // a truthful watchdog firing on a silently-dead thread, not a
+        // livelock. Skipping `fm_build_gc_plan`/`fm_drive_execute` (while
+        // still seeding `reference_state()`) removes the ONLY path that
+        // reached `fm_build_gc_plan` for a gated fork, so the EINVAL — and
+        // the thread death it caused — can no longer happen; the parent's
+        // own frame rewind (this function's `fm_begin_replay` just above)
+        // needs no reference DATA reconstructed for a value the platform
+        // contract already says is not preserved across a gated fork, only
+        // that decoding it never traps — which is a per-frame decode-time
+        // concern (the still-open item this same investigation flags: the
+        // guest's own `decode_anyref`/`decode_externref` local functions
+        // have no `is_gated_id`-equivalent bypass yet), not a replay-DRIVING
+        // concern this function needs to resolve.
+        //
+        // Size the transit table (STORE #2) for the SEALED graph before the
+        // resume below reaches the frame that held the gated value: its
+        // static WASM TYPE is still `externref`, so frame restore calls the
+        // guest's own `decode_externref`/`decode_anyref` regardless of the
+        // wire node's actual kind — `table.get(transit, recipe+1)` traps
+        // out-of-bounds on an ungrown table exactly like the drive-plan case
+        // `drive_reference_replay`'s own growth step guards (see there for
+        // the general rationale). There is no drive PLAN to read recipe ids
+        // out of here (that machinery is exactly what this branch skips), so
+        // size from the CAPTURE-side graph directly: `gated_placeholder`
+        // dedupes to ONE shared `i31` node regardless of how many gated
+        // values this fork observed (`intern_i31` dedupes by value, always
+        // `0`), so the sealed graph's own node count is already the exact
+        // upper bound — no plan-shaped data needed.
+        {
+            let node_count = capture.lock().unwrap().graph.nodes().len();
+            let Ok(needed) = u64::try_from(node_count).map(|n| n + 1) else {
+                eprintln!("gated fork's sealed graph node count overflowed a u64");
+                return false;
+            };
+            let current = fm.gc_transit_table.size(&mut *store);
+            if needed > current {
+                if let Err(e) =
+                    fm.gc_transit_table.grow(&mut *store, needed - current, wasmtime::Ref::Any(None))
+                {
+                    eprintln!(
+                        "growing fork-module __wpk_fork_ref_gc_transit (gated fork abort) failed: {e:#}"
+                    );
+                    return false;
+                }
+            }
+        }
+        if !begin_reference_replay_only(&mut *store, fm) {
             return false;
         }
         let Some(rewind_begin) = get_guest_export_typed::<u32, ()>(

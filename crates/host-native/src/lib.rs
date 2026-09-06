@@ -1943,6 +1943,70 @@ mod tests {
         Ok(())
     }
 
+    /// N1 refcomplete substrate (2026-09-05): the gate-hang fix's own proof.
+    /// A fork carrying a still-GATED reference (a genuine externref with NO
+    /// recorded mint-time provenance — see
+    /// `native_fork_externref_gate_indirect.wat`'s doc comment for exactly
+    /// why THIS fixture, not the older `native_fork_externref_gate.wat`,
+    /// still exercises the gate after the capture short-circuit landed)
+    /// must return `-EOPNOTSUPP` (errno 95) to the parent, spawn NO child,
+    /// and — the actual regression this test guards — the PARENT must keep
+    /// running afterward instead of the guest OS thread silently dying and
+    /// `run_pump`'s 30s hard-cap firing (root-caused in the 2026-09-05
+    /// substrate grounding doc §3: `drive_fork_capture_seal_and_launch_
+    /// child`'s gated-abort branch used to drive `fm_build_gc_plan` against
+    /// the sealed placeholder graph, which always fails `EINVAL` on native
+    /// since `decoded_gc_codecs()` is unconditionally empty here).
+    ///
+    /// This test is expected to complete in well under a second: it is a
+    /// regression guard against a 30-second hang, not a slow test — if this
+    /// ever takes anywhere near that long again, the gate-hang bug is back.
+    #[test]
+    fn smoke_fork_gated_externref_parent_survives() -> anyhow::Result<()> {
+        let Some(path) = kernel_path_or_skip() else {
+            return Ok(());
+        };
+        let Some(_fork_module_path) = fork_module_path_or_skip() else {
+            return Ok(());
+        };
+        let guest_wasm =
+            include_bytes!("../fixtures/native_fork_externref_gate_indirect.instrumented.wasm");
+
+        let options = guest::GuestOptions { enable_fork_module: true, ..Default::default() };
+        let started = std::time::Instant::now();
+        let outcome = guest::run_guest(&path, guest_wasm, &options)?;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            outcome.exit_code, 0,
+            "expected a clean EOPNOTSUPP gate with the parent surviving \
+             (stdout: {:?}, stderr: {:?}, trace: {:?}, proof: {:?})",
+            String::from_utf8_lossy(&outcome.stdout),
+            String::from_utf8_lossy(&outcome.stderr),
+            outcome.syscall_trace,
+            outcome.fork_proof_of_use,
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "gated fork took {elapsed:?} — the 30s pump hard-cap regression is back"
+        );
+        // No child was ever spawned for a gated fork: only the parent's own
+        // (single) frame graph is replayed, so the reference-reconstruction
+        // proof-of-use counters advance by exactly the amount ONE gated
+        // capture/abort-replay contributes — never a full success-shaped
+        // reconstruction count (that would mean the gate silently didn't
+        // fire). The gated placeholder is an `i31`, not a real `Externref`
+        // node, so `externrefs_resolved` (the externref-path proof-of-use
+        // counter) must stay at 0: this run never drives a real externref
+        // reconstruction.
+        let proof = outcome.fork_proof_of_use;
+        assert_eq!(
+            proof.externrefs_resolved, 0,
+            "a gated fork must never drive a real externref reconstruction: {proof:?}"
+        );
+        Ok(())
+    }
+
     /// N1-F5 Task 2: a REAL native `fork()` that carries a genuine WASM
     /// `externref` LIVE across the boundary, captured via mint-time
     /// PROVENANCE recording (`guest.rs`'s
@@ -1951,34 +2015,42 @@ mod tests {
     /// the replay side — the externref analogue of
     /// `smoke_fork_reconstructs_references`.
     ///
-    /// STATUS: `#[ignore]`d — BLOCKED on a decode-side gap outside
-    /// `crates/host-native`'s scope. Investigation (see `guest.rs`'s doc
-    /// comment on its `gc_lookup` binding, and
-    /// `.superpowers/sdd/2026-09-05-n1-f5-externref-capture/task-2-report.md`)
-    /// found the capture-time entry point a plain externref local actually
-    /// reaches is `gc_lookup`, not `__wpk_fork_ref_encode_externref`, and a
-    /// sound capture-side fix there was prototyped and verified to work. But
-    /// the frozen/shared replay drive-plan builder
-    /// (`crates/fork_codec::drive_plan::build_drive_plan`) only schedules a
+    /// STATUS: GREEN (N1 refcomplete substrate, 2026-09-05). Was
+    /// `#[ignore]`d, BLOCKED on a decode-side gap outside
+    /// `crates/host-native`'s scope: the capture-time entry point a plain
+    /// externref local actually reaches is `gc_lookup`, not
+    /// `__wpk_fork_ref_encode_externref` (see `guest.rs`'s doc comment on
+    /// its `gc_lookup` binding, and
+    /// `.superpowers/sdd/2026-09-05-n1-f5-externref-capture/task-2-report.md`),
+    /// and a sound capture-side fix there was prototyped and verified to
+    /// work, but the frozen/shared replay drive-plan builder
+    /// (`crates/fork_codec::drive_plan::build_drive_plan`) only scheduled a
     /// transit-publish for an externref reachable from a GC struct/array
     /// field or exception payload — not one reachable only from an ordinary
-    /// frame reference vector (this fixture's case) — so lifting the
-    /// encode-side gate alone makes BOTH the parent's resume and the
-    /// child's rewind trap instead of reconstructing. Mirrors
-    /// `smoke_fork_reconstructs_references`'s own HISTORY note precedent
-    /// (that test was itself `#[ignore]`d through N1-I5 Task 3 until its
-    /// capture path existed). Un-ignore this once the drive-plan gap closes.
+    /// frame reference vector (this fixture's case). That decode-side gap is
+    /// now CLOSED: `build_drive_plan`'s Phase 0b publishes EVERY `Externref`
+    /// recipe node unconditionally (see `crates/fork-codec/src/
+    /// drive_plan.rs`), and the transit table is sized for the plan before
+    /// it is driven (`drive_reference_replay`'s own growth step in
+    /// `guest.rs`). Mirrors `smoke_fork_reconstructs_references`'s own
+    /// HISTORY note precedent (that test was itself `#[ignore]`d through
+    /// N1-I5 Task 3 until its capture path existed).
     ///
     /// Fixture: `native_fork_externref_reconstruct.instrumented.wasm`
-    /// (`fixtures/native_fork_externref_reconstruct.wat`) — a NEW fixture
-    /// (the ORIGINAL `native_fork_externref_gate.wat` still proves today's
-    /// real, working behavior: a plain externref fork cleanly `EOPNOTSUPP`s
-    /// with the parent surviving). See the new fixture's own doc comment for
-    /// the full exit-code table.
+    /// (`fixtures/native_fork_externref_reconstruct.wat`). NOTE: the OLDER
+    /// `native_fork_externref_gate.wat` fixture is now SUPERSEDED as a gate
+    /// proof — it mints its externref via a DIRECT call, which the N1-F5 T1
+    /// provenance-wrapper pass DOES record, so with this fix landed that
+    /// fixture's fork actually SUCCEEDS (reconstructs) rather than gating.
+    /// The still-gated case is now proven by
+    /// `smoke_fork_gated_externref_parent_survives`
+    /// (`native_fork_externref_gate_indirect.wat`, which mints via
+    /// `call_indirect` specifically so no provenance is ever recorded — see
+    /// that fixture's own doc comment).
     ///
     /// Asserts correctness (`exit_code == 0`, both processes observe the
     /// SAME externref handle, 42) AND proof of use
-    /// (`fork_proof_of_use.references_reconstructed > 0`, so a silent
+    /// (`fork_proof_of_use.externrefs_resolved > 0`, so a silent
     /// fallback that merely happened to leave the local unread cannot pass).
     #[test]
     fn smoke_fork_externref_reconstructs() -> anyhow::Result<()> {
