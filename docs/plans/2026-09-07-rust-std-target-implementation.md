@@ -352,11 +352,17 @@ Requires `RUST_LIBC_UNSTABLE_MUSL_V1_2_3=1`.
 **M4 first cut done** (`941fea22a`): `programs/rust/std-hello` (a `std`
 staticlib linked via the SDK) runs on the kernel — `std::println!`,
 formatting, and a `std::fs` write/read round-trip all succeed, exit 0.
-Remaining M4 work: args/env (`std::env::args`/`vars`), `std::time`,
-`HashMap` (getrandom seeding), and confirming a normal `fn main` entry
-(currently the fixture exports `__main_argc_argv` from a staticlib;
-bin-crate linking via `rust-lld` fails on `-lc`, so SDK-driven linking
-is still M6).
+Verified working in the fixture: `std::println!`, `std::fs`
+round-trip, `std::time` (monotonic `Instant`), and `HashMap`
+(getrandom-seeded SipHash). **KNOWN GAP:** `std::env::args()` is empty
+because the staticlib entry bypasses std's `lang_start`, and on musl
+argv is captured by `lang_start` (musl does not pass argc/argv to
+`.init_array`, so glibc's arg-capture trick does not apply). The fix is
+a normal `fn main` bin entry, which requires SDK-driven linking (bin
+crates fail `rust-lld` on `-lc`/`-lgcc_s`). **This makes the SDK linker
+integration (Milestone 6, Task 6.1) a prerequisite for `std::env::args`
+and `fn main` ergonomics — pull it earlier if generic-CLI arg handling
+is needed before P3–P5.**
 
 ## Milestone 3 — `std` unix pal compiles for `kandelo`
 
