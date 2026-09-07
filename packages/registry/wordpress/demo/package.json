@@ -8,6 +8,6 @@
   },
   "dependencies": {
     "@playwright/test": "^1.62.1",
-    "tsx": "^4.23.12"
+    "tsx": "^4.23.13"
   }
 }

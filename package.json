@@ -22,7 +22,7 @@
     "@playwright/test": "^1.62.1",
     "esbuild": "^0.28.2",
     "playwright": "^1.59.1",
-    "tsx": "^4.23.12",
+    "tsx": "^4.23.13",
     "vitepress": "^1.6.4"
   },
   "dependencies": {
