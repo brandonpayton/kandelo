@@ -21,10 +21,12 @@ describe("MAP_SHARED mmap + msync", () => {
     expect(result.stdout).toContain("M2 close-survives ok");
     expect(result.stdout).toContain("mremap ok");
     expect(result.stdout).toContain("PASS");
-  }, 30000);
+  }, 60000);
 });
-// The explicit 30s timeout covers the heavier kernel this branch compiles and
-// runs under Vitest's `forks` pool (the identical program runs in ~150ms of
-// actual guest work standalone, but end-to-end Vitest kernel compile+run on
-// this branch is ~9s — well over the 5s default and unrelated to the mmap
-// path being exercised here).
+// The explicit 60s timeout covers the heavier kernel this branch compiles and
+// runs under Vitest's `forks` pool. The identical program is ~150ms of actual
+// guest work standalone, but end-to-end Vitest kernel compile+run on this
+// branch is ~9s solo — and materially longer under parallel file execution,
+// where CPU contention from other kernel-compiling integration files inflates
+// the wall-clock wait. The generous bound avoids flaky timeouts unrelated to
+// the mmap path being exercised here.
