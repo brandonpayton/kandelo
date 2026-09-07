@@ -2278,13 +2278,38 @@ mod tests {
     /// (sealed at `drive_fork_capture_seal_and_launch_child`, replacing the
     /// canonical-null floor `write_empty_module_state_arena` used to leave
     /// there permanently) carries the real captured graph into the
-    /// already-working REPLAY side. externref/typed-GC/static-root capture
-    /// stays gated (`docs/fork-reference-support.md`'s current platform
-    /// contract) — this fixture was trimmed to funcref-only so this test
-    /// does not trip the still-unimplemented `encode_externref` gate; a
-    /// LATER, separate dispatch (N1-I5b Task 2) adds its own
-    /// externref-carrying fixture and asserts the `EOPNOTSUPP` gate instead
-    /// of reconstruction.
+    /// already-working REPLAY side.
+    ///
+    /// SCOPE (not a gate): this fixture stays funcref-only to keep THIS
+    /// test a focused funcref/null reconstruction case. externref, typed
+    /// Wasm-GC (`struct`/`array`/`i31`), and static-root references are NO
+    /// LONGER gated — they are all captured on native (via `guest.rs`'s
+    /// provenance registries) and reconstructed through the SAME shared
+    /// module/`fork-codec` replay engine (`fm_begin_reference_replay` /
+    /// `fm_build_gc_plan` / `fm_drive_execute` over
+    /// `crates/fork-codec::drive_plan::build_drive_plan`) that funcref uses.
+    /// The sibling tests prove each kind end-to-end with a `fm_*` proof-of-
+    /// use counter: `smoke_fork_externref_reconstructs`,
+    /// `smoke_fork_gc_struct_reconstructs`, `smoke_fork_gc_two_object_cycle`,
+    /// `smoke_fork_gc_array_reconstructs`, and
+    /// `smoke_fork_static_root_reconstructs`. Reconstruction is never
+    /// host-side on native — the host only supplies the Bucket-C floor
+    /// (`resolve_externref`, the reference-typed catalog/transit tables,
+    /// PIC/shared-memory, the unwind `Tag`); the drive-order and value
+    /// materialization live in the shared module engine.
+    ///
+    /// The ONE remaining `EOPNOTSUPP` boundary is value-conditional, NOT
+    /// kind-level, and identical on every host (native, Node, browser): a
+    /// live anyref-lineage value with no recoverable production-site
+    /// provenance (a `call_indirect`/`call_ref`-minted externref the
+    /// instrumenter could not identify, or a genuinely engine-internalized
+    /// value). On native it is enforced in `guest.rs` at the
+    /// `take_unsupported_kind()` gated-abort branch (search
+    /// `drive_fork_capture_seal_and_launch_child`): capture records no
+    /// provenance → the fork aborts cleanly with `-EOPNOTSUPP`, no child is
+    /// spawned, and the parent survives. That boundary is proven by
+    /// `smoke_fork_gated_externref_parent_survives`, and documented in
+    /// `docs/fork-reference-support.md` ("One remaining gated boundary").
     #[test]
     fn smoke_fork_reconstructs_references() -> anyhow::Result<()> {
         let Some(path) = kernel_path_or_skip() else {

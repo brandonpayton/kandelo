@@ -7154,12 +7154,14 @@ fn drive_reference_replay(store: &mut Store<()>, fm: &ForkModule, guest_mem: &Sh
     // `static_root_catalog_table` (grown ONCE at guest instantiation, see the
     // N1-I5 Task 1 block above), this table's required size is PER-FORK (it
     // depends on THIS fork's own reference graph), so it must be (re-)grown
-    // here, per replay, before every drive. There is no capture-time growth
-    // call on native today — `gc_claim`'s documented host-side growth
-    // (`module_gc_codec.rs`'s "Claim grows ... through recipe+1 before
-    // returning") is dead here since GC claim stays gated (see this file's
-    // `gc_lookup` doc comment) — so this is the one place a native fork's
-    // transit table ever grows. Reads the plan bytes back out of the SAME
+    // here, per replay, before every drive. The capture side DOES grow a
+    // transit table (`gc_claim`/`gc_i31`/`gc_broker_encode` call
+    // `ensure_gc_transit_capacity` per `module_gc_codec.rs`'s "Claim grows
+    // ... through recipe+1 before returning" contract), but that grows the
+    // PARENT's live transit table during capture; a replayed CHILD (or the
+    // parent's own post-fork rewind) drives a freshly deserialized plan
+    // against a transit table that starts empty, so it must be sized here
+    // from the decoded plan before driving. Reads the plan bytes back out of the SAME
     // guest memory `fm_build_gc_plan` just serialized them into
     // (`fork_codec::drive_plan::read_step` is documented as usable by "tests
     // and the host" for exactly this).
