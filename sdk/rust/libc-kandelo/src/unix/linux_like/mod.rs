@@ -2192,7 +2192,9 @@ cfg_if! {
     if #[cfg(target_os = "emscripten")] {
         mod emscripten;
         pub use self::emscripten::*;
-    } else if #[cfg(target_os = "linux")] {
+    } else if #[cfg(any(target_os = "linux", target_os = "kandelo"))] {
+        // kandelo: Kandelo is a musl-based POSIX kernel; route it through the
+        // Linux musl bindings.
         mod linux;
         pub use self::linux::*;
         mod linux_l4re_shared;

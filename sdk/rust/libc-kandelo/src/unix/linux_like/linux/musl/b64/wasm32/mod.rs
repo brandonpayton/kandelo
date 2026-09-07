@@ -4,33 +4,41 @@ use crate::off_t;
 use crate::prelude::*;
 
 pub type wchar_t = i32;
-pub type nlink_t = u64;
-pub type blksize_t = c_long;
+// kandelo: Kandelo's musl (libc/musl-overlay/arch/wasm32posix/bits/alltypes.h.in)
+// defines `nlink_t` as `unsigned int` and `blksize_t` as `int`, unlike the
+// WALI ABI (which mirrors x86_64 Linux with a 64-bit `nlink_t`).
+pub type nlink_t = c_uint;
+pub type blksize_t = c_int;
 pub type __u64 = c_ulonglong;
 pub type __s64 = c_longlong;
 
 pub type stat64 = stat;
 
 s! {
+    // kandelo: This layout matches Kandelo's own musl, not the WALI ABI. See
+    // libc/musl-overlay/arch/wasm32posix/bits/stat.h, whose 112-byte record is
+    // pinned to crates/shared/src/process_layout.rs. Field offsets (repr(C)
+    // auto-padding reproduces the C padding exactly, given time_t=i64 and
+    // c_long=i32 on wasm32): st_size@32, st_atim@40, st_mtim@56, st_ctim@72,
+    // st_rdev@88, st_blksize@96, st_blocks@104. The `st_[amc]time_nsec` fields
+    // stand in for the C `struct timespec` members `st_[amc]tim.tv_nsec`.
     pub struct stat {
         pub st_dev: crate::dev_t,
         pub st_ino: crate::ino_t,
-        pub st_nlink: crate::nlink_t,
         pub st_mode: crate::mode_t,
+        pub st_nlink: crate::nlink_t,
         pub st_uid: crate::uid_t,
         pub st_gid: crate::gid_t,
-        __pad0: Padding<c_int>,
-        pub st_rdev: crate::dev_t,
         pub st_size: off_t,
-        pub st_blksize: crate::blksize_t,
-        pub st_blocks: crate::blkcnt_t,
         pub st_atime: crate::time_t,
         pub st_atime_nsec: c_long,
         pub st_mtime: crate::time_t,
         pub st_mtime_nsec: c_long,
         pub st_ctime: crate::time_t,
         pub st_ctime_nsec: c_long,
-        __unused: Padding<[c_long; 3]>,
+        pub st_rdev: crate::dev_t,
+        pub st_blksize: crate::blksize_t,
+        pub st_blocks: crate::blkcnt_t,
     }
 
     pub struct ipc_perm {
@@ -53,6 +61,10 @@ s! {
         __unused2: Padding<c_long>,
     }
 }
+
+// kandelo: Guard the overlay-pinned `struct stat` size at compile time.
+// libc/musl-overlay/arch/wasm32posix/bits/stat.h asserts sizeof == 112.
+const _: () = [()][(core::mem::size_of::<stat>() != 112) as usize];
 
 // Syscall table
 pub const SYS_read: c_long = 0;

@@ -87,7 +87,8 @@ cfg_if! {
     } else if #[cfg(target_os = "l4re")] {
         mod l4re;
         // pub(crate) use l4re::*;
-    } else if #[cfg(target_os = "linux")] {
+    } else if #[cfg(any(target_os = "linux", target_os = "kandelo"))] {
+        // kandelo: mirror linux-musl, which pulls in the Linux uapi headers.
         mod linux_uapi;
         pub(crate) use linux_uapi::*;
     } else if #[cfg(target_os = "netbsd")] {
@@ -175,7 +176,7 @@ cfg_if! {
 cfg_if! {
     if #[cfg(target_os = "android")] {
         pub use sys::socket::*;
-    } else if #[cfg(target_os = "linux")] {
+    } else if #[cfg(any(target_os = "linux", target_os = "kandelo"))] {
         pub use linux::can::bcm::*;
         pub use linux::can::error::*;
         pub use linux::can::j1939::*;
@@ -231,7 +232,8 @@ cfg_if! {
             target_os = "android",
             target_os = "emscripten",
             target_os = "l4re",
-            target_os = "linux"
+            target_os = "linux",
+            target_os = "kandelo"
         ))]
         pub use pthread::*;
         pub use unistd::*;
