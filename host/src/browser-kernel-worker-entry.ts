@@ -144,11 +144,14 @@ const O_WRONLY_CREAT_TRUNC =
   OPEN_FLAGS.O_WRONLY | OPEN_FLAGS.O_CREAT | OPEN_FLAGS.O_TRUNC;
 // State
 let kernelWorker: CentralizedKernelWorker;
-// Phase 6 D5: the co-resident wasm32 fork-module, compiled ONCE at kernel init
-// when the main thread forwards `WASM_POSIX_FORK_MODULE`. Browser workers
-// cannot read `process.env`, so the decision and bytes arrive in the init
-// message. Shipped to each fork-instrumented process worker; default off.
-let forkModuleEnabledBrowser = false;
+// Phase 6 D5 / Path B flip: the co-resident wasm32 fork-module, compiled ONCE
+// at kernel init when the main thread forwards `WASM_POSIX_FORK_MODULE`. Browser
+// workers cannot read `process.env`, so the decision and bytes arrive in the
+// init message (handleInit, below). The module is the DEFAULT reconstructor, so
+// this defaults true — but it is INERT until `forkModuleModule32Browser` is
+// compiled from shipped bytes (see the `forkModuleInitFields` guard), so it can
+// never manufacture a false "enabled" without the module actually present.
+let forkModuleEnabledBrowser = true;
 let forkModuleModule32Browser: WebAssembly.Module | null = null;
 function forkModuleInitFields(
   ptrWidth: 4 | 8,

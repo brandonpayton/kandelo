@@ -168,9 +168,11 @@ const port = parentPort;
  * host (the Node kernel worker builds every `centralized_init` message). When
  * enabled, resolve and compile the width-matching co-resident `fork-module`
  * once per pointer width and ship it to each fork-instrumented process worker.
- * Default (unset) leaves the init message byte-identical to today.
+ * Path B flip: the co-resident module is now the DEFAULT reconstructor+capturer.
+ * Default (unset) enables it; set `WASM_POSIX_FORK_MODULE=0` as the kill switch
+ * to force the legacy JS path.
  */
-const forkModuleEnabled = process.env.WASM_POSIX_FORK_MODULE === "1";
+const forkModuleEnabled = process.env.WASM_POSIX_FORK_MODULE !== "0";
 const forkModuleModuleByWidth = new Map<4 | 8, WebAssembly.Module>();
 function forkModuleInitFields(
   ptrWidth: 4 | 8,

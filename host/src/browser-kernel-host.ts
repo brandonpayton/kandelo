@@ -73,10 +73,11 @@ export interface BrowserKernelOptions {
   /** Host default pthread slots when a wasm binary declares -1 (default: 16). */
   defaultThreadSlots?: number;
   /**
-   * Phase 6 D5: enable the co-resident `fork-module` for fork-instrumented
-   * process workers (mirrors `WASM_POSIX_FORK_MODULE` on the Node host). When
-   * true, the wasm32 fork-module URL is fetched at boot and shipped to the
-   * kernel worker. Default false leaves the browser path unchanged.
+   * Enable the co-resident `fork-module` for fork-instrumented process workers
+   * (mirrors `WASM_POSIX_FORK_MODULE` on the Node host). Path B flip: the module
+   * is now the DEFAULT reconstructor, so when this is unset the wasm32
+   * fork-module URL is fetched at boot and shipped to the kernel worker. Pass
+   * `false` explicitly to force the legacy JS path.
    */
   forkModuleEnabled?: boolean;
   /** Additional VFS mount points */
@@ -423,9 +424,14 @@ export class BrowserKernel {
     const closedLazyAssets = opts.closedLazyAssets === undefined
       ? undefined
       : snapshotClosedLazyAssets(opts.closedLazyAssets);
-    // Phase 6 D5: fetch the optional wasm32 fork-module bytes only when the
-    // demo opted in. Default boots never resolve the artifact.
-    const forkModuleBytes = this.options.forkModuleEnabled
+    // Path B flip: the co-resident fork-module is the DEFAULT reconstructor on
+    // the browser V8 host too. This main-thread lever is the browser analog of
+    // Node's `WASM_POSIX_FORK_MODULE` default — it fetches the wasm32 module and
+    // ships it (plus the enabled flag) to the kernel worker so the worker's init
+    // handler actually receives the enabled flag. Pass `forkModuleEnabled: false`
+    // explicitly to force the legacy JS path.
+    const forkModuleEnabled = this.options.forkModuleEnabled !== false;
+    const forkModuleBytes = forkModuleEnabled
       ? await fetchDefaultBrowserForkModule32()
       : undefined;
     // Create the kernel worker
@@ -500,7 +506,7 @@ export class BrowserKernel {
         const initMsg: MainToKernelMessage = {
           type: "init",
           kernelWasmBytes: transferBuf,
-          ...(this.options.forkModuleEnabled && forkModuleBytes
+          ...(forkModuleEnabled && forkModuleBytes
             ? { forkModuleEnabled: true, forkModuleBytes }
             : {}),
           vfsImage: opts.vfsImage,
@@ -526,7 +532,7 @@ export class BrowserKernel {
           },
         };
         const transfer: Transferable[] = [transferBuf];
-        if (this.options.forkModuleEnabled && forkModuleBytes) {
+        if (forkModuleEnabled && forkModuleBytes) {
           transfer.push(forkModuleBytes);
         }
         if (opts.takeVfsImageOwnership) {
