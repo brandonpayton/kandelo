@@ -67,6 +67,7 @@ import {
   ForkCaptureSession,
   type ForkReferenceCaptureSurface,
 } from "./fork-capture-session";
+import { ForkModuleReconstructionFloor } from "./fork-module-reconstruction";
 import { ForkExternrefProvenanceTable } from "./fork-externref-provenance";
 import type { ForkReferenceCaptureModule } from "./fork-reference-capture-module";
 import type { ForkActivationExceptionProvider } from "./fork-reference-contracts";
@@ -1680,6 +1681,14 @@ export class ForkActivationRegistry {
   attachChild(
     arena: ForkModuleStateArena,
     decodedReferences?: DecodedSegmentedForkReferenceTransaction,
+    // Module-on child reconstruction: the co-resident fork-module is the SOLE
+    // reconstructor (decode + data feed + the whole `drive_plan` walk run in
+    // Rust), so this child path constructs the module-backed reconstruction
+    // FLOOR instead of a JS `ForkReferenceTransaction`. The getter reads the
+    // module's resident decoded-graph node count (`fm_decoded_node_count`) for
+    // the STORE #2 transit sizing. Omitted on the flag-off child path, which
+    // keeps the JS reconstruction engine.
+    moduleDecodedNodeCount?: () => number,
   ): void {
     this.requirePhase("idle", "attach child activation state");
     if (!arena.hasActiveArena() || !arena.isSealed()) {
@@ -1709,17 +1718,32 @@ export class ForkActivationRegistry {
       );
     }
     const functions = this.buildFunctionCatalog();
-    const references = new ForkReferenceTransaction(
-      functions,
-      this.externrefs,
-      this.memory,
-      this.allocateScratch,
-      this.deallocateScratch,
-      `${this.label}: references`,
-      this.staticRoots,
-      this.typedReplayOwner(),
-      this.externrefProvenance,
-    );
+    // Module-on child reconstruction constructs NO JS reference-graph engine:
+    // the co-resident module owns the decode, the RESTORE data feed, and the
+    // whole topological drive order. The floor only sizes the shared anyref
+    // transit (from the module's resident `fm_decoded_node_count`) and is the
+    // validate-only early-provider adoption target. A flag-off child keeps the
+    // JS engine.
+    const references: ForkReferenceCaptureSurface = moduleDecodedNodeCount
+      ? new ForkModuleReconstructionFloor(
+          this.typedReplayOwner(),
+          moduleDecodedNodeCount,
+          this.memory,
+          this.allocateScratch,
+          this.deallocateScratch,
+          `${this.label}: module reconstruction`,
+        )
+      : new ForkReferenceTransaction(
+          functions,
+          this.externrefs,
+          this.memory,
+          this.allocateScratch,
+          this.deallocateScratch,
+          `${this.label}: references`,
+          this.staticRoots,
+          this.typedReplayOwner(),
+          this.externrefProvenance,
+        );
     references.attachChild(decodedReferences ?? records);
     this.functions = functions;
     this.references = references;

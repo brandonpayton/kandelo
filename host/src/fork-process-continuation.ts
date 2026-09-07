@@ -1054,7 +1054,16 @@ export class ForkProcessContinuationCoordinator {
     this.arena = arena;
     this.replayOwnership = "owned";
     try {
-      this.registry.attachChild(arena, decodedReferences);
+      // When the co-resident module owns reference reconstruction, the registry
+      // constructs the module-backed reconstruction FLOOR (no JS engine) and
+      // sizes the shared transit from the module's resident decoded-graph node
+      // count. A module-backed FRAME fork whose references stayed on the JS path
+      // (`moduleReferenceReplay` false) keeps the JS reconstruction engine.
+      this.registry.attachChild(
+        arena,
+        decodedReferences,
+        this.moduleReferenceReplay ? () => backend.decodedNodeCount() : undefined,
+      );
       adoptPreinstantiatedReferences?.();
       // Activation 0's continuation root is the inherited launch anchor. Side
       // activations (a dlopen fork) recover their inherited anchors from the
@@ -1233,7 +1242,15 @@ export class ForkProcessContinuationCoordinator {
     this.arena = arena;
     this.replayOwnership = "borrowed";
     try {
-      this.registry.attachChild(arena, decodedReferences);
+      // Same module-backed reconstruction floor as the COW module child (see
+      // `attachModuleChild`): the module sizes the transit from its resident
+      // decoded graph and drives the whole reconstruction. A JS-reference
+      // borrowed child (`moduleReferenceReplay` false) keeps the JS engine.
+      this.registry.attachChild(
+        arena,
+        decodedReferences,
+        this.moduleReferenceReplay ? () => backend.decodedNodeCount() : undefined,
+      );
       adoptPreinstantiatedReferences?.();
       // Activation 0's borrowed continuation anchor is the parent's launch root
       // (the borrowed override returns `forkBufAddr`). Unlike the JS borrowed
