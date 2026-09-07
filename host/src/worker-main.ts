@@ -97,6 +97,7 @@ import {
   type ForkModuleInstance,
   instantiateForkModule,
 } from "./fork-module-instance";
+import { ForkReferenceCaptureModule } from "./fork-reference-capture-module";
 import { ForkModuleTrampolines } from "./fork-module-trampoline";
 import {
   FORK_MODULE_RESUME_CATALOG_CAP,
@@ -3875,6 +3876,22 @@ export async function centralizedWorkerMain(
         processContinuation.enableModuleBacking(
           forkModuleBackend,
           trampolines ? (id) => trampolines.evict(id) : undefined,
+        );
+      }
+      // Path B P3: route this worker's next fork's reference CAPTURE through the
+      // co-resident module's shared builder (the module is the SOLE capture
+      // graph). The parent reads its own vectors back from the resident builder
+      // (`fm_capture_vector_get`) during its post-fork replay; leaf values still
+      // come from `capturedValues` / the transit table (originals), so the
+      // parent's live-reference identity is preserved. Non-module forks (flag
+      // off) keep the JS capture graph.
+      if (forkModuleInstance) {
+        activationRegistry.setCaptureModule(
+          new ForkReferenceCaptureModule(
+            forkModuleInstance.exports,
+            memory,
+            `pid=${pid}: fork reference capture module`,
+          ),
         );
       }
       let processDlopenSupport: DlopenSupport | null = null;

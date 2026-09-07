@@ -3792,12 +3792,15 @@ mod wasm {
     }
 
     /// Complete a claimed struct/array/exnref placeholder into its final
-    /// aggregate recipe. `scalar_ptr`/`scalar_len` and the `edges`/`prov` arrays
-    /// are guest-linear-memory spans the host assembled exactly as native does
-    /// (`gc_define`): `scalars` = constructor-provenance seed bytes then the live
-    /// field snapshot; `edges` = provenance recipe ids then the field/element
-    /// vector. `has_provenance != 0` records a `GcProvenance` for validation
-    /// (its ids must name existing recipes). Returns `0` or `-1`.
+    /// aggregate recipe. `scalar_ptr`/`scalar_len` is the COMBINED scalar span in
+    /// guest linear memory (constructor-provenance seed bytes then the live field
+    /// snapshot) the host already assembled. `reference_vector_ordinal` names the
+    /// module-interned field/element vector; the edge vector is assembled here
+    /// exactly as native's `gc_define` does — provenance recipe ids first, then
+    /// that field vector — so the host never re-reads the vector it just interned.
+    /// `has_provenance != 0` records a `GcProvenance` for validation (its ids,
+    /// read from `prov_ptr`/`prov_count`, must name existing recipes and are the
+    /// prepended edges). Returns `0` or `-1`.
     #[allow(clippy::too_many_arguments)]
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_capture_define_gc(
@@ -3808,8 +3811,7 @@ mod wasm {
         kind: u32,
         scalar_ptr: usize,
         scalar_len: usize,
-        edges_ptr: usize,
-        edges_count: usize,
+        reference_vector_ordinal: u32,
         has_provenance: u32,
         prov_ptr: usize,
         prov_count: usize,
@@ -3825,15 +3827,29 @@ mod wasm {
         };
         let assembled = (|| -> Result<(), Errno> {
             let scalars = read_capture_bytes(scalar_ptr, scalar_len)?;
-            let edges = read_capture_u32_array(edges_ptr, edges_count)?;
+            let prov_ids = if has_provenance != 0 {
+                read_capture_u32_array(prov_ptr, prov_count)?
+            } else {
+                Vec::new()
+            };
+            let g = capture_state().as_mut().ok_or(Errno::EINVAL)?;
+            // Assemble edges = provenance ids ++ the interned field vector,
+            // mirroring native's `gc_define`. Ordinal 0 is the canonical empty
+            // vector (no field edges).
+            let field_vector = g
+                .vectors()
+                .get(reference_vector_ordinal as usize)
+                .ok_or(Errno::EINVAL)?
+                .clone();
+            let mut edges = prov_ids.clone();
+            edges.extend_from_slice(&field_vector);
             let provenance = if has_provenance != 0 {
                 Some(GcProvenance {
-                    reference_ids: read_capture_u32_array(prov_ptr, prov_count)?,
+                    reference_ids: prov_ids,
                 })
             } else {
                 None
             };
-            let g = capture_state().as_mut().ok_or(Errno::EINVAL)?;
             g.define_gc(
                 recipe_id,
                 activation,
@@ -3879,6 +3895,39 @@ mod wasm {
         match capture_state().as_mut() {
             Some(g) => capture_ok_id(g.finish_vector(handle)),
             None => {
+                set_err(Errno::EINVAL);
+                -1
+            }
+        }
+    }
+
+    /// Read entry `index` of interned reference vector `ordinal` from the RESIDENT
+    /// capture builder (the graph `fm_capture_*` is still building/has built this
+    /// fork), returning the recipe id or `-1` on out-of-bounds. This is the
+    /// PARENT's own post-fork replay read: after the parent seals, its frame
+    /// rewind asks which recipe ids each frame's reference vector holds so it can
+    /// hand back the ORIGINAL live values (kept host-side in `capturedValues`, and
+    /// in the module-owned transit table). Unlike `fm_ref_vector_get` — which
+    /// reads a DECODED transaction a child reconstructs from the wire — this reads
+    /// the live capture builder directly, so the parent never re-decodes its own
+    /// graph and never reconstructs (its live references keep their identity by
+    /// construction). Requires an active capture session.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_capture_vector_get(ordinal: u32, index: u32) -> i32 {
+        let Some(g) = capture_state().as_ref() else {
+            set_err(Errno::EINVAL);
+            return -1;
+        };
+        match g
+            .vectors()
+            .get(ordinal as usize)
+            .and_then(|v| v.get(index as usize))
+        {
+            Some(&recipe_id) if recipe_id <= i32::MAX as u32 => {
+                set_ok();
+                recipe_id as i32
+            }
+            _ => {
                 set_err(Errno::EINVAL);
                 -1
             }

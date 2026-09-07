@@ -1,5 +1,6 @@
 import {
   type ForkModuleStateArena,
+  type ForkModuleStateRecordKind,
 } from "./fork-module-state";
 import {
   type ForkReferenceRecipeEntry,
@@ -36,8 +37,20 @@ import {
 import { ForkStaticRootCatalog } from "./fork-static-root-catalog";
 import type { ForkExternrefProvenanceTable } from "./fork-externref-provenance";
 import {
+  FORK_CAPTURE_KIND_ARRAY,
+  FORK_CAPTURE_KIND_STRUCT,
+  type ForkReferenceCaptureModule,
+} from "./fork-reference-capture-module";
+import {
   WPK_FORK_REFERENCE_TRANSACTION_OWNER,
 } from "./generated/abi";
+
+/**
+ * Per-segment copy window for the module's `fm_capture_serialize` (bytes). A
+ * single window per section for the common small graph; the module bounds each
+ * KFRS segment to this, so the value only affects segment COUNT, never content.
+ */
+const FORK_CAPTURE_SEGMENT_WINDOW = 1 << 16;
 
 /**
  * The owner id is local to the ReferenceRecipe record kind. One process fork
@@ -233,6 +246,16 @@ export class ForkReferenceTransaction {
   >();
   private readonly freeReferenceVectorHandles: number[] = [];
   private nextReferenceVectorHandle = 1;
+  /**
+   * Path B P3 (module capture): per-open-vector length bookkeeping keyed by the
+   * MODULE's vector handle. The module owns the vector contents; the host keeps
+   * only the declared/observed length so `finishReferenceVector` still enforces
+   * the guest's `expectedLength` contract (the module has no such check).
+   */
+  private readonly moduleVectorLengths = new Map<
+    number,
+    { expected: number; count: number }
+  >();
   private readonly referenceVectorIntern:
     MutableForkReferenceVectorInternIndex = new Map();
   private readonly decodedReferenceVectors =
@@ -262,7 +285,36 @@ export class ForkReferenceTransaction {
      * Lookup-only: `lookupGcSlot` never mints through this table.
      */
     private readonly externrefProvenance?: ForkExternrefProvenanceTable,
+    /**
+     * Path B P3: when present, reference CAPTURE routes through the co-resident
+     * fork-module's shared `ReferenceGraphBuilder` (the `fm_capture_*` exports)
+     * instead of this class's JavaScript node/vector tables — the module is the
+     * SOLE capture graph. The per-host identity floor stays here (the
+     * `capturedValues` originals for the parent's own replay, the `objectIds`
+     * live-value dedup for a claimed GC value, the externref-provenance `WeakMap`,
+     * and the transit publish); only the graph construction/dedup/serialization
+     * moves to shared Rust, mirroring native's `guest.rs` capture bodies.
+     */
+    private readonly captureModule?: ForkReferenceCaptureModule,
   ) {}
+
+  /** Path B P3: is reference capture routed through the shared module builder? */
+  private get moduleCapture(): boolean {
+    return this.captureModule !== undefined;
+  }
+
+  /**
+   * Sync the parent's captured-value side table with a recipe id the module just
+   * assigned. The module returns dense ids, so a NEW node's id equals the current
+   * `capturedValues.length`; a dedup hit returns an existing id and leaves the
+   * value already recorded. This keeps `capturedValues[id]` one-to-one with the
+   * module graph so the parent's own replay hands back its ORIGINAL live value.
+   */
+  private recordModuleCapturedValue(id: number, value: unknown): void {
+    if (id === this.capturedValues.length) {
+      this.capturedValues.push(value);
+    }
+  }
 
   setExceptionSlotProvider(provider: ForkExceptionSlotProvider): void {
     if (this.exceptionSlots && this.exceptionSlots !== provider) {
@@ -275,9 +327,17 @@ export class ForkReferenceTransaction {
     if (this.phase !== "idle") {
       throw new Error(`cannot begin reference capture while transaction is ${this.phase}`);
     }
-    this.nodes.push({ id: 0, node: { kind: "null" } });
+    // Recipe 0 is the canonical null; its captured value (null) is kept host-side
+    // in BOTH modes so the parent's own replay decode returns it directly.
     this.capturedValues.push(null);
-    this.referenceVectors.push(PagedForkReferenceVector.empty);
+    if (this.moduleCapture) {
+      // The module is the SOLE capture graph: seed the shared builder (recipe 0 =
+      // null, vector 0 = empty). The JS node/vector tables stay empty and unused.
+      this.captureModule!.begin();
+    } else {
+      this.nodes.push({ id: 0, node: { kind: "null" } });
+      this.referenceVectors.push(PagedForkReferenceVector.empty);
+    }
     this.phase = "capture";
   }
 
@@ -286,6 +346,16 @@ export class ForkReferenceTransaction {
     if (value === null) return 0;
     if (typeof value !== "function") {
       throw new TypeError("fork funcref encoder received a non-function value");
+    }
+    if (this.moduleCapture) {
+      const recipe = this.functions.encode(value);
+      if (!recipe) throw new Error("non-null funcref produced a null catalog recipe");
+      const id = this.captureModule!.internFuncref(
+        recipe.moduleActivation,
+        recipe.ordinal,
+      );
+      this.recordModuleCapturedValue(id, value);
+      return id;
     }
     return this.intern(value, () => {
       const recipe = this.functions.encode(value);
@@ -321,6 +391,11 @@ export class ForkReferenceTransaction {
    */
   reserveGatedPlaceholder(value: unknown): number {
     this.requirePhase("capture", "reserve a gated placeholder recipe");
+    if (this.moduleCapture) {
+      const id = this.captureModule!.gatedPlaceholder();
+      this.recordModuleCapturedValue(id, value);
+      return id;
+    }
     const id = this.nodes.length;
     if (id > 0xffff_ffff) {
       throw new RangeError("fork reference recipe id space exhausted");
@@ -351,20 +426,30 @@ export class ForkReferenceTransaction {
     if (known !== undefined) return known;
     const staticRoot = this.staticRoots?.encode(value);
     if (staticRoot) {
-      const id = this.nodes.length;
-      if (id > 0xffff_ffff) {
-        throw new RangeError("fork reference recipe id space exhausted");
+      let id: number;
+      if (this.moduleCapture) {
+        id = this.captureModule!.internStaticRoot(
+          staticRoot.moduleActivation,
+          staticRoot.ordinal,
+        );
+        this.recordModuleCapturedValue(id, value);
+        this.rememberId(value, id);
+      } else {
+        id = this.nodes.length;
+        if (id > 0xffff_ffff) {
+          throw new RangeError("fork reference recipe id space exhausted");
+        }
+        this.nodes.push({
+          id,
+          node: {
+            kind: "static-root",
+            moduleActivation: staticRoot.moduleActivation,
+            staticRootOrdinal: staticRoot.ordinal,
+          },
+        });
+        this.capturedValues.push(value);
+        this.rememberId(value, id);
       }
-      this.nodes.push({
-        id,
-        node: {
-          kind: "static-root",
-          moduleActivation: staticRoot.moduleActivation,
-          staticRootOrdinal: staticRoot.ordinal,
-        },
-      });
-      this.capturedValues.push(value);
-      this.rememberId(value, id);
       // Publish the static root into the transit at `id + 1` so PARENT replay's
       // `decode_anyref` (a pure `table.get(transit, recipe + 1)`) reads it. A
       // captured i31 / struct is grown+published for the parent by
@@ -384,10 +469,17 @@ export class ForkReferenceTransaction {
     // not merely a GC-internalized anyref that happens to reach this seam.
     const externrefHandle = this.externrefProvenance?.lookup(value);
     if (externrefHandle !== undefined) {
-      const id = this.intern(value, () => ({
-        kind: "externref",
-        handle: externrefHandle,
-      }));
+      let id: number;
+      if (this.moduleCapture) {
+        id = this.captureModule!.internExternref(externrefHandle);
+        this.recordModuleCapturedValue(id, value);
+        this.rememberId(value, id);
+      } else {
+        id = this.intern(value, () => ({
+          kind: "externref",
+          handle: externrefHandle,
+        }));
+      }
       // Publish into the transit at `id + 1`, exactly like the static-root
       // branch above: the guest's generated `decode_externref` bridge (a
       // LOCAL Wasm function, not this file's JS `decodeExternref`) restores a
@@ -409,6 +501,15 @@ export class ForkReferenceTransaction {
     const value = this.gcSlotValue(table, slot);
     const known = this.lookupId(value);
     if (known !== undefined) return known;
+    if (this.moduleCapture) {
+      // The module publishes the placeholder id first (cycle-closing), exactly
+      // like the JS path; the live value + id are remembered host-side so a later
+      // field edge that aliases this value resolves to the same recipe.
+      const id = this.captureModule!.claimGc();
+      this.recordModuleCapturedValue(id, value);
+      this.rememberId(value, id);
+      return id;
+    }
     const id = this.nodes.length;
     if (id > 0xffff_ffff) {
       throw new RangeError("fork reference recipe id space exhausted");
@@ -441,6 +542,11 @@ export class ForkReferenceTransaction {
       || value > 0x3fff_ffff
     ) {
       throw new RangeError(`invalid signed i31 payload ${value}`);
+    }
+    if (this.moduleCapture) {
+      const id = this.captureModule!.internI31(value);
+      this.recordModuleCapturedValue(id, value);
+      return id;
     }
     const known = this.i31Ids.get(value);
     if (known !== undefined) return known;
@@ -483,6 +589,21 @@ export class ForkReferenceTransaction {
     this.assertU32(typeOrdinal, "GC type ordinal");
     this.assertU31(layoutId, "GC layout id", false);
     this.assertU32(referenceVectorOrdinal, "GC reference vector ordinal");
+    if (this.moduleCapture) {
+      this.defineGcModule(
+        recipeId,
+        moduleActivation,
+        typeOrdinal,
+        layoutId,
+        kind,
+        scalarPointer,
+        scalarByteLength,
+        referenceVectorOrdinal,
+        descriptor,
+        provenance,
+      );
+      return;
+    }
     if (!this.pendingGc.has(recipeId)) {
       throw new Error(`fork Wasm-GC recipe ${recipeId} is not pending definition`);
     }
@@ -583,6 +704,132 @@ export class ForkReferenceTransaction {
           };
     this.nodes.set(recipeId, { id: recipeId, node });
     this.pendingGc.delete(recipeId);
+  }
+
+  /**
+   * Module-capture `defineGc`: complete a claimed struct/array placeholder in the
+   * shared builder. Keeps the cheap host-side layout-coordinate + provenance
+   * consistency checks (the module cannot re-derive them), assembles the COMBINED
+   * scalar span (constructor-provenance seed then live snapshot) and the
+   * provenance recipe ids in guest memory, and routes the graph node construction
+   * to the module — which reads the interned field vector and prepends the
+   * provenance ids itself, exactly as native's `gc_define`. The JS
+   * `validateGcSnapshot` reference-count/scalar-shape check is intentionally NOT
+   * duplicated here (native does not run it either); the module validates edge
+   * bounds and the guest produces the field data.
+   */
+  private defineGcModule(
+    recipeId: number,
+    moduleActivation: number,
+    typeOrdinal: number,
+    layoutId: number,
+    kind: number,
+    scalarPointer: number | bigint,
+    scalarByteLength: number,
+    referenceVectorOrdinal: number,
+    descriptor: ForkGcCodecDescriptor,
+    provenance: ForkGcDefinitionProvenance | null,
+  ): void {
+    const layout = descriptor.require(layoutId);
+    if (layout.typeOrdinal !== typeOrdinal || layout.kind !== kind) {
+      throw new Error(
+        `fork Wasm-GC recipe ${recipeId} coordinate does not match `
+        + `${moduleActivation}:${typeOrdinal}:${layoutId}:${kind}`,
+      );
+    }
+    const requiresProvenance =
+      (layout.flags & FORK_GC_LAYOUT_REQUIRES_PROVENANCE) !== 0;
+    if (requiresProvenance !== (provenance !== null)) {
+      throw new Error(
+        `fork Wasm-GC recipe ${recipeId} has `
+        + `${provenance ? "unexpected" : "missing"} constructor provenance`,
+      );
+    }
+    const kindArg =
+      layout.kind === 1 ? FORK_CAPTURE_KIND_STRUCT : FORK_CAPTURE_KIND_ARRAY;
+    if (!provenance) {
+      // No constructor provenance: the combined scalars ARE the live field
+      // snapshot the guest already wrote to `scalarPointer`.
+      this.captureModule!.defineGc({
+        recipeId,
+        activation: moduleActivation,
+        typeOrdinal,
+        layoutId,
+        kind: kindArg,
+        scalarPtr: Number(scalarPointer),
+        scalarLen: scalarByteLength,
+        referenceVectorOrdinal,
+        hasProvenance: false,
+        provPtr: 0,
+        provCount: 0,
+      });
+      return;
+    }
+    // Provenance: validate against the layout exactly as the JS path does, then
+    // assemble (provenance scalars ++ live snapshot) and the provenance recipe
+    // ids into a scratch span the module reads.
+    const selected = descriptor.requireCaptureLayout(
+      layout.baseLayoutId,
+      provenance.record.layoutId,
+    );
+    if (
+      selected.id !== layout.id
+      || provenance.record.activationId !== moduleActivation
+      || provenance.record.baseLayoutId !== layout.baseLayoutId
+      || provenance.record.scalars.byteLength !== layout.provenanceScalarLength
+      || provenance.record.references.length !== layout.provenanceReferenceCount
+      || provenance.recipeIds.length !== layout.provenanceReferenceCount
+    ) {
+      throw new Error(
+        `fork Wasm-GC recipe ${recipeId} provenance does not match layout ${layout.id}`,
+      );
+    }
+    const provenanceScalars = provenance.record.scalars;
+    const provenanceIds = provenance.recipeIds;
+    const snapshot = this.readBytes(
+      scalarPointer,
+      scalarByteLength,
+      "fork Wasm-GC scalar payload",
+    );
+    const combined = new Uint8Array(
+      provenanceScalars.byteLength + snapshot.byteLength,
+    );
+    combined.set(provenanceScalars);
+    combined.set(snapshot, provenanceScalars.byteLength);
+    const provBytes = provenanceIds.length * 4;
+    // One scratch reservation holds the combined scalars then the provenance ids.
+    const scalarSpan = Math.max(1, combined.byteLength);
+    const total = scalarSpan + provBytes;
+    const base = this.reserveScratch(total);
+    try {
+      if (combined.byteLength > 0) {
+        this.writeBytes(base, combined, "fork Wasm-GC combined scalars");
+      }
+      const provPtr = base + scalarSpan;
+      if (provBytes > 0) {
+        const provBuf = new Uint8Array(provBytes);
+        const provView = new DataView(provBuf.buffer);
+        provenanceIds.forEach((id, index) =>
+          provView.setUint32(index * 4, id >>> 0, true),
+        );
+        this.writeBytes(provPtr, provBuf, "fork Wasm-GC provenance ids");
+      }
+      this.captureModule!.defineGc({
+        recipeId,
+        activation: moduleActivation,
+        typeOrdinal,
+        layoutId,
+        kind: kindArg,
+        scalarPtr: base,
+        scalarLen: combined.byteLength,
+        referenceVectorOrdinal,
+        hasProvenance: true,
+        provPtr,
+        provCount: provenanceIds.length,
+      });
+    } finally {
+      this.releaseScratch(base, total);
+    }
   }
 
   routeGc(recipeId: number, expectedActivation: number): number {
@@ -734,6 +981,32 @@ export class ForkReferenceTransaction {
       throw new Error(
         `cannot seal ${this.pendingExceptions.size} incomplete exception recipe(s)`,
       );
+    }
+    if (this.moduleCapture) {
+      if (this.moduleVectorLengths.size !== 0) {
+        throw new Error(
+          `cannot seal ${this.moduleVectorLengths.size} unfinished reference vector(s)`,
+        );
+      }
+      // The shared builder owns the canonical-capture validation (pending GC
+      // placeholders, open vectors, edge bounds); it fails loud on any fault.
+      this.captureModule!.validate();
+      const records = this.captureModule!.serializeRecords(
+        FORK_REFERENCE_TRANSACTION_OWNER_ID,
+        FORK_CAPTURE_SEGMENT_WINDOW,
+      );
+      let manifest: Uint8Array = new Uint8Array();
+      for (const record of records) {
+        arena.appendRecord({
+          kind: record.kind as ForkModuleStateRecordKind,
+          activationId: record.activationId,
+          ownerId: record.ownerId,
+          payload: record.payload,
+        });
+        manifest = record.payload;
+      }
+      this.phase = "sealed-parent";
+      return manifest;
     }
     if (this.pendingGc.size !== 0) {
       throw new Error(
@@ -973,6 +1246,11 @@ export class ForkReferenceTransaction {
     if (expectedLength === 0) {
       throw new RangeError("reference vector zero is the canonical empty vector");
     }
+    if (this.moduleCapture) {
+      const handle = this.captureModule!.beginVector();
+      this.moduleVectorLengths.set(handle, { expected: expectedLength, count: 0 });
+      return handle;
+    }
     let handle = this.freeReferenceVectorHandles.pop();
     if (handle === undefined) {
       if (this.nextReferenceVectorHandle > MAX_REFERENCE_VECTOR_ORDINAL) {
@@ -991,6 +1269,16 @@ export class ForkReferenceTransaction {
     this.requirePhase("capture", "append a reference vector");
     this.assertU32(handle, "reference vector builder handle");
     assertRecipeId(recipeId);
+    if (this.moduleCapture) {
+      const rec = this.moduleVectorLengths.get(handle);
+      if (!rec) {
+        throw new Error(`fork reference vector builder ${handle} is not allocated`);
+      }
+      // The module validates `recipeId` names an existing recipe.
+      this.captureModule!.appendVector(handle, recipeId);
+      rec.count += 1;
+      return;
+    }
     const vector = this.pendingReferenceVectors.get(handle);
     if (!vector) {
       throw new Error(`fork reference vector builder ${handle} is not allocated`);
@@ -1014,6 +1302,21 @@ export class ForkReferenceTransaction {
   finishReferenceVector(handle: number): number {
     this.requirePhase("capture", "finish a reference vector");
     this.assertU32(handle, "reference vector builder handle");
+    if (this.moduleCapture) {
+      const rec = this.moduleVectorLengths.get(handle);
+      if (!rec) {
+        throw new Error(`fork reference vector builder ${handle} is not allocated`);
+      }
+      if (rec.count !== rec.expected) {
+        throw new Error(
+          `fork reference vector builder ${handle} has ${rec.count} entries; `
+          + `expected ${rec.expected}`,
+        );
+      }
+      const ordinal = this.captureModule!.finishVector(handle);
+      this.moduleVectorLengths.delete(handle);
+      return ordinal;
+    }
     const pending = this.pendingReferenceVectors.get(handle);
     if (!pending) {
       throw new Error(`fork reference vector builder ${handle} is not allocated`);
@@ -1051,6 +1354,12 @@ export class ForkReferenceTransaction {
     this.assertU32(index, "reference vector index");
     let vector: ForkReferenceVector | undefined;
     if (this.phase === "parent-replay") {
+      if (this.moduleCapture) {
+        // The parent reads its OWN just-built vectors back from the resident
+        // shared builder (no re-decode); the recipe id then resolves to the
+        // ORIGINAL live value via `capturedValues` in `decode`.
+        return this.captureModule!.vectorGet(ordinal, index);
+      }
       vector = this.referenceVectors.get(ordinal);
     } else {
       this.requirePhase("child-replay", "read a reference vector");

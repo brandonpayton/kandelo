@@ -64,6 +64,7 @@ import {
   type ForkReferenceScratchDeallocate,
 } from "./fork-reference-transaction";
 import { ForkExternrefProvenanceTable } from "./fork-externref-provenance";
+import type { ForkReferenceCaptureModule } from "./fork-reference-capture-module";
 import type {
   DecodedSegmentedForkReferenceTransaction,
 } from "./fork-reference-segments";
@@ -724,6 +725,20 @@ export class ForkActivationRegistry {
    * next fork; capture entry also clears it defensively.
    */
   private unsupportedReferenceKind: string | null = null;
+
+  /**
+   * Path B P3: when set, a FORK capture (`beginCapture`) routes reference
+   * interning through the co-resident fork-module's shared builder (the module
+   * is the SOLE capture graph). The peer-table snapshot paths
+   * (`captureTableState`/`restoreTableState`) are unaffected and stay on the JS
+   * transaction. Set by the worker once the fork-module instance exists.
+   */
+  private captureModule: ForkReferenceCaptureModule | undefined;
+
+  /** Route FORK reference capture through the co-resident module (Path B P3). */
+  setCaptureModule(captureModule: ForkReferenceCaptureModule): void {
+    this.captureModule = captureModule;
+  }
 
   constructor(
     private readonly memory: WebAssembly.Memory,
@@ -1477,6 +1492,7 @@ export class ForkActivationRegistry {
       this.staticRoots,
       this.typedReplayOwner(),
       this.externrefProvenance,
+      this.captureModule,
     );
     references.beginCapture();
     this.functions = functions;

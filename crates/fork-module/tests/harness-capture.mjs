@@ -182,29 +182,7 @@ assert.equal(x.fm_capture_intern_funcref(10, 20), fId, "funcref dedups by coord"
 assert.equal(x.fm_capture_intern_i31(-5), iId, "i31 dedups by value");
 assert.equal(x.fm_capture_intern_static_root(3, 7), rId, "static root dedups");
 
-// struct 1 -> array 2 (cycle), leaf 7 (alias); scalars read from memory.
-writeBytes(SCRATCH_BASE, [0x78, 0x56, 0x34, 0x12]);
-writeU32Array(SCRATCH_BASE + 16, [aId, leafId]);
-assert.equal(
-  x.fm_capture_define_gc(
-    sId, 7 /*act*/, 2 /*type*/, 12 /*layout*/, KIND_STRUCT,
-    SCRATCH_BASE, 4, SCRATCH_BASE + 16, 2, 0 /*no prov*/, 0, 0,
-  ),
-  0,
-  `define struct failed errno=${lastErrno()}`,
-);
-// array 2 -> struct 1 (cycle), leaf 7 (alias).
-writeBytes(SCRATCH_BASE + 64, [0xaa, 0xbb]);
-writeU32Array(SCRATCH_BASE + 80, [sId, leafId]);
-assert.equal(
-  x.fm_capture_define_gc(
-    aId, 7, 3, 13, KIND_ARRAY, SCRATCH_BASE + 64, 2, SCRATCH_BASE + 80, 2, 0, 0, 0,
-  ),
-  0,
-  `define array failed errno=${lastErrno()}`,
-);
-
-// A shared/deduped vector: two identical builds return the same ordinal.
+// Build the field vectors first (the module reads them internally at define).
 function buildVector(ids) {
   const h = x.fm_capture_begin_vector();
   assert.ok(h >= 0, "begin_vector");
@@ -213,11 +191,37 @@ function buildVector(ids) {
   }
   return x.fm_capture_finish_vector(h);
 }
+// struct 1 -> array 2 (cycle), leaf 7 (alias); scalars read from memory.
+const structFields = buildVector([aId, leafId]);
+writeBytes(SCRATCH_BASE, [0x78, 0x56, 0x34, 0x12]);
+assert.equal(
+  x.fm_capture_define_gc(
+    sId, 7 /*act*/, 2 /*type*/, 12 /*layout*/, KIND_STRUCT,
+    SCRATCH_BASE, 4, structFields, 0 /*no prov*/, 0, 0,
+  ),
+  0,
+  `define struct failed errno=${lastErrno()}`,
+);
+// array 2 -> struct 1 (cycle), leaf 7 (alias).
+const arrayFields = buildVector([sId, leafId]);
+writeBytes(SCRATCH_BASE + 64, [0xaa, 0xbb]);
+assert.equal(
+  x.fm_capture_define_gc(
+    aId, 7, 3, 13, KIND_ARRAY, SCRATCH_BASE + 64, 2, arrayFields, 0, 0, 0,
+  ),
+  0,
+  `define array failed errno=${lastErrno()}`,
+);
+
+// A shared/deduped vector: two identical builds return the same ordinal.
 const o1 = buildVector([fId, xId, iId]);
 const o2 = buildVector([fId, xId, iId]);
 assert.equal(o1, o2, "identical vectors dedup to one ordinal");
 const o3 = buildVector([sId, aId]);
-assert.deepEqual([o1, o3], [1, 2], "distinct vectors take ascending ordinals");
+assert.notEqual(o1, o3, "distinct vectors take distinct ordinals");
+// Reading the resident builder's vectors back (the parent's own replay read).
+assert.equal(x.fm_capture_vector_get(o1, 0), fId, "vector_get reads the builder");
+assert.equal(x.fm_capture_vector_get(o3, 1), aId, "vector_get reads the builder");
 
 // Proof-of-use: the module interned every one of the above through the shared
 // builder (each successful op bumps the counter).
@@ -250,19 +254,19 @@ assert.ok(
 
 // Determinism: rebuilding the identical graph serializes byte-for-byte the same.
 x.fm_capture_begin();
-x.fm_capture_claim_gc();
-x.fm_capture_claim_gc();
-x.fm_capture_intern_funcref(10, 20);
-x.fm_capture_intern_externref(99);
-x.fm_capture_intern_i31(-5);
-x.fm_capture_intern_static_root(3, 7);
-x.fm_capture_intern_externref(0xffffffff >>> 0);
+x.fm_capture_claim_gc(); // 1
+x.fm_capture_claim_gc(); // 2
+x.fm_capture_intern_funcref(10, 20); // 3
+x.fm_capture_intern_externref(99); // 4
+x.fm_capture_intern_i31(-5); // 5
+x.fm_capture_intern_static_root(3, 7); // 6
+x.fm_capture_intern_externref(0xffffffff >>> 0); // 7
+const sf2 = buildVector([2, 7]); // ordinal 1
 writeBytes(SCRATCH_BASE, [0x78, 0x56, 0x34, 0x12]);
-writeU32Array(SCRATCH_BASE + 16, [2, 7]);
-x.fm_capture_define_gc(1, 7, 2, 12, KIND_STRUCT, SCRATCH_BASE, 4, SCRATCH_BASE + 16, 2, 0, 0, 0);
+x.fm_capture_define_gc(1, 7, 2, 12, KIND_STRUCT, SCRATCH_BASE, 4, sf2, 0, 0, 0);
+const af2 = buildVector([1, 7]); // ordinal 2
 writeBytes(SCRATCH_BASE + 64, [0xaa, 0xbb]);
-writeU32Array(SCRATCH_BASE + 80, [1, 7]);
-x.fm_capture_define_gc(2, 7, 3, 13, KIND_ARRAY, SCRATCH_BASE + 64, 2, SCRATCH_BASE + 80, 2, 0, 0, 0);
+x.fm_capture_define_gc(2, 7, 3, 13, KIND_ARRAY, SCRATCH_BASE + 64, 2, af2, 0, 0, 0);
 buildVector([3, 4, 5]);
 buildVector([3, 4, 5]);
 buildVector([1, 2]);

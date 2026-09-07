@@ -188,6 +188,31 @@ export const FORK_MODULE_REQUIRED_EXPORTS = [
   // module's own drive-time `table.get` and the guest's `_gc_allocate`
   // publish agree on a single table.
   "__wpk_fork_ref_gc_transit",
+  // Path B P3: the module-owned reference CAPTURE session over the shared
+  // `fork_codec::ReferenceGraphBuilder`. The host's thin capture-import bodies
+  // resolve each live reference to its recipe COORDINATE with the per-host
+  // identity floor and intern it here, so the module is the SOLE capture graph
+  // on V8 (mirrors native's `guest.rs` capture bodies calling `graph.intern_*`).
+  // `fm_capture_serialize` streams the KFRV/KFRS records the host drains into its
+  // module-state arena (the child's wire); `fm_capture_vector_get` serves the
+  // PARENT's own post-fork replay vector reads from the resident builder.
+  "fm_capture_begin",
+  "fm_capture_intern_funcref",
+  "fm_capture_intern_externref",
+  "fm_capture_intern_i31",
+  "fm_capture_intern_static_root",
+  "fm_capture_claim_gc",
+  "fm_capture_gated_placeholder",
+  "fm_capture_define_gc",
+  "fm_capture_begin_vector",
+  "fm_capture_append_vector",
+  "fm_capture_finish_vector",
+  "fm_capture_validate",
+  "fm_capture_serialize",
+  "fm_capture_serialized_len",
+  "fm_capture_record_header_size",
+  "fm_capture_vector_get",
+  "fm_capture_interned",
 ] as const;
 
 /** Required exports whose value is a `WebAssembly.Table`, not a function. */
