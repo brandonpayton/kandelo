@@ -1722,7 +1722,20 @@ function readSourceOnlyProjection(): LoadedSourceOnlyProjection {
       && packageName === "kernel"
       && members.length === 1
       && !members[0]!.mirrorPath.includes("/");
-    if (!isExactProgramNode && !isRootMirrorNode) {
+    // The co-resident fork-module side modules (`fork_module32.wasm` /
+    // `fork_module64.wasm`) are projected at the root by the local-build engine,
+    // built out-of-band by `crates/fork-module/build-wasm.sh` (they are not a
+    // registry package, so they never appear in the v2 `projection.packages`
+    // map). Admit them as their own single root-level member nodes so the V8
+    // browser host resolves the co-resident module through the same pinned
+    // projection as `kernel.wasm`.
+    const isCoresidentForkModuleNode =
+      !projection.packages.has(packageName)
+      && packageName === "fork-module"
+      && members.length === 1
+      && (members[0]!.mirrorPath === "fork_module32.wasm"
+        || members[0]!.mirrorPath === "fork_module64.wasm");
+    if (!isExactProgramNode && !isRootMirrorNode && !isCoresidentForkModuleNode) {
       throw sourceOnlyProjectionError(
         projectionPath,
         `node ${JSON.stringify(packageName)} (${targetArch}) is neither an exact v2 program node nor a root-mirror package`,
