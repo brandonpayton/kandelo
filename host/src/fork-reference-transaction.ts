@@ -1760,7 +1760,18 @@ export class ForkReferenceTransaction {
       if (!this.pendingExceptions.has(recipeId)) {
         throw new Error(`fork exception recipe ${recipeId} is not pending definition`);
       }
-      const payloads = this.readRecipeIds(
+      // Path B P5b: in module-capture mode the JS `this.nodes` array is EMPTY —
+      // the shared `ReferenceGraphBuilder` owns every recipe. So the exception's
+      // reference payload ids (funcref/externref already interned via
+      // `fm_capture_intern_*`) must be sourced against the MODULE, not the JS
+      // node table. `readRecipeIds` validates `id < this.nodes.length`, which
+      // would spuriously reject every real payload here. Read the raw ids with
+      // only the host-generic bounds (u32 count, recipe-id space) and let the
+      // module's own `append_vector` be the authority: it validates each id
+      // against the builder's node count (Rust `reference_graph_builder.rs:305`,
+      // EINVAL for a missing recipe), so a bad payload id still fails LOUD via
+      // the capture module's errno translation — never a silent mis-capture.
+      const payloads = this.readModuleRecipeIds(
         referenceIdsPointer,
         referenceCount,
         "fork exception reference payloads",
@@ -2407,6 +2418,34 @@ export class ForkReferenceTransaction {
       if (id >= this.nodes.length) {
         throw new Error(`${context} entry ${index} names missing recipe ${id}`);
       }
+      ids.push(id);
+    }
+    return ids;
+  }
+
+  /**
+   * Module-capture variant of {@link readRecipeIds}: reads the raw recipe ids
+   * from guest memory with ONLY the host-generic bounds (u32 count and the
+   * recipe-id space via `assertRecipeId`), and does NOT check them against the
+   * JS `this.nodes` array. In module-capture mode `this.nodes` is empty — the
+   * shared `ReferenceGraphBuilder` (behind `fm_capture_*`) owns every recipe —
+   * so a `this.nodes.length` bound would spuriously reject every real payload.
+   * The module is the authority: whatever consumes these ids (e.g. the capture
+   * module's `append_vector`) validates each against the builder's node count
+   * and fails loud (EINVAL) on a missing recipe.
+   */
+  private readModuleRecipeIds(
+    pointer: number | bigint,
+    count: number,
+    context: string,
+  ): number[] {
+    this.assertU32(count, `${context} count`);
+    const bytes = this.readBytes(pointer, count * 4, context);
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const ids: number[] = [];
+    for (let index = 0; index < count; index++) {
+      const id = view.getUint32(index * 4, true);
+      assertRecipeId(id);
       ids.push(id);
     }
     return ids;

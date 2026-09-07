@@ -119,28 +119,28 @@ describe("CatchRef fresh process worker replay", () => {
     expect(moduleReferenceProof(result.hostDiagnostics, "exnref")).toBeNull();
   });
 
-  it("reconstructs reference-bearing catches in fresh Node child workers", async () => {
+  it("reconstructs reference-bearing catches through the module (default)", async () => {
     // The first child calls a non-null funcref reconstructed from the child's
     // static function catalog. The second verifies a nullable externref
     // payload; both values originated in a caught exception recipe.
     //
-    // Path B flip (P5) BOUNDARY: this is the "narrow, synthetic-only"
-    // exception-carried reference-payload path (docs/fork-reference-support.md
-    // "Host-exception externref payloads remain a narrow, synthetic-only path";
-    // real guest C++ exceptions are scalar). The co-resident module does NOT
-    // yet reconstruct exception-carried reference payloads: the module-capture
-    // branch of `ForkReferenceTransaction.defineExceptionRecipe`
-    // (fork-reference-transaction.ts) validates payload recipe ids against the
-    // JS-only `this.nodes` array, which is empty in module-capture mode, so any
-    // reference-bearing exception throws "fork exception reference payloads
-    // entry N names missing recipe M". Until that P3 capture gap is closed
-    // (tracked for P6), this JS-path coverage opts out of the module default.
+    // Path B P5b: this exercises the exception-carried reference-payload path
+    // on the MODULE DEFAULT (no `forkModuleEnabled` override — the co-resident
+    // module is the flipped default after P5). Previously this was pinned to the
+    // JS path because the module-capture branch of
+    // `ForkReferenceTransaction.defineException` validated the exception's
+    // payload recipe ids against the JS-only `this.nodes` array, which is empty
+    // in module-capture mode, so any reference-bearing exception threw "fork
+    // exception reference payloads entry N names missing recipe M". P5b sources
+    // those ids against the MODULE builder (`readModuleRecipeIds` +
+    // `append_vector` validation) so the module reconstructs them. The exnref
+    // proof-of-use asserts the module — not a JS twin — drove the exception
+    // reconstruction.
     const result = await runCentralizedProgram({
       programPath: referencePayloadProgramPath,
       argv: ["reference-catch-payload-fresh-worker"],
       timeout: 30_000,
       useDefaultRootfs: false,
-      forkModuleEnabled: false,
     });
 
     expect(
@@ -148,5 +148,9 @@ describe("CatchRef fresh process worker replay", () => {
       `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
     ).toBe(0);
     expect(result.stderr).toBe("");
+    // The module reconstructed the caught exception recipe (payload references
+    // are carried by an exnref node), proving the module path — not the deleted-
+    // in-P6 JS twin — handled the reference-bearing exception.
+    expect(moduleReferenceProof(result.hostDiagnostics, "exnref")).not.toBeNull();
   });
 });

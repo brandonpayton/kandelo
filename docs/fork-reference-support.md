@@ -118,12 +118,28 @@ constructed child.
   count (the positive proof the module — not a silent JS fallback —
   drove the abort). The earlier "module-mode abort-replay deferred to
   M8" limitation is closed for this residual case.
-- **Host-exception externref payloads remain a narrow, synthetic-only
-  path.** A raw host (JS `JSTag`) exception whose payload is an
-  externref reconstructs through the retained exception machinery
-  (`ForkReferenceTransaction.materializeHostException`), independent of
-  the `GC_LOOKUP`/provenance path above. Only synthetic fixtures
-  exercise this; no real package hits it.
+- **Exception-carried reference payloads reconstruct on the module path
+  (Path B P5b, 2026-09-07).** An exception (guest `catch_ref` or a raw
+  host `JSTag` exception) whose caught recipe carries a reference payload
+  (a funcref or nullable externref) now reconstructs across a fork
+  through the co-resident module DEFAULT, not just the JS twin. The
+  module-capture branch of `ForkReferenceTransaction.defineException`
+  previously validated the exception's payload recipe ids against the
+  JS-only `this.nodes` array — empty in module-capture mode — so any
+  reference-bearing exception threw "fork exception reference payloads
+  entry N names missing recipe M". It now sources those ids against the
+  MODULE builder (`readModuleRecipeIds` feeding `fm_capture_append_vector`,
+  whose Rust `ReferenceGraphBuilder::append_vector` validates each id
+  against the builder's node count and returns `EINVAL` for a genuinely
+  missing recipe), so the shared engine reconstructs the payload and the
+  parent keeps its original live references. Proven on V8 by
+  `host/test/catch-ref-fresh-worker.test.ts` ("reconstructs
+  reference-bearing catches through the module (default)"), which asserts
+  the exnref module proof-of-use is non-null. This path is still
+  synthetic-only in terms of real packages (see the census below); no
+  real package produces a reference-carrying exception across a fork.
+  Native was unaffected: its capture path (`crates/host-native/src/guest.rs`)
+  calls the shared builder directly and never carried the JS-nodes bound.
 - **A host-import-returned externref that is not object-shaped has no
   handle to record.** The provenance table is keyed by JS object
   identity (`WeakMap`); a hypothetical future host import that returns
