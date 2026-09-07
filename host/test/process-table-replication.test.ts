@@ -8,6 +8,7 @@ import {
   type DylinkForkTablePatch,
 } from "../src/dylink-fork-archive";
 import type { ForkActivationRegistry } from "../src/fork-activation-registry";
+import type { ForkTableSnapshot } from "../src/fork-table-snapshot";
 import type { ForkModuleStateArena } from "../src/fork-module-state";
 
 interface TestTableReplicationOwner {
@@ -122,16 +123,23 @@ describe("process table replication publication", () => {
     let typedFallback = false;
     const registry = {
       captureFuncrefTablePatch: () => typedFallback ? null : patch(),
-      captureTableState: () => {
+      applyFuncrefTablePatch: () => {},
+    } as unknown as ForkActivationRegistry;
+    // Path-A A3/A4: the full-checkpoint capture/restore moved to the module-backed
+    // `ForkTableSnapshot`; this suite mocks it (it proves the patch-journal /
+    // compaction orchestration, NOT the reference engine — see the real-engine
+    // round-trip test in fork-table-snapshot-roundtrip.test.ts).
+    const tableSnapshot = {
+      capture: () => {
         checkpoints++;
         return 512;
       },
-      restoreTableState: () => {},
-      applyFuncrefTablePatch: () => {},
-    } as unknown as ForkActivationRegistry;
+      restore: () => {},
+    } as unknown as ForkTableSnapshot;
     const owner = __testCreateProcessTableReplicationOwner({
       generationAddress: 64,
       registry,
+      tableSnapshot,
       dlopen,
       newArena: () => arenaFixture(512),
       materializeModules: () => {},
@@ -169,13 +177,17 @@ describe("process table replication publication", () => {
       applyFuncrefTablePatch: (value: DylinkForkTablePatch) => {
         applied.push(value.generation!);
       },
-      restoreTableState: () => {
+    } as unknown as ForkActivationRegistry;
+    const tableSnapshot = {
+      capture: () => 512,
+      restore: () => {
         throw new Error("fork child must use its normal KFMS capture");
       },
-    } as unknown as ForkActivationRegistry;
+    } as unknown as ForkTableSnapshot;
     const child = __testCreateProcessTableReplicationOwner({
       generationAddress: 64,
       registry,
+      tableSnapshot,
       dlopen: dlopenFixture(archive),
       newArena: () => arenaFixture(512),
       materializeModules: () => {},
@@ -206,9 +218,12 @@ describe("process table replication publication", () => {
     const child = __testCreateProcessTableReplicationOwner({
       generationAddress: 64,
       registry: {
-        restoreTableState: () => {},
         applyFuncrefTablePatch: () => {},
       } as unknown as ForkActivationRegistry,
+      tableSnapshot: {
+        capture: () => 512,
+        restore: () => {},
+      } as unknown as ForkTableSnapshot,
       dlopen,
       newArena: () => arenaFixture(512),
       materializeModules: () => {

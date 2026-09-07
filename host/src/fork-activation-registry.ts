@@ -68,6 +68,10 @@ import {
   type ForkReferenceCaptureSurface,
 } from "./fork-capture-session";
 import { ForkModuleReconstructionFloor } from "./fork-module-reconstruction";
+import {
+  ForkTableReconstruction,
+  type ForkTableRestoreDependencies,
+} from "./fork-table-snapshot";
 import { ForkExternrefProvenanceTable } from "./fork-externref-provenance";
 import type { ForkReferenceCaptureModule } from "./fork-reference-capture-module";
 import type { ForkActivationExceptionProvider } from "./fork-reference-contracts";
@@ -1546,16 +1550,25 @@ export class ForkActivationRegistry {
     this.gcProvenance.abortPending();
     this.gcTransit.clear();
     const functions = this.buildFunctionCatalog();
-    const references = new ForkReferenceTransaction(
+    // Peer-table capture is module-only (Path-A A3): the co-resident module is
+    // the SOLE capture graph, exactly as the module-on fork `beginCapture`. There
+    // is no JS `ForkReferenceTransaction` fallback here — that engine is being
+    // deleted — so a worker without the fork module fails loudly.
+    if (!this.captureModule) {
+      throw new Error(
+        `${this.label}: peer table capture requires the co-resident fork module`,
+      );
+    }
+    const references = new ForkCaptureSession(
       functions,
       this.externrefs,
+      this.captureModule,
+      this.staticRoots,
+      this.externrefProvenance,
       this.memory,
       this.allocateScratch,
       this.deallocateScratch,
-      `${this.label}: peer table references`,
-      this.staticRoots,
-      this.typedReplayOwner(),
-      this.externrefProvenance,
+      `${this.label}: peer table capture session`,
     );
     references.beginCapture();
     this.functions = functions;
@@ -1587,7 +1600,10 @@ export class ForkActivationRegistry {
   /**
    * Apply one validated table-only snapshot to this Worker's instance graph.
    */
-  restoreTableState(arena: ForkModuleStateArena): void {
+  restoreTableState(
+    arena: ForkModuleStateArena,
+    deps: ForkTableRestoreDependencies,
+  ): void {
     this.requirePhase("idle", "restore peer table state");
     if (!arena.hasActiveArena() || !arena.isSealed()) {
       throw new Error(
@@ -1618,16 +1634,25 @@ export class ForkActivationRegistry {
       );
     }
     const functions = this.buildFunctionCatalog();
-    const references = new ForkReferenceTransaction(
+    // Peer-table restore is module-only (Path-A A4). The reconstruction runs in
+    // a LIVE worker whose guest reference-decode imports are JS-bound (only a
+    // fresh qualifying fork child binds them to the module), so the guest
+    // `restoreTables` walk calls `decodeFuncref` / `decodeExternref` back into
+    // this surface — the throwing `ForkModuleReconstructionFloor` cannot serve
+    // it. `ForkTableReconstruction` sizes the transit + drives the module
+    // reconstruction (externref/GC into STORE #2) AND decodes funcrefs from the
+    // module's resident decoded-graph oracle against this worker's own function
+    // catalogs (funcref-ordinal stability). No JS `ForkReferenceTransaction`.
+    const references = new ForkTableReconstruction(
       functions,
-      this.externrefs,
+      deps.oracle,
+      (recipeId) => this.gcTransit.get(recipeId + 1),
+      this.typedReplayOwner(),
+      () => deps.decodedNodeCount,
       this.memory,
       this.allocateScratch,
       this.deallocateScratch,
-      `${this.label}: peer table references`,
-      this.staticRoots,
-      this.typedReplayOwner(),
-      this.externrefProvenance,
+      `${this.label}: peer table reconstruction`,
     );
     references.attachChild(records);
     this.functions = functions;
@@ -1635,7 +1660,7 @@ export class ForkActivationRegistry {
     this.arena = arena;
     this.phase = "table-replay";
     try {
-      references.materializeAllTyped();
+      references.materializeAllTyped(deps.drive);
       for (const activation of this.activations()) {
         activation.moduleState.restoreTables(activation.activationId);
       }

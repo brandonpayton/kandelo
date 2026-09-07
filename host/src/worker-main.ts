@@ -105,6 +105,7 @@ import {
   FORK_MODULE_RESUME_CATALOG_CAP,
   ForkModuleContinuationBackend,
 } from "./fork-module-backend";
+import { ForkTableSnapshot } from "./fork-table-snapshot";
 import {
   type ForkModuleHostCapabilities,
   createForkModuleHostCapabilities,
@@ -2938,6 +2939,14 @@ interface ProcessTableReplicationOwner extends ForkActivationTableReplication {
 function createProcessTableReplicationOwner(options: {
   readonly generationAddress: number;
   readonly registry: ForkActivationRegistry;
+  /**
+   * Module-composed peer-table snapshot lifecycle (Path-A A3/A4). Owns the full
+   * table checkpoint capture/restore through the co-resident fork module; the
+   * `registry` above is retained only for the funcref-only patch fast path
+   * (`captureFuncrefTablePatch` / `applyFuncrefTablePatch`), which never touched
+   * the reference engine.
+   */
+  readonly tableSnapshot: ForkTableSnapshot;
   readonly dlopen: DlopenSupport;
   readonly newArena: () => ForkModuleStateArena;
   readonly materializeModules: (snapshot: DylinkForkArchiveSnapshot) => void;
@@ -2985,7 +2994,7 @@ function createProcessTableReplicationOwner(options: {
       ) {
         const arena = options.newArena();
         arena.attach(snapshot.tableStateRoot);
-        options.registry.restoreTableState(arena);
+        options.tableSnapshot.restore(arena);
         // The archive, not this temporary validated view, owns the mappings.
         patchFloor = snapshot.tableCheckpointGeneration;
       }
@@ -3031,7 +3040,7 @@ function createProcessTableReplicationOwner(options: {
     arena.begin();
     let root: number;
     try {
-      root = options.registry.captureTableState(arena);
+      root = options.tableSnapshot.capture(arena);
     } catch (error) {
       if (arena.hasActiveArena()) arena.release();
       throw error;
@@ -4296,6 +4305,11 @@ export async function centralizedWorkerMain(
       processTableReplication = createProcessTableReplicationOwner({
         generationAddress: tableGenerationAddress,
         registry: activationRegistry,
+        tableSnapshot: new ForkTableSnapshot(
+          activationRegistry,
+          forkModuleBackend,
+          `pid=${pid}: peer table snapshot`,
+        ),
         dlopen: dlopenSupport,
         newArena: newModuleStateArena,
         materializeModules: (snapshot) => {
@@ -6646,6 +6660,18 @@ export async function centralizedThreadWorkerMain(
         });
         threadForkModuleBackend.setup();
         threadProcessContinuation.enableModuleBacking(threadForkModuleBackend);
+        // Path-A A4 parity: route this pthread worker's peer-table CAPTURE
+        // through the co-resident module (the process path does this at
+        // `setCaptureModule` above). Peer-table replication is module-only now,
+        // so a pthread that publishes a full table checkpoint needs the capture
+        // module just as the process parent does.
+        threadActivationRegistry?.setCaptureModule(
+          new ForkReferenceCaptureModule(
+            threadForkModuleInstance.exports,
+            memory,
+            `pid=${pid} tid=${tid}: fork reference capture module`,
+          ),
+        );
       }
     }
     const processArchiveHeadOffset =
@@ -6877,6 +6903,11 @@ export async function centralizedThreadWorkerMain(
       threadTableReplication = createProcessTableReplicationOwner({
         generationAddress: processGenerationAddress,
         registry: threadActivationRegistry,
+        tableSnapshot: new ForkTableSnapshot(
+          threadActivationRegistry,
+          threadForkModuleBackend,
+          `pid=${pid} tid=${tid}: peer table snapshot`,
+        ),
         dlopen: threadDlopenSupport,
         newArena: newThreadModuleStateArena,
         materializeModules: (snapshot) => {
