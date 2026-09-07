@@ -179,6 +179,23 @@ const FIXTURES: Record<string, string> = {
     'let empt="";try{const z=zlib.zstdDecompressSync(Buffer.alloc(0));empt=(z&&z.length===0)?"EMPTY":"LEN:"+z.length;}catch(e){empt="THREW:"+(e&&e.message);}' +
     'console.log("ZSTD",viaZlib===viaBun,viaZlib,bad,trunc,empt);' +
     '}catch(e){console.log("ZSTDERR",(e&&e.name)||"",(e&&e.message)||e);}})();',
+  // Bun loader-dispatch (M2 Phase J): require() honors __kandeloAssetLoaders —
+  // text -> raw string, file -> absolute path, napi -> honest throw, and an
+  // unmapped path still loads as a normal CJS module.
+  "asset.md": "# heading\nbody line\n",
+  "asset.zst": "not-real-zstd-bytes\n",
+  "asset.node": "not-a-real-node-binary\n",
+  "plain.cjs": "module.exports={ok:42};\n",
+  "mainloader.cjs":
+    '(()=>{try{' +
+    'globalThis.__kandeloAssetLoaders={' +
+    '"/app/asset.md":"text","/app/asset.zst":"file","/app/asset.node":"napi"};' +
+    'const t=require("/app/asset.md");' +
+    'const f=require("/app/asset.zst");' +
+    'let n="";try{require("/app/asset.node");n="NOTHROW";}catch(e){n=(e&&e.message||"").indexOf("native Node addons")>=0?"THROW":"WRONG:"+(e&&e.message);}' +
+    'const j=require("/app/plain.cjs");' +
+    'console.log("LOADER",JSON.stringify(t),f,n,j&&j.ok);' +
+    '}catch(e){console.log("LOADERERR",(e&&e.name)||"",(e&&e.message)||e);}})();',
 };
 
 function stageFixtures(): string {
@@ -446,5 +463,12 @@ describe("spidermonkey-node ESM probe", () => {
     // eslint-disable-next-line no-console
     console.log("ZSTD OUT:", JSON.stringify(r.stdout.trim()), "ERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
     expect(r.stdout).toContain("ZSTD true hello zstd from kandelo THROW THROW EMPTY");
+  }, 90_000);
+
+  it.runIf(ready)("bun-run loader dispatch: text->string, file->path, napi->throw, unmapped->module", async () => {
+    const r = await runOne("/app/mainloader.cjs");
+    // eslint-disable-next-line no-console
+    console.log("LOADER OUT:", JSON.stringify(r.stdout.trim()), "ERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
+    expect(r.stdout).toContain('LOADER "# heading\\nbody line\\n" /app/asset.zst THROW 42');
   }, 90_000);
 });

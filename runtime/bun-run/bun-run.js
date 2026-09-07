@@ -29,6 +29,23 @@ if (r.status !== 0) fail("extract failed (exit " + r.status + "); see stderr abo
 const entry = (rStdout.match(/^ENTRY=(.+)$/m) || [])[1];
 if (!entry) fail("could not determine entry point (not a Bun executable?)", 1);
 
+// Install the per-file loader map so node-compat require() returns Bun-correct
+// values for embedded assets (text -> string, file -> path, json -> object,
+// napi -> honest throw). Keyed by absolute cache path to match require()'s
+// realpath'd lookup (the cache has no symlinks). Missing/old manifests are
+// tolerated: require() then behaves exactly as before.
+const cache = (rStdout.match(/^CACHE=(.+)$/m) || [])[1];
+if (cache) {
+  try {
+    const loaders = (JSON.parse(fs.readFileSync(cache + "/manifest.json", "utf8")) || {}).loaders;
+    if (loaders && typeof loaders === "object") {
+      const map = Object.create(null);
+      for (const rel of Object.keys(loaders)) map[cache + "/" + rel] = loaders[rel];
+      globalThis.__kandeloAssetLoaders = map;
+    }
+  } catch (_) { /* no loaders map: leave require() behavior unchanged */ }
+}
+
 // 2. Thin Bun-global shim. Unimplemented members throw named errors (never silent).
 const ni = (name) => () => { throw new Error("Bun." + name + " not implemented (Kandelo bun-run shim)"); };
 globalThis.__breq = (id) =>

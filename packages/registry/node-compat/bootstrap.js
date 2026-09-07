@@ -4679,6 +4679,36 @@ function _makeRequire(filename) {
             err.code = 'MODULE_NOT_FOUND';
             throw err;
         }
+
+        // Bun loader dispatch (M2 Phase J). bun-run installs
+        // globalThis.__kandeloAssetLoaders (abs cache path -> class) from the
+        // extract manifest. Honor it BEFORE shebang-strip, the .json-extension
+        // check, and the ESM/CJS dispatch, so the loader byte is authoritative.
+        // With no map present this is a no-op and require() behaves as before.
+        const _assetLoader = globalThis.__kandeloAssetLoaders &&
+            globalThis.__kandeloAssetLoaders[resolved];
+        if (_assetLoader === 'text') {
+            // Bun text loader: module.exports IS the raw file contents (no
+            // shebang strip -- a .txt/.md may legitimately begin "#!").
+            _moduleCache[resolved] = { exports: source };
+            return source;
+        }
+        if (_assetLoader === 'file') {
+            // Bun file loader: module.exports IS the absolute on-disk path.
+            _moduleCache[resolved] = { exports: resolved };
+            return resolved;
+        }
+        if (_assetLoader === 'json') {
+            const exports = JSON.parse(source);
+            _moduleCache[resolved] = { exports };
+            return exports;
+        }
+        if (_assetLoader === 'napi') {
+            throw new Error(`${id}: native Node addons (.node) are not ` +
+                `supported on spidermonkey-node`);
+        }
+        // 'js', 'unknown', or no map -> fall through to the existing behavior.
+
         source = _stripShebang(source);
 
         if (resolved.endsWith('.json')) {
