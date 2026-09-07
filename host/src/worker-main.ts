@@ -6560,21 +6560,26 @@ export async function centralizedThreadWorkerMain(
     // above on the main worker path) expects to read the MODULE-serialized KFRE
     // journal image from the frame arena; the two sides must move together. This
     // mirrors the main process worker's instantiate + backend + enableModuleBacking
-    // block, gated identically (flag on, single-activation via `!hasDylinkForkRole`,
-    // width match, catalog fits the cap). The pthread parent never reconstructs
-    // references (that happens in the child), so `resolve_externref` is wired
-    // (below, for identity parity) but expected to stay idle here. (The
-    // `wpk_fork_host.*` seam this comment used to describe was deleted, H3,
-    // 2026-09-06 — the module no longer declares those imports at all.)
-    // Flag-off / non-qualifying keeps `threadForkModuleInstance` null and every
-    // fork on the byte-identical JS path.
+    // block (width match + catalog fits the cap). The co-resident module is now
+    // the UNCONDITIONAL fork engine (no JS reference fallback), so a pthread
+    // parent MUST capture through it — including one in a dlopen-capable program
+    // (`hasDylinkForkRole`): the pthread parent only unwinds + serializes, and
+    // the multi-activation RECONSTRUCTION runs in the fresh child on the main
+    // worker path. (The earlier `!hasDylinkForkRole` single-activation gate would
+    // now leave a dlopen pthread with no capture module and hang its fork.) The
+    // pthread parent never reconstructs references (that happens in the child),
+    // so `resolve_externref` is wired (below, for identity parity) but expected
+    // to stay idle here. (The `wpk_fork_host.*` seam this comment used to
+    // describe was deleted, H3, 2026-09-06 — the module no longer declares those
+    // imports at all.) A catalog past the module cap keeps `threadForkModuleInstance`
+    // null; such a pthread fork then fails loud rather than silently running a
+    // deleted JS path.
     let threadForkModuleInstance: ForkModuleInstance | null = null;
     let threadForkModuleBackend: ForkModuleContinuationBackend | null = null;
     if (
       hasForkInstrumentation &&
       threadProcessContinuation &&
-      threadForkContinuation &&
-      !hasDylinkForkRole
+      threadForkContinuation
     ) {
       const forkModuleModule = initData.forkModuleModule;
       if (!forkModuleModule) {
