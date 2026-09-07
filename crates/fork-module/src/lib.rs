@@ -3615,28 +3615,44 @@ mod wasm {
     /// `u16 kind, u16 reserved, u32 activation_id, u32 owner_id, u32 payload_len`.
     const CAPTURE_RECORD_HEADER: usize = 16;
 
-    fn read_capture_u32_array(ptr: usize, count: usize) -> Result<Vec<u32>, Errno> {
-        if count == 0 {
-            return Ok(Vec::new());
-        }
-        let byte_len = count.checked_mul(4).ok_or(Errno::EINVAL)?;
-        let end = ptr.checked_add(byte_len).ok_or(Errno::EINVAL)?;
-        let mem = unsafe { mem_ref() };
-        let slice = mem.get(ptr..end).ok_or(Errno::EINVAL)?;
-        let mut out = Vec::with_capacity(count);
-        for chunk in slice.chunks_exact(4) {
-            out.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-        }
-        Ok(out)
-    }
-
+    /// Copy `len` bytes out of guest linear memory at absolute offset `ptr`.
+    ///
+    /// Uses the module's proven whole-memory read idiom (bounds-check against
+    /// `mem_len_bytes` then a raw `ptr::copy`), NOT `<[u8]>::get(range)` on the
+    /// whole-memory slice: that slice is based at wasm address 0, and range
+    /// indexing/`get` on a null-base slice miscompiles under `--release` (it
+    /// reports out-of-bounds for an in-bounds range), whereas single-element
+    /// access and raw pointer reads are correct — the same reason
+    /// `fm_set_activation_gc_codec` copies via a raw pointer.
     fn read_capture_bytes(ptr: usize, len: usize) -> Result<Vec<u8>, Errno> {
         if len == 0 {
             return Ok(Vec::new());
         }
         let end = ptr.checked_add(len).ok_or(Errno::EINVAL)?;
-        let mem = unsafe { mem_ref() };
-        Ok(mem.get(ptr..end).ok_or(Errno::EINVAL)?.to_vec())
+        if end > mem_len_bytes() {
+            return Err(Errno::EINVAL); // span past the end of guest memory
+        }
+        let mut out = alloc::vec![0u8; len];
+        // SAFETY: `[ptr, ptr+len)` is within guest linear memory (checked above);
+        // the destination is a distinct freshly-allocated `Vec`.
+        let src = core::hint::black_box(ptr) as *const u8;
+        unsafe {
+            core::ptr::copy(src, out.as_mut_ptr(), len);
+        }
+        Ok(out)
+    }
+
+    fn read_capture_u32_array(ptr: usize, count: usize) -> Result<Vec<u32>, Errno> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let byte_len = count.checked_mul(4).ok_or(Errno::EINVAL)?;
+        let raw = read_capture_bytes(ptr, byte_len)?;
+        let mut out = Vec::with_capacity(count);
+        for chunk in raw.chunks_exact(4) {
+            out.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        Ok(out)
     }
 
     /// Fold a builder `Result<u32>` into the ID-return convention: on success set

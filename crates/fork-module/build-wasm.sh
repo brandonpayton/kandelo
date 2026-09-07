@@ -193,4 +193,6 @@ if [[ "${1:-}" == "--run" ]]; then
   node crates/fork-module/tests/harness.mjs "$WASM32"
   echo "== running multi-activation frame-routing harness (wasm32) =="
   node crates/fork-module/tests/harness-multi-activation.mjs "$WASM32"
+  echo "== running reference-capture session harness (wasm32) =="
+  node crates/fork-module/tests/harness-capture.mjs "$WASM32"
 fi
