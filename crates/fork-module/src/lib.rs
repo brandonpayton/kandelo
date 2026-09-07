@@ -150,7 +150,7 @@ mod wasm {
         LinkedFrameFormat, LinkedFrameWriter, ModuleStateFormat, ReconstructionState,
         ReferenceGraphBuilder, ReferenceRecipeNode, ReferenceReplayDriver, ReferenceReplayFeed,
         ReferenceSegmentsWriter, ReferenceTransactionRecord, ReplayEvent, ReplayEventJournal,
-        ResumeSlotTable, RewindDriver,
+        ResumeSlotTable, RewindDriver, SegmentedReferenceTransaction,
     };
     use wasm_posix_shared::{abi, channel, mmap, ChannelStatus, Errno, Syscall};
 
@@ -864,6 +864,48 @@ mod wasm {
     // unchanged. Bumped by every route/payload-length/load/vector read. Never
     // resets.
     static REFERENCE_FEED_READS: AtomicU64 = AtomicU64::new(0);
+
+    // -- Module-owned wire-graph decode + externref-handle scan (orchestration
+    //    migration increment 1) -------------------------------------------------
+    //
+    // The decoded reference transaction the module OWNS for the current fork's
+    // decode/scan path, seeded by `fm_decode_reference_graph` from the KFMS
+    // module-state arena. This is the module-owned equivalent of the JS
+    // `decodeSegmentedForkReferenceTransaction` result: it lets the host (in a
+    // later host-rewire increment) stop decoding the wire graph in TypeScript
+    // (`fork-reference-segments.ts`) and stop scanning externref handles in
+    // TypeScript (`scanSegmentedForkReferenceExternrefHandles`,
+    // `fork-externref-process-owner.ts`), routing both through the ONE shared
+    // `fork_codec` decoder that already backs `fm_begin_reference_replay`. Held
+    // in its OWN static, independent of the replay `REFERENCE_STATE` driver: the
+    // pre-launch externref-handle scan runs BEFORE any replay driver is seeded,
+    // and a decode may be requested purely to inspect the graph.
+    struct DecodedGraphCell(UnsafeCell<Option<SegmentedReferenceTransaction>>);
+    // SAFETY: single-threaded per worker (see HeapCell).
+    unsafe impl Sync for DecodedGraphCell {}
+    static DECODED_GRAPH: DecodedGraphCell = DecodedGraphCell(UnsafeCell::new(None));
+
+    #[allow(clippy::mut_from_ref)]
+    fn decoded_graph() -> &'static mut Option<SegmentedReferenceTransaction> {
+        // SAFETY: single-threaded per worker; only one host drives decode/scan.
+        unsafe { &mut *DECODED_GRAPH.0.get() }
+    }
+
+    // Monotonic count of reference graphs the module has DECODED from a KFMS
+    // arena since worker start. Proof-of-use for the decode flip: after the host
+    // routes wire-graph decode through `fm_decode_reference_graph` this has
+    // advanced past its pre-fork value; a silent fallback to the TypeScript
+    // `decodeSegmentedForkReferenceTransaction` leaves it unchanged. Never resets.
+    static REFERENCE_GRAPHS_DECODED: AtomicU64 = AtomicU64::new(0);
+
+    // Monotonic count of externref handles the module has SCANNED out of decoded
+    // graphs since worker start. Proof-of-use for the scan flip: after the host
+    // routes the pre-launch externref-handle scan through
+    // `fm_scan_externref_handles` this has advanced by the graph's distinct
+    // externref-handle count; a silent fallback to the TypeScript
+    // `scanSegmentedForkReferenceExternrefHandles` leaves it unchanged. Never
+    // resets.
+    static EXTERNREF_HANDLES_SCANNED: AtomicU64 = AtomicU64::new(0);
 
     // -- Reference CAPTURE session (Path B P3 — module-owned encode graph) ----
     //
@@ -2270,9 +2312,22 @@ mod wasm {
     // host call site's contract, but M2 no longer opens a host root generation
     // scoped by it — the externref host seam retired (see `ReconstructionState`'s
     // doc) — so it is unused inside this impl.
-    fn begin_reference_replay_impl(module_state_root: u64, _pid: u32) -> Result<(), Errno> {
-        // The pointer width was seeded once (with the linked-frame format) via
-        // `fm_set_format`; the module-state chunk header size derives from it.
+    /// Decode a sealed module-state (KFMS) arena rooted at `module_state_root`
+    /// from the COPIED guest memory into the canonical reference transaction.
+    ///
+    /// This is the arena->records->transaction path shared by
+    /// `fm_begin_reference_replay` (the guest-driven replay) and
+    /// `fm_decode_reference_graph` / `fm_restore_from_arena` (the module-owned
+    /// orchestration entries). It uses the IMMUTABLE whole-memory view (reads
+    /// only, so the release-LLVM `&mut`-noalias miscompile the serialize/child
+    /// paths avoid does not apply), lifts each module-state record's payload into
+    /// a borrowed `ReferenceTransactionRecord`, and reuses the D6.0 transaction
+    /// decode. The pointer width was seeded once (with the linked-frame format)
+    /// via `fm_set_format`; not seeding it yet is a truthful `EINVAL`, never a
+    /// guessed geometry.
+    fn decode_reference_transaction_from_arena(
+        module_state_root: u64,
+    ) -> Result<SegmentedReferenceTransaction, Errno> {
         let pw = FMT_POINTER_WIDTH.load(Ordering::Relaxed);
         if pw == 0 {
             return Err(Errno::EINVAL);
@@ -2283,17 +2338,6 @@ mod wasm {
             pointer_width: pw as u8,
             chunk_header_size,
         };
-
-        // Reclaim any prior fork's reference state.
-        *reference_state() = None;
-        *reconstruction_state() = None;
-        *reference_feed() = None;
-
-        // Decode the sealed module-state arena from the COPIED guest memory
-        // (immutable whole-memory view — only reads, so the release-LLVM
-        // `&mut`-noalias miscompile the serialize/child paths avoid does not
-        // apply here). Then lift each record's payload into a borrowed
-        // `ReferenceTransactionRecord` view and reuse the D6.0 transaction decode.
         let mem = unsafe { mem_ref() };
         let module_state = decode_module_state(mem, module_state_root, &fmt)?;
         let mut records: Vec<ReferenceTransactionRecord> =
@@ -2310,10 +2354,18 @@ mod wasm {
                 payload,
             });
         }
-        let transaction = decode_segmented_reference_transaction(
-            &records,
-            abi::WPK_FORK_REFERENCE_TRANSACTION_OWNER,
-        )?;
+        decode_segmented_reference_transaction(&records, abi::WPK_FORK_REFERENCE_TRANSACTION_OWNER)
+    }
+
+    fn begin_reference_replay_impl(module_state_root: u64, _pid: u32) -> Result<(), Errno> {
+        // Reclaim any prior fork's reference state.
+        *reference_state() = None;
+        *reconstruction_state() = None;
+        *reference_feed() = None;
+
+        // Decode the sealed module-state arena into the canonical transaction
+        // (shared arena->transaction path; see the helper).
+        let transaction = decode_reference_transaction_from_arena(module_state_root)?;
         // Seed the RESTORE data-feed (Phase 6 item 3a) from the SAME decoded
         // transaction before it moves into the driver: the feed reproduces the JS
         // provider's mutable replay state (the reference-vector overlay + intern
@@ -2399,6 +2451,67 @@ mod wasm {
         *reconstruction_state() = Some(reconstruction);
         *reference_feed() = Some(feed);
         Ok(())
+    }
+
+    // -- Module-owned wire-graph decode / scan / restore impls (orchestration
+    //    migration increment 1) -------------------------------------------------
+
+    /// Decode the sealed KFMS arena rooted at `module_state_root` into the
+    /// module-owned decoded graph and return its node count (`>= 0`). Reuses the
+    /// SAME shared arena decode as `fm_begin_reference_replay`; unlike replay it
+    /// seeds NO driver/feed — it only makes the decoded graph resident for
+    /// `fm_scan_externref_handles` and host inspection. Reclaims any prior graph.
+    fn decode_reference_graph_impl(module_state_root: u64) -> Result<u32, Errno> {
+        *decoded_graph() = None;
+        let transaction = decode_reference_transaction_from_arena(module_state_root)?;
+        let node_count = u32::try_from(transaction.nodes.len()).map_err(|_| Errno::EINVAL)?;
+        *decoded_graph() = Some(transaction);
+        REFERENCE_GRAPHS_DECODED.fetch_add(1, Ordering::Relaxed);
+        Ok(node_count)
+    }
+
+    /// Scan the resident decoded graph for its DISTINCT externref broker handles
+    /// (first-seen order, deduped exactly like the JS `Set`), write them as a
+    /// little-endian `u32` array into guest memory at `dst_ptr`, and return the
+    /// count. `dst_cap` is the caller-provided capacity in u32 ELEMENTS (size it
+    /// from the decoded node count, an upper bound). A count that would overflow
+    /// `dst_cap`, or no resident decoded graph, is a truthful `EINVAL` — never a
+    /// partial or fabricated scan.
+    fn scan_externref_handles_impl(dst_ptr: usize, dst_cap: usize) -> Result<u32, Errno> {
+        let transaction = decoded_graph().as_ref().ok_or(Errno::EINVAL)?;
+        let mut handles: Vec<u32> = Vec::new();
+        for entry in &transaction.nodes {
+            if let ReferenceRecipeNode::Externref { handle } = entry.node {
+                if !handles.contains(&handle) {
+                    handles.push(handle);
+                }
+            }
+        }
+        if handles.len() > dst_cap {
+            return Err(Errno::EINVAL);
+        }
+        let byte_len = handles.len().checked_mul(4).ok_or(Errno::EINVAL)?;
+        if byte_len != 0 {
+            let end = dst_ptr.checked_add(byte_len).ok_or(Errno::EINVAL)?;
+            if end > mem_len_bytes() {
+                return Err(Errno::EINVAL); // span past the end of guest memory
+            }
+            // SAFETY: `[dst_ptr, dst_ptr+byte_len)` is within guest linear memory
+            // (checked above); the source is a distinct local `Vec`. Absolute
+            // guest-offset writes through an opaque-zero base, the same
+            // guest-offset-as-pointer idiom the frame/channel paths use.
+            let mut cursor = dst_ptr;
+            for handle in &handles {
+                unsafe {
+                    let ptr = core::hint::black_box(cursor) as *mut u8;
+                    core::ptr::copy_nonoverlapping(handle.to_le_bytes().as_ptr(), ptr, 4);
+                }
+                cursor += 4;
+            }
+        }
+        let count = u32::try_from(handles.len()).map_err(|_| Errno::EINVAL)?;
+        EXTERNREF_HANDLES_SCANNED.fetch_add(count as u64, Ordering::Relaxed);
+        Ok(count)
     }
 
     // -- Reference RESTORE data-feed helpers (Phase 6 item 3a) ---------------
@@ -4086,6 +4199,110 @@ mod wasm {
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_capture_interned() -> i64 {
         CAPTURE_INTERNED.load(Ordering::Relaxed) as i64
+    }
+
+    // -- Module-owned wire-graph decode + scan + restore exports (orchestration
+    //    migration increment 1) -------------------------------------------------
+    //
+    // Additive `fm_*` surfaces over the EXISTING `fork_codec` decode/replay/drive
+    // engine (`reference_segments.rs` decode, `reference_replay.rs` driver/feed,
+    // `drive_plan.rs` build_drive_plan). They let a later host-rewire increment
+    // retire the TypeScript wire-graph decode (`fork-reference-segments.ts`),
+    // externref-handle scan (`scanSegmentedForkReferenceExternrefHandles`), and
+    // replay ENTRY wrapper (`restoreModuleState`/`materializeAllTyped`), routing
+    // all three through the ONE shared engine that already backs
+    // `fm_begin_reference_replay`. The wire format is FROZEN — these carry no new
+    // algorithm and no new engine-floor seam.
+
+    /// Decode the sealed KFMS module-state arena rooted at `module_state_root`
+    /// into the module-owned decoded reference graph. Returns the graph's node
+    /// count (`>= 0`) or `-1` (reason in `fm_last_errno`). The decoded graph
+    /// stays resident for `fm_scan_externref_handles` and `fm_decoded_node_count`
+    /// until the next decode or replay. See `decode_reference_graph_impl`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_decode_reference_graph(module_state_root: usize) -> i32 {
+        match decode_reference_graph_impl(module_state_root as u64) {
+            Ok(count) if count <= i32::MAX as u32 => {
+                set_ok();
+                count as i32
+            }
+            Ok(_) => {
+                set_err(Errno::EINVAL);
+                -1
+            }
+            Err(e) => {
+                set_err(e);
+                -1
+            }
+        }
+    }
+
+    /// The node count of the resident decoded graph (`fm_decode_reference_graph`
+    /// result), or `-1` if none is resident. Lets the host size the
+    /// `fm_scan_externref_handles` destination buffer without re-decoding.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_decoded_node_count() -> i32 {
+        match decoded_graph().as_ref() {
+            Some(t) => match i32::try_from(t.nodes.len()) {
+                Ok(n) => {
+                    set_ok();
+                    n
+                }
+                Err(_) => {
+                    set_err(Errno::EINVAL);
+                    -1
+                }
+            },
+            None => {
+                set_err(Errno::EINVAL);
+                -1
+            }
+        }
+    }
+
+    /// Scan the resident decoded graph for its distinct externref broker handles,
+    /// writing them as a little-endian `u32` array into guest memory at `dst_ptr`
+    /// (capacity `dst_cap` u32 elements), and return the count (`>= 0`) or `-1`
+    /// (reason in `fm_last_errno`). See `scan_externref_handles_impl`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_scan_externref_handles(dst_ptr: usize, dst_cap: usize) -> i32 {
+        match scan_externref_handles_impl(dst_ptr, dst_cap) {
+            Ok(count) if count <= i32::MAX as u32 => {
+                set_ok();
+                count as i32
+            }
+            Ok(_) => {
+                set_err(Errno::EINVAL);
+                -1
+            }
+            Err(e) => {
+                set_err(e);
+                -1
+            }
+        }
+    }
+
+    /// Monotonic count of reference graphs the module has DECODED from a KFMS
+    /// arena since worker start (orchestration migration increment 1).
+    /// Proof-of-use for the decode flip: a value greater than its pre-fork
+    /// reading proves the host routed wire-graph decode through the module; a
+    /// silent fallback to the TypeScript `decodeSegmentedForkReferenceTransaction`
+    /// leaves it unchanged. Never resets.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_reference_graphs_decoded() -> i64 {
+        REFERENCE_GRAPHS_DECODED.load(Ordering::Relaxed) as i64
+    }
+
+    /// Monotonic count of externref handles the module has SCANNED out of decoded
+    /// graphs since worker start (orchestration migration increment 1).
+    /// Proof-of-use for the scan flip: a value greater than its pre-fork reading
+    /// proves the host routed the pre-launch externref-handle scan through the
+    /// module; a silent fallback to the TypeScript
+    /// `scanSegmentedForkReferenceExternrefHandles` leaves it unchanged. Never
+    /// resets.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_externref_handles_scanned() -> i64 {
+        EXTERNREF_HANDLES_SCANNED.load(Ordering::Relaxed) as i64
     }
 
     /// The sticky errno of the most recent export call (0 == success).
