@@ -8,10 +8,11 @@
  #ifdef XP_UNIX
  #  ifndef __wasi__
  #    include <arpa/inet.h>
-@@ -1885,7 +1886,86 @@
+@@ -1884,6 +1885,122 @@
+     }
    }
    return false;
- }
++}
 +
 +// Kandelo: native zstd DECOMPRESSION. Input: a string, ArrayBuffer, or typed
 +// array holding a zstd frame. Output: a fresh Uint8Array of the decoded bytes.
@@ -32,7 +33,26 @@
 +  if (!KandeloValueToBytes(cx, args[0], &in)) {
 +    return false;
 +  }
- 
++
++  // Empty input decodes to empty output (matches Node/zlib-family behavior),
++  // avoiding a spurious "not a valid frame" throw on a zero-length buffer.
++  if (in.empty()) {
++    RootedObject empty(cx, KandeloNewUint8ArrayCopy(cx, nullptr, 0));
++    if (!empty) {
++      return false;
++    }
++    args.rval().setObject(*empty);
++    return true;
++  }
++
++  // Hard upper bound on decoded size. These frames are UNTRUSTED input: a
++  // ~20-byte frame can declare a multi-gigabyte content size in its header,
++  // and an unbounded std::vector allocation would throw bad_alloc out of this
++  // JSNative (an abort/DoS) rather than a catchable JS error. Any frame that
++  // decodes to more than this fails loud. 512 MiB is far above any real
++  // embedded asset yet safely below the wasm guest's address space.
++  const size_t kMaxZstdDecodeBytes = (size_t)512 * 1024 * 1024;
++
 +  unsigned long long contentSize =
 +      ZSTD_getFrameContentSize(in.data(), in.size());
 +  std::vector<uint8_t> out;
@@ -42,6 +62,11 @@
 +                        "zstd decompression failed: not a valid zstd frame");
 +    return false;
 +  } else if (contentSize != ZSTD_CONTENTSIZE_UNKNOWN) {
++    if (contentSize > kMaxZstdDecodeBytes) {
++      JS_ReportErrorASCII(
++          cx, "zstd decompression failed: declared content size exceeds limit");
++      return false;
++    }
 +    out.resize((size_t)contentSize);
 +    size_t r = ZSTD_decompress(out.data(), out.size(), in.data(), in.size());
 +    if (ZSTD_isError(r)) {
@@ -51,7 +76,8 @@
 +    }
 +    out.resize(r);
 +  } else {
-+    // Unknown content size: stream-decode into a growable buffer.
++    // Unknown content size: stream-decode into a growable buffer, bounding
++    // total growth against the same limit.
 +    ZSTD_DStream* ds = ZSTD_createDStream();
 +    if (!ds) {
 +      JS_ReportErrorASCII(cx, "zstd: out of memory");
@@ -61,6 +87,12 @@
 +    ZSTD_inBuffer inb = {in.data(), in.size(), 0};
 +    size_t chunk = ZSTD_DStreamOutSize();
 +    for (;;) {
++      if (out.size() + chunk > kMaxZstdDecodeBytes) {
++        ZSTD_freeDStream(ds);
++        JS_ReportErrorASCII(cx,
++                            "zstd decompression failed: output exceeds limit");
++        return false;
++      }
 +      size_t base = out.size();
 +      out.resize(base + chunk);
 +      ZSTD_outBuffer outb = {out.data() + base, chunk, 0};
@@ -72,11 +104,17 @@
 +                           ZSTD_getErrorName(r));
 +        return false;
 +      }
-+      if (r == 0 && inb.pos == inb.size) {
-+        break;  // frame fully consumed
++      if (r == 0) {
++        break;  // frame fully decoded
 +      }
++      // r > 0: the decoder needs another call. If it consumed all input
++      // without filling the output buffer, the frame is truncated — fail loud
++      // rather than returning the partial bytes decoded so far. Otherwise the
++      // output buffer filled up, so grow it and continue.
 +      if (inb.pos == inb.size && outb.pos < outb.size) {
-+        break;  // input exhausted
++        ZSTD_freeDStream(ds);
++        JS_ReportErrorASCII(cx, "zstd decompression failed: truncated frame");
++        return false;
 +      }
 +    }
 +    ZSTD_freeDStream(ds);
@@ -90,12 +128,10 @@
 +  }
 +  args.rval().setObject(*result);
 +  return true;
-+}
-+
+ }
+ 
  static bool DefineKandeloNodeNative(JSContext* cx) {
-   RootedObject native(cx, JS_NewPlainObject(cx));
-   if (!native) {
-@@ -1894,6 +1974,7 @@
+@@ -1894,6 +2011,7 @@
    const JSFunctionSpec funcs[] = {
        JS_FN("evalScriptAsFunction", KandeloNativeEvalScriptAsFunction, 2, 0),
        JS_FN("__kandeloRequireModule", KandeloNativeRequireModule, 1, 0),

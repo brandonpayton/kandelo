@@ -162,17 +162,22 @@ const FIXTURES: Record<string, string> = {
   "mainvmcb.cjs": '(()=>{try{const vm=require("vm");let got=0;const c=vm.createContext({log:(v)=>{got=v;}});vm.runInContext("log(42)",c);console.log("VMCB",got);}catch(e){console.log("VMCBERR",(e&&e.name)||"",(e&&e.message)||e);}})();',
   "mainvmscript.cjs": '(()=>{try{const vm=require("vm");const s=new vm.Script("base+1");const a=s.runInContext(vm.createContext({base:10}));const b=s.runInContext(vm.createContext({base:20}));console.log("VMSCRIPT",a,b);}catch(e){console.log("VMSCRIPTERR",(e&&e.name)||"",(e&&e.message)||e);}})();',
   "mainvmthrow.cjs": '(()=>{try{const vm=require("vm");let m="";try{vm.runInContext("throw new Error(\'boom\')",vm.createContext({}));}catch(e){m=e.message;}console.log("VMTHROW",m);}catch(e){console.log("VMTHROWERR",(e&&e.name)||"",(e&&e.message)||e);}})();',
-  // Native zstd DECOMPRESSION (M2 Phase I). ZBLOB_HEX is the zstd frame of
-  // "hello zstd from kandelo" (generated on the host with the zstd CLI). Decodes
-  // via zlib.zstdDecompressSync and Bun.zstdDecompressSync (falls back to the
-  // zlib value here — the Bun global is only present under bun-run), and proves a
-  // corrupt frame fails loud ("zstd decompression failed").
+  // Native zstd DECOMPRESSION (M2 Phase I). The hex is the zstd frame of
+  // "hello zstd from kandelo" (generated on the host with the zstd CLI; its
+  // header carries no content size, so it exercises the streaming decode path).
+  // Decodes via zlib.zstdDecompressSync and Bun.zstdDecompressSync (falls back
+  // to the zlib value here — the Bun global is only present under bun-run), and
+  // proves fail-loud on BOTH a header-invalid frame AND a truncated valid frame
+  // (never a silent partial), plus empty-input → empty output.
   "mainzstd.cjs":
     '(()=>{try{const zlib=require("zlib");const hex="28b52ffd0458b9000068656c6c6f207a7374642066726f6d206b616e64656c6f4e81847f";const b=Buffer.from(hex,"hex");' +
     'const viaZlib=zlib.zstdDecompressSync(b).toString("utf8");' +
     'const viaBun=(typeof Bun!=="undefined"&&Bun.zstdDecompressSync)?Buffer.from(Bun.zstdDecompressSync(b)).toString("utf8"):viaZlib;' +
-    'let bad="";try{zlib.zstdDecompressSync(Buffer.from([40,181,47,253,9,9,9,9]));bad="NOTHROW";}catch(e){bad=(e&&e.message||"").indexOf("zstd decompression failed")>=0?"THROW":"WRONG:"+(e&&e.message);}' +
-    'console.log("ZSTD",viaZlib===viaBun,viaZlib,bad);' +
+    'const fl=(fn)=>{try{fn();return "NOTHROW";}catch(e){return (e&&e.message||"").indexOf("zstd decompression failed")>=0?"THROW":"WRONG:"+(e&&e.message);}};' +
+    'const bad=fl(()=>zlib.zstdDecompressSync(Buffer.from([40,181,47,253,9,9,9,9])));' +
+    'const trunc=fl(()=>zlib.zstdDecompressSync(b.subarray(0,b.length-6)));' +
+    'let empt="";try{const z=zlib.zstdDecompressSync(Buffer.alloc(0));empt=(z&&z.length===0)?"EMPTY":"LEN:"+z.length;}catch(e){empt="THREW:"+(e&&e.message);}' +
+    'console.log("ZSTD",viaZlib===viaBun,viaZlib,bad,trunc,empt);' +
     '}catch(e){console.log("ZSTDERR",(e&&e.name)||"",(e&&e.message)||e);}})();',
 };
 
@@ -440,6 +445,6 @@ describe("spidermonkey-node ESM probe", () => {
     const r = await runOne("/app/mainzstd.cjs");
     // eslint-disable-next-line no-console
     console.log("ZSTD OUT:", JSON.stringify(r.stdout.trim()), "ERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
-    expect(r.stdout).toContain("ZSTD true hello zstd from kandelo THROW");
+    expect(r.stdout).toContain("ZSTD true hello zstd from kandelo THROW THROW EMPTY");
   }, 90_000);
 });
