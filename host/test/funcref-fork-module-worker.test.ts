@@ -79,34 +79,14 @@ describe("funcref fork through the co-resident module (Phase 6 D6.5)", () => {
     if (workDir) rmSync(workDir, { recursive: true, force: true });
   });
 
-  it("reconstructs and calls the carried funcref in a fresh child (flag off)", async () => {
-    // Parity baseline: the JS reference path reconstructs the funcref and the
-    // child calls it, exiting 0. No fork-module proof-of-use is emitted.
+  it("drives the carried funcref reconstruction through the module", async () => {
     const result = await runCentralizedProgram({
       programPath,
       argv: ["funcref-local-fork-fresh-worker"],
       timeout: 30_000,
       useDefaultRootfs: false,
-      forkModuleEnabled: false,
     });
-    expect(
-      result.exitCode,
-      `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
-    ).toBe(0);
-    expect(result.stderr).toBe("");
-    expect(moduleReferencesReconstructed(result.hostDiagnostics)).toBeNull();
-  });
-
-  it("drives the carried funcref reconstruction through the module (flag on)", async () => {
-    const result = await runCentralizedProgram({
-      programPath,
-      argv: ["funcref-local-fork-fresh-worker"],
-      timeout: 30_000,
-      useDefaultRootfs: false,
-      forkModuleEnabled: true,
-    });
-    // (a) CORRECTNESS: child called the reconstructed funcref and exited 0,
-    // identical to the flag-off run.
+    // (a) CORRECTNESS: child called the reconstructed funcref and exited 0.
     expect(
       result.exitCode,
       `flag-on funcref fork exited unexpectedly\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,

@@ -55,37 +55,18 @@ describe("exnref fork through the co-resident module (Phase 6 D6.5)", () => {
     if (workDir) rmSync(workDir, { recursive: true, force: true });
   });
 
-  it("reconstructs and re-throws the carried exnref in a fresh child (flag off)", async () => {
-    // Parity baseline: the JS reference path reconstructs the exnref and the
-    // child re-throws/re-catches it, exiting 0. No fork-module proof-of-use.
+  it("drives the carried exnref reconstruction through the module", async () => {
     const result = await runCentralizedProgram({
       programPath,
       argv: ["exnref-local-fork-fresh-worker"],
       timeout: 30_000,
       useDefaultRootfs: false,
-      forkModuleEnabled: false,
-    });
-    expect(
-      result.exitCode,
-      `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
-    ).toBe(0);
-    expect(result.stderr).toBe("");
-    expect(moduleReferenceProof(result.hostDiagnostics, "exnref")).toBeNull();
-  });
-
-  it("drives the carried exnref reconstruction through the module (flag on)", async () => {
-    const result = await runCentralizedProgram({
-      programPath,
-      argv: ["exnref-local-fork-fresh-worker"],
-      timeout: 30_000,
-      useDefaultRootfs: false,
-      forkModuleEnabled: true,
     });
     // (a) CORRECTNESS: child re-threw the reconstructed exnref, recovered
-    // payload 42, and exited 0 — identical to the flag-off run.
+    // payload 42, and exited 0.
     expect(
       result.exitCode,
-      `flag-on exnref fork exited unexpectedly\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      `exnref fork exited unexpectedly\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
     ).toBe(0);
     expect(result.stderr).toBe("");
     // (b) PROOF OF USE: the module reconstructed the carried exnref.

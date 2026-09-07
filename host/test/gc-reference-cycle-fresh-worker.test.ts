@@ -60,37 +60,12 @@ describe("Multi-node Wasm GC reference cycle in a fresh process Worker", () => {
     if (workDir) rmSync(workDir, { recursive: true, force: true });
   });
 
-  it("reconstructs a multi-node Wasm-GC cycle fork through a fresh child (flag off)", async () => {
-    // N1 Node/browser parity: typed Wasm-GC struct/array/i31 capture is
-    // un-gated (mirrors native's already-shipped `gc_lookup`/`gc_claim`
-    // layering). The fresh child now genuinely reconstructs the struct<->array
-    // cycle, alias carryover, and scalar field through the JS reference path
-    // (this is the flag-off / `forkModuleEnabled: false` run) and exits 0 with
-    // empty stderr, instead of the old capture-side EOPNOTSUPP gate.
-    const result = await runCentralizedProgram({
-      programPath,
-      argv: ["gc-reference-cycle-fresh-worker"],
-      timeout: 30_000,
-      useDefaultRootfs: false,
-      // Path B flip (P5): the module is the DEFAULT reconstructor, so this
-      // JS-path coverage opts out explicitly (matching the comment above). The
-      // flag-on sibling proves the module reconstructs the same cycle.
-      forkModuleEnabled: false,
-    });
-
-    expect(
-      result.exitCode,
-      `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
-    ).toBe(0);
-    expect(result.stderr).toBe("");
-  });
-
-  it("reconstructs the same multi-node Wasm-GC cycle fork through the co-resident module (flag on)", async () => {
-    // EQUIVALENCE + DRIVE PROOF (Phase 6 item 3c production flip): with the
-    // co-resident fork-module ENABLED, the child's ref.eq alias checks + the
-    // cyclic array element + the scalar struct field + the i31 leaf value all
-    // still hold, so it exits 0 with empty stderr — the SAME child outcome as
-    // the flag-off run above (equivalence). PROOF OF USE has two counters:
+  it("reconstructs the multi-node Wasm-GC cycle fork through the co-resident module", async () => {
+    // DRIVE PROOF (Phase 6 item 3c production flip): with the co-resident
+    // fork-module (the UNCONDITIONAL fork engine), the child's ref.eq alias
+    // checks + the cyclic array element + the scalar struct field + the i31 leaf
+    // value all still hold, so it exits 0 with empty stderr. PROOF OF USE has two
+    // counters:
     //
     //   * `gc` (`fm_gc_nodes_reconstructed`): the graph was ADMITTED through the
     //     module (the item 3a data feed). Advances in `fm_begin_reference_replay`.
@@ -100,20 +75,18 @@ describe("Multi-node Wasm GC reference cycle in a fresh process Worker", () => {
     //     Advances once per `call_indirect` into a guest `_gc_allocate`/`_gc_fill`.
     //
     // A nonzero `drive` count is the distinct proof — over and above `gc` — that
-    // the MODULE, not the JS fallback, reconstructed the typed graph on this
-    // RESTORE path. That the child still exits 0 proves the module-driven order
-    // reconstructs the identical references the proven JS order does.
+    // the MODULE reconstructed the typed graph on this RESTORE path. That the
+    // child exits 0 proves the module-driven order reconstructs the references.
     const result = await runCentralizedProgram({
       programPath,
       argv: ["gc-reference-cycle-fresh-worker"],
       timeout: 30_000,
       useDefaultRootfs: false,
-      forkModuleEnabled: true,
     });
 
     expect(
       result.exitCode,
-      `flag-on GC cycle fork exited unexpectedly\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      `GC cycle fork exited unexpectedly\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
     ).toBe(0);
     expect(result.stderr).toBe("");
 

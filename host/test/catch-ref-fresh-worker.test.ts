@@ -104,7 +104,6 @@ describe("CatchRef fresh process worker replay", () => {
       argv: ["catch-ref-fresh-worker"],
       timeout: 30_000,
       useDefaultRootfs: false,
-      forkModuleEnabled: true,
     });
 
     // (a) PARITY.

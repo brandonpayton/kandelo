@@ -129,7 +129,6 @@ describe("module-mode gated externref fork aborts cleanly (P4)", () => {
       programPath,
       argv: ["externref-gated-indirect-fork-fresh-worker"],
       timeout: 30_000,
-      forkModuleEnabled: true,
       forkHostImportRegistrar: registerHostReferenceImports,
     });
     const elapsed = Date.now() - started;

@@ -71,7 +71,6 @@ describe("fork-module kernel-rejected fork (childPid < 0) abort-replay", () => {
       argv: ["d_01_single_fork"],
       timeout: 10_000,
       useDefaultRootfs: false,
-      forkModuleEnabled: true,
       // Admits exactly the root process's own initial address space, so its
       // fork()'s new child Memory allocation samples an already-exhausted
       // budget and is rejected by the real (non-mocked) host admission gate.

@@ -55,7 +55,7 @@ function forkModuleProof(hostDiagnostics: readonly HostDiagnostic[]): {
 
 describe("fork-from-non-main-thread", () => {
   it.skipIf(!hasFork)(
-    "a pthread fork child can fork again from its inherited continuation",
+    "drives BOTH sides of a fork-from-thread through the co-resident module",
     async () => {
       const result = await runCentralizedProgram({
         programPath: forkFromThreadBinary!,
@@ -65,55 +65,11 @@ describe("fork-from-non-main-thread", () => {
         // touches the VFS. Keep the pthread fork proof independent of the
         // separately versioned rootfs package rebuild.
         useDefaultRootfs: false,
-        // Path B flip (P5): the module is the DEFAULT reconstructor, so this
-        // "Flag OFF" JS-path coverage opts out explicitly; the flag-on sibling
-        // below proves the module drives the pthread fork frames (proof > 0).
-        forkModuleEnabled: false,
       });
 
-      expect(result.exitCode, `stderr=${result.stderr}\nstdout=${result.stdout}`).toBe(0);
-
-      // Parent thread reached the fork-callable code path.
-      expect(result.stdout).toContain("THREAD_STARTED");
-      expect(result.stdout).toContain("PRE_FORK_THREAD");
-
-      // Parent thread received a positive child pid.
-      expect(result.stdout).toMatch(/PARENT_THREAD: child=\d+/);
-
-      // Child resumed inside the thread function, took the pid==0 branch,
-      // ran the post-fork code, and exited cleanly. This is the load-bearing
-      // expectation: without correct fork-from-thread, the child traps in
-      // _start before any thread code runs.
-      expect(result.stdout).toContain("GRANDCHILD_THREAD: ok");
-      expect(result.stdout).toMatch(/CHILD_THREAD: grandchild=\d+/);
-
-      // Final PASS line — main thread joined the worker and waitpid()'d
-      // the child to a normal exit.
-      expect(result.stdout).toContain("PASS");
-
-      // Flag OFF: the co-resident fork-module is never engaged, so neither the
-      // pthread parent nor the child emits a proof-of-use diagnostic.
-      const proof = forkModuleProof(result.hostDiagnostics);
-      expect(proof.parentFrames).toEqual([]);
-      expect(proof.childFrames).toEqual([]);
-    },
-    20_000,
-  );
-
-  it.skipIf(!hasFork)(
-    "drives BOTH sides of a fork-from-thread through the co-resident module (flag on)",
-    async () => {
-      const result = await runCentralizedProgram({
-        programPath: forkFromThreadBinary!,
-        argv: ["fork-from-thread"],
-        timeout: 15_000,
-        useDefaultRootfs: false,
-        forkModuleEnabled: true,
-      });
-
-      // (a) CORRECTNESS / PARITY: identical observable behavior to flag-off —
-      // the child resumed inside the thread function, forked again, and the run
-      // exited cleanly. A wrong module-driven unwind/rewind would trap or hang.
+      // (a) CORRECTNESS: the child resumed inside the thread function, forked
+      // again, and the run exited cleanly. A wrong module-driven unwind/rewind
+      // would trap or hang.
       expect(
         result.exitCode,
         `stderr=${result.stderr}\nstdout=${result.stdout}`,
@@ -168,7 +124,6 @@ describe("fork-from-non-main-thread", () => {
         argv: ["fork-from-concurrent-threads"],
         timeout: 60_000,
         useDefaultRootfs: false,
-        forkModuleEnabled: true,
       });
 
       // Correctness/parity: 16 concurrent fork pairs, each pthread parent

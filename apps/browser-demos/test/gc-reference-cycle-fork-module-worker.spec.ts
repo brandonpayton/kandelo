@@ -85,7 +85,6 @@ test.afterAll(() => {
 async function runGcCycleFork(
   page: Page,
   baseURL: string,
-  forkModuleEnabled: boolean,
 ): Promise<BrowserForkModuleResult> {
   const asViteFsUrl = (path: string) => new URL(`/@fs/${path}`, baseURL).href;
 
@@ -96,7 +95,6 @@ async function runGcCycleFork(
       memoryFsModuleUrl,
       fixtureUrl,
       argv0,
-      forkModuleEnabled,
     }) => {
       const { BrowserKernel } = await import(
         /* @vite-ignore */ browserKernelModuleUrl
@@ -117,7 +115,6 @@ async function runGcCycleFork(
         );
       const kernel = new BrowserKernel({
         maxWorkers: 4,
-        forkModuleEnabled,
         onStdout: (data: Uint8Array) => {
           stdout += decoder.decode(data);
         },
@@ -155,12 +152,11 @@ async function runGcCycleFork(
 
         // The child posts its typed-GC proof-of-use AFTER the guest's exit
         // resolves `spawn`; give that best-effort diagnostic a bounded window to
-        // arrive before teardown. Flag-off never emits it, so a short settle
-        // catches an erroneous late emission without waiting.
+        // arrive before teardown.
         const started = Date.now();
-        const windowMs = forkModuleEnabled ? 8_000 : 500;
+        const windowMs = 8_000;
         while (Date.now() - started < windowMs) {
-          if (forkModuleEnabled && hasForkModuleDriveDiagnostic()) break;
+          if (hasForkModuleDriveDiagnostic()) break;
           await new Promise((r) => setTimeout(r, 50));
         }
         return { exitCode, stdout, stderr, diagnostics };
@@ -173,7 +169,6 @@ async function runGcCycleFork(
       memoryFsModuleUrl: asViteFsUrl(memoryFsModulePath),
       fixtureUrl: asViteFsUrl(programPath),
       argv0: ARGV0,
-      forkModuleEnabled,
     },
   );
 }
@@ -211,13 +206,13 @@ test("Chromium drives the multi-node typed-GC fork reconstruction through the mo
   test.setTimeout(180_000);
   expect(baseURL).toBeTruthy();
 
-  const result = await runGcCycleFork(page, baseURL!, true);
+  const result = await runGcCycleFork(page, baseURL!);
 
   // (a) CORRECTNESS: the child reconstructed the struct<->array cycle + i31 leaf
   // and self-verified every alias, exiting 0 with empty stderr.
   expect(
     result.exitCode,
-    `flag-on GC cycle fork exited unexpectedly\n${JSON.stringify(result, null, 2)}`,
+    `GC cycle fork exited unexpectedly\n${JSON.stringify(result, null, 2)}`,
   ).toBe(0);
   expect(result.stderr).toBe("");
 
@@ -239,23 +234,4 @@ test("Chromium drives the multi-node typed-GC fork reconstruction through the mo
       `the graph but did not drive the typed allocate/fill order (item 3c)\n${JSON.stringify(result, null, 2)}`,
   ).not.toBeNull();
   expect(driveSteps!).toBeGreaterThan(0);
-});
-
-test("Chromium reconstructs the multi-node typed-GC graph unchanged with the module disabled", async ({
-  page,
-  baseURL,
-  browserName,
-}) => {
-  test.skip(browserName !== "chromium", "the aggregate browser gate uses Chromium");
-  test.setTimeout(180_000);
-  expect(baseURL).toBeTruthy();
-
-  const result = await runGcCycleFork(page, baseURL!, false);
-
-  // Flag-off parity: the JS typed path reconstructs the same graph and the child
-  // exits 0. No fork-module proof-of-use is emitted.
-  expect(result.exitCode, JSON.stringify(result, null, 2)).toBe(0);
-  expect(result.stderr).toBe("");
-  expect(moduleReferenceProof(result.diagnostics, "gc")).toBeNull();
-  expect(moduleReferenceProof(result.diagnostics, "drive")).toBeNull();
 });

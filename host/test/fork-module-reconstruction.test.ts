@@ -234,16 +234,18 @@ describe("ForkActivationRegistry module-on child reconstruction", () => {
     expect(registry.phaseName()).toBe("idle");
   });
 
-  it("keeps the JS ForkReferenceTransaction on the flag-off child path (no node-count source)", () => {
+  it("fails loud when no decoded-node-count source is supplied (module unconditional)", () => {
     const registry = new ForkActivationRegistry(
       new WebAssembly.Memory({ initial: 16 }),
       makeExternrefs(),
       "test registry",
     );
-    // No decoded-node-count source => flag-off child reconstruction keeps the JS
-    // reference engine, exactly as before this severance.
-    registry.attachChild(emptyReconstructionArena(), emptyDecodedTransaction());
-    expect(registry.currentReferences()).toBeInstanceOf(ForkReferenceTransaction);
-    registry.abort();
+    // The co-resident module is the UNCONDITIONAL reconstructor: there is no
+    // flag-off JS reference engine behind it. A child reconstruction reached
+    // without the module's node-count source (a fork the module could not back)
+    // fails loud instead of silently constructing a deleted `ForkReferenceTransaction`.
+    expect(() =>
+      registry.attachChild(emptyReconstructionArena(), emptyDecodedTransaction()),
+    ).toThrow(/requires the co-resident fork module/);
   });
 });

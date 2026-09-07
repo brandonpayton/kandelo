@@ -76,7 +76,6 @@ test.afterAll(() => {
 async function runFuncrefFork(
   page: Page,
   baseURL: string,
-  forkModuleEnabled: boolean,
 ): Promise<BrowserForkModuleResult> {
   const asViteFsUrl = (path: string) => new URL(`/@fs/${path}`, baseURL).href;
 
@@ -87,7 +86,6 @@ async function runFuncrefFork(
       memoryFsModuleUrl,
       fixtureUrl,
       argv0,
-      forkModuleEnabled,
     }) => {
       const { BrowserKernel } = await import(
         /* @vite-ignore */ browserKernelModuleUrl
@@ -107,7 +105,6 @@ async function runFuncrefFork(
         );
       const kernel = new BrowserKernel({
         maxWorkers: 4,
-        forkModuleEnabled,
         onStdout: (data: Uint8Array) => {
           stdout += decoder.decode(data);
         },
@@ -145,12 +142,11 @@ async function runFuncrefFork(
 
         // The child posts its `fork_module_references` proof-of-use AFTER the
         // guest's exit resolves `spawn`; give that best-effort diagnostic a
-        // bounded window to arrive before teardown. Flag-off never emits it, so
-        // a short settle catches an erroneous late emission without waiting.
+        // bounded window to arrive before teardown.
         const started = Date.now();
-        const windowMs = forkModuleEnabled ? 8_000 : 500;
+        const windowMs = 8_000;
         while (Date.now() - started < windowMs) {
-          if (forkModuleEnabled && hasForkModuleReferenceDiagnostic()) break;
+          if (hasForkModuleReferenceDiagnostic()) break;
           await new Promise((r) => setTimeout(r, 50));
         }
         return { exitCode, stdout, stderr, diagnostics };
@@ -163,7 +159,6 @@ async function runFuncrefFork(
       memoryFsModuleUrl: asViteFsUrl(memoryFsModulePath),
       fixtureUrl: asViteFsUrl(programPath),
       argv0: ARGV0,
-      forkModuleEnabled,
     },
   );
 }
@@ -192,12 +187,12 @@ test("Chromium drives a carried funcref reconstruction through the module", asyn
   test.setTimeout(180_000);
   expect(baseURL).toBeTruthy();
 
-  const result = await runFuncrefFork(page, baseURL!, true);
+  const result = await runFuncrefFork(page, baseURL!);
 
   // (a) CORRECTNESS: the child called the reconstructed funcref and exited 0.
   expect(
     result.exitCode,
-    `flag-on funcref fork exited unexpectedly\n${JSON.stringify(result, null, 2)}`,
+    `funcref fork exited unexpectedly\n${JSON.stringify(result, null, 2)}`,
   ).toBe(0);
   // (b) PROOF OF USE: the module reconstructed the carried funcref.
   const references = moduleReferencesReconstructed(result.diagnostics);
@@ -207,21 +202,4 @@ test("Chromium drives a carried funcref reconstruction through the module", asyn
       `not drive the reference reconstruction\n${JSON.stringify(result, null, 2)}`,
   ).not.toBeNull();
   expect(references!).toBeGreaterThan(0);
-});
-
-test("Chromium reconstructs the carried funcref unchanged with the module disabled", async ({
-  page,
-  baseURL,
-  browserName,
-}) => {
-  test.skip(browserName !== "chromium", "the aggregate browser gate uses Chromium");
-  test.setTimeout(180_000);
-  expect(baseURL).toBeTruthy();
-
-  const result = await runFuncrefFork(page, baseURL!, false);
-
-  // Flag-off parity: the JS reference path reconstructs the funcref and the
-  // child calls it, exiting 0. No fork-module proof-of-use is emitted.
-  expect(result.exitCode, JSON.stringify(result, null, 2)).toBe(0);
-  expect(moduleReferencesReconstructed(result.diagnostics)).toBeNull();
 });

@@ -280,7 +280,6 @@ describe.skipIf(!hasPrerequisites)("fork from a dlopened side module", () => {
       argv: ["fork-from-side-main", libraryPath],
       timeout: 30_000,
       io: new NodePlatformIO(),
-      forkModuleEnabled: true,
     });
     expect(result.exitCode, `stderr:\n${result.stderr}`).toBe(0);
     expect(result.stdout).toContain("side fork ok");
@@ -342,7 +341,6 @@ describe.skipIf(!hasPrerequisites)("fork from a dlopened side module", () => {
         argv: ["vfork-from-side-main", "/lib/libvforkinside.so"],
         timeout: 30_000,
         rootfsImage: await imageOwner.saveImage(),
-        forkModuleEnabled: true,
       });
       expect(result.exitCode, `stderr:\n${result.stderr}`).toBe(0);
       expect(result.stderr).toBe("");

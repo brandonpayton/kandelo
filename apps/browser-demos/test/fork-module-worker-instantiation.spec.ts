@@ -33,7 +33,6 @@ interface BrowserForkModuleResult {
 async function runSingleFork(
   page: Page,
   baseURL: string,
-  forkModuleEnabled: boolean,
 ): Promise<BrowserForkModuleResult> {
   const asViteFsUrl = (path: string) => new URL(`/@fs/${path}`, baseURL).href;
 
@@ -44,7 +43,6 @@ async function runSingleFork(
       memoryFsModuleUrl,
       fixtureUrl,
       argv0,
-      forkModuleEnabled,
     }) => {
       const { BrowserKernel } = await import(
         /* @vite-ignore */ browserKernelModuleUrl
@@ -60,7 +58,6 @@ async function runSingleFork(
         diagnostics.some((d) => d.source === "fork-module");
       const kernel = new BrowserKernel({
         maxWorkers: 4,
-        forkModuleEnabled,
         onStdout: (data: Uint8Array) => {
           stdout += decoder.decode(data);
         },
@@ -102,14 +99,12 @@ async function runSingleFork(
         // the parent worker finishes its post-guest JS and posts the fork-module
         // proof-of-use frame count. Give that best-effort diagnostic a bounded
         // window to arrive before teardown so the test observes the real
-        // module-drove-the-fork evidence rather than racing the worker.
-        // Flag-on: poll up to 8s for the proof-of-use diagnostic. Flag-off never
-        // emits it, so a short 500ms settle is enough to catch an erroneous late
-        // emission without waiting the full window.
+        // module-drove-the-fork evidence rather than racing the worker. Poll up
+        // to 8s for the proof-of-use diagnostic.
         const started = Date.now();
-        const windowMs = forkModuleEnabled ? 8_000 : 500;
+        const windowMs = 8_000;
         while (Date.now() - started < windowMs) {
-          if (forkModuleEnabled && hasForkModuleDiagnostic()) break;
+          if (hasForkModuleDiagnostic()) break;
           await new Promise((r) => setTimeout(r, 50));
         }
         return { exitCode, stdout, stderr, diagnostics };
@@ -122,7 +117,6 @@ async function runSingleFork(
       memoryFsModuleUrl: asViteFsUrl(memoryFsModulePath),
       fixtureUrl: asViteFsUrl(resolveBinary(FIXTURE)),
       argv0: FIXTURE,
-      forkModuleEnabled,
     },
   );
 }
@@ -153,18 +147,18 @@ test("Chromium drives a qualifying fork through the co-resident module", async (
   test.setTimeout(180_000);
   expect(baseURL).toBeTruthy();
 
-  const result = await runSingleFork(page, baseURL!, true);
+  const result = await runSingleFork(page, baseURL!);
 
   expect(
     result.exitCode,
-    `flag-on fork exited unexpectedly\n${JSON.stringify(result, null, 2)}`,
+    `fork exited unexpectedly\n${JSON.stringify(result, null, 2)}`,
   ).toBe(0);
   for (const fragment of EXPECT) {
     expect(result.stdout).toContain(fragment);
   }
-  // PROOF the module actually served the fork (not a silent JS fallback): the
-  // parent worker reported a nonzero committed-frame count, forwarded by the
-  // browser kernel worker as a `fork-module` diagnostic.
+  // PROOF the module actually served the fork: the parent worker reported a
+  // nonzero committed-frame count, forwarded by the browser kernel worker as a
+  // `fork-module` diagnostic.
   const frames = moduleFramesCommitted(result.diagnostics);
   expect(
     frames,
@@ -172,24 +166,4 @@ test("Chromium drives a qualifying fork through the co-resident module", async (
       `the fork\n${JSON.stringify(result, null, 2)}`,
   ).not.toBeNull();
   expect(frames!).toBeGreaterThan(0);
-});
-
-test("Chromium boots and forks unchanged with the fork-module disabled", async ({
-  page,
-  baseURL,
-  browserName,
-}) => {
-  test.skip(browserName !== "chromium", "the aggregate browser gate uses Chromium");
-  test.setTimeout(180_000);
-  expect(baseURL).toBeTruthy();
-
-  const result = await runSingleFork(page, baseURL!, false);
-
-  expect(result.exitCode, JSON.stringify(result, null, 2)).toBe(0);
-  for (const fragment of EXPECT) {
-    expect(result.stdout).toContain(fragment);
-  }
-  // Flag-off is byte-identical to today: the module path is never taken, so no
-  // proof-of-use diagnostic is emitted.
-  expect(moduleFramesCommitted(result.diagnostics)).toBeNull();
 });

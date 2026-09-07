@@ -42,49 +42,17 @@ describe("Wasm GC static-root binder in a fresh process Worker", () => {
     if (workDir) rmSync(workDir, { recursive: true, force: true });
   });
 
-  it("reconstructs an immutable static-root fork through the JS reference path (flag off)", async () => {
-    // N1 Node/browser parity: an immutable static root is un-gated
-    // (`GC_LOOKUP`'s static-root branch, restored verbatim from the pre-gate
-    // history; see
-    // `docs/plans/2026-09-05-n1-nodebrowser-reference-parity-grounding.md`).
-    // The fresh child re-publishes the static root via `materializeAllTyped`
-    // PHASE A and exits 0 with empty stderr. No co-resident module is enabled
-    // here, so the static-root proof-of-use (module participation only)
-    // stays null.
+  it("reconstructs the immutable static-root fork through the co-resident module", async () => {
     const result = await runCentralizedProgram({
       programPath,
       argv: ["static-root-local-fork-fresh-worker"],
       timeout: 30_000,
       useDefaultRootfs: false,
-      // Path B flip (P5): the co-resident module is now the DEFAULT
-      // reconstructor, so this JS-path coverage must opt out explicitly. The
-      // flag-on sibling below proves the module reconstructs the same
-      // immutable static root (proof-of-use non-null).
-      forkModuleEnabled: false,
     });
 
     expect(
       result.exitCode,
-      `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
-    ).toBe(0);
-    expect(result.stderr).toBe("");
-    expect(
-      moduleReferenceProof(result.hostDiagnostics, "static-root"),
-    ).toBeNull();
-  });
-
-  it("reconstructs the same static-root fork through the co-resident module (flag on)", async () => {
-    const result = await runCentralizedProgram({
-      programPath,
-      argv: ["static-root-local-fork-fresh-worker"],
-      timeout: 30_000,
-      useDefaultRootfs: false,
-      forkModuleEnabled: true,
-    });
-
-    expect(
-      result.exitCode,
-      `flag-on static-root fork exited unexpectedly\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      `static-root fork exited unexpectedly\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
     ).toBe(0);
     expect(result.stderr).toBe("");
     const staticRootsPublished = moduleReferenceProof(

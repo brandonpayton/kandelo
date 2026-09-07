@@ -382,7 +382,6 @@ describe.skipIf(!hasSysroot || !hasKernel)("fork after dlopen end-to-end", () =>
       argv: ["fork-dlopen-module", soPath],
       timeout: 30_000,
       io: io(),
-      forkModuleEnabled: true,
     });
 
     expect(result.stderr).not.toContain("table index is out of bounds");
@@ -474,7 +473,6 @@ describe.skipIf(!hasSysroot || !hasKernel)("fork after dlopen end-to-end", () =>
       argv: ["side-module-selffork", soPath],
       timeout: 30_000,
       io: io(),
-      forkModuleEnabled: true,
     });
 
     expect(result.stderr).not.toContain("table index is out of bounds");

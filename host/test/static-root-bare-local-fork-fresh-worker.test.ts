@@ -49,43 +49,17 @@ describe("Wasm GC bare static-root fork in a fresh process Worker", () => {
     if (workDir) rmSync(workDir, { recursive: true, force: true });
   });
 
-  it("reconstructs a bare static-root fork through the JS reference path (flag off)", async () => {
-    // N1 Node/browser parity: un-gated (see the sibling
-    // static-root-local-fork-fresh-worker.test.ts and
-    // docs/plans/2026-09-05-n1-nodebrowser-reference-parity-grounding.md). The
-    // fresh child reconstructs the bare static root and exits 0 with empty
-    // stderr. No co-resident module is enabled here, so the static-root
-    // proof-of-use (module participation only) stays null.
+  it("reconstructs the bare static-root fork through the co-resident module", async () => {
     const result = await runCentralizedProgram({
       programPath,
       argv: ["static-root-bare-local-fork-fresh-worker"],
       timeout: 30_000,
       useDefaultRootfs: false,
-      forkModuleEnabled: false,
     });
 
     expect(
       result.exitCode,
-      `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
-    ).toBe(0);
-    expect(result.stderr).toBe("");
-    expect(
-      moduleReferenceProof(result.hostDiagnostics, "static-root"),
-    ).toBeNull();
-  });
-
-  it("reconstructs the same bare static-root fork through the co-resident module (flag on)", async () => {
-    const result = await runCentralizedProgram({
-      programPath,
-      argv: ["static-root-bare-local-fork-fresh-worker"],
-      timeout: 30_000,
-      useDefaultRootfs: false,
-      forkModuleEnabled: true,
-    });
-
-    expect(
-      result.exitCode,
-      `flag-on bare static-root fork exited unexpectedly\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      `bare static-root fork exited unexpectedly\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
     ).toBe(0);
     expect(result.stderr).toBe("");
     const staticRootsPublished = moduleReferenceProof(

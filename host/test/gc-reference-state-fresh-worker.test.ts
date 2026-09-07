@@ -42,46 +42,17 @@ describe("Wasm GC reference state in a fresh process Worker", () => {
     if (workDir) rmSync(workDir, { recursive: true, force: true });
   });
 
-  it("reconstructs a cyclic typed-GC identity fork through a fresh child (flag off)", async () => {
-    // N1 Node/browser parity: typed Wasm-GC struct capture is un-gated (see
-    // the sibling gc-reference-cycle-fresh-worker.test.ts and
-    // docs/plans/2026-09-05-n1-nodebrowser-reference-parity-grounding.md).
-    // The fresh child now genuinely reconstructs the self-cyclic struct
-    // through the JS reference path (no co-resident module here) and exits 0
-    // with empty stderr; the typed-GC proof-of-use (module participation
-    // only) stays null.
+  it("reconstructs the cyclic typed-GC identity fork through the co-resident module", async () => {
     const result = await runCentralizedProgram({
       programPath,
       argv: ["gc-reference-state-fresh-worker"],
       timeout: 30_000,
       useDefaultRootfs: false,
-      // Path B flip (P5): the co-resident module is now the DEFAULT
-      // reconstructor, so this JS-path coverage must opt out explicitly. The
-      // flag-on sibling below proves the module reconstructs this same cyclic
-      // typed-GC identity (proof-of-use non-null).
-      forkModuleEnabled: false,
     });
 
     expect(
       result.exitCode,
-      `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
-    ).toBe(0);
-    expect(result.stderr).toBe("");
-    expect(moduleReferenceProof(result.hostDiagnostics, "gc")).toBeNull();
-  });
-
-  it("reconstructs the same cyclic typed-GC identity fork through the co-resident module (flag on)", async () => {
-    const result = await runCentralizedProgram({
-      programPath,
-      argv: ["gc-reference-state-fresh-worker"],
-      timeout: 30_000,
-      useDefaultRootfs: false,
-      forkModuleEnabled: true,
-    });
-
-    expect(
-      result.exitCode,
-      `flag-on GC fork exited unexpectedly\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      `GC fork exited unexpectedly\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
     ).toBe(0);
     expect(result.stderr).toBe("");
     const gcNodes = moduleReferenceProof(result.hostDiagnostics, "gc");

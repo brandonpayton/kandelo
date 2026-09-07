@@ -29,7 +29,6 @@ describe("vfork borrowed replay through the fork-module (flag on)", () => {
       execPrograms: new Map([["/bin/vfork-exec-child", execChild]]),
       useDefaultRootfs: false,
       timeout: 20_000,
-      forkModuleEnabled: true,
     });
 
     expect(result.exitCode, result.stderr).toBe(0);

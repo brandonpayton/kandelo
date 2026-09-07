@@ -2,24 +2,21 @@ import { describe, expect, it } from "vitest";
 import { resolveBinary } from "../src/binary-resolver";
 import { runCentralizedProgram } from "./centralized-test-helper";
 
-// Phase 6 D5: prove the co-resident `fork-module` instantiates at process init
-// behind `forkModuleEnabled` inside a REAL centralized worker (parent + fork
-// child), and that a real single-parent fork still completes end-to-end. The
-// import flip is NOT done in this step, so a successful fork is the proof that
-// init-time placement + `continuationMmap` reservation do not perturb the live
-// guest. `fork-module-instance.test.ts` separately asserts the required
+// Phase 6 D5: prove the co-resident `fork-module` — the UNCONDITIONAL fork
+// engine — instantiates at process init inside a REAL centralized worker
+// (parent + fork child), and that a real single-parent fork completes
+// end-to-end. `fork-module-instance.test.ts` separately asserts the required
 // exports at the unit level.
 
 const FIXTURE = "programs/d_01_single_fork.wasm";
 const EXPECT = ["PRE_FORK", "CHILD: ok", "PASS: D-01"];
 
-async function runSingleFork(forkModuleEnabled: boolean) {
+async function runSingleFork() {
   const binary = resolveBinary(FIXTURE);
   const result = await runCentralizedProgram({
     programPath: binary,
     argv: [FIXTURE],
     timeout: 10_000,
-    forkModuleEnabled,
   });
   return result;
 }
@@ -41,39 +38,28 @@ function moduleFramesCommitted(
   return null;
 }
 
-describe("fork-module worker instantiation (flag-gated)", () => {
+describe("fork-module worker instantiation", () => {
   it("drives a qualifying fork through the co-resident module", async () => {
-    const result = await runSingleFork(true);
+    const result = await runSingleFork();
     expect(
       result.exitCode,
-      `flag-on fork exited unexpectedly\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      `fork exited unexpectedly\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
     ).toBe(0);
     for (const fragment of EXPECT) {
       expect(result.stdout).toContain(fragment);
     }
-    // PROOF the module actually served the fork (not a silent JS fallback): the
-    // parent worker reported a nonzero committed-frame count. The child's own
-    // module use is proven by "CHILD: ok" — a replay-only child that never
-    // reached the module's driver would crash instead of printing it. Resume
-    // slots are proven by construction (the module registers the SAME full
-    // resume catalog the JS `__wpk_fork_resume_table` uses): a wrong slot would
-    // dispatch the wrong resume thunk and diverge from "PASS: D-01".
+    // PROOF the module actually served the fork: the parent worker reported a
+    // nonzero committed-frame count. The child's own module use is proven by
+    // "CHILD: ok" — a replay-only child that never reached the module's driver
+    // would crash instead of printing it. Resume slots are proven by
+    // construction (the module registers the SAME full resume catalog the JS
+    // `__wpk_fork_resume_table` uses): a wrong slot would dispatch the wrong
+    // resume thunk and diverge from "PASS: D-01".
     const frames = moduleFramesCommitted(result.hostDiagnostics);
     expect(
       frames,
       "expected a fork-module proof-of-use diagnostic; the module did not drive the fork",
     ).not.toBeNull();
     expect(frames!).toBeGreaterThan(0);
-  });
-
-  it("boots and forks unchanged with the fork-module disabled", async () => {
-    const result = await runSingleFork(false);
-    expect(result.exitCode).toBe(0);
-    for (const fragment of EXPECT) {
-      expect(result.stdout).toContain(fragment);
-    }
-    // Flag-off is byte-identical to today: the module path is never taken, so
-    // no proof-of-use diagnostic is emitted.
-    expect(moduleFramesCommitted(result.hostDiagnostics)).toBeNull();
   });
 });

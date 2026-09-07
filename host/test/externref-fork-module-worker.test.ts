@@ -102,54 +102,24 @@ describe("externref fork through the co-resident module (Phase 6 D6.5)", () => {
     if (workDir) rmSync(workDir, { recursive: true, force: true });
   });
 
-  it("reconstructs a carried host externref fork through the JS reference path (flag off)", async () => {
-    // N1 Node/browser parity: a plain host externref with recorded provenance
-    // (this fixture's `get_ext` import, routed through the broker) is un-gated
-    // (`GC_LOOKUP`'s third branch, see
-    // `docs/plans/2026-09-05-n1-nodebrowser-reference-parity-grounding.md`).
-    // The fresh child re-roots the SAME broker identity and its `check_ext`
-    // call confirms it, so it exits 0 with empty stderr. No co-resident module
-    // is enabled here, so nothing drove the restore THROUGH the module — the
-    // externref proof-of-use stays null (that diagnostic specifically proves
-    // module participation, not JS-path success; see
-    // `fork-module-reference-proof.ts`).
-    const result = await runCentralizedProgram({
-      programPath,
-      argv: ["externref-local-fork-fresh-worker"],
-      timeout: 30_000,
-      forkModuleEnabled: false,
-      forkHostImportRegistrar: registerHostReferenceImports,
-    });
-    expect(
-      result.exitCode,
-      `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
-    ).toBe(0);
-    expect(result.stderr).toBe("");
-    expect(
-      moduleReferenceProof(result.hostDiagnostics, "externref"),
-    ).toBeNull();
-  });
-
   // F1 (module abort-replay) + N1 Node/browser parity: with the co-resident
-  // fork-module ENABLED, the carried externref is now reconstructed for real
-  // (not gated) through the module's `host_resolve_externref` engine-floor
-  // seam, exactly as the fixture's own header comment describes. This is the
-  // primary end-to-end proof that externref capture/restore work identically
-  // under both flags.
-  it("reconstructs the same carried host externref fork through the co-resident module (flag on)", async () => {
+  // fork-module (the UNCONDITIONAL fork engine), the carried externref is
+  // reconstructed for real (not gated) through the module's
+  // `host_resolve_externref` engine-floor seam, exactly as the fixture's own
+  // header comment describes. This is the primary end-to-end proof that
+  // externref capture/restore work through the module.
+  it("reconstructs the carried host externref fork through the co-resident module", async () => {
     const result = await runCentralizedProgram({
       programPath,
       argv: ["externref-local-fork-fresh-worker"],
       timeout: 30_000,
-      forkModuleEnabled: true,
       forkHostImportRegistrar: registerHostReferenceImports,
     });
     // (a) CORRECTNESS/PARITY: the child's `check_ext` confirms the SAME host
-    // identity survived the fork and it exits 0, exactly as the flag-off (JS
-    // reference path) run does.
+    // identity survived the fork and it exits 0.
     expect(
       result.exitCode,
-      `flag-on externref fork exited unexpectedly\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      `externref fork exited unexpectedly\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
     ).toBe(0);
     expect(result.stderr).toBe("");
     // (b) PROOF OF USE: the co-resident module re-rooted the carried externref
