@@ -285,6 +285,51 @@ compile-fix loop; the acceptance is "zero `libc` errors."
 
 ---
 
+## Milestone 2 status + a discovered milestone (2026-09-07)
+
+**M1 done** (`60eff3460`): the delivery mechanism had to change for the
+Nix toolchain (no rustup). `scripts/build-rust-sysroot.sh` assembles a
+private writable sysroot (mirror-by-symlink, `rust-src` copied writable),
+points std's `libc` at `sdk/rust/libc-kandelo` via the library-workspace
+`[patch.crates-io]`, and emits a `rustc` wrapper injecting `--sysroot`.
+The `std` overlay is delivered as full changed files under
+`sdk/rust/std-overlay/` (mirroring `library/`), captured from the private
+sysroot by `scripts/export-rust-overlay.sh` and re-applied on rebuild.
+
+**M2 done** (`a5d7d87d6`): `-Zbuild-std=std` produces zero errors
+originating in `sdk/rust/libc-kandelo/`. Added `kandelo` to the
+module-selection gates (reuse `linux_like → linux → musl`) and the
+per-item pthread gates.
+
+**DISCOVERY — the wasm32 libc leaf is WALI, not Kandelo musl.** A
+`wasm32` arch leaf already existed, routed via `musl/mod.rs` to **`b64`**
+(not `b32` as this plan assumed), and it encodes the **WALI ABI**
+(WebAssembly Linux Interface — mirrors x86_64 Linux). Only `stat` /
+`nlink_t` / `blksize_t` were reconciled to Kandelo's
+`libc/musl-overlay/arch/wasm32posix/` (with a passing 112-byte `stat`
+size assertion). The leaf's **syscall numbers (x86_64), and many
+constants (`O_*`, signals, errno, `ipc_perm`) remain WALI values** — they
+compile but are runtime-wrong for Kandelo, whose ABI is pinned in
+`crates/shared/src/lib.rs` and `libc/musl-overlay/bits/`.
+
+### Milestone 2.5 — Reconcile the wasm32 libc leaf to Kandelo's ABI
+
+**This gates M4 runtime correctness.** A `std` program may compile and
+link but pass wrong flag/errno/struct values to Kandelo's musl until this
+is done.
+
+- Reconcile the `wasm32` leaf's syscall numbers against
+  `libc/musl-overlay/bits/syscall.h.in` + `crates/shared/src/lib.rs`.
+- Reconcile `O_*`, `SOCK_*`, `MAP_*`, signal numbers, errno values,
+  `ioctl` numbers, and `ipc_perm`/other struct layouts against the
+  overlay headers.
+- Decide the `b32` vs `b64` question honestly: confirm Kandelo
+  `wasm32posix` type widths (`c_long`, `time_t`, `off_t`) against the
+  overlay and place the leaf in the correct bits module.
+- Add compile-time `size_of`/offset assertions against
+  `crates/shared/src/process_layout.rs` where layouts are ABI-pinned.
+- Validate at runtime via M4/M5 fixtures, not just compilation.
+
 ## Milestone 3 — `std` unix pal compiles for `kandelo`
 
 Goal: `-Z build-std=std,panic_abort` completes; `std` builds.
