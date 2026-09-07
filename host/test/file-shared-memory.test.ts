@@ -1538,6 +1538,62 @@ describe("file/POSIX MAP_SHARED page cache", () => {
     expect(childMapping.snapshot).toBeInstanceOf(Uint8Array);
   });
 
+  it("NEW-1: exec drops the pid's writeback refcount map", () => {
+    const h = createFileHarness();
+    const pid = h.pids[0];
+    const addr = 0x1000;
+    asKernelOwnedFile(h, 4096);
+    expect(h.map(pid, 4, addr)).toBe(true);
+    expect((h.kw as any).fdWritebackFdRefs.has(pid)).toBe(true);
+    // exec finalize preserves the pid but the CLOEXEC dups are gone; the stale
+    // refcount map must be dropped (no leak, no closes needed).
+    h.kw.finalizeAddressSpaceForExec(pid);
+    expect((h.kw as any).fdWritebackFdRefs.has(pid)).toBe(false);
+    expect((h.kw as any).sharedMappings.has(pid)).toBe(false);
+    expect(h.closeWritebackFd).not.toHaveBeenCalled();
+  });
+
+  it("NEW-2: refuses fd-writeback flush when the dup was closed (closefrom)", () => {
+    const h = createFileHarness();
+    const pid = h.pids[0];
+    const addr = 0x1000;
+    asKernelOwnedFile(h, 4096);
+    expect(h.map(pid, 4, addr)).toBe(true);
+    const pwrite = vi.fn(() => true);
+    h.kw.testAuthority.configureScratchBoundaryHooksForTest({
+      pwriteFromProcessMemory: pwrite,
+    });
+    new Uint8Array(h.memories.get(pid)!.buffer)[addr + 5] = 0xab;
+    // The guest closed the (guest-visible) writeback dup: fstat now fails.
+    h.getFdStatForSharedMapping.mockReturnValue({ kind: "error", errno: 9 });
+    // Flush is refused (EIO) and never pwrites to a possibly-reused number.
+    expect((h.kw as any).flushSharedMappings(h.channels.get(pid), [addr, 4096]))
+      .toBe(false);
+    expect(pwrite).not.toHaveBeenCalled();
+  });
+
+  it("NEW-2: refuses fd-writeback flush when the dup was repointed (dup2)", () => {
+    const h = createFileHarness();
+    const pid = h.pids[0];
+    const addr = 0x1000;
+    asKernelOwnedFile(h, 4096);
+    expect(h.map(pid, 4, addr)).toBe(true);
+    const pwrite = vi.fn(() => true);
+    h.kw.testAuthority.configureScratchBoundaryHooksForTest({
+      pwriteFromProcessMemory: pwrite,
+    });
+    new Uint8Array(h.memories.get(pid)!.buffer)[addr + 5] = 0xab;
+    // dup2 rebound the number onto a different file (different ino).
+    h.getFdStatForSharedMapping.mockReturnValue({
+      kind: "ok",
+      value: { dev: 0n, ino: 999n, size: 4096, mode: REGULAR_MODE, hostHandle: null },
+    });
+    // Refused: pwriting here would corrupt the unrelated file.
+    expect((h.kw as any).flushSharedMappings(h.channels.get(pid), [addr, 4096]))
+      .toBe(false);
+    expect(pwrite).not.toHaveBeenCalled();
+  });
+
   it("rejects a backend that cannot promise stable file identity", () => {
     const h = createFileHarness();
     h.io.fileHandleIdentity.mockReturnValue(null);

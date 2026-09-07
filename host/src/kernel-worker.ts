@@ -1627,6 +1627,15 @@ interface SharedMmapMapping {
    * is re-fstat'd at flush when the descriptor is still open.
    */
   fileSize?: number;
+  /**
+   * The kernel file identity (dev/ino) the writeback descriptor must still
+   * refer to at flush time. Because `writebackFd` is a guest-visible fd
+   * number, a guest `closefrom`/`dup2` can close or repoint it; verifying the
+   * identity before pwrite prevents writing this mapping's bytes into a
+   * different file the number was rebound to.
+   */
+  expectedDev?: bigint;
+  expectedIno?: bigint;
 }
 
 interface SharedMmapFdStat {
@@ -1681,6 +1690,9 @@ interface FdWritebackSharedMmap {
   len: number;
   /** File size at mmap time; writeback is clamped to the live size, never past it. */
   fileSize: number;
+  /** Kernel file identity the writeback dup must still refer to at flush time. */
+  dev: bigint;
+  ino: bigint;
 }
 
 type FileSharedMmapPreparationResult =
@@ -3220,6 +3232,8 @@ export class CentralizedKernelWorker {
   private fdWritebackFdRefs = new Map<number, Map<number, number>>();
   /** One-shot guard so a persistent RAW+OPAQUE_RECORD ABI drift is loud but not a flood. */
   #warnedRawOpaqueRecordDrift = false;
+  /** Bounded counter so refused fd-writeback flushes stay observable without flooding. */
+  #fdWritebackFlushLossReports = 0;
   /** Host-owned byte stores for anonymous MAP_SHARED mappings. */
   private anonymousSharedBackings = new Map<
     string,
@@ -9704,6 +9718,11 @@ export class CentralizedKernelWorker {
       }
       this.sharedMappings.delete(pid);
     }
+    // exec closed every F_DUPFD_CLOEXEC writeback dup (they are close-on-exec),
+    // so the per-pid refcount entries are now stale. Drop them without issuing
+    // closes, exactly as process teardown does — otherwise the stale counts
+    // would leak and a post-exec fd-number reuse could prevent a later close.
+    this.fdWritebackFdRefs.delete(pid);
     this.invalidateSharedMmapFdCacheForPid(pid);
 
     // kernelExecCommit is the irreversible Rust commit. It has already drained
@@ -27259,7 +27278,14 @@ export class CentralizedKernelWorker {
       if (fdAccess.value !== O_RDWR) return { kind: "error", errno: EACCES };
       return {
         kind: "fd-writeback",
-        context: { fd, fileOffset, len, fileSize: stat.size },
+        context: {
+          fd,
+          fileOffset,
+          len,
+          fileSize: stat.size,
+          dev: stat.dev,
+          ino: stat.ino,
+        },
       };
     }
     const accessResult = this.getFdAccessModeForSharedMapping(
@@ -27421,6 +27447,18 @@ export class CentralizedKernelWorker {
     // (the bounds check above) so an early return never leaks a dup. If the
     // dup fails (e.g. RLIMIT_NOFILE), fall back to the guest fd: writeback
     // still works while the fd is open, only close-after-mmap is not covered.
+    //
+    // BOUNDARY (no host handle for kernel-owned files): this dup lives in the
+    // GUEST fd table (F_DUPFD_CLOEXEC against the guest pid), so it is a
+    // guest-visible descriptor number. It survives a close() of the *original*
+    // fd, but a guest `closefrom`/`close_fds` (Python subprocess default) or a
+    // `dup2` onto this number can still close or repoint it. Writeback then
+    // fails truthfully rather than silently: flushFdWritebackMapping re-fstats
+    // and refuses to pwrite unless the descriptor still refers to the same
+    // (dev, ino), so a repointed number can never corrupt an unrelated file,
+    // and the failure surfaces as EIO/diagnostic. Full robustness (a
+    // guest-invisible kernel-held writeback handle) requires a kernel change
+    // and ABI bump — out of scope for this host-only bridge.
     const writebackFd = this.dupWritebackFd(channel, context.fd, entry)
       ?? context.fd;
     const snapshot = processMem.slice(mapAddr, mapAddr + context.len);
@@ -27437,6 +27475,8 @@ export class CentralizedKernelWorker {
       fdWriteback: true,
       writebackFd,
       fileSize: context.fileSize,
+      expectedDev: context.dev,
+      expectedIno: context.ino,
       snapshot,
     };
     pidMap.set(mapAddr, mapping);
@@ -27549,6 +27589,30 @@ export class CentralizedKernelWorker {
     }
   }
 
+  /**
+   * Emit a truthful diagnostic when an fd-writeback flush is refused because
+   * the guest-visible writeback dup was closed or repointed. Bounded so a
+   * pathological guest cannot flood the log, but never silent (that would be
+   * the "convenient illusion" the platform contract forbids).
+   */
+  private reportFdWritebackFlushLoss(
+    pid: number,
+    mapAddr: number,
+    reason: string,
+  ): void {
+    if (this.#fdWritebackFlushLossReports >= 50) return;
+    this.#fdWritebackFlushLossReports++;
+    const suffix = this.#fdWritebackFlushLossReports === 50
+      ? " (further fd-writeback loss reports suppressed)"
+      : "";
+    console.error(
+      `[MAP_SHARED writeback lost] pid=${pid} mapping@0x${mapAddr.toString(16)}: `
+      + `${reason}; the guest closed or repointed the writeback descriptor `
+      + `(e.g. closefrom/close_fds/dup2), so dirty bytes could not be flushed `
+      + `to the kernel-owned file.${suffix}`,
+    );
+  }
+
   /** Record one more reference to a mapping's owned writeback dup. */
   private retainFdWritebackFd(pid: number, mapping: SharedMmapMapping): void {
     if (!mapping.fdWriteback) return;
@@ -27589,7 +27653,15 @@ export class CentralizedKernelWorker {
    * the file past EOF. Only byte runs that differ from the mapping's snapshot
    * are written, so concurrent mappings of the same file preserve each other's
    * disjoint updates; the snapshot is then advanced to the flushed content.
-   * Returns false only on a real write failure (the caller surfaces EIO).
+   *
+   * Returns false when the write cannot be performed safely — a real pwrite
+   * failure, or (the guest-visible-dup boundary) the writeback descriptor no
+   * longer refers to the mapping's file because the guest closed it
+   * (`closefrom`/`close_fds`) or repointed the number (`dup2`). In the latter
+   * cases the flush is REFUSED rather than blindly pwriting: writing to a
+   * closed number is pointless and writing to a dup2-repointed number would
+   * corrupt an unrelated file. Callers surface EIO where observable
+   * (msync/exec) and a diagnostic is emitted so the loss is never silent.
    */
   private flushFdWritebackMapping(
     channel: ChannelInfo,
@@ -27600,15 +27672,34 @@ export class CentralizedKernelWorker {
     entry?: KernelWorkerEntryContext,
   ): boolean {
     const writebackFd = mapping.writebackFd ?? mapping.fd;
-    // Consult the live size so a legitimate post-mmap ftruncate-larger is
-    // honored, and never write past EOF (no file growth). If the descriptor is
-    // gone the last known size is the conservative clamp.
-    let liveSize = mapping.fileSize ?? 0;
+    // Consult the live descriptor for both the current size (so a legitimate
+    // post-mmap ftruncate-larger is honored) AND its identity. Because the dup
+    // is a guest-visible fd number, verify it still refers to this mapping's
+    // file before any pwrite.
     const liveStat = this.getFdStatForSharedMapping(channel, writebackFd, entry);
-    if (liveStat.kind === "ok") {
-      liveSize = liveStat.value.size;
-      mapping.fileSize = liveSize;
+    if (liveStat.kind !== "ok") {
+      // The descriptor is gone (guest closed it, e.g. closefrom). Refuse the
+      // flush truthfully instead of pwriting to a possibly-reused number.
+      this.reportFdWritebackFlushLoss(channel.pid, mapAddr, "descriptor closed");
+      return false;
     }
+    if (
+      (mapping.expectedDev !== undefined
+        && liveStat.value.dev !== mapping.expectedDev)
+      || (mapping.expectedIno !== undefined
+        && liveStat.value.ino !== mapping.expectedIno)
+    ) {
+      // The number was repointed (dup2) onto a different file. pwriting here
+      // would corrupt that unrelated file — refuse and report.
+      this.reportFdWritebackFlushLoss(
+        channel.pid,
+        mapAddr,
+        "descriptor repointed to a different file",
+      );
+      return false;
+    }
+    const liveSize = liveStat.value.size;
+    mapping.fileSize = liveSize;
     const mappingOffset = flushStart - mapAddr;
     const fileOffsetBase = mapping.fileOffset + mappingOffset;
     if (fileOffsetBase >= liveSize) return true; // entirely past EOF; drop.
@@ -27641,6 +27732,10 @@ export class CentralizedKernelWorker {
         fileOffsetBase + runStart,
         entry,
       )) {
+        // A real write failure. Report it so the loss is never silent even on
+        // the exit/teardown path (where the caller drops the boolean); msync/
+        // exec additionally surface EIO from the returned false.
+        this.reportFdWritebackFlushLoss(channel.pid, mapAddr, "write failed");
         success = false;
         break;
       }
