@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 int main(void) {
     const char *path = "/tmp/mmap_shared_test";
@@ -64,6 +65,70 @@ int main(void) {
 
     close(fd);
     unlink(path);
+
+    /* H1: a whole-page MAP_SHARED of a short file must never grow the file.
+     * The tmpfs file is 100 bytes but the mapping covers a full page; writing
+     * within EOF must persist, a write past EOF must be dropped, and the file
+     * size must stay 100. Regression for the fd-writeback bridge growing the
+     * file to the full mapping length. */
+    {
+        const char *h1 = "/tmp/mmap_shared_h1";
+        int fd1 = open(h1, O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (fd1 < 0) { perror("H1 open"); return 1; }
+        if (ftruncate(fd1, 100) < 0) { perror("H1 ftruncate"); return 1; }
+        char *m1 = mmap(NULL, pagesize, PROT_READ | PROT_WRITE, MAP_SHARED,
+                        fd1, 0);
+        if (m1 == MAP_FAILED) { perror("H1 mmap"); return 1; }
+        m1[0] = 'A';    /* within EOF: must persist */
+        m1[500] = 'B';  /* past EOF: must be dropped, must not grow the file */
+        if (msync(m1, pagesize, MS_SYNC) < 0) { perror("H1 msync"); return 1; }
+        struct stat st;
+        if (fstat(fd1, &st) < 0) { perror("H1 fstat"); return 1; }
+        if (st.st_size != 100) {
+            fprintf(stderr, "H1 file grew to %lld (expected 100)\n",
+                    (long long)st.st_size);
+            return 1;
+        }
+        lseek(fd1, 0, SEEK_SET);
+        char h1b = 0;
+        if (read(fd1, &h1b, 1) != 1 || h1b != 'A') {
+            fprintf(stderr, "H1 in-EOF write not persisted\n");
+            return 1;
+        }
+        munmap(m1, pagesize);
+        close(fd1);
+        unlink(h1);
+        printf("H1 no-grow ok\n");
+    }
+
+    /* M2: writeback must survive close(fd) after mmap. POSIX keeps the mapping
+     * valid after the descriptor is closed. Regression for storing the guest
+     * fd number (which becomes EBADF on close) instead of a stable dup. */
+    {
+        const char *m2p = "/tmp/mmap_shared_m2";
+        int fd2 = open(m2p, O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (fd2 < 0) { perror("M2 open"); return 1; }
+        if (ftruncate(fd2, pagesize) < 0) { perror("M2 ftruncate"); return 1; }
+        char *m2 = mmap(NULL, pagesize, PROT_READ | PROT_WRITE, MAP_SHARED,
+                        fd2, 0);
+        if (m2 == MAP_FAILED) { perror("M2 mmap"); return 1; }
+        close(fd2);            /* legal: the mapping stays valid */
+        m2[0] = 'Q';
+        m2[1] = 'Z';
+        if (msync(m2, pagesize, MS_SYNC) < 0) { perror("M2 msync"); return 1; }
+        munmap(m2, pagesize);
+        int rfd = open(m2p, O_RDONLY);
+        if (rfd < 0) { perror("M2 reopen"); return 1; }
+        char m2b[2] = {0};
+        if (read(rfd, m2b, 2) != 2 || m2b[0] != 'Q' || m2b[1] != 'Z') {
+            fprintf(stderr, "M2 writeback lost after close(fd): '%c%c'\n",
+                    m2b[0], m2b[1]);
+            return 1;
+        }
+        close(rfd);
+        unlink(m2p);
+        printf("M2 close-survives ok\n");
+    }
 
     /* mremap MREMAP_MAYMOVE preserves prefix bytes.
      * Regression for host/src/kernel-worker.ts SYS_MREMAP post-syscall fixup.

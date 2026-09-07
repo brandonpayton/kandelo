@@ -1607,6 +1607,26 @@ interface SharedMmapMapping {
   backingKey?: string;
   snapshot?: Uint8Array;
   seenVersion?: number;
+  /**
+   * Writable MAP_SHARED of a kernel-owned regular file (in-kernel tmpfs /
+   * memfd, `hostHandle === null`): true marks the fd-writeback bridge. Such a
+   * mapping has no host byte-store backing; writeback rides `writebackFd`.
+   */
+  fdWriteback?: boolean;
+  /**
+   * Stable, independent kernel descriptor (a `F_DUPFD_CLOEXEC` dup of the
+   * guest fd taken at mmap time) used for all writeback pread/pwrite/fstat.
+   * Holding an independent dup means writeback survives a guest `close(fd)`
+   * after the mapping is established, as POSIX requires. Falls back to `fd`
+   * when the dup could not be taken (e.g. the process is at RLIMIT_NOFILE).
+   */
+  writebackFd?: number;
+  /**
+   * Last observed size of the kernel-owned file. Writeback is clamped so a
+   * whole-page mapping never grows the file past its real EOF; the live size
+   * is re-fstat'd at flush when the descriptor is still open.
+   */
+  fileSize?: number;
 }
 
 interface SharedMmapFdStat {
@@ -1659,6 +1679,8 @@ interface FdWritebackSharedMmap {
   fd: number;
   fileOffset: number;
   len: number;
+  /** File size at mmap time; writeback is clamped to the live size, never past it. */
+  fileSize: number;
 }
 
 type FileSharedMmapPreparationResult =
@@ -1692,6 +1714,20 @@ interface PreparedInheritedSharedMapping {
   readonly latest: Uint8Array;
 }
 
+/**
+ * A writable fd-writeback (kernel-owned tmpfs/memfd) mapping inherited across
+ * fork. It has no host byte-store backing: the child's memory is already a
+ * full copy of the parent's (so no backing read is needed), and fork copies
+ * the fd table, so the child inherits the same stable writeback descriptor
+ * number. Only a child `sharedMappings` entry must be registered so the
+ * child's own msync/munmap/exit flush its writes back to the file.
+ */
+interface PreparedInheritedFdWritebackMapping {
+  readonly mapAddr: number;
+  readonly source: SharedMmapMapping;
+  readonly inherited: SharedMmapMapping;
+}
+
 interface PreparedInheritedSysvMapping {
   readonly mapAddr: number;
   readonly source: SysvShmMapping;
@@ -1712,6 +1748,7 @@ interface PreparedSharedMappingInheritance {
   readonly parentSysvEntries:
     readonly (readonly [number, SysvShmMapping])[];
   readonly sharedMappings: readonly PreparedInheritedSharedMapping[];
+  readonly fdWritebackMappings: readonly PreparedInheritedFdWritebackMapping[];
   readonly sysvMappings: readonly PreparedInheritedSysvMapping[];
 }
 
@@ -2361,6 +2398,15 @@ interface ScratchBoundaryTestHooks {
     channel: Pick<ChannelInfo, "pid" | "memory" | "channelOffset">,
     fd: number,
   ) => SharedMmapHostResult<number>;
+  readonly dupWritebackFd?: (pid: number, fd: number) => number | null;
+  readonly closeWritebackFd?: (pid: number, writebackFd: number) => void;
+  readonly pwriteFromProcessMemory?: (
+    pid: number,
+    fd: number,
+    processAddr: number,
+    len: number,
+    fileOffset: number,
+  ) => boolean;
   readonly getPtrWidth?: (pid: number) => 4 | 8;
   readonly guestTidForChannel?: (channel: ChannelInfo) => number;
   readonly afterProcessMemorySnapshot?: (channel: ChannelInfo) => void;
@@ -3164,6 +3210,14 @@ export class CentralizedKernelWorker {
   >();
   /** Per-process MAP_SHARED mappings: pid → Map<addr, info>. */
   private sharedMappings = new Map<number, Map<number, SharedMmapMapping>>();
+  /**
+   * Refcount of stable fd-writeback dups: pid → (writebackFd → count). A single
+   * mmap owns one dup; a middle-split creates a second sub-mapping that shares
+   * it, so the dup is closed only once every sub-mapping referencing it is
+   * released. Guest-fd fallbacks (writebackFd === guest fd) are never counted
+   * or closed. Dropped wholesale on process teardown (the fd table is gone).
+   */
+  private fdWritebackFdRefs = new Map<number, Map<number, number>>();
   /** Host-owned byte stores for anonymous MAP_SHARED mappings. */
   private anonymousSharedBackings = new Map<
     string,
@@ -3539,6 +3593,13 @@ export class CentralizedKernelWorker {
           getFdAccessModeForSharedMapping:
             options.getFdAccessModeForSharedMapping
               ?? previous?.getFdAccessModeForSharedMapping,
+          dupWritebackFd:
+            options.dupWritebackFd ?? previous?.dupWritebackFd,
+          closeWritebackFd:
+            options.closeWritebackFd ?? previous?.closeWritebackFd,
+          pwriteFromProcessMemory:
+            options.pwriteFromProcessMemory
+              ?? previous?.pwriteFromProcessMemory,
           getPtrWidth:
             options.getPtrWidth ?? previous?.getPtrWidth,
           guestTidForChannel:
@@ -9576,6 +9637,17 @@ export class CentralizedKernelWorker {
             continue;
           }
           if (mapping.backingKey) continue;
+          if (mapping.fdWriteback) {
+            if (!this.flushFdWritebackMapping(
+              channel,
+              addr,
+              mapping,
+              addr,
+              mapping.len,
+              entry,
+            )) return -EIO;
+            continue;
+          }
           if (!this.pwriteFromProcessMemory(
             channel,
             mapping.fd,
@@ -27126,8 +27198,21 @@ export class CentralizedKernelWorker {
       // population) — otherwise every read-only MAP_SHARED mmap of a
       // kernel-owned regular file (e.g. musl's `__map_file`, used by
       // locale/timezone/message-catalog loading) fails with ENOTSUP purely
-      // because the file happens to live on tmpfs.
-      if (!writable) return { kind: "unsupported" };
+      // because the file happens to live on tmpfs. Any file mapping still
+      // requires a *readable* descriptor (POSIX), so an O_WRONLY fd is EACCES
+      // rather than a silently zero-filled "success".
+      if (!writable) {
+        const readAccess = this.getFdAccessModeForSharedMapping(
+          channel,
+          fd,
+          entry,
+        );
+        if (readAccess.kind === "error") return readAccess;
+        if (readAccess.value === O_WRONLY) {
+          return { kind: "error", errno: EACCES };
+        }
+        return { kind: "unsupported" };
+      }
 
       // A *writable* mapping still needs its writes to reach the kernel-owned
       // file. It does so through the guest's own kernel fd: pread for the
@@ -27156,7 +27241,7 @@ export class CentralizedKernelWorker {
       if (fdAccess.value !== O_RDWR) return { kind: "error", errno: EACCES };
       return {
         kind: "fd-writeback",
-        context: { fd, fileOffset, len },
+        context: { fd, fileOffset, len, fileSize: stat.size },
       };
     }
     const accessResult = this.getFdAccessModeForSharedMapping(
@@ -27283,13 +27368,19 @@ export class CentralizedKernelWorker {
   }
 
   /**
-   * Install a bare fd-tracked writable MAP_SHARED mapping of a kernel-owned
-   * (tmpfs) file after a successful kernel mmap. The region is first populated
-   * from the file through the guest's kernel fd (pread), then registered
-   * without a host byte-store backing so that every publication point
-   * (msync/munmap/exec/teardown) flushes its writes back to the same file
-   * through the guest fd (pwrite). This is the writeback bridge for files that
-   * have no persistent host handle.
+   * Install an fd-writeback MAP_SHARED mapping of a kernel-owned (tmpfs/memfd)
+   * file after a successful kernel mmap. The region is populated from the file
+   * through the guest's kernel fd (pread) and registered without a host
+   * byte-store backing. Writeback rides an independent dup of the guest fd:
+   *
+   *  - A `F_DUPFD_CLOEXEC` dup gives a stable descriptor so writeback survives
+   *    a later `close(fd)` (POSIX: the mapping stays valid after close), and is
+   *    inherited across `fork` (child writeback works) yet closed across `exec`
+   *    (the address space is torn down and flushed first).
+   *  - The initial snapshot lets each publication point flush only the bytes
+   *    this mapping actually changed, so concurrent mappings of the same file
+   *    do not clobber each other's disjoint writes.
+   *  - The file size is carried so writeback never grows the file past EOF.
    */
   private registerFdWritebackSharedMmap(
     channel: ChannelInfo,
@@ -27308,18 +27399,243 @@ export class CentralizedKernelWorker {
     // bytes before any write.
     this.populateMmapFromFile(channel, mapAddr, origArgs, rawPageOffset, entry);
     if (this.hostReaped?.has(channel.pid)) return { kind: "mapped" };
+    // Take the stable writeback descriptor AFTER the only failure point
+    // (the bounds check above) so an early return never leaks a dup. If the
+    // dup fails (e.g. RLIMIT_NOFILE), fall back to the guest fd: writeback
+    // still works while the fd is open, only close-after-mmap is not covered.
+    const writebackFd = this.dupWritebackFd(channel, context.fd, entry)
+      ?? context.fd;
+    const snapshot = processMem.slice(mapAddr, mapAddr + context.len);
     let pidMap = this.sharedMappings.get(channel.pid);
     if (!pidMap) {
       pidMap = new Map();
       this.sharedMappings.set(channel.pid, pidMap);
     }
-    pidMap.set(mapAddr, {
+    const mapping: SharedMmapMapping = {
       fd: context.fd,
       fileOffset: context.fileOffset,
       len: context.len,
       writable: true,
-    });
+      fdWriteback: true,
+      writebackFd,
+      fileSize: context.fileSize,
+      snapshot,
+    };
+    pidMap.set(mapAddr, mapping);
+    this.retainFdWritebackFd(channel.pid, mapping);
     return { kind: "mapped" };
+  }
+
+  /**
+   * Dup a guest fd into an independent, close-on-exec kernel descriptor via
+   * `F_DUPFD_CLOEXEC`, returning the new descriptor or null on failure. The
+   * dup shares the open-file description (offset/status) with the original but
+   * is a distinct table entry, so closing the guest fd does not invalidate it.
+   */
+  private dupWritebackFd(
+    channel: ChannelInfo,
+    fd: number,
+    entry?: KernelWorkerEntryContext,
+  ): number | null {
+    const testHook = this.#scratchBoundaryTestHooks?.dupWritebackFd;
+    if (testHook) return testHook(channel.pid, fd);
+    const previousPid = this.currentHandlePid;
+    try {
+      this.#bindKernelTidForChannel(channel, entry);
+      this.currentHandlePid = channel.pid;
+      const result = this.#requireMainScratchRegion().withLease((lease) => {
+        const kernelView = lease.dataView(0, CH_TOTAL_SIZE);
+        kernelView.setUint32(CH_SYSCALL, SYS_FCNTL, true);
+        kernelView.setBigInt64(CH_ARGS, BigInt(fd), true);
+        kernelView.setBigInt64(
+          CH_ARGS + CH_ARG_SIZE,
+          BigInt(F_DUPFD_CLOEXEC),
+          true,
+        );
+        kernelView.setBigInt64(CH_ARGS + 2 * CH_ARG_SIZE, 0n, true);
+        for (let i = 3; i < CH_ARGS_COUNT; i++) {
+          kernelView.setBigInt64(CH_ARGS + i * CH_ARG_SIZE, 0n, true);
+        }
+        this.#invokeEntryScratchExport(
+          entry,
+          lease,
+          "kernel_handle_channel",
+          [
+            lease.exportPointer(0, CH_TOTAL_SIZE),
+            CH_TOTAL_SIZE,
+            channel.pid,
+            0n,
+          ],
+        );
+        const resultView = lease.dataView(0, CH_TOTAL_SIZE);
+        return {
+          value: Number(resultView.getBigInt64(CH_RETURN, true)),
+          errno: resultView.getUint32(CH_ERRNO, true),
+        };
+      });
+      if (!Number.isSafeInteger(result.value) || result.value < 0
+        || result.errno !== 0) {
+        return null;
+      }
+      return result.value;
+    } catch (error) {
+      this.#rethrowKernelEntryFatal(error);
+      return null;
+    } finally {
+      this.currentHandlePid = previousPid;
+    }
+  }
+
+  /**
+   * Close a stable writeback descriptor previously taken by `dupWritebackFd`.
+   * Best-effort: a failed close (already-torn-down fd table, EBADF) must not
+   * abort mapping teardown.
+   */
+  private closeWritebackFd(
+    pid: number,
+    writebackFd: number,
+    entry?: KernelWorkerEntryContext,
+  ): void {
+    const testHook = this.#scratchBoundaryTestHooks?.closeWritebackFd;
+    if (testHook) { testHook(pid, writebackFd); return; }
+    const registration = this.processes.get(pid);
+    const channel = registration?.channels?.[0];
+    if (!channel) return;
+    const previousPid = this.currentHandlePid;
+    try {
+      this.#bindKernelTidForChannel(channel, entry);
+      this.currentHandlePid = pid;
+      this.#requireMainScratchRegion().withLease((lease) => {
+        const kernelView = lease.dataView(0, CH_TOTAL_SIZE);
+        kernelView.setUint32(CH_SYSCALL, SYS_CLOSE, true);
+        kernelView.setBigInt64(CH_ARGS, BigInt(writebackFd), true);
+        for (let i = 1; i < CH_ARGS_COUNT; i++) {
+          kernelView.setBigInt64(CH_ARGS + i * CH_ARG_SIZE, 0n, true);
+        }
+        this.#invokeEntryScratchExport(
+          entry,
+          lease,
+          "kernel_handle_channel",
+          [
+            lease.exportPointer(0, CH_TOTAL_SIZE),
+            CH_TOTAL_SIZE,
+            pid,
+            0n,
+          ],
+        );
+      });
+    } catch (error) {
+      this.#rethrowKernelEntryFatal(error);
+    } finally {
+      this.currentHandlePid = previousPid;
+    }
+  }
+
+  /** Record one more reference to a mapping's owned writeback dup. */
+  private retainFdWritebackFd(pid: number, mapping: SharedMmapMapping): void {
+    if (!mapping.fdWriteback) return;
+    const wf = mapping.writebackFd;
+    if (wf == null || wf === mapping.fd) return; // guest-fd fallback: not owned
+    let perPid = this.fdWritebackFdRefs.get(pid);
+    if (!perPid) {
+      perPid = new Map();
+      this.fdWritebackFdRefs.set(pid, perPid);
+    }
+    perPid.set(wf, (perPid.get(wf) ?? 0) + 1);
+  }
+
+  /** Release one reference; close the owned writeback dup when it hits zero. */
+  private releaseFdWritebackFd(
+    pid: number,
+    mapping: SharedMmapMapping,
+    entry?: KernelWorkerEntryContext,
+  ): void {
+    if (!mapping.fdWriteback) return;
+    const wf = mapping.writebackFd;
+    if (wf == null || wf === mapping.fd) return;
+    const perPid = this.fdWritebackFdRefs.get(pid);
+    if (!perPid) return;
+    const next = (perPid.get(wf) ?? 0) - 1;
+    if (next > 0) {
+      perPid.set(wf, next);
+      return;
+    }
+    perPid.delete(wf);
+    if (perPid.size === 0) this.fdWritebackFdRefs.delete(pid);
+    this.closeWritebackFd(pid, wf, entry);
+  }
+
+  /**
+   * Flush the dirty bytes of an fd-writeback mapping back to its kernel-owned
+   * file, clamped to the file's live size so a whole-page mapping never grows
+   * the file past EOF. Only byte runs that differ from the mapping's snapshot
+   * are written, so concurrent mappings of the same file preserve each other's
+   * disjoint updates; the snapshot is then advanced to the flushed content.
+   * Returns false only on a real write failure (the caller surfaces EIO).
+   */
+  private flushFdWritebackMapping(
+    channel: ChannelInfo,
+    mapAddr: number,
+    mapping: SharedMmapMapping,
+    flushStart: number,
+    flushLen: number,
+    entry?: KernelWorkerEntryContext,
+  ): boolean {
+    const writebackFd = mapping.writebackFd ?? mapping.fd;
+    // Consult the live size so a legitimate post-mmap ftruncate-larger is
+    // honored, and never write past EOF (no file growth). If the descriptor is
+    // gone the last known size is the conservative clamp.
+    let liveSize = mapping.fileSize ?? 0;
+    const liveStat = this.getFdStatForSharedMapping(channel, writebackFd, entry);
+    if (liveStat.kind === "ok") {
+      liveSize = liveStat.value.size;
+      mapping.fileSize = liveSize;
+    }
+    const mappingOffset = flushStart - mapAddr;
+    const fileOffsetBase = mapping.fileOffset + mappingOffset;
+    if (fileOffsetBase >= liveSize) return true; // entirely past EOF; drop.
+    const writableLen = Math.min(flushLen, liveSize - fileOffsetBase);
+    if (writableLen <= 0) return true;
+
+    const processMem = new Uint8Array(channel.memory.buffer);
+    const snapshot = mapping.snapshot;
+    let success = true;
+    let i = 0;
+    while (i < writableLen) {
+      // Skip bytes this mapping has not changed since its last flush.
+      if (snapshot
+        && processMem[flushStart + i] === snapshot[mappingOffset + i]) {
+        i++;
+        continue;
+      }
+      const runStart = i;
+      do { i++; } while (
+        i < writableLen
+        && !(snapshot
+          && processMem[flushStart + i] === snapshot[mappingOffset + i])
+      );
+      const runLen = i - runStart;
+      if (!this.pwriteFromProcessMemory(
+        channel,
+        writebackFd,
+        flushStart + runStart,
+        runLen,
+        fileOffsetBase + runStart,
+        entry,
+      )) {
+        success = false;
+        break;
+      }
+    }
+    // Advance the snapshot to the bytes just published so a later flush only
+    // sends new changes (and cannot re-clobber a peer's writes).
+    if (success && snapshot) {
+      snapshot.set(
+        processMem.subarray(flushStart, flushStart + writableLen),
+        mappingOffset,
+      );
+    }
+    return success;
   }
 
   /** Resolve a backend-qualified identity from the live handle, never its path. */
@@ -28854,7 +29170,34 @@ export class CentralizedKernelWorker {
       : [];
     const childBytes = childMemory.buffer.byteLength;
     const sharedMappings: PreparedInheritedSharedMapping[] = [];
+    const fdWritebackMappings: PreparedInheritedFdWritebackMapping[] = [];
     for (const [mapAddr, mapping] of parentSharedEntries) {
+      // Bare fd-writeback (kernel-owned tmpfs/memfd) mappings carry no backing.
+      // The child's memory is already a full fork copy and its fd table
+      // inherits the same stable writeback descriptor, so it only needs a
+      // registered child mapping entry to flush its own writes.
+      if (!mapping.backingKey && mapping.fdWriteback) {
+        if (
+          !Number.isSafeInteger(mapAddr)
+          || mapAddr < 0
+          || !Number.isSafeInteger(mapping.fileOffset)
+          || mapping.fileOffset < 0
+          || !Number.isSafeInteger(mapping.len)
+          || mapping.len < 0
+          || !Number.isSafeInteger(mapAddr + mapping.len)
+          || mapAddr + mapping.len > childBytes
+        ) {
+          throw new Error(
+            `Cannot inherit fd-writeback mapping at 0x${mapAddr.toString(16)}`,
+          );
+        }
+        fdWritebackMappings.push({
+          mapAddr,
+          source: mapping,
+          inherited: { ...mapping },
+        });
+        continue;
+      }
       if (!mapping.backingKey) continue;
       if (
         !Number.isSafeInteger(mapAddr)
@@ -28956,6 +29299,7 @@ export class CentralizedKernelWorker {
       parentSysvMap,
       parentSysvEntries,
       sharedMappings,
+      fdWritebackMappings,
       sysvMappings,
     };
   }
@@ -29023,6 +29367,21 @@ export class CentralizedKernelWorker {
         );
       }
     }
+    for (const mapping of prepared.fdWritebackMappings) {
+      if (
+        mapping.source.fd !== mapping.inherited.fd
+        || mapping.source.writebackFd !== mapping.inherited.writebackFd
+        || mapping.source.fileOffset !== mapping.inherited.fileOffset
+        || mapping.source.len !== mapping.inherited.len
+        || mapping.source.writable !== mapping.inherited.writable
+        || mapping.source.fdWriteback !== mapping.inherited.fdWriteback
+        || mapping.source.backingKey !== undefined
+      ) {
+        return new Error(
+          `fd-writeback mapping changed during inheritance at 0x${mapping.mapAddr.toString(16)}`,
+        );
+      }
+    }
     for (const mapping of prepared.sysvMappings) {
       if (
         mapping.source.segId !== mapping.segId
@@ -29039,6 +29398,13 @@ export class CentralizedKernelWorker {
       if (mapping.mapAddr + mapping.inherited.len > childBytes) {
         return new Error(
           `Child memory changed during shared mapping inheritance`,
+        );
+      }
+    }
+    for (const mapping of prepared.fdWritebackMappings) {
+      if (mapping.mapAddr + mapping.inherited.len > childBytes) {
+        return new Error(
+          `Child memory changed during fd-writeback mapping inheritance`,
         );
       }
     }
@@ -29224,6 +29590,20 @@ export class CentralizedKernelWorker {
       if (!mapping.writable) continue;
       if (mapping.backingKey) continue;
 
+      if (mapping.fdWriteback) {
+        // Kernel-owned (tmpfs/memfd) file: clamp to live size, flush only the
+        // dirty runs through the stable writeback descriptor.
+        if (!this.flushFdWritebackMapping(
+          channel,
+          mapAddr,
+          mapping,
+          flushStart,
+          flushLen,
+          entry,
+        )) success = false;
+        continue;
+      }
+
       // Compatibility for pre-page-cache tracking in focused exec harnesses.
       if (!this.pwriteFromProcessMemory(
         channel,
@@ -29248,6 +29628,8 @@ export class CentralizedKernelWorker {
     fileOffset: number,
     entry?: KernelWorkerEntryContext,
   ): boolean {
+    const testHook = this.#scratchBoundaryTestHooks?.pwriteFromProcessMemory;
+    if (testHook) return testHook(channel.pid, fd, processAddr, len, fileOffset);
     const scratch = this.#requireMainScratchRegion();
 
     try {
@@ -29353,6 +29735,7 @@ export class CentralizedKernelWorker {
 
       if (overlapStart <= mapAddr && overlapEnd >= mapEnd) {
         this.releaseSharedMapping(mapping, entry);
+        this.releaseFdWritebackFd(pid, mapping, entry);
         pidMap.delete(mapAddr);
         continue;
       }
@@ -29364,7 +29747,10 @@ export class CentralizedKernelWorker {
         mapping.len = mapEnd - overlapEnd;
         if (mapping.snapshot) mapping.snapshot = mapping.snapshot.slice(trim);
         if (mapping.len > 0) pidMap.set(overlapEnd, mapping);
-        else this.releaseSharedMapping(mapping, entry);
+        else {
+          this.releaseSharedMapping(mapping, entry);
+          this.releaseFdWritebackFd(pid, mapping, entry);
+        }
         continue;
       }
 
@@ -29390,6 +29776,9 @@ export class CentralizedKernelWorker {
           : this.anonymousSharedBackings.get(mapping.backingKey);
         if (backing) backing.refCount++;
       }
+      // The split sub-mapping shares the same writeback dup; refcount it so the
+      // descriptor is closed only after both sub-mappings are released.
+      this.retainFdWritebackFd(pid, rightMapping);
       pidMap.set(overlapEnd, rightMapping);
     }
 
@@ -30030,6 +30419,22 @@ export class CentralizedKernelWorker {
         seenVersion: mapping.backingVersion,
       });
     }
+    // fd-writeback (kernel-owned) mappings need no backing read: the child's
+    // memory is already a full fork copy. Register a child entry whose snapshot
+    // is the fork-time content so the child's later writes flush as dirty runs
+    // through its inherited writeback descriptor.
+    const childFdWritebackMappings: SharedMmapMapping[] = [];
+    for (const mapping of prepared.fdWritebackMappings) {
+      const childMapping: SharedMmapMapping = {
+        ...mapping.inherited,
+        snapshot: childMem.slice(
+          mapping.mapAddr,
+          mapping.mapAddr + mapping.inherited.len,
+        ),
+      };
+      childSharedMap.set(mapping.mapAddr, childMapping);
+      childFdWritebackMappings.push(childMapping);
+    }
     const childSysvMap = new Map<number, SysvShmMapping>();
     for (const mapping of materialized.sysvMappings) {
       childSysvMap.set(mapping.mapAddr, {
@@ -30064,6 +30469,12 @@ export class CentralizedKernelWorker {
       if (childSharedMap.size > 0) {
         this.sharedMappings.set(prepared.childPid, childSharedMap);
         sharedPublished = true;
+        // The child's inherited writeback descriptors are independent fd-table
+        // entries; count them under the child pid so they are closed on the
+        // child's own munmap (and dropped wholesale on child teardown).
+        for (const childMapping of childFdWritebackMappings) {
+          this.retainFdWritebackFd(prepared.childPid, childMapping);
+        }
       }
       if (childSysvMap.size > 0) {
         this.shmMappings.set(prepared.childPid, childSysvMap);
@@ -30075,6 +30486,9 @@ export class CentralizedKernelWorker {
         && this.sharedMappings.get(prepared.childPid) === childSharedMap
       ) {
         this.sharedMappings.delete(prepared.childPid);
+        // Undo the writeback-dup refcounts taken for this child; nothing was
+        // dup'd here (fork already copied the fd table) so no close is needed.
+        this.fdWritebackFdRefs.delete(prepared.childPid);
       }
       if (
         sysvPublished
@@ -30176,6 +30590,17 @@ export class CentralizedKernelWorker {
                 continue;
               }
               if (mapping.backingKey) continue;
+              if (mapping.fdWriteback) {
+                this.flushFdWritebackMapping(
+                  channel,
+                  addr,
+                  mapping,
+                  addr,
+                  mapping.len,
+                  entry,
+                );
+                continue;
+              }
               this.pwriteFromProcessMemory(
                 channel,
                 mapping.fd,
@@ -30196,6 +30621,9 @@ export class CentralizedKernelWorker {
         }
         this.sharedMappings?.delete(pid);
       }
+      // The kernel destroys the whole fd table on teardown, so the writeback
+      // dups vanish with it; drop their bookkeeping without issuing closes.
+      this.fdWritebackFdRefs.delete(pid);
       this.invalidateSharedMmapFdCacheForPid(pid);
       if (this.shmMappings) {
         this.releaseAllSysvShmMappingsForProcess(pid, false, entry);

@@ -136,6 +136,10 @@ function createFileHarness() {
   const getFdAccessModeForSharedMapping = vi.fn(
     () => ({ kind: "ok" as const, value: 2 }),
   );
+  // Kernel-owned (tmpfs/memfd) fd-writeback bridge: dup the guest fd into a
+  // stable descriptor (deterministic fd+1000 here) and record closes.
+  const dupWritebackFd = vi.fn((_pid: number, fd: number) => fd + 1000);
+  const closeWritebackFd = vi.fn();
   const getFdStatForSharedMapping = vi.fn(
     (_channel: unknown, fd: number) => {
       return fdHostHandles.has(fd)
@@ -178,6 +182,8 @@ function createFileHarness() {
     getFdAccessModeForSharedMapping,
     getFdStatForSharedMapping,
     getFdPathForSharedMapping,
+    dupWritebackFd,
+    closeWritebackFd,
   });
   installKernelWorkerTestScratch(
     kw as unknown as Record<string, unknown>,
@@ -211,6 +217,8 @@ function createFileHarness() {
   return {
     channels,
     close,
+    dupWritebackFd,
+    closeWritebackFd,
     fdHostHandles,
     fdIdentity,
     fdSupportsMmapWriteback,
@@ -1417,6 +1425,117 @@ describe("file/POSIX MAP_SHARED page cache", () => {
     expect(h.mapResult(h.pids[0], 4, 0x1000))
       .toEqual({ kind: "error", errno: 13 });
     expect((h.kw as any).sharedMappings.size).toBe(0);
+  });
+
+  it("read-only MAP_SHARED of a kernel-owned file rejects an O_WRONLY fd", () => {
+    const h = createFileHarness();
+    h.getFdStatForSharedMapping.mockReturnValue({
+      kind: "ok",
+      value: {
+        dev: 0n, ino: 1n, size: h.logicalSize(), mode: REGULAR_MODE,
+        hostHandle: null,
+      },
+    });
+    h.getFdAccessModeForSharedMapping.mockReturnValue({ kind: "ok", value: 1 });
+    // PROT_READ only (read-only mapping) still requires a readable descriptor.
+    expect(h.mapResult(h.pids[0], 4, 0x1000, 4096, PROT_READ))
+      .toEqual({ kind: "error", errno: 13 });
+  });
+
+  // Model a kernel-owned (tmpfs/memfd) regular file of a chosen size.
+  const asKernelOwnedFile = (h: FileHarness, size: number) =>
+    h.getFdStatForSharedMapping.mockReturnValue({
+      kind: "ok",
+      value: { dev: 0n, ino: 1n, size, mode: REGULAR_MODE, hostHandle: null },
+    });
+
+  it("M2: fd-writeback rides a stable dup so it survives close(fd)", () => {
+    const h = createFileHarness();
+    const pid = h.pids[0];
+    const addr = 0x1000;
+    asKernelOwnedFile(h, 4096);
+    expect(h.map(pid, 4, addr)).toBe(true);
+    const mapping = (h.kw as any).sharedMappings.get(pid).get(addr);
+    expect(mapping.fdWriteback).toBe(true);
+    // The dup (fd+1000) is an independent descriptor, not the guest fd, so a
+    // later close(fd) cannot invalidate writeback.
+    expect(mapping.writebackFd).toBe(1004);
+    expect(h.dupWritebackFd).toHaveBeenCalledWith(pid, 4);
+
+    const pwrite = vi.fn(() => true);
+    h.kw.testAuthority.configureScratchBoundaryHooksForTest({
+      pwriteFromProcessMemory: pwrite,
+    });
+    new Uint8Array(h.memories.get(pid)!.buffer)[addr + 5] = 0xab;
+    expect((h.kw as any).flushSharedMappings(h.channels.get(pid), [addr, 4096]))
+      .toBe(true);
+    expect(pwrite).toHaveBeenCalled();
+    for (const call of pwrite.mock.calls) expect(call[1]).toBe(1004);
+
+    // munmap closes the owned dup exactly once.
+    (h.kw as any).cleanupSharedMappings(pid, addr, 4096);
+    expect(h.closeWritebackFd).toHaveBeenCalledWith(pid, 1004);
+    expect(h.closeWritebackFd).toHaveBeenCalledTimes(1);
+  });
+
+  it("H1: fd-writeback never writes past the file's live EOF", () => {
+    const h = createFileHarness();
+    const pid = h.pids[0];
+    const addr = 0x1000;
+    // File is only 100 bytes though the mapping covers a whole 4096 page.
+    asKernelOwnedFile(h, 100);
+    expect(h.map(pid, 4, addr, 4096)).toBe(true);
+    const pwrite = vi.fn(() => true);
+    h.kw.testAuthority.configureScratchBoundaryHooksForTest({
+      pwriteFromProcessMemory: pwrite,
+    });
+    const mem = new Uint8Array(h.memories.get(pid)!.buffer);
+    mem[addr + 0] = 0x41;    // within EOF
+    mem[addr + 200] = 0x42;  // past EOF — must never be written back
+    expect((h.kw as any).flushSharedMappings(h.channels.get(pid), [addr, 4096]))
+      .toBe(true);
+    expect(pwrite).toHaveBeenCalled();
+    for (const call of pwrite.mock.calls) {
+      const len = call[3] as number;
+      const fileOffset = call[4] as number;
+      expect(fileOffset + len).toBeLessThanOrEqual(100);
+    }
+  });
+
+  it("fd-writeback flushes only the bytes this mapping changed", () => {
+    const h = createFileHarness();
+    const pid = h.pids[0];
+    const addr = 0x1000;
+    asKernelOwnedFile(h, 4096);
+    expect(h.map(pid, 4, addr, 4096)).toBe(true);
+    const pwrite = vi.fn(() => true);
+    h.kw.testAuthority.configureScratchBoundaryHooksForTest({
+      pwriteFromProcessMemory: pwrite,
+    });
+    new Uint8Array(h.memories.get(pid)!.buffer)[addr + 10] = 0x55;
+    expect((h.kw as any).flushSharedMappings(h.channels.get(pid), [addr, 4096]))
+      .toBe(true);
+    // Exactly one dirty run of length 1 at file offset 10 — a stale peer's
+    // whole-mapping flush therefore cannot clobber another mapping's bytes.
+    expect(pwrite).toHaveBeenCalledTimes(1);
+    expect(pwrite.mock.calls[0][3]).toBe(1);
+    expect(pwrite.mock.calls[0][4]).toBe(10);
+  });
+
+  it("M3: a writable fd-writeback mapping is inherited across fork", () => {
+    const h = createFileHarness();
+    const [parentPid, , childPid] = h.pids;
+    const addr = 0x1800;
+    asKernelOwnedFile(h, 4096);
+    expect(h.map(parentPid, 4, addr)).toBe(true);
+    h.kw.inheritProcessSharedMappings(parentPid, childPid);
+    const childMap = (h.kw as any).sharedMappings.get(childPid);
+    expect(childMap.size).toBe(1);
+    const childMapping = childMap.get(addr);
+    expect(childMapping.fdWriteback).toBe(true);
+    // fork copies the fd table: the child inherits the same writeback fd.
+    expect(childMapping.writebackFd).toBe(1004);
+    expect(childMapping.snapshot).toBeInstanceOf(Uint8Array);
   });
 
   it("rejects a backend that cannot promise stable file identity", () => {

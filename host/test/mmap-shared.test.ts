@@ -15,6 +15,10 @@ describe("MAP_SHARED mmap + msync", () => {
     expect(result.stdout).toContain("msync ok");
     expect(result.stdout).toContain("read back: xyz");
     expect(result.stdout).toContain("read after munmap: xyzw");
+    // H1: a whole-page MAP_SHARED of a 100-byte tmpfs file must not grow it.
+    expect(result.stdout).toContain("H1 no-grow ok");
+    // M2: writeback must survive close(fd) taken after mmap.
+    expect(result.stdout).toContain("M2 close-survives ok");
     expect(result.stdout).toContain("mremap ok");
     expect(result.stdout).toContain("PASS");
   }, 30000);
