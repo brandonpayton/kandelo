@@ -496,6 +496,36 @@ Commit.
 
 ---
 
+## M5 status (2026-09-07) — DONE
+
+All three run on the kernel (exit 0), as `fn main` bin crates:
+
+- **P4 threads** (`33bf9964f`, `programs/rust/thread-demo`): 4
+  `std::thread` workers + `Arc<Mutex<u64>>`; deterministic total, no
+  lost updates. pthread→clone, futex Mutex, TLS all work.
+- **P5 net** (`422a1aa02`, `programs/rust/net-demo`): `std::net` TCP
+  loopback (bind/accept/connect/echo). socket stack + `sockaddr_in`
+  layout correct.
+- **P3 process** (`ab461b774`, `programs/rust/proc-demo`):
+  `std::process::Command` self-spawn returns exit 42.
+
+**Key finding (resolves Task 6.3, corrects the posix_spawn assumption):**
+`std::process` on musl uses **fork+exec** — the module imports
+`kernel_fork` + `kernel_execve`, not the non-forking `SYS_SPAWN` the
+design hoped `std` would take. So fork-using Rust programs must be
+fork-instrumented, and **`wasm-fork-instrument` is verified to work on
+Rust/LLVM codegen** (the design-flagged risk is cleared). The kernel
+correctly refuses an uninstrumented artifact at guest-initiated exec.
+Implication: the `wasm32posix-cargo` wrapper (Task 6.1) must run
+`scripts/run-wasm-fork-instrument.sh` as a final pass for fork-using
+programs (or unconditionally).
+
+**M2.5 note:** through threads/net/process, no WALI-derived libc
+constant has bitten — common syscalls, socket/`sockaddr` layouts, and
+signal-free paths all match Kandelo's generic-like musl. M2.5 remains
+worthwhile for divergent constants and any direct-`syscall()` path, but
+it is not blocking the demonstrated surface.
+
 ## Milestone 6 — Productization & upstream prep
 
 ### Task 6.1: `wasm32posix-cargo` / `wasm32posix-rustc` wrappers

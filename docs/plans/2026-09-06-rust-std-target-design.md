@@ -287,10 +287,14 @@ on the kernel — `programs/rust/std-hello` does `std::println!` +
 `std::fs` round-trip, exit 0. Delivered via the private-sysroot
 mechanism (`scripts/build-rust-sysroot.sh` + `sdk/rust/libc-kandelo` +
 `sdk/rust/std-overlay/`), built with `-Zbuild-std=std` and
-`RUST_LIBC_UNSTABLE_MUSL_V1_2_3=1`. Caveat: the wasm32 libc leaf is
-WALI-derived; its syscall numbers and divergent constants still need
-reconciliation (plan Milestone 2.5) before full-std trust. The original
-two walls, for the record:
+`RUST_LIBC_UNSTABLE_MUSL_V1_2_3=1`. Full-parity (E) surface now demonstrated on the kernel:
+`fn main`/args/env, `std::fs`, `std::time`, `HashMap`, `std::thread` +
+`Mutex`/`Arc`, `std::net` TCP loopback, and `std::process::Command`
+(fork+exec, once fork-instrumented — `wasm-fork-instrument` verified on
+Rust codegen). Caveat: the wasm32 libc leaf is WALI-derived; divergent
+constants/syscall numbers still merit reconciliation (plan Milestone
+2.5), though none has bitten the demonstrated surface. The original two
+walls, for the record:
 1. `core`/`stdarch` — solved by the `["unix","wasm"]` family list
    (above); no core patch.
 2. The `libc` crate — `-Zbuild-std=std` now fails inside `libc`
