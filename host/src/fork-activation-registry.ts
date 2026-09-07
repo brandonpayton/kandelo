@@ -55,13 +55,11 @@ import {
   forkGcCodecProviderFromInstance,
   type ForkGcCodecProvider,
 } from "./fork-gc-codec";
-import {
-  FORK_HOST_EXCEPTION_ACTIVATION_ID,
-  type ForkExternrefRecipeProvider,
-  type ForkGcDefinitionProvenance,
-  type ForkReferenceScratchAllocate,
-  type ForkReferenceScratchDeallocate,
-} from "./fork-reference-transaction";
+import { FORK_HOST_EXCEPTION_ACTIVATION_ID } from "./fork-reference-wire";
+import type {
+  ForkReferenceScratchAllocate,
+  ForkReferenceScratchDeallocate,
+} from "./fork-reference-scratch";
 import {
   ForkCaptureSession,
   type ForkReferenceCaptureSurface,
@@ -73,7 +71,11 @@ import {
 } from "./fork-table-snapshot";
 import { ForkExternrefProvenanceTable } from "./fork-externref-provenance";
 import type { ForkReferenceCaptureModule } from "./fork-reference-capture-module";
-import type { ForkActivationExceptionProvider } from "./fork-reference-contracts";
+import type {
+  ForkActivationExceptionProvider,
+  ForkExternrefRecipeProvider,
+  ForkGcDefinitionProvenance,
+} from "./fork-reference-contracts";
 // Re-home (Path-A INC-C wiring, part 2): the per-activation exception provider
 // contract moved to staying glue so the staying reconstruction floor
 // (`fork-early-reference-provider.ts`) can reference it without importing this

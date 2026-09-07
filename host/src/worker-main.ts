@@ -143,7 +143,7 @@ import {
   decodeSegmentedForkReferenceTransaction,
   type DecodedSegmentedForkReferenceTransaction,
 } from "./fork-reference-segments";
-import { FORK_REFERENCE_TRANSACTION_OWNER_ID } from "./fork-reference-transaction";
+import { FORK_REFERENCE_TRANSACTION_OWNER_ID } from "./fork-reference-wire";
 import {
   forkGcCodecProviderFromInstance,
   readForkGcCodecDescriptor,

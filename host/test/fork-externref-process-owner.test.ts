@@ -8,7 +8,7 @@ import {
 import {
   type ForkReferenceRecipeGraph,
 } from "../src/fork-reference-recipes";
-import { FORK_REFERENCE_TRANSACTION_OWNER_ID } from "../src/fork-reference-transaction";
+import { FORK_REFERENCE_TRANSACTION_OWNER_ID } from "../src/fork-reference-wire";
 import {
   encodeSegmentedForkReferenceRecords,
   PagedForkReferenceVector,

@@ -18,7 +18,7 @@ import {
 } from "../src/fork-reference-segments";
 import {
   FORK_REFERENCE_TRANSACTION_OWNER_ID,
-} from "../src/fork-reference-transaction";
+} from "../src/fork-reference-wire";
 
 function graph(): ForkReferenceRecipeEntry[] {
   return [
