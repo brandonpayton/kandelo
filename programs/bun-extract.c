@@ -85,6 +85,20 @@ static int has_json_unsafe_byte(const char *s) {
     return 0;
 }
 
+/* Map a Bun standalone-graph loader byte (observed on Claude Code 2.1.x) to a
+ * stable class string the runtime honors. Unknown bytes return "" and are
+ * treated as js (executed) by the consumer -- a safe, logged fallback. */
+static const char *loader_class(unsigned char b) {
+  switch (b) {
+    case 1:  return "js";
+    case 13: return "text";
+    case 5:  return "file";
+    case 6:  return "json";
+    case 10: return "napi";
+    default: return "";
+  }
+}
+
 /* Replace all occurrences of `from` with `to` in text; returns malloc'd result, sets *outlen.
  * Returns NULL (with *outlen = 0) on allocation failure; callers must treat that as fatal,
  * not fall back to writing the unremapped text. */
@@ -285,12 +299,15 @@ int main(int argc, char **argv) {
     char entry_rel[4200] = "";
     int entry_fmt = 0;
     int entry_found = 0;
+    char *loaders = NULL; size_t loaders_len = 0, loaders_cap = 0;
+    uint32_t unknown_loaders = 0;
 
     for (uint32_t i = 0; i < count; i++) {
         if (pread_all(fd, rec, REC, base + modules_off + (off_t)i * REC) != 0) { fprintf(stderr, "read rec %u\n", i); return 1; }
         uint32_t name_off = rd_u32(rec),    name_len = rd_u32(rec + 4);
         uint32_t cont_off = rd_u32(rec + 8), cont_len = rd_u32(rec + 12);
         unsigned char enc = rec[48];
+        unsigned char loader = rec[49];
         unsigned char fmt = rec[50];
         if (name_len > 4096) { fprintf(stderr, "name too long at %u\n", i); return 1; }
         if (pread_all(fd, nm, name_len, base + name_off) != 0) { fprintf(stderr, "read name %u\n", i); return 1; }
@@ -317,6 +334,30 @@ int main(int argc, char **argv) {
         written++;
 
         if (prepare && is_hit) continue; /* cache already populated */
+
+        int is_js = is_entry || (loader == 1);
+
+        if (prepare && !is_entry && loader != 1) {
+            const char *cls = loader_class(loader);
+            if (cls[0] == 0) {
+                unknown_loaders++;   /* unknown -> omitted; consumer runs as js */
+            } else {
+                char eb[4400];
+                int m = snprintf(eb, sizeof eb, "%s\"%s\":\"%s\"",
+                                 loaders_len ? "," : "", rel_out, cls);
+                if (m < 0 || m >= (int)sizeof eb) {
+                    fprintf(stderr, "bun-extract: loaders entry too long at %u\n", i);
+                    free(loaders); return 1;
+                }
+                if (loaders_len + (size_t)m + 1 > loaders_cap) {
+                    loaders_cap = (loaders_len + (size_t)m + 1) * 2;
+                    loaders = realloc(loaders, loaders_cap);
+                    if (!loaders) { fprintf(stderr, "oom\n"); return 1; }
+                }
+                memcpy(loaders + loaders_len, eb, (size_t)m);
+                loaders_len += (size_t)m; loaders[loaders_len] = 0;
+            }
+        }
 
         /* Widen the comparison: cont_len is attacker-controlled and, at
          * UINT32_MAX, "cont_len + 1" wraps to 0 in 32-bit arithmetic, which
@@ -345,7 +386,6 @@ int main(int argc, char **argv) {
             if (utf8) { text = utf8; tlen = ol; } else { text = (char *)cbuf; tlen = 0; }
         }
 
-        int is_js = is_entry || ends_with(rel_out, ".js") || ends_with(rel_out, ".mjs") || ends_with(rel_out, ".cjs");
         if (prepare && is_js) {
             char to[8200];
             snprintf(to, sizeof(to), "%s/", cachedir);
@@ -364,6 +404,14 @@ int main(int argc, char **argv) {
             fwrite(text, 1, tlen, f);
         }
         fclose(f);
+
+        if (prepare && !is_js) {
+            const char *cls = loader_class(loader);
+            if (cls[0]) {
+                int has = (tlen && memmem(text, tlen, "/$bunfs/root/", 13) != NULL);
+                printf("ASSET_VERBATIM %s %s\n", rel_out, has ? "yes" : "no");
+            }
+        }
         free(utf8);
     }
 
@@ -378,11 +426,18 @@ int main(int argc, char **argv) {
         if (!is_hit) {
             snprintf(dest, sizeof(dest), "%s/manifest.json", cachedir);
             FILE *mf = fopen(dest, "wb");
-            if (mf) { fprintf(mf, "{\"entry\":\"%s\",\"format\":%d}\n", entry_rel, entry_fmt); fclose(mf); }
+            if (mf) { fprintf(mf, "{\"entry\":\"%s\",\"format\":%d,\"loaders\":{%s}}\n",
+                              entry_rel, entry_fmt, loaders ? loaders : ""); fclose(mf); }
 
             snprintf(dest, sizeof(dest), "%s/package.json", cachedir);
             FILE *pf = fopen(dest, "wb");
             if (pf) { fprintf(pf, "{\"type\":\"module\"}\n"); fclose(pf); }
+
+            printf("MANIFEST_LOADERS {%s}\n", loaders ? loaders : "");
+            if (unknown_loaders) {
+                fprintf(stderr, "bun-extract: %u modules with unrecognized loader byte (treated as js)\n",
+                        unknown_loaders);
+            }
         }
 
         fprintf(stderr, "prepared %u modules (%u ESM) at %s\nentry: %s\n", written, esm, cachedir, entry_rel);
@@ -398,6 +453,7 @@ int main(int argc, char **argv) {
                 printf("REMAP_OK %s\n", strstr(buf, "/$bunfs/root/") ? "FAIL" : cachedir);
             }
         }
+        free(loaders); loaders = NULL;
     } else {
         /* Emit a tiny manifest so a loader knows the entry point. */
         snprintf(dest, sizeof(dest), "%s/_manifest.json", outdir);

@@ -13,44 +13,45 @@ import { describe, expect, it } from "vitest";
 import { tryResolveBinary } from "../src/binary-resolver";
 import { runCentralizedProgram } from "./centralized-test-helper";
 
-// Build the same minimal graph as the native test fixture: 3 ESM modules,
-// one under a subdirectory, base at file offset 0.
+// Build a graph exercising multiple loaders: js entry + js chunk + text .md +
+// file .zst. The .md/.zst contents embed "/$bunfs/root/" to prove they are
+// written VERBATIM (only js-class modules get the specifier remap).
 function buildFixture(): Uint8Array {
   const TRAILER = Buffer.from("\n---- Bun! ----\n", "latin1");
-  const mods: Array<[string, string]> = [
-    ["/$bunfs/root/cli", '// entry\nimport "/$bunfs/root/chunk-a.js";\nimport "/$bunfs/root/sub/b.js";\n'],
-    ["/$bunfs/root/chunk-a.js", "export const a=1;\n"],
-    ["/$bunfs/root/sub/b.js", "export const b=2;\n"],
+  // [name, contents, loaderByte, moduleFormat]
+  const mods: Array<[string, string, number, number]> = [
+    ["/$bunfs/root/cli", '// entry\nimport "/$bunfs/root/chunk-a.js";\n', 1, 1],
+    ["/$bunfs/root/chunk-a.js", 'export const a="/$bunfs/root/chunk-a.js";\n', 1, 1],
+    ["/$bunfs/root/preamble.md", "# heading\nsee /$bunfs/root/preamble.md\n", 13, 0],
+    ["/$bunfs/root/blob.zst", "ZSTDBYTES /$bunfs/root/blob.zst\n", 5, 0],
   ];
   const parts: Buffer[] = [];
   let len = 0;
-  const sp: Array<{ no: number; nl: number; co: number; cl: number }> = [];
-  for (const [name, cont] of mods) {
+  const sp: Array<{ no: number; nl: number; co: number; cl: number; ld: number; fmt: number }> = [];
+  for (const [name, cont, ld, fmt] of mods) {
     const nb = Buffer.from(name, "latin1");
     const cb = Buffer.from(cont, "latin1");
     const no = len; parts.push(nb); len += nb.length;
     const co = len; parts.push(cb); len += cb.length;
-    sp.push({ no, nl: nb.length, co, cl: cb.length });
+    sp.push({ no, nl: nb.length, co, cl: cb.length, ld, fmt });
   }
   const modOff = len;
   for (const s of sp) {
     const rec = Buffer.alloc(52);
     rec.writeUInt32LE(s.no, 0); rec.writeUInt32LE(s.nl, 4);
     rec.writeUInt32LE(s.co, 8); rec.writeUInt32LE(s.cl, 12);
-    // sourcemap/bytecode/module_info/bytecode_origin_path = 0
-    rec[48] = 1; // encoding Latin1
-    rec[49] = 0; // loader
-    rec[50] = 1; // module_format Esm
-    rec[51] = 0; // side
+    rec[48] = 1;      // encoding Latin1
+    rec[49] = s.ld;   // loader
+    rec[50] = s.fmt;  // module_format
+    rec[51] = 0;      // side
     parts.push(rec); len += 52;
   }
   const modLen = len - modOff;
-  const byteCount = len; // Offsets sits at base+byteCount
+  const byteCount = len;
   const off = Buffer.alloc(32);
-  off.writeUInt32LE(byteCount, 0); off.writeUInt32LE(0, 4); // u64 byte_count
+  off.writeUInt32LE(byteCount, 0); off.writeUInt32LE(0, 4);
   off.writeUInt32LE(modOff, 8); off.writeUInt32LE(modLen, 12);
   off.writeUInt32LE(0, 16); // entry_point_id = 0
-  // compile_exec_argv_ptr (8) + flags (4) = 0
   parts.push(off); parts.push(TRAILER);
   return Buffer.concat(parts);
 }
@@ -74,9 +75,39 @@ describe("bun-extract guest program", () => {
 
       expect(result.exitCode).toBe(0);
       // Parsed the graph in-guest:
-      expect(result.stdout).toContain("EXTRACTED count=3 esm=3 entry=cli");
+      expect(result.stdout).toContain("EXTRACTED count=4 esm=2 entry=cli");
       // Wrote the tree and read the entry file back inside the guest VFS:
       expect(result.stdout).toContain("ENTRY_HEAD // entry");
+    },
+    45_000,
+  );
+
+  it.runIf(wasm != null && existsSync(wasm!))(
+    "prepare records a per-file loader manifest and writes non-js assets verbatim",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "bun-loaders-"));
+      const fixture = join(dir, "fixture.bin");
+      writeFileSync(fixture, buildFixture());
+      const r = await runCentralizedProgram({
+        programPath: wasm!,
+        argv: ["bun-extract", "--prepare", "/fixture.bin", "/cache"],
+        execPrograms: new Map([["/fixture.bin", fixture]]),
+        useDefaultRootfs: false,
+        timeout: 30_000,
+      });
+      expect(r.exitCode).toBe(0);
+      // Manifest loaders map: text + file recorded; js entry/chunk omitted.
+      const m = r.stdout.match(/^MANIFEST_LOADERS (.+)$/m)?.[1];
+      expect(m).toBeTruthy();
+      const loaders = JSON.parse(m!);
+      expect(loaders["preamble.md"]).toBe("text");
+      expect(loaders["blob.zst"]).toBe("file");
+      expect(loaders["chunk-a.js"]).toBeUndefined(); // js omitted (default)
+      // Verbatim proof: the .md/.zst self-checks still contain /$bunfs/root/,
+      // while the js entry was remapped (REMAP_OK = no /$bunfs/root/ left).
+      expect(r.stdout).toMatch(/^ASSET_VERBATIM preamble\.md yes$/m);
+      expect(r.stdout).toMatch(/^ASSET_VERBATIM blob\.zst yes$/m);
+      expect(r.stdout).toContain("REMAP_OK");
     },
     45_000,
   );
