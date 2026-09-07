@@ -1572,6 +1572,45 @@ export class ForkReferenceTransaction {
     childPayloadValue: unknown = value,
   ): number {
     this.requirePhase("capture", "capture a host exception");
+    if (this.moduleCapture) {
+      const known = this.lookupExceptionId(value);
+      if (known !== undefined && this.exceptionCacheIndexes.has(known)) {
+        return known;
+      }
+      // A host JS exception is an exnref whose sole payload is the externref
+      // carrying its (owner-normalized) JS value. Intern the payload, claim the
+      // exnref placeholder, then complete it referencing that payload — the
+      // module-graph mirror of the JS path below. The externref->exnref
+      // upgrade-in-place case is out of scope for module capture (see
+      // `claimExceptionSlot`); a fresh claim keeps the common path sound.
+      const handle = this.externrefs.capture(childPayloadValue);
+      const payloadId = this.captureModule!.internExternref(handle);
+      this.recordModuleCapturedValue(payloadId, childPayloadValue);
+      const recipeId = this.captureModule!.claimGc();
+      this.recordModuleCapturedValue(recipeId, value);
+      this.rememberId(value, recipeId);
+      this.exceptionCacheIndexes.set(
+        recipeId,
+        this.exceptionCacheIndexes.size + 1,
+      );
+      const vectorHandle = this.captureModule!.beginVector();
+      this.captureModule!.appendVector(vectorHandle, payloadId);
+      const vectorOrdinal = this.captureModule!.finishVector(vectorHandle);
+      this.captureModule!.defineGc({
+        recipeId,
+        activation: FORK_HOST_EXCEPTION_ACTIVATION_ID,
+        typeOrdinal: 0,
+        layoutId: 0,
+        kind: FORK_CAPTURE_KIND_EXNREF,
+        scalarPtr: 0,
+        scalarLen: 0,
+        referenceVectorOrdinal: vectorOrdinal,
+        hasProvenance: false,
+        provPtr: 0,
+        provCount: 0,
+      });
+      return recipeId;
+    }
     const known = this.lookupExceptionId(value);
     if (known !== undefined && this.nodes.get(known)?.node.kind === "exnref") {
       return known;
