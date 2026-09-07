@@ -891,6 +891,34 @@ mod wasm {
         unsafe { &mut *CAPTURE_STATE.0.get() }
     }
 
+    // Whether a capture session has been ARMED by `fm_capture_begin` but the
+    // shared builder has not yet been created. The builder is created LAZILY on
+    // the first intern rather than eagerly in `fm_capture_begin`, because the
+    // per-fork bump-heap reset in `fm_begin_unwind` runs BETWEEN the host's
+    // `fm_capture_begin` (issued in the fork syscall handler, before the guest
+    // unwinds) and the first reference encode (issued during the unwind, after
+    // `fm_begin_unwind`). Creating the builder eagerly would place its `Vec`/
+    // `BTreeMap` backing in the bump region that `fm_begin_unwind` then reclaims,
+    // corrupting the graph. Arming + lazy creation guarantees the builder is
+    // allocated AFTER the fork's single bump reset, so it survives capture, seal,
+    // and the parent's own `fm_capture_vector_get` replay reads (no further reset
+    // occurs on the parent path).
+    static CAPTURE_ARMED: AtomicU32 = AtomicU32::new(0);
+
+    /// The resident capture builder, created lazily on first use once armed.
+    /// `Err(EINVAL)` if no capture session is armed (a misordered host call).
+    #[allow(clippy::mut_from_ref)]
+    fn capture_builder() -> Result<&'static mut ReferenceGraphBuilder, Errno> {
+        let slot = capture_state();
+        if slot.is_none() {
+            if CAPTURE_ARMED.load(Ordering::Relaxed) == 0 {
+                return Err(Errno::EINVAL);
+            }
+            *slot = Some(ReferenceGraphBuilder::begin());
+        }
+        Ok(slot.as_mut().unwrap())
+    }
+
     // Owns the serialized KFRV/KFRS record stream `fm_capture_serialize` emits so
     // the pointer it returns stays valid while the host drains the records into
     // its module-state arena (mirrors `DRIVE_PLAN`'s rooting of the drive plan).
@@ -1468,9 +1496,17 @@ mod wasm {
         // The format must have been seeded (once) via `fm_set_format`.
         let fmt = format()?;
 
-        // Reclaim the previous fork's state and heap before this fork.
+        // Reclaim the previous fork's state before this fork. The bump-HEAP reset
+        // is skipped when a capture session is armed: `fm_capture_begin` already
+        // reset the bump at the true fork start (before the guest began encoding
+        // references into the co-resident capture builder), and resetting again
+        // here would reclaim that live builder mid-fork. `swap(0)` consumes the
+        // arming so a later non-capture fork (or a flag-off fork that never calls
+        // `fm_capture_begin`) still reclaims the heap here as before.
         *state() = None;
-        ALLOC.reset();
+        if CAPTURE_ARMED.swap(0, Ordering::Relaxed) == 0 {
+            ALLOC.reset();
+        }
 
         let mut module = ForkModule {
             activations: BTreeMap::new(),
@@ -3699,7 +3735,23 @@ mod wasm {
     /// any previously serialized record stream. Mirrors the host's `beginCapture`.
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_capture_begin() {
+        // `fm_capture_begin` is the FIRST module call of a capture fork (the host
+        // issues it in the fork syscall handler, before the guest unwinds). Make
+        // it the fork's SINGLE bump-heap reset point: reclaim the previous fork's
+        // state here, then ARM the session so `fm_begin_unwind` (which runs LATER,
+        // interleaved with the reference encode) does NOT reset again and wipe the
+        // capture builder. Empirically the guest encodes references BOTH before
+        // and after `fm_begin_unwind`, so the builder must be allocated from a
+        // bump that is reset exactly once, at the true fork start — here.
+        ALLOC.reset();
+        // Create the builder EAGERLY, now that the bump is fresh for this fork:
+        // the guest may issue its first reference encode BEFORE `fm_begin_unwind`,
+        // and `fm_begin_unwind` consumes the arming (so it won't reset the bump),
+        // so a deferred builder could be requested when neither the builder nor
+        // the arming is present. Eager creation makes the builder always available
+        // for the rest of the fork.
         *capture_state() = Some(ReferenceGraphBuilder::begin());
+        CAPTURE_ARMED.store(1, Ordering::Relaxed);
         // SAFETY: single-threaded per worker; only one capture is live at a time.
         unsafe {
             *CAPTURE_SERIALIZED.0.get() = None;
@@ -3712,10 +3764,10 @@ mod wasm {
     /// funcref catalog (floor) before calling.
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_capture_intern_funcref(activation: u32, ordinal: u32) -> i32 {
-        match capture_state().as_mut() {
-            Some(g) => capture_ok_id(g.intern_funcref(activation, ordinal)),
-            None => {
-                set_err(Errno::EINVAL);
+        match capture_builder() {
+            Ok(g) => capture_ok_id(g.intern_funcref(activation, ordinal)),
+            Err(e) => {
+                set_err(e);
                 -1
             }
         }
@@ -3726,10 +3778,10 @@ mod wasm {
     /// provenance) before calling; the module never sees the live externref.
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_capture_intern_externref(handle: u32) -> i32 {
-        match capture_state().as_mut() {
-            Some(g) => capture_ok_id(g.intern_externref(handle)),
-            None => {
-                set_err(Errno::EINVAL);
+        match capture_builder() {
+            Ok(g) => capture_ok_id(g.intern_externref(handle)),
+            Err(e) => {
+                set_err(e);
                 -1
             }
         }
@@ -3738,10 +3790,10 @@ mod wasm {
     /// Intern an `i31ref` by its signed 31-bit payload.
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_capture_intern_i31(value: i32) -> i32 {
-        match capture_state().as_mut() {
-            Some(g) => capture_ok_id(g.intern_i31(value)),
-            None => {
-                set_err(Errno::EINVAL);
+        match capture_builder() {
+            Ok(g) => capture_ok_id(g.intern_i31(value)),
+            Err(e) => {
+                set_err(e);
                 -1
             }
         }
@@ -3750,10 +3802,10 @@ mod wasm {
     /// Intern a statically-rooted reference by its catalog coordinate.
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_capture_intern_static_root(activation: u32, ordinal: u32) -> i32 {
-        match capture_state().as_mut() {
-            Some(g) => capture_ok_id(g.intern_static_root(activation, ordinal)),
-            None => {
-                set_err(Errno::EINVAL);
+        match capture_builder() {
+            Ok(g) => capture_ok_id(g.intern_static_root(activation, ordinal)),
+            Err(e) => {
+                set_err(e);
                 -1
             }
         }
@@ -3765,10 +3817,10 @@ mod wasm {
     /// `fm_capture_define_gc`. Mirrors native's `gc_claim` body.
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_capture_claim_gc() -> i32 {
-        match capture_state().as_mut() {
-            Some(g) => capture_ok_id(g.claim_gc()),
-            None => {
-                set_err(Errno::EINVAL);
+        match capture_builder() {
+            Ok(g) => capture_ok_id(g.claim_gc()),
+            Err(e) => {
+                set_err(e);
                 -1
             }
         }
@@ -3782,10 +3834,10 @@ mod wasm {
     /// the host's decision; this only keeps the sealed graph canonical.
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_capture_gated_placeholder() -> i32 {
-        match capture_state().as_mut() {
-            Some(g) => capture_ok_id(g.push_gated_placeholder()),
-            None => {
-                set_err(Errno::EINVAL);
+        match capture_builder() {
+            Ok(g) => capture_ok_id(g.push_gated_placeholder()),
+            Err(e) => {
+                set_err(e);
                 -1
             }
         }
@@ -3832,7 +3884,7 @@ mod wasm {
             } else {
                 Vec::new()
             };
-            let g = capture_state().as_mut().ok_or(Errno::EINVAL)?;
+            let g = capture_builder()?;
             // Assemble edges = provenance ids ++ the interned field vector,
             // mirroring native's `gc_define`. Ordinal 0 is the canonical empty
             // vector (no field edges).
@@ -3867,10 +3919,10 @@ mod wasm {
     /// Open a reference-vector builder, returning its handle (`>= 0`).
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_capture_begin_vector() -> i32 {
-        match capture_state().as_mut() {
-            Some(g) => capture_ok_id(g.begin_vector()),
-            None => {
-                set_err(Errno::EINVAL);
+        match capture_builder() {
+            Ok(g) => capture_ok_id(g.begin_vector()),
+            Err(e) => {
+                set_err(e);
                 -1
             }
         }
@@ -3879,10 +3931,10 @@ mod wasm {
     /// Append a recipe id to an open vector builder. Returns `0` or `-1`.
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_capture_append_vector(handle: u32, recipe_id: u32) -> i32 {
-        match capture_state().as_mut() {
-            Some(g) => capture_ok_void(g.append_vector(handle, recipe_id)),
-            None => {
-                set_err(Errno::EINVAL);
+        match capture_builder() {
+            Ok(g) => capture_ok_void(g.append_vector(handle, recipe_id)),
+            Err(e) => {
+                set_err(e);
                 -1
             }
         }
@@ -3892,10 +3944,10 @@ mod wasm {
     /// ordinal (`>= 1`; identical vectors dedup to one ordinal).
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_capture_finish_vector(handle: u32) -> i32 {
-        match capture_state().as_mut() {
-            Some(g) => capture_ok_id(g.finish_vector(handle)),
-            None => {
-                set_err(Errno::EINVAL);
+        match capture_builder() {
+            Ok(g) => capture_ok_id(g.finish_vector(handle)),
+            Err(e) => {
+                set_err(e);
                 -1
             }
         }
@@ -3940,8 +3992,10 @@ mod wasm {
     /// early, mirroring the TS `validateCanonicalCapture`.
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_capture_validate() -> i32 {
-        match capture_state().as_ref() {
-            Some(g) => match g.validate() {
+        // Create-if-armed: an empty capture (no references) is still a valid
+        // null-only graph the host may seal.
+        match capture_builder() {
+            Ok(g) => match g.validate() {
                 Ok(()) => {
                     set_ok();
                     0
@@ -3951,8 +4005,8 @@ mod wasm {
                     -1
                 }
             },
-            None => {
-                set_err(Errno::EINVAL);
+            Err(e) => {
+                set_err(e);
                 -1
             }
         }
@@ -3971,7 +4025,7 @@ mod wasm {
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_capture_serialize(owner_id: u32, segment_data_bytes: usize) -> usize {
         let built = (|| -> Result<Vec<u8>, Errno> {
-            let g = capture_state().as_ref().ok_or(Errno::EINVAL)?;
+            let g = capture_builder()?;
             let writer = ReferenceSegmentsWriter::new(owner_id, segment_data_bytes)?;
             let mut stream: Vec<u8> = Vec::new();
             let mut sink =
