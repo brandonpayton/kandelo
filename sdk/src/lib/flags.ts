@@ -317,6 +317,14 @@ const IGNORED_EXACT = new Set([
   '-lpthread',
   '-fPIE', '-pie',
   '-lrt', '-lresolv', '-lm', '-lcrypt', '-lutil',
+  // -lgcc_s: WebAssembly has no shared libgcc; unwinder/intrinsic symbols
+  // come from the compiler runtime (compiler_builtins for Rust,
+  // compiler_rt glue for C), so a -lgcc_s request (e.g. from rustc's link
+  // line when it drives the SDK as its linker) must be dropped rather than
+  // passed to wasm-ld, which would fail to find it. A bare -lc is NOT
+  // ignored here: the SDK deliberately preserves and orders explicit -lc
+  // after the syscall glue (it resolves to the sysroot musl libc.a).
+  '-lgcc_s',
   '-rdynamic', '-Wl,-Bsymbolic',
   '-Wl,-z,noexecstack', '-Wl,-z,text', '-Wl,-z,relro',
   '-Wl,-z,now', '-Wl,-z,nocopyreloc',

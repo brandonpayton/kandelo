@@ -14,8 +14,8 @@
   "generate-arange-section": false,
   "has-thread-local": true,
   "is-like-wasm": true,
-  "linker": "rust-lld",
-  "linker-flavor": "wasm-lld",
+  "linker": "wasm32posix-cc",
+  "linker-flavor": "wasm-lld-cc",
   "linker-is-gnu": false,
   "lld-flavor": "wasm",
   "llvm-target": "wasm32-unknown-unknown",
@@ -36,5 +36,6 @@
   ],
   "target-pointer-width": 32,
   "tls-model": "local-exec",
-  "vendor": "unknown"
+  "vendor": "unknown",
+  "entry-name": "__main_argc_argv"
 }
