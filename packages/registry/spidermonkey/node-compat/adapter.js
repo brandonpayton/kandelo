@@ -375,6 +375,10 @@
             }
             return native.__kandeloRequireModule(path);
         },
+        __kandeloZstdDecompress(bytes) {
+            if (typeof native.__kandeloZstdDecompress !== 'function') throw new Error('native __kandeloZstdDecompress is unavailable');
+            return native.__kandeloZstdDecompress(bytes);
+        },
         __kandeloVmMakeContext(sandbox, opts) {
             if (typeof native.__kandeloVmMakeContext !== 'function') throw new Error('native __kandeloVmMakeContext is unavailable');
             return native.__kandeloVmMakeContext(sandbox, opts);

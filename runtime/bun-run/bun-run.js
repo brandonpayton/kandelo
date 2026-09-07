@@ -42,6 +42,10 @@ globalThis.Bun = {
   spawn: ni("spawn"), serve: ni("serve"),
   stringWidth: (s) => String(s).length,
   stripANSI: (s) => String(s).replace(/\x1b\[[0-9;]*m/g, ""),
+  // zstd decompression via node-compat's zlib (native __kandeloZstdDecompress
+  // seam). Compression is not implemented (libzstd is decompress-only).
+  zstdDecompressSync: (bytes) => require("zlib").zstdDecompressSync(bytes),
+  zstdDecompress: (bytes) => Promise.resolve(require("zlib").zstdDecompressSync(bytes)),
   gc() {}, deepEquals: (a, b) => JSON.stringify(a) === JSON.stringify(b),
 };
 

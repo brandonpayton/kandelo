@@ -1,0 +1,105 @@
+--- a/js/src/shell/js.cpp
++++ b/js/src/shell/js.cpp
+@@ -56,6 +56,7 @@
+ #include <utility>
+ #include <vector>
+ #include <zlib.h>
++#include <zstd.h>
+ #ifdef XP_UNIX
+ #  ifndef __wasi__
+ #    include <arpa/inet.h>
+@@ -1885,7 +1886,86 @@
+   }
+   return false;
+ }
++
++// Kandelo: native zstd DECOMPRESSION. Input: a string, ArrayBuffer, or typed
++// array holding a zstd frame. Output: a fresh Uint8Array of the decoded bytes.
++// Fail-loud on any zstd error (never partial or garbage output). This is a
++// decompress-only seam; zstd compression is intentionally not implemented (see
++// docs/posix-status.md). Input bytes are copied into a heap std::vector by
++// KandeloValueToBytes before any allocation, reusing the same byte-marshalling
++// helper as the zlib seam.
++static bool KandeloNativeZstdDecompress(JSContext* cx, unsigned argc,
++                                        Value* vp) {
++  CallArgs args = CallArgsFromVp(argc, vp);
++  if (args.length() < 1) {
++    JS_ReportErrorASCII(cx, "__kandeloZstdDecompress(bytes)");
++    return false;
++  }
++
++  std::vector<uint8_t> in;
++  if (!KandeloValueToBytes(cx, args[0], &in)) {
++    return false;
++  }
+ 
++  unsigned long long contentSize =
++      ZSTD_getFrameContentSize(in.data(), in.size());
++  std::vector<uint8_t> out;
++
++  if (contentSize == ZSTD_CONTENTSIZE_ERROR) {
++    JS_ReportErrorASCII(cx,
++                        "zstd decompression failed: not a valid zstd frame");
++    return false;
++  } else if (contentSize != ZSTD_CONTENTSIZE_UNKNOWN) {
++    out.resize((size_t)contentSize);
++    size_t r = ZSTD_decompress(out.data(), out.size(), in.data(), in.size());
++    if (ZSTD_isError(r)) {
++      JS_ReportErrorUTF8(cx, "zstd decompression failed: %s",
++                         ZSTD_getErrorName(r));
++      return false;
++    }
++    out.resize(r);
++  } else {
++    // Unknown content size: stream-decode into a growable buffer.
++    ZSTD_DStream* ds = ZSTD_createDStream();
++    if (!ds) {
++      JS_ReportErrorASCII(cx, "zstd: out of memory");
++      return false;
++    }
++    ZSTD_initDStream(ds);
++    ZSTD_inBuffer inb = {in.data(), in.size(), 0};
++    size_t chunk = ZSTD_DStreamOutSize();
++    for (;;) {
++      size_t base = out.size();
++      out.resize(base + chunk);
++      ZSTD_outBuffer outb = {out.data() + base, chunk, 0};
++      size_t r = ZSTD_decompressStream(ds, &outb, &inb);
++      out.resize(base + outb.pos);
++      if (ZSTD_isError(r)) {
++        ZSTD_freeDStream(ds);
++        JS_ReportErrorUTF8(cx, "zstd decompression failed: %s",
++                           ZSTD_getErrorName(r));
++        return false;
++      }
++      if (r == 0 && inb.pos == inb.size) {
++        break;  // frame fully consumed
++      }
++      if (inb.pos == inb.size && outb.pos < outb.size) {
++        break;  // input exhausted
++      }
++    }
++    ZSTD_freeDStream(ds);
++  }
++
++  RootedObject result(
++      cx, KandeloNewUint8ArrayCopy(cx, out.empty() ? nullptr : out.data(),
++                                   out.size()));
++  if (!result) {
++    return false;
++  }
++  args.rval().setObject(*result);
++  return true;
++}
++
+ static bool DefineKandeloNodeNative(JSContext* cx) {
+   RootedObject native(cx, JS_NewPlainObject(cx));
+   if (!native) {
+@@ -1894,6 +1974,7 @@
+   const JSFunctionSpec funcs[] = {
+       JS_FN("evalScriptAsFunction", KandeloNativeEvalScriptAsFunction, 2, 0),
+       JS_FN("__kandeloRequireModule", KandeloNativeRequireModule, 1, 0),
++      JS_FN("__kandeloZstdDecompress", KandeloNativeZstdDecompress, 1, 0),
+       JS_FN("__kandeloVmMakeContext", KandeloVmMakeContext, 2, 0),
+       JS_FN("__kandeloVmIsContext", KandeloVmIsContext, 1, 0),
+       JS_FN("__kandeloVmRunInContext", KandeloVmRunInContext, 3, 0),

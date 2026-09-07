@@ -153,14 +153,30 @@ fi
     exit 1
 }
 
+ZSTD_PREFIX="${WASM_POSIX_DEP_LIBZSTD_DIR:-}"
+if [ -z "$ZSTD_PREFIX" ]; then
+    echo "==> Resolving libzstd via cargo xtask build-deps..."
+    ZSTD_PREFIX="$(resolve_dep libzstd)"
+fi
+[ -f "$ZSTD_PREFIX/lib/libzstd.a" ] || {
+    echo "ERROR: libzstd resolve missing libzstd.a at $ZSTD_PREFIX" >&2
+    exit 1
+}
+[ -d "$ZSTD_PREFIX/include" ] || {
+    echo "ERROR: libzstd resolve missing include directory at $ZSTD_PREFIX" >&2
+    exit 1
+}
+export WASM_POSIX_DEP_LIBZSTD_DIR="$ZSTD_PREFIX"
+
 if [ "$RESOLVER_BUILD" -eq 1 ]; then
     export WASM_POSIX_DEP_WORK_DIR="$WORK_DIR"
     export WASM_POSIX_DEP_LIBCXX_DIR="$LIBCXX_PREFIX"
     export WASM_POSIX_DEP_OPENSSL_DIR="$OPENSSL_PREFIX"
     export WASM_POSIX_DEP_ZLIB_DIR="$ZLIB_PREFIX"
+    export WASM_POSIX_DEP_LIBZSTD_DIR="$ZSTD_PREFIX"
     SYSROOT="$(
         kandelo_package_prepare_private_sysroot spidermonkey "$SYSROOT" \
-            libcxx openssl zlib
+            libcxx openssl zlib libzstd
     )"
     export WASM_POSIX_SYSROOT="$SYSROOT"
 fi
@@ -174,6 +190,7 @@ ln -sf "$LIBCXX_PREFIX/lib/libc++abi.a" "$SYSROOT/lib/libc++abi.a"
 ln -sf "$OPENSSL_PREFIX/lib/libssl.a" "$SYSROOT/lib/libssl.a"
 ln -sf "$OPENSSL_PREFIX/lib/libcrypto.a" "$SYSROOT/lib/libcrypto.a"
 ln -sf "$ZLIB_PREFIX/lib/libz.a" "$SYSROOT/lib/libz.a"
+ln -sf "$ZSTD_PREFIX/lib/libzstd.a" "$SYSROOT/lib/libzstd.a"
 rm -rf "$SYSROOT/include/c++/v1"
 ln -sfn "$LIBCXX_PREFIX/include/c++/v1" "$SYSROOT/include/c++/v1"
 
@@ -363,9 +380,9 @@ else
     export HOST_CC="${HOST_CC:-cc}"
     export HOST_CXX="${HOST_CXX:-c++}"
 fi
-export CFLAGS="${CFLAGS:-} -D_GNU_SOURCE -I$OPENSSL_PREFIX/include -I$ZLIB_PREFIX/include"
-export CXXFLAGS="${CXXFLAGS:-} -D_GNU_SOURCE -fexceptions -I$OPENSSL_PREFIX/include -I$ZLIB_PREFIX/include"
-export LDFLAGS="${LDFLAGS:-} -lc++ -lc++abi $OPENSSL_PREFIX/lib/libssl.a $OPENSSL_PREFIX/lib/libcrypto.a $ZLIB_PREFIX/lib/libz.a -Wl,-z,stack-size=16777216"
+export CFLAGS="${CFLAGS:-} -D_GNU_SOURCE -I$OPENSSL_PREFIX/include -I$ZLIB_PREFIX/include -I$ZSTD_PREFIX/include"
+export CXXFLAGS="${CXXFLAGS:-} -D_GNU_SOURCE -fexceptions -I$OPENSSL_PREFIX/include -I$ZLIB_PREFIX/include -I$ZSTD_PREFIX/include"
+export LDFLAGS="${LDFLAGS:-} -lc++ -lc++abi $OPENSSL_PREFIX/lib/libssl.a $OPENSSL_PREFIX/lib/libcrypto.a $ZLIB_PREFIX/lib/libz.a $ZSTD_PREFIX/lib/libzstd.a -Wl,-z,stack-size=16777216"
 
 if [ -f "$OBJ_DIR/config.status" ] && {
     ! grep -q 'getrandom_backend' "$OBJ_DIR/config.status" ||

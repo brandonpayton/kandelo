@@ -4439,8 +4439,9 @@ _builtinModules['perf_hooks'].monitorEventLoopDelay = function () {
 };
 
 // zlib: async callback wrappers over the existing *Sync implementations,
-// plus throwing stubs for the raw-inflate and zstd codecs (not wired
-// through the wasm sysroot's libz binding).
+// plus a throwing stub for raw-inflate, and real zstd DECOMPRESSION backed by
+// the native __kandeloZstdDecompress seam (a decompress-only libzstd linked
+// into node.wasm). zstd compression stays an honest not-impl (see below).
 _builtinModules['zlib'].deflate = function (buf, opts, cb) {
     if (typeof opts === 'function') { cb = opts; opts = undefined; }
     try {
@@ -4456,7 +4457,35 @@ _builtinModules['zlib'].inflate = function (buf, opts, cb) {
     } catch (e) { queueMicrotask(() => cb(e)); }
 };
 _builtinModules['zlib'].inflateRawSync = _notImpl('zlib', 'inflateRawSync');
-_builtinModules['zlib'].createZstdDecompress = _notImpl('zlib', 'createZstdDecompress');
+// zstd DECOMPRESSION: real, backed by the native __kandeloZstdDecompress seam
+// (a decompress-only libzstd linked into node.wasm). Fail-loud on a corrupt
+// frame — the native seam throws "zstd decompression failed: ...".
+_builtinModules['zlib'].zstdDecompressSync = function (buf) {
+    const u8 = buf instanceof Uint8Array ? buf
+        : buf instanceof ArrayBuffer ? new Uint8Array(buf)
+        : Buffer.from(buf);
+    return Buffer.from(_nodeNative.__kandeloZstdDecompress(u8));
+};
+_builtinModules['zlib'].createZstdDecompress = function () {
+    const t = new stream.Transform();
+    const parts = [];
+    t._transform = function (chunk, _enc, cb) {
+        parts.push(chunk instanceof Uint8Array ? chunk : Buffer.from(chunk));
+        cb();
+    };
+    t._flush = function (cb) {
+        try {
+            const all = Buffer.concat(parts);
+            this.push(Buffer.from(_nodeNative.__kandeloZstdDecompress(all)));
+            cb();
+        } catch (e) { cb(e); }
+    };
+    return t;
+};
+// zstd COMPRESSION is intentionally not implemented (the linked libzstd is
+// decompress-only). Honest fail-loud stubs, never a silent no-op.
+_builtinModules['zlib'].createZstdCompress = _notImpl('zlib', 'createZstdCompress');
+_builtinModules['zlib'].zstdCompressSync = _notImpl('zlib', 'zstdCompressSync');
 
 // Node exposes `node:module` as the CJS Module class itself: a
 // constructor that doubles as the namespace for createRequire / _cache
