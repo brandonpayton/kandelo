@@ -47,11 +47,17 @@ import { WPK_FORK_REFERENCE_TRANSACTION_OWNER } from "../src/generated/abi";
 
 const PAGE = 65536;
 const PTR_WIDTH = 4 as const;
+const PID = 4242;
 const GENERATION_ID = 7;
 const EINVAL = 22;
 // Distinct durable broker handles this fork's externrefs name (a canonical
 // capture graph dedups externref by handle, so the graph has one node each).
 const HANDLES = [11, 22, 33] as const;
+// The drive-plan step layout (mirrors crates/fork-codec/src/drive_plan.rs).
+const DRIVE_STEP_SIZE = 16;
+const DRIVE_STEP_OFF_OP = 0;
+const DRIVE_STEP_OFF_RECIPE = 8;
+const DRIVE_OP_EXTERNREF_TRANSIT = 4;
 // A guest scratch region for the scan output: below the frame reserve (8 MiB)
 // and well above the tiny arena (which grows up from one page), so it never
 // collides with the arena, the reserve, or the module's own data at 32 MiB.
@@ -106,8 +112,13 @@ interface ForkModuleExports {
   fm_decode_reference_graph: (root: number) => number;
   fm_decoded_node_count: () => number;
   fm_scan_externref_handles: (dstPtr: number, dstCap: number) => number;
+  fm_restore_from_arena: (root: number, pid: number) => number;
+  fm_begin_reference_replay: (root: number, pid: number) => void;
+  fm_build_gc_plan: (pid: number) => number;
+  fm_gc_plan_count: () => number;
   fm_reference_graphs_decoded: () => bigint;
   fm_externref_handles_scanned: () => bigint;
+  fm_externrefs_resolved: () => bigint;
   fm_last_errno: () => number;
 }
 
@@ -132,6 +143,23 @@ function instantiate(memory: WebAssembly.Memory): {
   x.fm_set_format(PTR_WIDTH, 0);
   expect(x.fm_last_errno()).toBe(0);
   return { x };
+}
+
+function readPlan(memory: WebAssembly.Memory, ptr: number, count: number): number[][] {
+  const view = new DataView(memory.buffer);
+  const steps: number[][] = [];
+  for (let i = 0; i < count; i++) {
+    const base = ptr + i * DRIVE_STEP_SIZE;
+    steps.push([
+      view.getUint32(base + DRIVE_STEP_OFF_OP, true),
+      view.getUint32(base + DRIVE_STEP_OFF_RECIPE, true),
+    ]);
+  }
+  return steps;
+}
+
+function readRawPlan(memory: WebAssembly.Memory, ptr: number, count: number): Uint8Array {
+  return new Uint8Array(memory.buffer).slice(ptr, ptr + count * DRIVE_STEP_SIZE);
 }
 
 describe("fork-module decode / scan / restore (orchestration migration increment 1)", () => {
@@ -204,5 +232,52 @@ describe("fork-module decode / scan / restore (orchestration migration increment
     // No fm_decode_reference_graph was called.
     expect(x.fm_scan_externref_handles(SCAN_SCRATCH, 8)).toBe(-1);
     expect(x.fm_last_errno()).toBe(EINVAL);
+  });
+
+  it("fm_restore_from_arena seeds the driver and builds a plan identical to begin + build", () => {
+    const memory = new WebAssembly.Memory({ initial: 256, maximum: 16384, shared: true });
+    const root = buildExternrefArena(memory);
+    const { x } = instantiate(memory);
+
+    // (1) The single restore entry: seed + build in one call.
+    const beforeResolved = Number(x.fm_externrefs_resolved());
+    const planPtr = x.fm_restore_from_arena(root, PID);
+    expect(x.fm_last_errno()).toBe(0);
+    expect(planPtr).not.toBe(0);
+
+    const count = x.fm_gc_plan_count();
+    // Every externref recipe gets a Phase-0b transit-publish step.
+    expect(count).toBe(HANDLES.length);
+    // Restore seeded the driver AND admitted the graph (bookkeeping advanced).
+    expect(Number(x.fm_externrefs_resolved()) - beforeResolved).toBe(HANDLES.length);
+
+    // The plan is exactly the externref-transit steps, one per recipe (1..N).
+    const steps = readPlan(memory, planPtr, count);
+    steps.forEach(([op, recipe], index) => {
+      expect(op).toBe(DRIVE_OP_EXTERNREF_TRANSIT);
+      expect(recipe).toBe(index + 1);
+    });
+    const restoreRaw = readRawPlan(memory, planPtr, count);
+
+    // (2) The two-step path restore collapses: begin_reference_replay + build.
+    x.fm_begin_reference_replay(root, PID);
+    expect(x.fm_last_errno()).toBe(0);
+    const planPtr2 = x.fm_build_gc_plan(PID);
+    expect(planPtr2).not.toBe(0);
+    const count2 = x.fm_gc_plan_count();
+    expect(count2).toBe(count);
+    const twoStepRaw = readRawPlan(memory, planPtr2, count2);
+
+    // Byte-for-byte identical: fm_restore_from_arena is the composition.
+    expect(Array.from(restoreRaw)).toEqual(Array.from(twoStepRaw));
+  });
+
+  it("fm_restore_from_arena fails cleanly on a malformed arena root", () => {
+    const memory = new WebAssembly.Memory({ initial: 256, maximum: 16384, shared: true });
+    buildExternrefArena(memory);
+    const { x } = instantiate(memory);
+
+    expect(x.fm_restore_from_arena(PAGE * 4, PID)).toBe(0);
+    expect(x.fm_last_errno()).not.toBe(0);
   });
 });

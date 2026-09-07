@@ -2514,6 +2514,25 @@ mod wasm {
         Ok(count)
     }
 
+    /// Seed the reference replay driver/feed from the KFMS arena rooted at
+    /// `module_state_root` AND build the whole topological drive plan in ONE
+    /// module call, returning the plan's guest address (the `plan_ptr` argument
+    /// for the injected `fm_drive_execute` shim; the step count is
+    /// `fm_gc_plan_count`). This is the replay-orchestration ENTRY: it collapses
+    /// the JS `beginReferenceReplay` + `restoreModuleState`/`materializeAllTyped`
+    /// wrapper — which sized transit and sequenced the drive host-side, looping
+    /// leaf drives — into the module, so the module now owns seeding + drive-order
+    /// construction and the host issues a SINGLE `fm_drive_execute(plan, count)`.
+    /// GC graphs still require each participating activation's
+    /// `fm_set_activation_gc_codec` to have run first, exactly as
+    /// `fm_build_gc_plan` does today; an un-seeded GC activation, a malformed
+    /// arena, or an unadmitted reference kind (`EOPNOTSUPP`, host keeps the JS
+    /// path) is a truthful failure, never a wrong plan.
+    fn restore_from_arena_impl(module_state_root: u64, pid: u32) -> Result<usize, Errno> {
+        begin_reference_replay_impl(module_state_root, pid)?;
+        build_gc_plan_impl(pid)
+    }
+
     // -- Reference RESTORE data-feed helpers (Phase 6 item 3a) ---------------
     //
     // Each helper borrows the immutable transaction from the resident driver and
@@ -4278,6 +4297,26 @@ mod wasm {
             Err(e) => {
                 set_err(e);
                 -1
+            }
+        }
+    }
+
+    /// Seed the reference replay driver/feed AND build the drive plan from the
+    /// KFMS arena rooted at `module_state_root` in one call, returning the drive
+    /// plan's guest address (0 on failure; reason in `fm_last_errno`). The step
+    /// count is read from `fm_gc_plan_count`. This is the replay-orchestration
+    /// ENTRY that collapses the JS `beginReferenceReplay` + `restoreModuleState`
+    /// wrapper into the module. See `restore_from_arena_impl`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_restore_from_arena(module_state_root: usize, pid: u32) -> usize {
+        match restore_from_arena_impl(module_state_root as u64, pid) {
+            Ok(ptr) => {
+                set_ok();
+                ptr
+            }
+            Err(e) => {
+                set_err(e);
+                0
             }
         }
     }
