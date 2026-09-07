@@ -320,11 +320,18 @@ mod tests {
     /// Extract every `-p <name>` / `--package <name>` token following a
     /// `cargo build` invocation in a shell script's text. Deliberately
     /// simple (whitespace-token scanning, not a shell parser): false
-    /// negatives are the only failure mode this guard risks -- a build
-    /// script that invokes cargo in some more exotic way this misses would
-    /// ship undetected, exactly like before this test existed. It must not
-    /// have false positives that fail an unrelated package's test, so it
-    /// only fires on an EXACT `-p`/`--package` flag pair.
+    /// negatives are the acceptable failure mode -- a build script that
+    /// invokes cargo in some more exotic way this misses would ship
+    /// undetected, exactly like before this test existed.
+    ///
+    /// To avoid false positives that would fail an unrelated package's test,
+    /// it fires only on an EXACT `-p`/`--package` flag pair AND ignores the
+    /// two common shell vectors where `cargo build -p <name>` text is not a
+    /// real invocation: whole-line and trailing inline `#` comments, and
+    /// `echo`/`printf` lines that merely print such a string. It is not a
+    /// shell lexer, so `cargo build` embedded in a quoted variable assignment
+    /// is still (rarely) matchable; the guard exists for real build recipes,
+    /// where that shape does not occur.
     ///
     /// Deliberately excludes `xtask` and `fork-module-inject`: many package
     /// build scripts run `cargo build -p xtask` (or the fork-module
@@ -339,7 +346,23 @@ mod tests {
     fn cargo_build_dash_p_crate_names(script_text: &str) -> BTreeSet<String> {
         const BUILD_TOOL_CRATES: &[&str] = &["xtask", "fork-module-inject"];
         let mut names = BTreeSet::new();
-        for line in script_text.lines() {
+        for raw_line in script_text.lines() {
+            // Strip a trailing inline comment. Shell comments begin at an
+            // unquoted '#'; the common, quote-free form is " #...". This is a
+            // heuristic, not a lexer, and only trims from the first " #".
+            let line = match raw_line.find(" #") {
+                Some(idx) => &raw_line[..idx],
+                None => raw_line,
+            };
+            let trimmed = line.trim_start();
+            // Skip whole-line comments and lines that merely echo/print a
+            // command string: the cargo text there is data, not an invocation.
+            if trimmed.starts_with('#')
+                || trimmed.starts_with("echo ")
+                || trimmed.starts_with("printf ")
+            {
+                continue;
+            }
             if !line.contains("cargo build") {
                 continue;
             }
@@ -354,5 +377,33 @@ mod tests {
             }
         }
         names
+    }
+
+    #[test]
+    fn cargo_build_scan_ignores_comments_and_echoed_strings() {
+        // Real invocations are detected.
+        let real = "set -e\ncargo build -p kandelo --release\n";
+        assert!(cargo_build_dash_p_crate_names(real).contains("kandelo"));
+
+        // A whole-line comment must not trigger the guard.
+        let comment = "# formerly cargo build -p kandelo\ncargo build -p realcrate\n";
+        let got = cargo_build_dash_p_crate_names(comment);
+        assert!(got.contains("realcrate"));
+        assert!(!got.contains("kandelo"));
+
+        // A trailing inline comment is stripped.
+        let inline = "cargo build -p realcrate # was: cargo build -p kandelo\n";
+        let got = cargo_build_dash_p_crate_names(inline);
+        assert!(got.contains("realcrate"));
+        assert!(!got.contains("kandelo"));
+
+        // An echoed/printed command string is data, not an invocation.
+        let echoed =
+            "echo \"cargo build -p kandelo\"\nprintf 'cargo build -p other\\n'\n";
+        assert!(cargo_build_dash_p_crate_names(echoed).is_empty());
+
+        // Build-tool crates remain excluded regardless.
+        let tool = "cargo build -p xtask\n";
+        assert!(cargo_build_dash_p_crate_names(tool).is_empty());
     }
 }

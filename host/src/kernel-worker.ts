@@ -3218,6 +3218,8 @@ export class CentralizedKernelWorker {
    * or closed. Dropped wholesale on process teardown (the fd table is gone).
    */
   private fdWritebackFdRefs = new Map<number, Map<number, number>>();
+  /** One-shot guard so a persistent RAW+OPAQUE_RECORD ABI drift is loud but not a flood. */
+  #warnedRawOpaqueRecordDrift = false;
   /** Host-owned byte stores for anonymous MAP_SHARED mappings. */
   private anonymousSharedBackings = new Map<
     string,
@@ -11119,6 +11121,22 @@ export class CentralizedKernelWorker {
       || (cancellationWakeAllowed && !cancellationPoint)
       || opaqueRecordOnRawSyscall
     ) {
+      // Unlike a merely malformed untrusted request, a RAW syscall carrying
+      // OPAQUE_RECORD specifically indicates guest-codegen/host-guard ABI
+      // drift (a correctly generated guest never marshals a RAW syscall into
+      // an opaque record). Returning EINVAL keeps this request non-fatal, but
+      // the drift must stay observable rather than looking like routine input
+      // validation — emit a loud one-shot diagnostic (one per worker so a
+      // pervasive drift does not flood) before the errno.
+      if (opaqueRecordOnRawSyscall && !this.#warnedRawOpaqueRecordDrift) {
+        this.#warnedRawOpaqueRecordDrift = true;
+        console.error(
+          `[ABI DRIFT] RAW syscall ${syscallNr} carried REQUEST_FLAG_OPAQUE_RECORD `
+          + `(pid=${channel.pid}); rejecting with EINVAL. This indicates a guest `
+          + `codegen/host-guard ABI mismatch, not a routine malformed request. `
+          + `Further occurrences are suppressed.`,
+        );
+      }
       this.completeChannelRawAndRelisten(channel, -1, EINVAL, entry);
       return null;
     }
