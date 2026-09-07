@@ -1078,24 +1078,33 @@ export class ForkProcessContinuationCoordinator {
       // set once the whole graph is admitted; externref resolution (PHASE A/B)
       // must also precede restore so the still-JS externref decode reads the
       // values the module rooted.
+      // Reconstruction-orchestration ENTRY: seed the module's reference graph
+      // AND build the whole topological drive plan in ONE module call
+      // (`restoreFromArena` = the collapsed `fm_begin_reference_replay` +
+      // `fm_build_gc_plan`). This moves the reference SEEDING + drive-order
+      // CONSTRUCTION into the module; the host then issues a single
+      // `driveRestoredPlan` inside `restoreModuleState`, rather than seeding here
+      // and rebuilding the plan inside the drive closure.
+      let restoredPlan: number | undefined;
       if (this.moduleReferenceReplay) {
-        backend.beginReferenceReplay(arena.rootAddress());
+        restoredPlan = backend.restoreFromArena(arena.rootAddress());
       }
       // P2 (Path B): when the module reference replay is active, the module's
-      // reference graph is seeded (`beginReferenceReplay` above) and every
-      // participating activation's KFGC codec + the host-exception owner were
-      // seeded at worker init, so hand the WHOLE typed reconstruction to the
-      // co-resident module. `restoreModuleState` invokes this delegate as the SOLE
-      // reconstructor: the module drives the entire `drive_plan` walk (static-root
-      // publish, EVERY externref transit publish, then the typed allocate/fill/exn
-      // order) and no JS reconstruction runs. It then drives each guest's global/
-      // table restore against the module-reconstructed identities. A graph with no
-      // typed replay owner (funcref/externref-only frame locals) reconstructs
-      // through the flipped module decode imports and builds a no-op plan. Flag-off
-      // children pass no delegate and keep the byte-identical JS drive.
+      // reference graph is seeded and its drive plan built (`restoreFromArena`
+      // above) and every participating activation's KFGC codec + the
+      // host-exception owner were seeded at worker init, so hand the WHOLE typed
+      // reconstruction to the co-resident module. `restoreModuleState` invokes
+      // this delegate as the SOLE reconstructor: the module executes the entire
+      // pre-built `drive_plan` walk (static-root publish, EVERY externref transit
+      // publish, then the typed allocate/fill/exn order) and no JS reconstruction
+      // runs. It then drives each guest's global/table restore against the
+      // module-reconstructed identities. A graph with no typed replay owner
+      // (funcref/externref-only frame locals) reconstructs through the flipped
+      // module decode imports and drives a no-op (0-step) plan. Flag-off children
+      // pass no delegate and keep the byte-identical JS drive.
       const typedDrive = this.moduleReferenceReplay
         ? (): void => {
-            backend.driveTypedGraph();
+            backend.driveRestoredPlan(restoredPlan!);
           }
         : undefined;
       this.registry.restoreModuleState(typedDrive);
@@ -1238,14 +1247,17 @@ export class ForkProcessContinuationCoordinator {
       const records = arena.recordViews();
       this.phase = "child-replay";
       // Reference reconstruction runs through the module (never a JS fallback),
-      // mirroring `attachModuleChild`: seed the reference graph BEFORE restoring
-      // module state, then hand the typed allocate/fill/exn order to the module.
+      // mirroring `attachModuleChild`: the reconstruction-orchestration ENTRY
+      // seeds the reference graph AND builds the drive plan in ONE module call
+      // (`restoreFromArena`), then the module executes the pre-built typed
+      // allocate/fill/exn order via `driveRestoredPlan`.
+      let restoredPlan: number | undefined;
       if (this.moduleReferenceReplay) {
-        backend.beginReferenceReplay(arena.rootAddress());
+        restoredPlan = backend.restoreFromArena(arena.rootAddress());
       }
       const typedDrive = this.moduleReferenceReplay
         ? (): void => {
-            backend.driveTypedGraph();
+            backend.driveRestoredPlan(restoredPlan!);
           }
         : undefined;
       this.registry.restoreModuleState(typedDrive);

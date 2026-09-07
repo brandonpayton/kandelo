@@ -314,6 +314,60 @@ export class ForkModuleContinuationBackend {
   }
 
   /**
+   * Reconstruction-orchestration ENTRY (Phase 6). Seed the reference replay
+   * driver/feed from the inherited KFMS arena rooted at `moduleStateRoot` AND
+   * build the whole topological drive plan in ONE module call
+   * (`fm_restore_from_arena` = the collapsed `fm_begin_reference_replay` +
+   * `fm_build_gc_plan`), returning the plan's guest address for
+   * `driveRestoredPlan`. This moves the reference SEEDING + drive-order
+   * CONSTRUCTION into the module: the host no longer issues a separate
+   * `beginReferenceReplay` and then rebuilds the plan inside the drive closure.
+   * GC graphs still require each participating activation's `setActivationGcCodec`
+   * to have run at worker init (exactly as `driveTypedGraph` does). A missing
+   * driver, un-seeded GC activation, malformed arena, or an unadmitted reference
+   * kind (`EOPNOTSUPP`, host keeps the JS path) is a truthful throw, never a
+   * wrong plan.
+   */
+  restoreFromArena(moduleStateRoot: number): number {
+    this.requireSetup("restore from arena");
+    const planPtr = this.toNum(
+      this.exports.fm_restore_from_arena(this.wptr(moduleStateRoot), this.pid),
+    );
+    this.requireOk("fm_restore_from_arena");
+    return planPtr;
+  }
+
+  /**
+   * Execute a drive plan previously built by `restoreFromArena` through the
+   * injected `fm_drive_execute` shim. Mirrors `driveTypedGraph`'s count/ptr
+   * validation but consumes the PRE-BUILT plan rather than rebuilding it — the
+   * plan-BUILD moved to the `restoreFromArena` entry. The shared anyref transit
+   * must already be sized by the caller's `prepareTransit` (the host-side floor
+   * the module cannot size from Rust). Returns the executed step count (0 for a
+   * graph with no drivable node, e.g. funcref/null-only).
+   */
+  driveRestoredPlan(planPtr: number): number {
+    this.requireSetup("drive restored plan");
+    const count = Number(this.exports.fm_gc_plan_count() as number | bigint);
+    if (!Number.isSafeInteger(count) || count < 0) {
+      throw new Error(
+        `${this.label}: fm_gc_plan_count returned invalid count ${count}`,
+      );
+    }
+    if (count === 0) return 0;
+    if (!Number.isSafeInteger(planPtr) || planPtr <= 0) {
+      throw new Error(
+        `${this.label}: fm_restore_from_arena returned invalid plan ptr ${planPtr}`,
+      );
+    }
+    // The injected shim owns its own truthful failure (a post-allocate integrity
+    // violation traps with `unreachable`); it sets no errno, so completion IS
+    // success.
+    this.exports.fm_drive_execute(this.wptr(planPtr), count);
+    return count;
+  }
+
+  /**
    * Seed the module's funcref/null reference graph for this fork from the KFMS
    * module-state arena rooted at `moduleStateRoot` (Phase 6 D6.1). The caller
    * gates this on the funcref-only reference predicate; the module re-checks and

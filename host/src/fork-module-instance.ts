@@ -167,6 +167,16 @@ export const FORK_MODULE_REQUIRED_EXPORTS = [
   "fm_set_host_exception_owner",
   "fm_build_gc_plan",
   "fm_gc_plan_count",
+  // Phase 6 (reconstruction-orchestration ENTRY): the module-owned entry that
+  // collapses `fm_begin_reference_replay` + `fm_build_gc_plan` into ONE call —
+  // it seeds the reference driver/feed from the inherited KFMS arena AND builds
+  // the whole topological drive plan, returning the plan's guest address for a
+  // single `fm_drive_execute`. This moves the reference seeding + drive-order
+  // CONSTRUCTION out of the host into the module; the host issues one entry call
+  // then one drive, rather than seeding, then rebuilding the plan inside the
+  // drive closure. Transit SIZING stays the host floor (`prepareTransit`): the
+  // module cannot grow the anyref transit table from Rust.
+  "fm_restore_from_arena",
   "fm_drive_bump",
   "fm_drive_steps_executed",
   // Static-root binder: admit static-root WasmGC graphs through the module. A
