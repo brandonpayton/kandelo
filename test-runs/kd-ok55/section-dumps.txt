@@ -1,0 +1,57 @@
+### nested_fork_call.wat (fixture) RAW
+
+switch_dispatch__nested_fork_call.wasm:	file format wasm 0x1
+
+Sections:
+
+     Type start=0x0000000a end=0x00000015 (size=0x0000000b) count: 2
+   Import start=0x00000017 end=0x0000003e (size=0x00000027) count: 2
+ Function start=0x00000040 end=0x00000042 (size=0x00000002) count: 1
+   Memory start=0x00000044 end=0x00000047 (size=0x00000003) count: 1
+   Export start=0x00000049 end=0x0000005c (size=0x00000013) count: 2
+     Code start=0x0000005e end=0x00000078 (size=0x0000001a) count: 1
+
+### nested_fork_call INSTRUMENTED
+
+switch_dispatch__nested_fork_call.inst.wasm:	file format wasm 0x1
+
+Sections:
+
+     Type start=0x0000000a end=0x0000001c (size=0x00000012) count: 4
+   Import start=0x0000001e end=0x00000045 (size=0x00000027) count: 2
+ Function start=0x00000047 end=0x0000004e (size=0x00000007) count: 6
+   Memory start=0x00000050 end=0x00000053 (size=0x00000003) count: 1
+   Global start=0x00000055 end=0x00000060 (size=0x0000000b) count: 2
+   Export start=0x00000063 end=0x000000e3 (size=0x00000080) count: 7
+     Code start=0x000000e6 end=0x000001e1 (size=0x000000fb) count: 6
+   Custom start=0x000001e4 end=0x00000277 (size=0x00000093) "name"
+   Custom start=0x00000279 end=0x000002a0 (size=0x00000027) "producers"
+
+### manyfn_m1000 RAW
+
+manyfn_m1000.wasm:	file format wasm 0x1
+
+Sections:
+
+     Type start=0x0000000a end=0x0000000f (size=0x00000005) count: 1
+   Import start=0x00000011 end=0x00000027 (size=0x00000016) count: 1
+ Function start=0x0000002a end=0x00000414 (size=0x000003ea) count: 1000
+   Memory start=0x00000416 end=0x00000419 (size=0x00000003) count: 1
+   Export start=0x0000041c end=0x00002271 (size=0x00001e55) count: 1000
+     Code start=0x00002274 end=0x000035fe (size=0x0000138a) count: 1000
+
+### manyfn_m1000 INSTRUMENTED
+
+manyfn_m1000.inst.wasm:	file format wasm 0x1
+
+Sections:
+
+     Type start=0x0000000a end=0x00000016 (size=0x0000000c) count: 3
+   Import start=0x00000018 end=0x0000002e (size=0x00000016) count: 1
+ Function start=0x00000031 end=0x00000420 (size=0x000003ef) count: 1005
+   Memory start=0x00000422 end=0x00000425 (size=0x00000003) count: 1
+   Global start=0x00000427 end=0x00000432 (size=0x0000000b) count: 2
+   Export start=0x00000435 end=0x000022fc (size=0x00001ec7) count: 1005
+     Code start=0x00002300 end=0x0001e42a (size=0x0001c12a) count: 1005
+   Custom start=0x0001e42d end=0x0001e4c5 (size=0x00000098) "name"
+   Custom start=0x0001e4c7 end=0x0001e4ee (size=0x00000027) "producers"

@@ -1,0 +1,12 @@
+Instrument a wasm module with save/restore machinery for POSIX fork()
+
+Usage: wasm-fork-instrument [OPTIONS] <INPUT>
+
+Arguments:
+  <INPUT>  Input wasm file to instrument
+
+Options:
+  -o, --output <OUTPUT>  Output path for the instrumented wasm file. Required unless `--discover-only` is set (analysis-only mode)
+      --entry <ENTRY>    The fully-qualified name of the import that triggers unwind. Format: `module.field`. Defaults to `kernel.kernel_fork` [default: kernel.kernel_fork]
+      --discover-only    Analyze the module and print the discovered fork-path function set as JSON to stdout. Skips instrumentation and output emission. Useful for validating call-graph discovery against hand-maintained onlylists
+  -h, --help             Print help

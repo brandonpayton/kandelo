@@ -1,0 +1,21 @@
+=== build restart at Thu Jul  2 05:19:24 EDT 2026 with DEVELOPER_DIR=/Library/Developer/CommandLineTools ===
+==> Building wasm-fork-instrument for aarch64-apple-darwin...
+   Compiling proc-macro2 v1.0.106
+   Compiling serde_core v1.0.228
+   Compiling quote v1.0.45
+   Compiling serde v1.0.228
+   Compiling anyhow v1.0.102
+   Compiling clap_builder v4.6.0
+   Compiling syn v2.0.117
+   Compiling indexmap v2.14.0
+   Compiling hashbrown v0.16.1
+   Compiling gimli v0.32.3
+   Compiling wasmparser v0.245.1
+   Compiling clap_derive v4.6.1
+   Compiling walrus-macro v0.26.0
+   Compiling clap v4.6.1
+   Compiling walrus v0.26.1
+   Compiling fork-instrument v0.1.0 (/Users/brandon/src/kandelo-gascity/worktrees/kandelo/kd-ok55-evaluate-fork-instrumentation-size-overhead-42-of-perl.w/crates/fork-instrument)
+    Finished `release` profile [optimized] target(s) in 13.63s
+==> Installed /Users/brandon/src/kandelo-gascity/worktrees/kandelo/kd-ok55-evaluate-fork-instrumentation-size-overhead-42-of-perl.w/tools/bin/wasm-fork-instrument
+=== build done at Thu Jul  2 05:19:37 EDT 2026 ===

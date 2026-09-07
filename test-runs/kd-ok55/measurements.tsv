@@ -1,0 +1,21 @@
+group	label	raw_bytes	inst_bytes	delta_bytes	pct_of_inst	pct_of_raw	forkpath_fns	nfuncs_raw	nfuncs_inst	code_raw	code_inst	code_delta
+fixture	switch_dispatch/carryover_at_subregion.wat	93	625	532	85.1	572.0	2	2	6	22	227	205
+fixture	switch_dispatch/direct_call_carryover_in_block.wat	113	819	706	86.2	624.8	3	3	7	35	414	379
+fixture	switch_dispatch/guard_dispatch_non_fork_call.wat	118	647	529	81.8	448.3	2	3	6	24	226	202
+fixture	switch_dispatch/nested_fork_call.wat	120	672	552	82.1	460.0	2	3	6	26	251	225
+fixture	switch_dispatch/posix_spawn_class.wat	160	696	536	77.0	335.0	2	3	6	43	255	212
+fixture	switch_dispatch/top_level_carryover.wat	114	838	724	86.4	635.1	3	3	7	36	433	397
+fixture	switch_dispatch/waitpid_class.wat	113	618	505	81.7	446.9	2	3	6	19	197	178
+fixture	trampoline/legacy_try_fork.wat	102	630	528	83.8	517.6	2	2	6	22	227	205
+fixture	trampoline/nested_call_indirect.wat	128	789	661	83.8	516.4	3	3	7	41	375	334
+fixture	trampoline/nested_carryover_in_loop.wat	135	907	772	85.1	571.9	3	3	7	57	502	445
+fixture	trampoline/nested_multivalue_params.wat	98	662	564	85.2	575.5	2	2	6	21	258	237
+fixture	trampoline/top_level_carryover.wat	114	838	724	86.4	635.1	3	3	7	36	433	397
+dispatcher	dispatcher_n1 (1 fn, 1 fork-calls)	72	555	483	87.0	670.8	2	2	6	6	163	157
+dispatcher	dispatcher_n10 (1 fn, 10 fork-calls)	99	808	709	87.7	716.2	2	2	6	33	416	383
+dispatcher	dispatcher_n100 (1 fn, 100 fork-calls)	371	3486	3115	89.4	839.6	2	2	6	304	3094	2790
+dispatcher	dispatcher_n1000 (1 fn, 1000 fork-calls)	3071	30456	27385	89.9	891.7	2	2	6	3004	30063	27059
+manyfn	manyfn_m1 (1 fork-path fns)	64	547	483	88.3	754.7	2	2	6	6	163	157
+manyfn	manyfn_m10 (10 fork-path fns)	163	1628	1465	90.0	898.8	11	11	15	51	1189	1138
+manyfn	manyfn_m100 (100 fork-path fns)	1245	12554	11309	90.1	908.4	101	101	105	501	11485	10984
+manyfn	manyfn_m1000 (1000 fork-path fns)	13822	124142	110320	88.9	798.1	1001	1001	1005	5002	114986	109984

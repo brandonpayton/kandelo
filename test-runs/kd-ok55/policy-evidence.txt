@@ -1,0 +1,25 @@
+== disabled-policy packages ==
+packages/registry/node-vfs/package.toml:27:fork_instrumentation = "disabled"
+packages/registry/node/package.toml:21:fork_instrumentation = "disabled"
+packages/registry/spidermonkey/package.toml:63:fork_instrumentation = "disabled"
+packages/registry/spidermonkey-node/package.toml:21:fork_instrumentation = "disabled"
+
+== direct $FORK_INSTRUMENT / run-wasm-fork-instrument.sh callers in build scripts ==
+packages/registry/coreutils/build-coreutils.sh:255:    FORK_INSTRUMENT="$REPO_ROOT/scripts/run-wasm-fork-instrument.sh"
+packages/registry/bash/build-bash.sh:406:FORK_INSTRUMENT="$REPO_ROOT/scripts/run-wasm-fork-instrument.sh"
+packages/registry/dash/build-dash.sh:162:FORK_INSTRUMENT="$REPO_ROOT/scripts/run-wasm-fork-instrument.sh"
+packages/registry/git/build-git.sh:99:FORK_INSTRUMENT="$REPO_ROOT/scripts/run-wasm-fork-instrument.sh"
+packages/registry/dinit/build-dinit.sh:203:FORK_INSTRUMENT="$REPO_ROOT/scripts/run-wasm-fork-instrument.sh"
+packages/registry/lsof/build-lsof.sh:43:FORK_INSTRUMENT="$REPO_ROOT/scripts/run-wasm-fork-instrument.sh"
+packages/registry/modeset/build-modeset.sh:36:"$REPO_ROOT/scripts/run-wasm-fork-instrument.sh" \
+packages/registry/nginx/build-nginx-local.sh:405:FORK_INSTRUMENT="$REPO_ROOT/scripts/run-wasm-fork-instrument.sh"
+packages/registry/netcat/build-netcat.sh:110:FORK_INSTRUMENT="$REPO_ROOT/scripts/run-wasm-fork-instrument.sh"
+packages/registry/php/build-php.sh:331:FORK_INSTRUMENT="$REPO_ROOT/scripts/run-wasm-fork-instrument.sh"
+packages/registry/ruby/build-ruby.sh:1129:FORK_INSTRUMENT="$REPO_ROOT/scripts/run-wasm-fork-instrument.sh"
+packages/registry/vim/build-vim.sh:53:FORK_INSTRUMENT="$REPO_ROOT/scripts/run-wasm-fork-instrument.sh"
+packages/registry/sqlite/build-testfixture.sh:280:FORK_INSTRUMENT="$REPO_ROOT/scripts/run-wasm-fork-instrument.sh"
+packages/registry/tcl/build-tcl.sh:168:    FORK_INSTRUMENT="$REPO_ROOT/scripts/run-wasm-fork-instrument.sh"
+
+== perl fork config + install (auto-policy path) ==
+307:        -Dd_fork=define \
+531:install_local_binary perl "$SCRIPT_DIR/bin/perl.wasm"

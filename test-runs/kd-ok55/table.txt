@@ -1,0 +1,35 @@
+
+label                                           raw     inst    delta  %inst   fp code_raw code_inst   code_Δ
+--------------------------------------------------------------------------------------------------------------
+switch_dispatch/carryover_at_subregion.wat       93      625      532  85.1%    2       22       227      205
+switch_dispatch/direct_call_carryover_in_block.wat      113      819      706  86.2%    3       35       414      379
+switch_dispatch/guard_dispatch_non_fork_call.wat      118      647      529  81.8%    2       24       226      202
+switch_dispatch/nested_fork_call.wat            120      672      552  82.1%    2       26       251      225
+switch_dispatch/posix_spawn_class.wat           160      696      536  77.0%    2       43       255      212
+switch_dispatch/top_level_carryover.wat         114      838      724  86.4%    3       36       433      397
+switch_dispatch/waitpid_class.wat               113      618      505  81.7%    2       19       197      178
+trampoline/legacy_try_fork.wat                  102      630      528  83.8%    2       22       227      205
+trampoline/nested_call_indirect.wat             128      789      661  83.8%    3       41       375      334
+trampoline/nested_carryover_in_loop.wat         135      907      772  85.1%    3       57       502      445
+trampoline/nested_multivalue_params.wat          98      662      564  85.2%    2       21       258      237
+trampoline/top_level_carryover.wat              114      838      724  86.4%    3       36       433      397
+dispatcher_n1 (1 fn, 1 fork-calls)               72      555      483  87.0%    2        6       163      157
+dispatcher_n10 (1 fn, 10 fork-calls)             99      808      709  87.7%    2       33       416      383
+dispatcher_n100 (1 fn, 100 fork-calls)          371     3486     3115  89.4%    2      304      3094     2790
+dispatcher_n1000 (1 fn, 1000 fork-calls)       3071    30456    27385  89.9%    2     3004     30063    27059
+manyfn_m1 (1 fork-path fns)                      64      547      483  88.3%    2        6       163      157
+manyfn_m10 (10 fork-path fns)                   163     1628     1465  90.0%   11       51      1189     1138
+manyfn_m100 (100 fork-path fns)                1245    12554    11309  90.1%  101      501     11485    10984
+manyfn_m1000 (1000 fork-path fns)             13822   124142   110320  88.9% 1001     5002    114986   109984
+
+=== Section breakdown (bytes): dispatcher_n1000 raw vs instrumented ===
+section                     raw       inst      delta
+Code                       3004      30063      27059
+Custom:name                   0        147        147
+Custom:producers              0         39         39
+Export                       14        123        109
+Function                      2          7          5
+Global                        0         11         11
+Import                       22         22          0
+Memory                        3          3          0
+Type                          5         12          7
