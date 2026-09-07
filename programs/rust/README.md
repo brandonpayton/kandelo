@@ -13,6 +13,8 @@ link against musl → syscall channel → kernel).
 - `thread-demo/` — P4: std::thread + std::sync::Mutex/Arc (pthread ->
   clone, futex-backed locking), deterministic shared-counter total.
 - `net-demo/` — P5: std::net TCP loopback (bind/accept/connect/echo).
+- `proc-demo/` — P3: std::process::Command (fork+exec self-spawn).
+  REQUIRES fork instrumentation (see the fixture header).
 
 Build/run: see `sdk/rust/README.md`. Run with
 `npx tsx examples/run-wasm.ts <fixture>/<name>.wasm` (a self-contained

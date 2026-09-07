@@ -34,6 +34,12 @@ async function main(): Promise<void> {
         maxWorkers: 4,
         onStdout: (_pid, data) => process.stdout.write(data),
         onStderr: (_pid, data) => process.stderr.write(data),
+        // Resolve exec of the program's own path back to its bytes so a
+        // self-contained program can fork/exec or posix_spawn itself (used
+        // by the std::process fixture). No general /bin resolution — this
+        // runner stays minimal on purpose.
+        onResolveExec: (path) =>
+            path === wasmPath ? program.slice(0) : null,
     });
     await host.init();
 
