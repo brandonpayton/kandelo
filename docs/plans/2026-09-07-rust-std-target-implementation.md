@@ -330,6 +330,34 @@ is done.
   `crates/shared/src/process_layout.rs` where layouts are ABI-pinned.
 - Validate at runtime via M4/M5 fixtures, not just compilation.
 
+**Refinement (after M4 first cut):** common `O_*` flags coincide between
+WALI/x86_64 and Kandelo's generic-like `wasm32posix` musl, so the
+function-call path (`open`/`read`/`write`) already works — `std::fs` ran
+correctly. M2.5 is therefore narrower: focus on divergent constants,
+struct layouts consumed by std (`stat`/metadata already reconciled;
+`sigaction`, socket structs next), signal numbers, and any direct
+`syscall(SYS_*)` path std uses (the WALI numbers are x86_64, wrong for
+Kandelo). Drive each by a failing M4/M5 fixture, not speculation.
+
+## M3/M4 status (2026-09-07)
+
+**M3 done** (`f2798ca86`): `std` compiles for `wasm32-unknown-kandelo`.
+10 overlay files under `sdk/rust/std-overlay/` add `kandelo` unix-pal
+arms (futex, random→getrandom, paths, args, fs DirEntry, os::linux
+fs/raw reuse); `stack_overflow` correctly falls to the no-op impl
+(guard pages can't fault); `thread::set_name` → no-op. Verified by a
+from-overlay sysroot rebuild producing a clean `libstd` rlib.
+Requires `RUST_LIBC_UNSTABLE_MUSL_V1_2_3=1`.
+
+**M4 first cut done** (`941fea22a`): `programs/rust/std-hello` (a `std`
+staticlib linked via the SDK) runs on the kernel — `std::println!`,
+formatting, and a `std::fs` write/read round-trip all succeed, exit 0.
+Remaining M4 work: args/env (`std::env::args`/`vars`), `std::time`,
+`HashMap` (getrandom seeding), and confirming a normal `fn main` entry
+(currently the fixture exports `__main_argc_argv` from a staticlib;
+bin-crate linking via `rust-lld` fails on `-lc`, so SDK-driven linking
+is still M6).
+
 ## Milestone 3 — `std` unix pal compiles for `kandelo`
 
 Goal: `-Z build-std=std,panic_abort` completes; `std` builds.
