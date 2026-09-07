@@ -608,6 +608,26 @@ mod tests {
     }
 
     #[test]
+    fn gated_placeholders_are_distinct_canonical_leaves() {
+        // Each gated placeholder is its own recipe id (no i31 dedup), so the
+        // host's captured-value side table stays one-to-one with the graph even
+        // when several gated live values collapse to the same wire shape.
+        let mut b = ReferenceGraphBuilder::begin();
+        let g1 = b.push_gated_placeholder().unwrap();
+        let g2 = b.push_gated_placeholder().unwrap();
+        // A real interned i31(0) still dedups against itself, but NOT against the
+        // gated placeholders — they are independent nodes.
+        let z1 = b.intern_i31(0).unwrap();
+        let z2 = b.intern_i31(0).unwrap();
+        assert_eq!((g1, g2), (1, 2), "gated placeholders take fresh ids");
+        assert_eq!(z1, z2, "intern_i31 still dedups by value");
+        assert_eq!(z1, 3, "the interned i31 is a fourth distinct node");
+        assert_eq!(b.nodes().len(), 4);
+        b.validate().expect("a graph of gated leaves is canonical");
+        assert_round_trips(&b, 1 << 16);
+    }
+
+    #[test]
     fn interns_dedup_by_coordinate() {
         let mut b = ReferenceGraphBuilder::begin();
         let a1 = b.intern_funcref(1, 2).unwrap();

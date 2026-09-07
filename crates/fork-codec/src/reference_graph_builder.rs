@@ -191,6 +191,21 @@ impl ReferenceGraphBuilder {
         Ok(id)
     }
 
+    /// Reserve a self-contained placeholder leaf for a GATED capture kind
+    /// (externref / typed Wasm-GC / static-root with no recoverable
+    /// production-site provenance), returning its recipe id. Mirrors the TS
+    /// `reserveGatedPlaceholder` and native's `NativeReferenceCapture::
+    /// gated_placeholder`: it pushes a fresh, canonical `i31(0)` leaf — the
+    /// cheapest node that passes `validate` without real backing — WITHOUT the
+    /// `intern_i31` value dedup, so each gated live value gets its own distinct
+    /// recipe id (the host keeps the live value beside it for the parent's own
+    /// abort-replay). The sealed graph of a gated fork is discarded unread; this
+    /// only has to keep the graph canonical and the id space one-to-one with the
+    /// host's captured-value side table.
+    pub fn push_gated_placeholder(&mut self) -> Result<u32, Errno> {
+        self.push_node(ReferenceRecipeNode::I31 { value: 0 })
+    }
+
     /// Claim a fresh graph identity for a GC value before its fields are known,
     /// returning the placeholder recipe id. Mirrors `claimGcSlot`: publishing the
     /// id first lets a field edge close a cycle back onto this node. The

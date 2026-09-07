@@ -146,10 +146,11 @@ mod wasm {
 
     use fork_codec::{
         decode_module_state, decode_replay_events_image, decode_segmented_reference_transaction,
-        drive_plan, encode_replay_events, ChunkAllocator,
+        drive_plan, encode_replay_events, AggregateKind, ChunkAllocator, GcProvenance,
         LinkedFrameFormat, LinkedFrameWriter, ModuleStateFormat, ReconstructionState,
-        ReferenceRecipeNode, ReferenceReplayDriver, ReferenceReplayFeed, ReferenceTransactionRecord,
-        ReplayEvent, ReplayEventJournal, ResumeSlotTable, RewindDriver,
+        ReferenceGraphBuilder, ReferenceRecipeNode, ReferenceReplayDriver, ReferenceReplayFeed,
+        ReferenceSegmentsWriter, ReferenceTransactionRecord, ReplayEvent, ReplayEventJournal,
+        ResumeSlotTable, RewindDriver,
     };
     use wasm_posix_shared::{abi, channel, mmap, ChannelStatus, Errno, Syscall};
 
@@ -863,6 +864,49 @@ mod wasm {
     // unchanged. Bumped by every route/payload-length/load/vector read. Never
     // resets.
     static REFERENCE_FEED_READS: AtomicU64 = AtomicU64::new(0);
+
+    // -- Reference CAPTURE session (Path B P3 — module-owned encode graph) ----
+    //
+    // The encode-side sibling of `REFERENCE_STATE`/`REFERENCE_FEED`. As the
+    // parent's instrumented `wpk_fork_module_state_save` walk discovers Wasm
+    // reference values, the host's thin capture-import bodies resolve each value
+    // to its recipe COORDINATE using the irreducible per-host identity floor (V8
+    // `WeakMap` externref provenance / the transit `table.get`; native's
+    // `Rooted`+`ref_eq`) and then intern that coordinate here through the SHARED
+    // `fork_codec::ReferenceGraphBuilder` — byte-for-byte the same graph the
+    // decoder reconstructs. This is exactly native's shape (`guest.rs`'s capture
+    // bodies call `graph.intern_externref`, etc.), lifted to a module export so
+    // BOTH V8 hosts route capture interning through the ONE shared builder
+    // instead of the per-host TypeScript `ForkReferenceTransaction` capture graph.
+    // The floor stays host-side: the module never sees a live reference — only
+    // resolved i32/i64 coordinates.
+    struct CaptureCell(UnsafeCell<Option<ReferenceGraphBuilder>>);
+    // SAFETY: single-threaded per worker (see HeapCell).
+    unsafe impl Sync for CaptureCell {}
+    static CAPTURE_STATE: CaptureCell = CaptureCell(UnsafeCell::new(None));
+
+    #[allow(clippy::mut_from_ref)]
+    fn capture_state() -> &'static mut Option<ReferenceGraphBuilder> {
+        // SAFETY: single-threaded per worker; only one guest drives capture.
+        unsafe { &mut *CAPTURE_STATE.0.get() }
+    }
+
+    // Owns the serialized KFRV/KFRS record stream `fm_capture_serialize` emits so
+    // the pointer it returns stays valid while the host drains the records into
+    // its module-state arena (mirrors `DRIVE_PLAN`'s rooting of the drive plan).
+    struct CaptureSerializedCell(UnsafeCell<Option<Vec<u8>>>);
+    // SAFETY: single-threaded per worker (see HeapCell).
+    unsafe impl Sync for CaptureSerializedCell {}
+    static CAPTURE_SERIALIZED: CaptureSerializedCell = CaptureSerializedCell(UnsafeCell::new(None));
+
+    // Monotonic count of reference coordinates the module has INTERNED into the
+    // shared capture builder since worker start (Path B P3). Proof-of-use mirror
+    // of `REFERENCES_RECONSTRUCTED` for the CAPTURE (parent/encode) side: after a
+    // flag-on fork routes capture through the module this has advanced past its
+    // pre-fork value; a silent fallback to the TypeScript capture graph leaves it
+    // unchanged. Bumped once per successful intern/claim/define/gated-placeholder.
+    // Never resets.
+    static CAPTURE_INTERNED: AtomicU64 = AtomicU64::new(0);
 
     // The i32 sentinels `fm_funcref_ordinal` returns to the injected wasm shim.
     // A NON-NEGATIVE value is a catalog ordinal for `table.get`; `NULL_ORDINAL`
@@ -3548,6 +3592,380 @@ mod wasm {
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_drive_steps_executed() -> i64 {
         DRIVE_STEPS_EXECUTED.load(Ordering::Relaxed) as i64
+    }
+
+    // -- Reference CAPTURE session exports (Path B P3) -----------------------
+    //
+    // Thin, PURE-SCALAR surfaces over the shared `ReferenceGraphBuilder`. The
+    // host's capture-import bodies resolve each live reference to its recipe
+    // COORDINATE with the per-host identity floor and then call these to intern
+    // it into the ONE shared graph. No export takes or returns a reference: the
+    // live-value identity layering stays host-side (Bucket C), exactly as native
+    // keeps it in `guest.rs` while calling `graph.intern_*`. Recipe ids are
+    // `>= 1` (id 0 is the canonical null the builder seeds); every ID-returning
+    // export returns `-1` on failure with the reason in `fm_capture_last_errno`.
+
+    /// GC aggregate kind discriminants `fm_capture_define_gc` accepts. Mirror the
+    /// host's `defineGc` kind argument (struct=1, array=2) plus exnref=3.
+    const CAPTURE_KIND_STRUCT: u32 = 1;
+    const CAPTURE_KIND_ARRAY: u32 = 2;
+    const CAPTURE_KIND_EXNREF: u32 = 3;
+
+    /// Fixed header of one record in the `fm_capture_serialize` record stream:
+    /// `u16 kind, u16 reserved, u32 activation_id, u32 owner_id, u32 payload_len`.
+    const CAPTURE_RECORD_HEADER: usize = 16;
+
+    fn read_capture_u32_array(ptr: usize, count: usize) -> Result<Vec<u32>, Errno> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let byte_len = count.checked_mul(4).ok_or(Errno::EINVAL)?;
+        let end = ptr.checked_add(byte_len).ok_or(Errno::EINVAL)?;
+        let mem = unsafe { mem_ref() };
+        let slice = mem.get(ptr..end).ok_or(Errno::EINVAL)?;
+        let mut out = Vec::with_capacity(count);
+        for chunk in slice.chunks_exact(4) {
+            out.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        Ok(out)
+    }
+
+    fn read_capture_bytes(ptr: usize, len: usize) -> Result<Vec<u8>, Errno> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let end = ptr.checked_add(len).ok_or(Errno::EINVAL)?;
+        let mem = unsafe { mem_ref() };
+        Ok(mem.get(ptr..end).ok_or(Errno::EINVAL)?.to_vec())
+    }
+
+    /// Fold a builder `Result<u32>` into the ID-return convention: on success set
+    /// errno OK, bump the capture proof-of-use counter, and return the id (a
+    /// recipe id or vector handle/ordinal); on failure record the errno and
+    /// return `-1`. A recipe id that would not fit in `i32` is a truthful
+    /// `EINVAL` rather than a value the host would misread as an error.
+    fn capture_ok_id(result: Result<u32, Errno>) -> i32 {
+        match result {
+            Ok(id) if id <= i32::MAX as u32 => {
+                set_ok();
+                CAPTURE_INTERNED.fetch_add(1, Ordering::Relaxed);
+                id as i32
+            }
+            Ok(_) => {
+                set_err(Errno::EINVAL);
+                -1
+            }
+            Err(e) => {
+                set_err(e);
+                -1
+            }
+        }
+    }
+
+    /// Fold a builder `Result<()>` into the VOID-return convention: `0` on
+    /// success, `-1` on failure (reason in `fm_capture_last_errno`).
+    fn capture_ok_void(result: Result<(), Errno>) -> i32 {
+        match result {
+            Ok(()) => {
+                set_ok();
+                CAPTURE_INTERNED.fetch_add(1, Ordering::Relaxed);
+                0
+            }
+            Err(e) => {
+                set_err(e);
+                -1
+            }
+        }
+    }
+
+    /// Begin (or restart) a reference-capture session: seed a fresh shared
+    /// builder (recipe 0 = canonical null, vector 0 = empty sentinel) and drop
+    /// any previously serialized record stream. Mirrors the host's `beginCapture`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_capture_begin() {
+        *capture_state() = Some(ReferenceGraphBuilder::begin());
+        // SAFETY: single-threaded per worker; only one capture is live at a time.
+        unsafe {
+            *CAPTURE_SERIALIZED.0.get() = None;
+        }
+        set_ok();
+    }
+
+    /// Intern a function reference by its catalog coordinate. Returns its recipe
+    /// id (`>= 1`) or `-1`. The host resolves `(activation, ordinal)` from the
+    /// funcref catalog (floor) before calling.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_capture_intern_funcref(activation: u32, ordinal: u32) -> i32 {
+        match capture_state().as_mut() {
+            Some(g) => capture_ok_id(g.intern_funcref(activation, ordinal)),
+            None => {
+                set_err(Errno::EINVAL);
+                -1
+            }
+        }
+    }
+
+    /// Intern a durable host externref by broker handle (`1..=0xffff_ffff`). The
+    /// host resolves the handle from its externref identity floor (V8 `WeakMap`
+    /// provenance) before calling; the module never sees the live externref.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_capture_intern_externref(handle: u32) -> i32 {
+        match capture_state().as_mut() {
+            Some(g) => capture_ok_id(g.intern_externref(handle)),
+            None => {
+                set_err(Errno::EINVAL);
+                -1
+            }
+        }
+    }
+
+    /// Intern an `i31ref` by its signed 31-bit payload.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_capture_intern_i31(value: i32) -> i32 {
+        match capture_state().as_mut() {
+            Some(g) => capture_ok_id(g.intern_i31(value)),
+            None => {
+                set_err(Errno::EINVAL);
+                -1
+            }
+        }
+    }
+
+    /// Intern a statically-rooted reference by its catalog coordinate.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_capture_intern_static_root(activation: u32, ordinal: u32) -> i32 {
+        match capture_state().as_mut() {
+            Some(g) => capture_ok_id(g.intern_static_root(activation, ordinal)),
+            None => {
+                set_err(Errno::EINVAL);
+                -1
+            }
+        }
+    }
+
+    /// Claim a fresh graph identity for a GC value before its fields are known,
+    /// returning the placeholder recipe id. The host publishes the id first, then
+    /// recurses into the value's fields (closing cycles), then completes it with
+    /// `fm_capture_define_gc`. Mirrors native's `gc_claim` body.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_capture_claim_gc() -> i32 {
+        match capture_state().as_mut() {
+            Some(g) => capture_ok_id(g.claim_gc()),
+            None => {
+                set_err(Errno::EINVAL);
+                -1
+            }
+        }
+    }
+
+    /// Reserve a self-contained placeholder leaf for a GATED capture kind (an
+    /// externref/anyref with no recoverable production-site provenance). Returns
+    /// a fresh distinct recipe id; the host keeps the live value beside it so the
+    /// PARENT's own abort-replay hands the exact value back. Mirrors native's
+    /// `gated_placeholder`. The soundness gate itself (`EOPNOTSUPP`, no child) is
+    /// the host's decision; this only keeps the sealed graph canonical.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_capture_gated_placeholder() -> i32 {
+        match capture_state().as_mut() {
+            Some(g) => capture_ok_id(g.push_gated_placeholder()),
+            None => {
+                set_err(Errno::EINVAL);
+                -1
+            }
+        }
+    }
+
+    /// Complete a claimed struct/array/exnref placeholder into its final
+    /// aggregate recipe. `scalar_ptr`/`scalar_len` and the `edges`/`prov` arrays
+    /// are guest-linear-memory spans the host assembled exactly as native does
+    /// (`gc_define`): `scalars` = constructor-provenance seed bytes then the live
+    /// field snapshot; `edges` = provenance recipe ids then the field/element
+    /// vector. `has_provenance != 0` records a `GcProvenance` for validation
+    /// (its ids must name existing recipes). Returns `0` or `-1`.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_capture_define_gc(
+        recipe_id: u32,
+        activation: u32,
+        type_ordinal: u32,
+        layout_id: u32,
+        kind: u32,
+        scalar_ptr: usize,
+        scalar_len: usize,
+        edges_ptr: usize,
+        edges_count: usize,
+        has_provenance: u32,
+        prov_ptr: usize,
+        prov_count: usize,
+    ) -> i32 {
+        let kind_enum = match kind {
+            CAPTURE_KIND_STRUCT => AggregateKind::Struct,
+            CAPTURE_KIND_ARRAY => AggregateKind::Array,
+            CAPTURE_KIND_EXNREF => AggregateKind::Exnref,
+            _ => {
+                set_err(Errno::EINVAL);
+                return -1;
+            }
+        };
+        let assembled = (|| -> Result<(), Errno> {
+            let scalars = read_capture_bytes(scalar_ptr, scalar_len)?;
+            let edges = read_capture_u32_array(edges_ptr, edges_count)?;
+            let provenance = if has_provenance != 0 {
+                Some(GcProvenance {
+                    reference_ids: read_capture_u32_array(prov_ptr, prov_count)?,
+                })
+            } else {
+                None
+            };
+            let g = capture_state().as_mut().ok_or(Errno::EINVAL)?;
+            g.define_gc(
+                recipe_id,
+                activation,
+                type_ordinal,
+                layout_id,
+                kind_enum,
+                &scalars,
+                &edges,
+                provenance,
+            )
+        })();
+        capture_ok_void(assembled)
+    }
+
+    /// Open a reference-vector builder, returning its handle (`>= 0`).
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_capture_begin_vector() -> i32 {
+        match capture_state().as_mut() {
+            Some(g) => capture_ok_id(g.begin_vector()),
+            None => {
+                set_err(Errno::EINVAL);
+                -1
+            }
+        }
+    }
+
+    /// Append a recipe id to an open vector builder. Returns `0` or `-1`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_capture_append_vector(handle: u32, recipe_id: u32) -> i32 {
+        match capture_state().as_mut() {
+            Some(g) => capture_ok_void(g.append_vector(handle, recipe_id)),
+            None => {
+                set_err(Errno::EINVAL);
+                -1
+            }
+        }
+    }
+
+    /// Finish an open vector builder, interning it and returning its stable
+    /// ordinal (`>= 1`; identical vectors dedup to one ordinal).
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_capture_finish_vector(handle: u32) -> i32 {
+        match capture_state().as_mut() {
+            Some(g) => capture_ok_id(g.finish_vector(handle)),
+            None => {
+                set_err(Errno::EINVAL);
+                -1
+            }
+        }
+    }
+
+    /// Validate the built graph as a canonical, sealable capture (no pending GC
+    /// placeholder, no open vector, every edge names an existing recipe). Returns
+    /// `0` or `-1`. `fm_capture_serialize` validates too; this lets the host gate
+    /// early, mirroring the TS `validateCanonicalCapture`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_capture_validate() -> i32 {
+        match capture_state().as_ref() {
+            Some(g) => match g.validate() {
+                Ok(()) => {
+                    set_ok();
+                    0
+                }
+                Err(e) => {
+                    set_err(e);
+                    -1
+                }
+            },
+            None => {
+                set_err(Errno::EINVAL);
+                -1
+            }
+        }
+    }
+
+    /// Serialize the built graph into a module-owned KFRV/KFRS record stream and
+    /// return its guest address (0 on failure; reason in `fm_capture_last_errno`).
+    /// The stream is a sequence of records, each `CAPTURE_RECORD_HEADER` bytes
+    /// (`u16 kind, u16 reserved, u32 activation_id, u32 owner_id, u32 payload_len`)
+    /// followed by `payload_len` payload bytes, in the exact emit order of the
+    /// shared `ReferenceSegmentsWriter` (five KFRS sections then the KFRV
+    /// manifest). The host drains each record into its module-state arena via
+    /// `appendRecord({kind, activationId, ownerId, payload})` — the same records
+    /// the TS `appendSegmentedForkReferenceTransaction` emitted, now from the ONE
+    /// shared writer. `fm_capture_serialized_len` reports the stream length.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_capture_serialize(owner_id: u32, segment_data_bytes: usize) -> usize {
+        let built = (|| -> Result<Vec<u8>, Errno> {
+            let g = capture_state().as_ref().ok_or(Errno::EINVAL)?;
+            let writer = ReferenceSegmentsWriter::new(owner_id, segment_data_bytes)?;
+            let mut stream: Vec<u8> = Vec::new();
+            let mut sink =
+                |kind: u16, activation_id: u32, owner: u32, payload: &[u8]| -> Result<(), Errno> {
+                    let len = u32::try_from(payload.len()).map_err(|_| Errno::EINVAL)?;
+                    stream.extend_from_slice(&kind.to_le_bytes());
+                    stream.extend_from_slice(&0u16.to_le_bytes());
+                    stream.extend_from_slice(&activation_id.to_le_bytes());
+                    stream.extend_from_slice(&owner.to_le_bytes());
+                    stream.extend_from_slice(&len.to_le_bytes());
+                    stream.extend_from_slice(payload);
+                    Ok(())
+                };
+            writer.write(&mut sink, g)?;
+            Ok(stream)
+        })();
+        match built {
+            Ok(stream) => {
+                let ptr = stream.as_ptr() as usize;
+                // SAFETY: single-threaded per worker; root the bytes so the
+                // returned pointer stays valid while the host drains the records.
+                unsafe {
+                    *CAPTURE_SERIALIZED.0.get() = Some(stream);
+                }
+                set_ok();
+                ptr
+            }
+            Err(e) => {
+                set_err(e);
+                0
+            }
+        }
+    }
+
+    /// The byte length of the record stream `fm_capture_serialize` last produced,
+    /// or 0 if none is live. The header of each record is `CAPTURE_RECORD_HEADER`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_capture_serialized_len() -> usize {
+        // SAFETY: single-threaded per worker.
+        match unsafe { &*CAPTURE_SERIALIZED.0.get() } {
+            Some(stream) => stream.len(),
+            None => 0,
+        }
+    }
+
+    /// The record-stream header size (bytes) preceding each record's payload.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_capture_record_header_size() -> i32 {
+        CAPTURE_RECORD_HEADER as i32
+    }
+
+    /// Monotonic count of coordinates the module has interned into the shared
+    /// capture builder since worker start (Path B P3). Proof-of-use for the
+    /// CAPTURE flip: a value greater than its pre-fork reading proves the parent
+    /// routed reference capture through the ONE shared builder; a silent fallback
+    /// to the TypeScript capture graph leaves it unchanged. Never resets.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_capture_interned() -> i64 {
+        CAPTURE_INTERNED.load(Ordering::Relaxed) as i64
     }
 
     /// The sticky errno of the most recent export call (0 == success).
