@@ -130,6 +130,7 @@ import {
   type ForkExceptionReferenceReplayImports,
   type ForkExceptionProvider,
 } from "./fork-exception-provider";
+import { assertForkModuleExnrefTagsDeclared } from "./fork-module-exnref-admission";
 import { ForkEarlyChildReferenceProvider } from "./fork-early-reference-provider";
 import {
   decodeSegmentedForkReferenceTransaction,
@@ -4371,25 +4372,72 @@ export async function centralizedWorkerMain(
         // reconstructs the entire reference kind set (null / funcref / externref /
         // i31 / exnref / struct / array / static-root; see
         // `fork-module/src/lib.rs` "the whole reference kind set the module
-        // reconstructs"), and `fm_begin_reference_replay` re-checks each kind and
-        // fails loud (`EOPNOTSUPP`) on a genuine host/module disagreement, so the
-        // host-side per-kind check was redundant defense-in-depth for a fallback
-        // that no longer exists. Whenever the module instantiated for this child
-        // it now owns the whole reference graph: wire decode (module-internal
+        // reconstructs"). The kind-set the module admits is NOT a fresh
+        // engine-floor callback per kind; the module re-checks most kinds and
+        // fails loud where IT can see the fault — GC layout validity in
+        // `GcCodecHints::require_layout` (`EINVAL`) and externref
+        // production-provenance in `fm_begin_reference_replay`. Two validity checks
+        // remain HOST-OWNED by the module's own contract
+        // (`fork_codec::reference_replay.rs:210-212, 261-263` — "a check it alone
+        // can see"): the GC-descriptor layout gate (still enforced by the module's
+        // `require_layout`) and the EXNREF exception-descriptor tag gate. The
+        // module has NO exception-codec seeding, so it CANNOT re-check that an
+        // exnref recipe's tag is declared by its owning activation; that check is
+        // restored below as a fail-loud host boundary
+        // (`assertForkModuleExnrefTagsDeclared`), NOT as a JS reconstruction
+        // fallback. Whenever the module instantiated for this child it owns the
+        // whole reference graph: wire decode (module-internal
         // `fork_codec::reference_segments`, seeded from the KFMS arena by
         // `fm_begin_reference_replay`), the full topological drive-order
         // (`fm_build_gc_plan` + `fm_drive_execute` over `drive_plan` Phase
         // 0/0b/3-5 — static-root publish, EVERY externref transit publish, then
         // typed allocate/fill/exn), and every `fm_ref_*` restore data feed. The
         // `decodedChildReferences` decode the host keeps is used only for
-        // host-side WIRING (funcref/static-root catalog mirror seeding), not for
-        // reconstruction. Multi-activation (dlopen) forks are covered identically:
-        // the merged, activation-namespaced funcref/static-root catalogs resolve
-        // each node against its owning activation.
+        // host-side WIRING (funcref/static-root catalog mirror seeding + the
+        // exnref tag gate below), not for reconstruction. Multi-activation
+        // (dlopen) forks are covered identically: the merged, activation-
+        // namespaced funcref/static-root catalogs resolve each node against its
+        // owning activation.
         moduleReferenceKindsSupported =
           useForkModule &&
           forkModuleInstance !== null &&
           decodedChildReferences !== null;
+        // HOST-OWNED exnref tag-validity boundary (see
+        // `fork-module-exnref-admission.ts` for the full contract). The module
+        // cannot re-check exnref tag validity — it has no exception-codec seeding
+        // and `GcCodecHints`'s exnref arm assigns the DRIVE_OP_EXN owner
+        // unconditionally — so a corrupt / mismatched exnref recipe would
+        // otherwise be `call_indirect`-driven blindly. Fail loud here instead
+        // (EINVAL), before the module drives reconstruction, so the parent's fork
+        // child dies truthfully rather than silently mis-reconstructing an
+        // exception value. Normal forks always name a declared tag, so this never
+        // fires on a well-formed fork. Survives P6 (host glue).
+        if (moduleReferenceKindsSupported && decodedChildReferences) {
+          const declaredExnrefTags = new Map<number, ReadonlySet<number>>(
+            declarations.map((declaration) => [
+              declaration.activationId,
+              new Set(
+                declaration.exceptionDescriptor.tags.map((tag) => tag.tagOrdinal),
+              ),
+            ]),
+          );
+          const exnrefNodes = [...decodedChildReferences.graph.nodes].flatMap(
+            (entry) =>
+              entry.node.kind === "exnref"
+                ? [
+                    {
+                      moduleActivation: entry.node.moduleActivation,
+                      tagOrdinal: entry.node.tagOrdinal,
+                    },
+                  ]
+                : [],
+          );
+          assertForkModuleExnrefTagsDeclared(
+            declaredExnrefTags,
+            exnrefNodes,
+            `pid=${pid}: fork exnref admission`,
+          );
+        }
         earlyChildReferences = new ForkEarlyChildReferenceProvider({
           records,
           transaction: decodedChildReferences,

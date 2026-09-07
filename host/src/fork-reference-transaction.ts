@@ -1558,31 +1558,17 @@ export class ForkReferenceTransaction {
         owner.publishTransit(entry.id, this.materializedValues.get(entry.id));
       }
     }
-    // PHASE B — externref transit publish. UNCONDITIONAL, unlike PHASE A above:
-    // `owner.publishExternref` calls the GUEST program's own generated
-    // `_gc_publish_externref_transit` export directly (`any.convert_extern` +
-    // `table.set` on the shared anyref transit `forkGcTransit` wraps) — it
-    // never routed through any fork-module host capability, so there is no
-    // M2-deleted seam here to avoid double-calling.
-    //
-    // It also cannot be skipped on the module path the way PHASE A can: the
-    // module's own `DRIVE_OP_EXTERNREF_TRANSIT` step (run inside
-    // `fm_drive_execute`, itself gated on `hasModuleDriveNode` below —
-    // struct/array/i31/exnref/static-root, NOT plain "externref") only roots
-    // struct/array/exnref-REACHABLE externref leaves
-    // (`transit_rooted_recipes` seeds from Struct/Array edges). A directly
-    // held externref carried across the fork as a plain reference LOCAL
-    // (restored through the reference-vector feed, `__wpk_fork_ref_vector_get`
-    // + `__wpk_fork_ref_decode_externref`) is not struct/array/exnref-reachable
-    // and so is never covered by that drive step, on OR off the module path.
-    // Skipping this JS publish for that common case would leave its transit
-    // slot unseeded (a verified regression: the module-path externref fork
-    // test fails with a null/mismatched reconstruction without this loop).
-    // Because `ForkExternrefTokenCache.materialize` is idempotent, republishing
-    // a struct/array-reachable leaf here after the module's own drive step
-    // already rooted it is a safe, redundant no-op (same canonical token),
-    // not a correctness risk — so this loop always runs, on both the flag-off
-    // and module-backed paths.
+    // PHASE B — externref transit publish (FLAG-OFF JS path only; the module-sole
+    // branch at the top of this method returned before here). `owner.publishExternref`
+    // calls the GUEST program's own generated `_gc_publish_externref_transit`
+    // export directly (`any.convert_extern` + `table.set` on the shared anyref
+    // transit `forkGcTransit` wraps). It publishes EVERY externref node, incl. a
+    // directly held externref carried as a plain reference LOCAL (restored through
+    // the reference-vector feed, `__wpk_fork_ref_vector_get` +
+    // `__wpk_fork_ref_decode_externref`), which no reachability walk would reach.
+    // On the MODULE path this JS loop does not run: the co-resident module's
+    // `drive_plan` Phase 0b is the same UNCONDITIONAL every-externref pass (see the
+    // module-sole branch above), so it publishes those slots itself.
     for (const entry of this.decodedNodes) {
       if (entry.node.kind !== "externref") continue;
       // Externref leaves must exist before immutable GC constructors or
