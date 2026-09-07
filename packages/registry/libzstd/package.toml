@@ -1,0 +1,27 @@
+# Per-library manifest consumed by `cargo xtask build-deps`.
+# Decompress-only libzstd (the app only decompresses embedded assets); the
+# build compiles zstd's official single-file DECODER amalgamation. Compress is
+# intentionally absent — see docs/posix-status.md.
+kind = "library"
+
+name = "libzstd"
+version = "1.5.6"
+kernel_abi = 7
+depends_on = []
+arches = ["wasm32", "wasm64"]
+
+[source]
+url = "https://github.com/facebook/zstd/archive/refs/tags/v1.5.6.tar.gz"
+sha256 = "30f35f71c1203369dc979ecde0400ffea93c27391bfd2ac5a9715d2173d92ff7"
+provider = "archive"
+
+[license]
+spdx = "BSD-3-Clause OR GPL-2.0-only"
+url = "https://github.com/facebook/zstd/blob/v1.5.6/LICENSE"
+
+[build]
+script_path = "packages/registry/libzstd/build-libzstd.sh"
+
+[outputs]
+libs = ["lib/libzstd.a"]
+headers = ["include/zstd.h"]
