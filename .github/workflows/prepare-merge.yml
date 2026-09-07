@@ -230,7 +230,7 @@ jobs:
       package_staging_required: ${{ steps.route.outputs.package_staging_required }}
       package_staging_reason: ${{ steps.route.outputs.package_staging_reason }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.synthesize-merge.outputs.base_sha }}
           fetch-depth: 0
@@ -273,7 +273,7 @@ jobs:
           base-ref: ${{ needs.synthesize-merge.outputs.base_sha }}
           fetch-base: "false"
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.synthesize-merge.outputs.base_sha }}
           path: abi-staging-authority
@@ -393,7 +393,7 @@ jobs:
       # Approval verification executes trusted base-branch code, never helper
       # code supplied by the pull request receiving the write-capable token.
       - name: Checkout approval verifier
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.synthesize-merge.outputs.base_sha }}
           sparse-checkout: .github/scripts/require-exact-head-approval.sh
@@ -483,7 +483,7 @@ jobs:
           needs.change-scope.outputs.exact_abi_staging_applicable != 'true' &&
           (needs.change-scope.outputs.package_staging_required == 'true' ||
            needs.change-scope.outputs.test_gate_required == 'true')
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # WHY: this selector runs beside a write-capable token. The pull
           # request may change its future behavior, but it cannot replace the
@@ -925,7 +925,7 @@ jobs:
       staging_tag: ${{ steps.compute.outputs.staging_tag }}
       merge_base_sha: ${{ steps.compute.outputs.merge_base_sha }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.synthesize-merge.outputs.base_sha }}
           fetch-depth: 1
@@ -1241,7 +1241,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.synthesize-merge.outputs.base_sha }}
           fetch-depth: 1
@@ -1299,7 +1299,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.preflight.outputs.promote_matrix) }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.synthesize-merge.outputs.base_sha }}
           fetch-depth: 1
@@ -1395,7 +1395,7 @@ jobs:
         include: ${{ fromJSON(needs.preflight.outputs.library_matrix) }}
     steps:
       - id: checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.synthesize-merge.outputs.base_sha }}
           fetch-depth: 1
@@ -1516,7 +1516,7 @@ jobs:
         include: ${{ fromJSON(needs.preflight.outputs.program_matrix) }}
     steps:
       - id: checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.synthesize-merge.outputs.base_sha }}
           fetch-depth: 1
@@ -1624,7 +1624,7 @@ jobs:
       BINARY_MATERIALIZATION_CHANGED: ${{ needs.change-scope.outputs.binary_materialization_changed }}
       EXACT_ABI_STAGING_APPLICABLE: ${{ needs.change-scope.outputs.exact_abi_staging_applicable }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.synthesize-merge.outputs.base_sha }}
           fetch-depth: 1
@@ -1751,7 +1751,7 @@ jobs:
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.suite.outputs.skip != 'true'
         with:
           ref: ${{ needs.synthesize-merge.outputs.base_sha }}
@@ -1818,7 +1818,7 @@ jobs:
       actions: read
       contents: read
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.synthesize-merge.outputs.base_sha }}
           fetch-depth: 1
@@ -1885,7 +1885,7 @@ jobs:
               -o host/test/fixtures/deep-wasm-recursion.wasm
           '
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.synthesize-merge.outputs.base_sha }}
           path: abi-staging-authority
@@ -1959,7 +1959,7 @@ jobs:
             route: sortix runtime
             submodules: tests/sortix/os-test
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.synthesize-merge.outputs.base_sha }}
           fetch-depth: 1
@@ -2016,7 +2016,7 @@ jobs:
           name: exact-abi-source-test-workspace
           path: ${{ runner.temp }}/exact-abi-source-test-workspace
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.synthesize-merge.outputs.base_sha }}
           path: abi-staging-authority
@@ -2280,7 +2280,7 @@ jobs:
       STAGING_SHELL_RUN_ID: ${{ needs.staging-shell-snapshot.outputs.run_id }}
       USE_STAGING_SHELL_HANDOFF: "false"
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.synthesize-merge.outputs.base_sha }}
           fetch-depth: 1
@@ -2741,7 +2741,7 @@ jobs:
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.suite.outputs.skip != 'true'
         with:
           ref: ${{ needs.synthesize-merge.outputs.base_sha }}
@@ -3116,7 +3116,7 @@ jobs:
           fi
 
       - name: Checkout candidate lifecycle helpers
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # This job has release-write authority. Execute lifecycle code from
           # the exact trusted base that was synthesized and tested, never from
