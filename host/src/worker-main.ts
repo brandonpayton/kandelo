@@ -133,7 +133,10 @@ import {
   type ForkExceptionReferenceReplayImports,
   type ForkExceptionProvider,
 } from "./fork-exception-provider";
-import { assertForkModuleExnrefTagsDeclared } from "./fork-module-exnref-admission";
+import {
+  assertForkModuleExnrefTagsDeclared,
+  type ForkExnrefNode,
+} from "./fork-module-exnref-admission";
 import { ForkEarlyChildReferenceProvider } from "./fork-early-reference-provider";
 import {
   decodeSegmentedForkReferenceTransaction,
@@ -4411,12 +4414,15 @@ export async function centralizedWorkerMain(
         // (`fm_build_gc_plan` + `fm_drive_execute` over `drive_plan` Phase
         // 0/0b/3-5 — static-root publish, EVERY externref transit publish, then
         // typed allocate/fill/exn), and every `fm_ref_*` restore data feed. The
-        // `decodedChildReferences` decode the host keeps is used only for
-        // host-side WIRING (funcref/static-root catalog mirror seeding + the
-        // exnref tag gate below), not for reconstruction. Multi-activation
-        // (dlopen) forks are covered identically: the merged, activation-
-        // namespaced funcref/static-root catalogs resolve each node against its
-        // owning activation.
+        // `decodedChildReferences` decode the host keeps no longer drives the two
+        // host-side STRUCTURAL consumers — the exnref tag gate and the static-root
+        // catalog mirror seeding both read node kinds + coordinates from the
+        // module's `fm_decoded_*` accessors now (Path-A INC-C) — but it is still
+        // held for the reconstruction WIRING it feeds (`ForkEarlyChildReferenceProvider`
+        // + the continuation `attachChild`), not for the reconstruction algorithm
+        // itself. Multi-activation (dlopen) forks are covered identically: the
+        // merged, activation-namespaced funcref/static-root catalogs resolve each
+        // node against its owning activation.
         moduleReferenceKindsSupported =
           useForkModule &&
           forkModuleInstance !== null &&
@@ -4431,7 +4437,23 @@ export async function centralizedWorkerMain(
         // child dies truthfully rather than silently mis-reconstructing an
         // exception value. Normal forks always name a declared tag, so this never
         // fires on a well-formed fork. Survives P6 (host glue).
-        if (moduleReferenceKindsSupported && decodedChildReferences) {
+        if (
+          moduleReferenceKindsSupported &&
+          decodedChildReferences &&
+          forkModuleBackend
+        ) {
+          // Path-A INC-C: make the MODULE's decoded reference graph resident so
+          // BOTH structural consumers — this exnref tag-validity gate and the
+          // merged static-root catalog mirror seeding below — read node kinds +
+          // coordinates from the module's `fm_decoded_*` accessors instead of
+          // walking the JS `decodeSegmentedForkReferenceTransaction` structure.
+          // One decode here serves both: the resident graph survives the later
+          // attach (which seeds the replay DRIVER, not this read-only graph), and
+          // both consumers run under the same `moduleReferenceKindsSupported`
+          // guard, so the exnref gate always runs when the static-root block does.
+          const nodeCount = forkModuleBackend.decodeReferenceGraph(
+            childArena.rootAddress(),
+          );
           const declaredExnrefTags = new Map<number, ReadonlySet<number>>(
             declarations.map((declaration) => [
               declaration.activationId,
@@ -4440,17 +4462,23 @@ export async function centralizedWorkerMain(
               ),
             ]),
           );
-          const exnrefNodes = [...decodedChildReferences.graph.nodes].flatMap(
-            (entry) =>
-              entry.node.kind === "exnref"
-                ? [
-                    {
-                      moduleActivation: entry.node.moduleActivation,
-                      tagOrdinal: entry.node.tagOrdinal,
-                    },
-                  ]
-                : [],
-          );
+          // WireNodeKind.Exnref (`fork-reference-recipes.ts`): the module's
+          // `fm_decoded_node_kind` returns the same discriminant the JS decode's
+          // `entry.node.kind === "exnref"` filter selected.
+          const WIRE_NODE_KIND_EXNREF = 3;
+          const exnrefNodes: ForkExnrefNode[] = [];
+          for (let index = 0; index < nodeCount; index += 1) {
+            if (
+              forkModuleBackend.decodedNodeKind(index) !== WIRE_NODE_KIND_EXNREF
+            ) {
+              continue;
+            }
+            exnrefNodes.push({
+              moduleActivation:
+                forkModuleBackend.decodedNodeModuleActivation(index),
+              tagOrdinal: forkModuleBackend.decodedNodeOrdinal(index),
+            });
+          }
           assertForkModuleExnrefTagsDeclared(
             declaredExnrefTags,
             exnrefNodes,
@@ -4953,23 +4981,40 @@ export async function centralizedWorkerMain(
           // byte-identical to the raw-ordinal mapping. The mirror is cleared right
           // after the attach drives the plan so it never pins a child root past
           // replay.
-          // `moduleReferenceKindsSupported` (this block's guard) is only true when
-          // the gate iterated `decodedChildReferences.graph.nodes`, so it is
-          // non-null here (the GC-codec seeding above assumes the same fork state).
-          const staticRootNodes = [
-            ...decodedChildReferences!.graph.nodes,
-          ].filter((entry) => entry.node.kind === "static-root");
+          // `moduleReferenceKindsSupported` (this block's guard) is only true on
+          // the module path, where the exnref gate above already made the module's
+          // decoded reference graph resident. Read the static-root nodes from the
+          // module's `fm_decoded_*` accessors (node index == canonical node id)
+          // instead of walking the JS `decodeSegmentedForkReferenceTransaction`
+          // structure. The resident graph survived the intervening guest
+          // instantiation + attach (which seed the replay DRIVER, not this
+          // read-only graph). WireNodeKind.StaticRoot (`fork-reference-recipes.ts`)
+          // is 7 — the same discriminant the JS `entry.node.kind === "static-root"`
+          // filter selected.
+          const WIRE_NODE_KIND_STATIC_ROOT = 7;
+          const decodedNodeCount = forkModuleBackend.decodedNodeCount();
+          const staticRootNodes: { activation: number; ordinal: number }[] = [];
+          for (let index = 0; index < decodedNodeCount; index += 1) {
+            if (
+              forkModuleBackend.decodedNodeKind(index) !==
+              WIRE_NODE_KIND_STATIC_ROOT
+            ) {
+              continue;
+            }
+            staticRootNodes.push({
+              activation: forkModuleBackend.decodedNodeModuleActivation(index),
+              ordinal: forkModuleBackend.decodedNodeOrdinal(index),
+            });
+          }
           if (staticRootNodes.length > 0) {
             const mirror = forkModuleInstance.staticRootCatalog;
             const maxOrdinalByActivation = new Map<number, number>();
             for (const entry of staticRootNodes) {
-              if (entry.node.kind !== "static-root") continue;
-              const activation = entry.node.moduleActivation;
               maxOrdinalByActivation.set(
-                activation,
+                entry.activation,
                 Math.max(
-                  maxOrdinalByActivation.get(activation) ?? 0,
-                  entry.node.staticRootOrdinal,
+                  maxOrdinalByActivation.get(entry.activation) ?? 0,
+                  entry.ordinal,
                 ),
               );
             }
@@ -4986,13 +5031,11 @@ export async function centralizedWorkerMain(
               mirror.grow(staticRootWidth - mirror.length, null);
             }
             for (const entry of staticRootNodes) {
-              if (entry.node.kind !== "static-root") continue;
-              const activation = entry.node.moduleActivation;
               mirror.set(
-                staticRootBase.get(activation)! + entry.node.staticRootOrdinal,
+                staticRootBase.get(entry.activation)! + entry.ordinal,
                 activationRegistry.decodeStaticRoot(
-                  activation,
-                  entry.node.staticRootOrdinal,
+                  entry.activation,
+                  entry.ordinal,
                 ),
               );
             }

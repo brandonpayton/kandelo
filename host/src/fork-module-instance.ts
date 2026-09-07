@@ -192,6 +192,25 @@ export const FORK_MODULE_REQUIRED_EXPORTS = [
   // borrowed-specific work, the child-private replay prefix, stays host floor).
   "fm_attach_child",
   "fm_attach_borrowed_child",
+  // Path-A INC-C (module-owned decoded-graph STRUCTURE readout): make the wire
+  // reference graph resident and read its per-node kind + coordinates from the
+  // module, so the host no longer walks the JS
+  // `decodeSegmentedForkReferenceTransaction` structure for the two structural
+  // consumers (the exnref tag-validity admission gate + the merged static-root
+  // catalog mirror seeding).
+  //  - `fm_decode_reference_graph` decodes the KFMS arena into the resident
+  //    read-only graph and returns its node count (distinct from the replay
+  //    driver `fm_restore_from_arena`/`fm_attach_child` seed; it survives a later
+  //    attach, which does not touch this graph).
+  //  - `fm_decoded_node_count` re-reads that resident node count.
+  //  - `fm_decoded_node_kind` / `fm_decoded_node_module_activation` /
+  //    `fm_decoded_node_ordinal` are the per-node structural accessors (node
+  //    index == canonical node id).
+  "fm_decode_reference_graph",
+  "fm_decoded_node_count",
+  "fm_decoded_node_kind",
+  "fm_decoded_node_module_activation",
+  "fm_decoded_node_ordinal",
   // Static-root binder: admit static-root WasmGC graphs through the module. A
   // DRIVE_OP_STATIC_ROOT drive step publishes each immutable static root into the
   // anyref transit at slot `recipe + 1` via a wasm `table.get(static_root_catalog,

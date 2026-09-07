@@ -377,6 +377,86 @@ export class ForkModuleContinuationBackend {
   }
 
   /**
+   * Path-A INC-C: decode the inherited KFMS module-state arena rooted at
+   * `moduleStateRoot` into the module's RESIDENT read-only reference graph and
+   * return its node count. Distinct from `restoreFromArena`/`attachChild` (which
+   * seed the replay DRIVER): this seeds ONLY the read-only decoded graph so the
+   * host can read node kinds + coordinates from the module (`decodedNodeKind` /
+   * `decodedNodeModuleActivation` / `decodedNodeOrdinal`) instead of walking the
+   * JS `decodeSegmentedForkReferenceTransaction` structure. Reuses the SAME
+   * shared arena decode as the replay entry, so the resident structure is
+   * byte-identical to the JS decode. Reclaims any prior resident graph and
+   * survives a later `attachChild` (which does not touch it), so a pre-instance
+   * decode stays readable across the post-instance attach.
+   */
+  decodeReferenceGraph(moduleStateRoot: number): number {
+    this.requireSetup("decode reference graph");
+    const count = this.toNum(
+      this.exports.fm_decode_reference_graph(this.wptr(moduleStateRoot)),
+    );
+    this.requireOk("fm_decode_reference_graph");
+    return count;
+  }
+
+  /**
+   * The node count of the module's resident decoded reference graph (the
+   * `decodeReferenceGraph` result). Fails loudly (`fm_last_errno`) if no graph is
+   * resident.
+   */
+  decodedNodeCount(): number {
+    this.requireSetup("decoded node count");
+    const count = this.toNum(this.exports.fm_decoded_node_count());
+    this.requireOk("fm_decoded_node_count");
+    return count;
+  }
+
+  /**
+   * The wire node-kind discriminant (`0..=7`: null 0, funcref 1, externref 2,
+   * exnref 3, i31 4, struct 5, array 6, static-root 7) of the resident decoded
+   * graph node at `index` (== canonical node id). Fails loudly if no graph is
+   * resident or `index` is out of range.
+   */
+  decodedNodeKind(index: number): number {
+    this.requireSetup("decoded node kind");
+    // `index` is a `usize` module argument, so it takes the same guest-word
+    // conversion as a pointer (i64 on wasm64, i32 on wasm32).
+    const kind = this.toNum(this.exports.fm_decoded_node_kind(this.wptr(index)));
+    this.requireOk("fm_decoded_node_kind");
+    return kind;
+  }
+
+  /**
+   * The `module_activation` coordinate of the resident decoded graph node at
+   * `index` (funcref/exnref/struct/array/static-root). Fails loudly if no graph
+   * is resident, `index` is out of range, or the node's kind carries no
+   * activation (null/externref/i31) — callers must gate on `decodedNodeKind`.
+   */
+  decodedNodeModuleActivation(index: number): number {
+    this.requireSetup("decoded node module activation");
+    const value = this.toNum(
+      this.exports.fm_decoded_node_module_activation(this.wptr(index)),
+    );
+    this.requireOk("fm_decoded_node_module_activation");
+    return value;
+  }
+
+  /**
+   * The kind-specific ordinal ("second word") of the resident decoded graph node
+   * at `index`: funcref function ordinal, exnref tag ordinal, struct/array type
+   * ordinal, static-root static-root ordinal. Fails loudly if no graph is
+   * resident, `index` is out of range, or the node's kind carries no ordinal
+   * (null/externref/i31) — callers must gate on `decodedNodeKind`.
+   */
+  decodedNodeOrdinal(index: number): number {
+    this.requireSetup("decoded node ordinal");
+    const value = this.toNum(
+      this.exports.fm_decoded_node_ordinal(this.wptr(index)),
+    );
+    this.requireOk("fm_decoded_node_ordinal");
+    return value;
+  }
+
+  /**
    * Execute a drive plan previously built by `restoreFromArena` through the
    * injected `fm_drive_execute` shim. Mirrors `driveTypedGraph`'s count/ptr
    * validation but consumes the PRE-BUILT plan rather than rebuilding it — the
