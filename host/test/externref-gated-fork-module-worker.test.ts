@@ -41,6 +41,23 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runCentralizedProgram } from "./centralized-test-helper";
 import { defineForkExternrefImport } from "../src/fork-externref-import-mailbox";
 import type { ForkHostImportOwnerRuntime } from "../src/fork-host-import-runtime";
+import type { HostDiagnostic } from "../src/host-diagnostic";
+
+// Positive proof-of-use reader: the parent worker reports how many frames the
+// co-resident module committed for its fork (the worker-tail
+// `fork_module_frames` diagnostic). A nonzero count for a gated fork proves the
+// module's OWN abort path drove this fork's unwind — a silent JS fallback never
+// constructs the backend and emits nothing (returns null here).
+function forkModuleFramesCommitted(
+  hostDiagnostics: readonly HostDiagnostic[],
+): number | null {
+  for (const diagnostic of hostDiagnostics) {
+    if (diagnostic.source !== "fork-module") continue;
+    const match = /fork_module_frames=(\d+)/.exec(diagnostic.message);
+    if (match) return Number(match[1]);
+  }
+  return null;
+}
 
 const testDir = dirname(fileURLToPath(import.meta.url));
 const fixtureSource = resolve(
@@ -135,6 +152,20 @@ describe("module-mode gated externref fork aborts cleanly (P4)", () => {
     // No child was ever launched, so the fixture never printed a child marker
     // (it has none) and never spawned a second process — proven by the exit-0
     // parent-only path above.
+
+    // POSITIVE proof-of-use: the module's OWN continuation-journal abort path
+    // drove this gated fork's unwind. The parent worker reports a nonzero
+    // committed-frame count; a silent JS fallback (no module backend) would
+    // emit no `fork-module` frame diagnostic at all (null here). This is what
+    // distinguishes "aborted through the module" from "aborted through the JS
+    // engine that P6 deletes".
+    const framesCommitted = forkModuleFramesCommitted(result.hostDiagnostics);
+    expect(
+      framesCommitted,
+      "expected a fork-module frame proof-of-use diagnostic; the module did " +
+        "not drive the gated fork's abort",
+    ).not.toBeNull();
+    expect(framesCommitted!).toBeGreaterThan(0);
 
     // The gate-hang regression guard: assert an explicit bounded budget, not
     // the 30s timeout. A re-introduced pump/gate hang blows past this with a

@@ -5122,6 +5122,23 @@ export async function centralizedWorkerMain(
               );
               forkResult = -FORK_REFERENCE_EOPNOTSUPP;
               processContinuation.beginAbortReplay(FORK_REFERENCE_EOPNOTSUPP);
+              // Path B P4 proof-of-use: when the co-resident module is enabled,
+              // `beginAbortReplay` above routed through the module's OWN abort
+              // path (`beginModuleAbortReplay` -> `fm_begin_abort`), replaying
+              // the parent's committed frames rather than the JS engine that P6
+              // deletes. Emit the committed-frame count INLINE here — symmetric
+              // with the success branch's inline emission below — so the proof
+              // is deterministic for a gated parent that spawns no child and
+              // may exit immediately (its worker-tail emission can race the
+              // `kernel_exit` teardown). A silent JS-only abort (no module
+              // backend) constructs no backend and emits nothing.
+              if (forkModuleBackend && !initData.isForkChild) {
+                port.postMessage({
+                  type: "fork_module_frames",
+                  pid,
+                  frames: Number(forkModuleBackend.framesCommitted()),
+                } satisfies WorkerToHostMessage);
+              }
               continue;
             }
             const borrowedReplay = Number(forkMode) === PROCESS_FORK_MODE_VFORK

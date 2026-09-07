@@ -98,17 +98,26 @@ constructed child.
 
 ## Known gaps and residuals
 
-- **Module-mode abort for the one remaining gated case.** With
-  `WASM_POSIX_FORK_MODULE=1` set (an opt-in mode, not the default),
-  whether the co-resident fork module's own continuation journal can
-  abort cleanly for the one still-gated case above (rather than the
-  JS `beginAbortReplay` path) was not re-verified as part of the N1
-  Node/browser parity work — all of that work's own module-enabled
-  (`forkModuleEnabled: true`) test coverage exercises fixtures that
-  now succeed rather than gate. A previously-documented "module-mode
-  abort-replay deferred to M8" limitation applied when every one of
-  these kinds was gated; re-confirm before relying on a clean
-  module-mode abort for the residual case.
+- **Module-mode abort for the one remaining gated case — VERIFIED
+  (Path B P4, 2026-09-07).** With `WASM_POSIX_FORK_MODULE=1` set (an
+  opt-in mode, not the default), the one still-gated case above now
+  aborts cleanly through the co-resident fork module's OWN
+  continuation-journal abort path (`beginAbortReplay` ->
+  `beginModuleAbortReplay` -> `fm_begin_abort`), not the JS
+  reconstruction engine that P6 deletes. This is proven end to end on
+  V8 by `host/test/externref-gated-fork-module-worker.test.ts` — the
+  Node/V8 mate of native's
+  `crates/host-native/src/lib.rs::smoke_fork_gated_externref_parent_
+  survives`. Under `forkModuleEnabled: true`, a live host externref
+  minted via `call_indirect` (so the provenance-wrapper pass records
+  nothing and it reaches the gate) forked across `kernel_fork`
+  returns exactly `-EOPNOTSUPP`, spawns no child, leaves the parent's
+  own externref identity intact, completes within a bounded
+  wall-clock budget (guarding the gate-hang regression against a ~30s
+  pump cap), and reports a nonzero co-resident-module committed-frame
+  count (the positive proof the module — not a silent JS fallback —
+  drove the abort). The earlier "module-mode abort-replay deferred to
+  M8" limitation is closed for this residual case.
 - **Host-exception externref payloads remain a narrow, synthetic-only
   path.** A raw host (JS `JSTag`) exception whose payload is an
   externref reconstructs through the retained exception machinery
