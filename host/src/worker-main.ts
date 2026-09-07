@@ -4360,114 +4360,36 @@ export async function centralizedWorkerMain(
             .filter((entry) => entry.exceptionDescriptor !== undefined)
             .map((entry) => entry.activationId)
             .sort((left, right) => left - right)[0] ?? 0xffff_ffff;
-        // Phase 6 D6.4a predicate (widened from D6.3a): this child's references
-        // can be reconstructed through the module iff EVERY graph node is null,
-        // funcref, externref, exnref, or a typed-GC value (struct / array / i31).
-        // Funcref stays the wasm→wasm `table.get` path; externref is re-rooted
-        // through the `wpk_fork_host` engine-floor seam (`host_resolve_externref`
-        // over the broker token cache); an exnref adds NO new engine-floor
-        // callback — its program exception tag is guest-module-local, so the guest
-        // export `__wpk_fork_exception_materialize` does the throw/`catch_ref`, and
-        // the module only roots the exnref's reachable externref payloads through
-        // the anyref transit. Admitting typed GC (D6.4a) ALSO adds no new
-        // engine-floor callback and moves NO drive-order into the module: the fork
-        // side module is instantiated BEFORE the guest exists, so it cannot import
-        // the guest's `_gc_allocate`/`_gc_fill` exports; the PROVEN JS drive-order
-        // (`materializeTypedGraph`) keeps the topological allocate/fill walk plus
-        // cycle-breaking and aliases. The module's only GC job is leaf identity +
-        // transit rooting — PHASE B roots every struct/array-reachable externref
-        // leaf (already brought into production above), and i31 is a scalar leaf.
-        // An exnref is admitted ONLY when its owning activation ships a valid
-        // exception codec descriptor naming the tag; a struct/array is admitted
-        // ONLY when its owning activation ships a GC codec descriptor with the
-        // node's layout — defenses the module cannot see, so the host adds them
-        // here (mirroring the JS drive-order's `validateGcRecipe`, which requires
-        // the same layout before materializing).
-        // static-root is now admitted too: the static-root binder publishes each
-        // immutable root into the anyref transit via a DRIVE_OP_STATIC_ROOT step
-        // (`table.get` the merged catalog mirror + `table.set` transit, both wasm)
-        // — no host seam. So no reference kind remains on the JS path. The module
-        // re-checks the same KIND predicate (and per-activation base seeding) in
-        // `fm_begin_reference_replay`, so a host/module disagreement fails loud
-        // (`EOPNOTSUPP`), never silently.
-        const exceptionDescriptorAdmitsExnref = (
-          activation: number,
-          tagOrdinal: number,
-        ): boolean => {
-          const declaration = declarations.find(
-            (entry) => entry.activationId === activation,
-          );
-          if (!declaration) return false;
-          return declaration.exceptionDescriptor.tags.some(
-            (tag) => tag.tagOrdinal === tagOrdinal,
-          );
-        };
-        // A struct/array is admitted only when its owning activation ships a GC
-        // codec descriptor whose layout the node names — the same gate the JS
-        // drive-order enforces via `ForkGcCodecDescriptor.require(layoutId)` inside
-        // `validateGcRecipe`. Without a valid layout the module cannot be admitted
-        // (the guest still drives the GC fill under the JS order), so it falls back
-        // to the byte-identical JS reference path rather than admitting blindly.
-        const gcDescriptorAdmits = (
-          activation: number,
-          layoutId: number,
-        ): boolean => {
-          const declaration = declarations.find(
-            (entry) => entry.activationId === activation,
-          );
-          if (!declaration || !declaration.gcDescriptor) return false;
-          try {
-            declaration.gcDescriptor.require(layoutId);
-            return true;
-          } catch {
-            return false;
-          }
-        };
+        // P2 (Path B): the co-resident module is the SOLE reconstructor whenever
+        // it is active for this fork — there is no longer a per-kind host
+        // admission gate, and no JS reconstruction fallback behind it. The former
+        // all-or-nothing predicate iterated every graph node and, on a single
+        // unadmitted node (e.g. an exnref whose activation lacked a matching
+        // exception descriptor, or a struct/array whose layout the host could not
+        // pre-validate), routed the WHOLE fork onto the JS reference engine. That
+        // fallback is deleted: native proves the shared module admits and
+        // reconstructs the entire reference kind set (null / funcref / externref /
+        // i31 / exnref / struct / array / static-root; see
+        // `fork-module/src/lib.rs` "the whole reference kind set the module
+        // reconstructs"), and `fm_begin_reference_replay` re-checks each kind and
+        // fails loud (`EOPNOTSUPP`) on a genuine host/module disagreement, so the
+        // host-side per-kind check was redundant defense-in-depth for a fallback
+        // that no longer exists. Whenever the module instantiated for this child
+        // it now owns the whole reference graph: wire decode (module-internal
+        // `fork_codec::reference_segments`, seeded from the KFMS arena by
+        // `fm_begin_reference_replay`), the full topological drive-order
+        // (`fm_build_gc_plan` + `fm_drive_execute` over `drive_plan` Phase
+        // 0/0b/3-5 — static-root publish, EVERY externref transit publish, then
+        // typed allocate/fill/exn), and every `fm_ref_*` restore data feed. The
+        // `decodedChildReferences` decode the host keeps is used only for
+        // host-side WIRING (funcref/static-root catalog mirror seeding), not for
+        // reconstruction. Multi-activation (dlopen) forks are covered identically:
+        // the merged, activation-namespaced funcref/static-root catalogs resolve
+        // each node against its owning activation.
         moduleReferenceKindsSupported =
           useForkModule &&
           forkModuleInstance !== null &&
-          // Phase 6 D7a.1b: multi-activation (dlopen) REFERENCES now reconstruct
-          // through the module via a MERGED, activation-namespaced funcref
-          // catalog (the host lays each activation's catalog at a distinct base
-          // and seeds `fm_set_activation_catalog_base`). The predicate below
-          // iterates EVERY graph node and checks each node's kind against its
-          // OWNING activation's descriptor (`entry.node.moduleActivation`), so it
-          // is already whole-fork and multi-activation aware; the single
-          // `modules.size === 1` gate that kept dlopen references on the JS path
-          // is removed. The whole fork's references still go all-or-nothing (one
-          // flag), so a single unadmitted node keeps the entire fork on the
-          // byte-identical JS reference path.
-          [...decodedChildReferences.graph.nodes].every((entry) => {
-            switch (entry.node.kind) {
-              case "null":
-              case "funcref":
-              case "externref":
-              case "i31":
-                return true;
-              case "exnref":
-                return exceptionDescriptorAdmitsExnref(
-                  entry.node.moduleActivation,
-                  entry.node.tagOrdinal,
-                );
-              case "struct":
-              case "array":
-                return gcDescriptorAdmits(
-                  entry.node.moduleActivation,
-                  entry.node.layoutId ?? 0,
-                );
-              // static-root: the binder publishes each immutable root into the
-              // anyref transit via a DRIVE_OP_STATIC_ROOT step (`table.get` the
-              // merged catalog mirror + `table.set` transit, both wasm) — no host
-              // seam. Admitted whole-fork like every other kind; the module
-              // re-checks (`fm_static_root_slot`) so a disagreeing host can never
-              // drive an un-seeded activation's catalog slice.
-              case "static-root":
-                return true;
-              // Any future kind stays on the byte-identical JS reference path.
-              default:
-                return false;
-            }
-          });
+          decodedChildReferences !== null;
         earlyChildReferences = new ForkEarlyChildReferenceProvider({
           records,
           transaction: decodedChildReferences,

@@ -1437,21 +1437,19 @@ export class ForkReferenceTransaction {
    * dependency edges, exceptions are cached in their owning activation, and
    * mutable fields are filled only after every identity exists.
    *
-   * Phase 6 item 3c: when `moduleDrive` is supplied (a flag-on qualifying child
-   * whose reference graph was admitted through the co-resident fork-module), the
-   * typed allocate/fill/exn topological SUB-LOOP below is replaced by the module
-   * drive (`fm_build_gc_plan` + `fm_drive_execute`). PHASE A/B — the static-root
-   * transit pin and the externref-leaf publish just above it — still runs on the
-   * JS path: the module drive's guest `_gc_allocate`/`_gc_fill` reads those leaves
-   * and roots out of the SAME shared transit table this transaction publishes
-   * them into. `moduleDrive` calls the guest `_gc_allocate`/`_gc_fill`/
-   * `_exception_materialize` exports (via the module's `call_indirect` drive
-   * table) exactly as the JS sub-loop would through `owner.provider(...)`, so the
-   * guest GC state it publishes into the transit table is equivalent; the JS
-   * `allocated`/`filled`/`completedExceptions` bookkeeping (all function-local)
-   * simply never runs, and no consumer downstream of `restoreModuleState` reads
-   * it. When `moduleDrive` is omitted (flag-off, or a non-qualifying fork) this
-   * is byte-identical to before.
+   * P2 (Path B): when `moduleDrive` is supplied (the co-resident fork-module is
+   * active for this child), the module is the SOLE typed reconstructor. It owns
+   * the WHOLE `drive_plan` walk — Phase 0 static-root publish, Phase 0b externref
+   * transit publish (EVERY externref node), then Phase 3-5 defaultable-shell
+   * pre-alloc / allocate-identity / fill — via `fm_build_gc_plan` +
+   * `fm_drive_execute`, driving the guest `_gc_allocate`/`_gc_fill`/
+   * `_exception_materialize` exports through its `call_indirect` drive table. None
+   * of the JS descriptor validation, the PHASE A/B publishes, or the topological
+   * sub-loop below run in that case: they are the flag-off JS path only (P6
+   * deletes them). Earlier this method delegated ONLY the innermost typed sub-loop
+   * to the module and still ran PHASE A/B in JS; the drive-plan Phase 0/0b
+   * widening lets the module do all of it, so it is now the sole reconstructor.
+   * When `moduleDrive` is omitted (flag-off) this is byte-identical to before.
    */
   materializeAllTyped(moduleDrive?: () => void): void {
     this.requirePhase("child-replay", "materialize typed references");
@@ -1470,6 +1468,37 @@ export class ForkReferenceTransaction {
       ) {
         throw new Error(`${this.label} has no typed-reference replay owner`);
       }
+      this.typedMaterialized = true;
+      return;
+    }
+    if (moduleDrive) {
+      // P2 (Path B): MODULE-SOLE typed reconstruction. The co-resident module
+      // owns the ENTIRE typed reconstruction for this fork — no JS reconstruction
+      // runs. Previously this method ran the JS descriptor validation, the PHASE
+      // A static-root publish, the PHASE B externref publish, and the topological
+      // allocate/fill/exn sub-loop, delegating ONLY the innermost typed sub-loop
+      // to the module. Now the module's `fm_build_gc_plan` + `fm_drive_execute`
+      // reproduce the whole `drive_plan` walk: Phase 0 (static-root publish),
+      // Phase 0b (EVERY externref node published into the anyref transit — the
+      // widened pass that supersedes the JS PHASE B special-case for directly held
+      // externref leaves), then Phase 3-5 (defaultable-shell pre-alloc, the
+      // allocate/identity walk with cycle-break, and the fill walk). Kind
+      // admission and per-recipe layout validation are re-checked inside
+      // `fm_begin_reference_replay` / `fm_build_gc_plan`, which fail loud
+      // (`EOPNOTSUPP`/trap) on a genuine disagreement — so the JS validation loop
+      // below is redundant defense for a JS drive that no longer runs.
+      //
+      // The shared anyref transit is SIZED here (the module's injected shim writes
+      // slot `recipe+1` but does not grow the table) to cover every recipe id.
+      // `driveTypedGraph` builds the plan and returns a no-op (0 steps) for a graph
+      // with no drivable node (funcref/null-only), so calling it unconditionally is
+      // safe. A pure-externref graph WITH a typed replay owner drives its Phase 0b
+      // externref publishes through the module here; a pure-externref graph with NO
+      // typed owner took the owner-null early return above and reconstructs its
+      // externref frame locals through the flipped `__wpk_fork_ref_decode_externref`
+      // module import directly (no transit slot needed).
+      owner.prepareTransit(Math.max(0, this.decodedNodes.length - 1));
+      moduleDrive();
       this.typedMaterialized = true;
       return;
     }
@@ -1562,32 +1591,10 @@ export class ForkReferenceTransaction {
       // stores anyref, so a generated Wasm helper performs the conversion.
       owner.publishExternref(entry.id, this.decodeExternref(entry.id));
     }
-    // Phase 6 item 3c production flip: once PHASE A/B (static-root pin + externref
-    // publish) has seeded the shared transit table, hand the typed allocate/fill/
-    // exn topological order to the co-resident fork-module. The module's
-    // `fm_build_gc_plan` reproduces THIS same walk (allocate-all-shells-first,
-    // dependency-ordered constructors, cycle break, then fills) and drives the
-    // guest exports through its `call_indirect` drive table, publishing each
-    // reconstructed identity into the same transit table the JS sub-loop would.
-    // Only run it when there is actually module-drive work: struct/array/i31/exnref
-    // (the typed allocate/fill/exn topological order) OR a static-root (the
-    // DRIVE_OP_STATIC_ROOT publish above is emitted first in the same plan). A
-    // funcref/externref/null-only fork stays on the untouched path and never asks
-    // the module to build an empty plan.
-    if (moduleDrive) {
-      const hasModuleDriveNode = this.decodedNodes.some(({ node }) =>
-        node.kind === "struct"
-        || node.kind === "array"
-        || node.kind === "i31"
-        || node.kind === "exnref"
-        || node.kind === "static-root"
-      );
-      if (hasModuleDriveNode) {
-        moduleDrive();
-        this.typedMaterialized = true;
-        return;
-      }
-    }
+    // P2 (Path B): the module-drive delegation was hoisted to the MODULE-SOLE
+    // branch at the top of this method. Everything from here down is the flag-off
+    // JS reconstruction path ONLY (reached when `moduleDrive` is undefined); it is
+    // slated for deletion in P6 once the flip lands.
     const allocated = new Set(this.adoptedAllocatedTypedRecipes);
     const completedExceptions = new Set(
       this.adoptedMaterializedExceptionRecipes,

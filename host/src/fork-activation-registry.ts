@@ -1712,9 +1712,12 @@ export class ForkActivationRegistry {
       // identity first, while passive data/element segments are still intact
       // for array.new_data/array.new_elem constructors.
       //
-      // Phase 6 item 3c: `typedDrive`, when supplied by the module-backed child
-      // coordinator, replaces the JS typed allocate/fill/exn sub-loop with the
-      // co-resident fork-module drive (PHASE A/B still runs on the JS path).
+      // P2 (Path B): `typedDrive`, when supplied by the module-backed child
+      // coordinator, makes the co-resident fork-module the SOLE typed
+      // reconstructor — it drives the whole `drive_plan` walk (static-root
+      // publish, EVERY externref transit publish, then the typed allocate/fill/
+      // exn order), so no JS reconstruction (validation, PHASE A/B, or the
+      // sub-loop) runs on the module path.
       this.currentReferences().materializeAllTyped(typedDrive);
     }
     for (const activation of this.activations()) {
