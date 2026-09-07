@@ -108,7 +108,15 @@ Key spec fields:
   - the 8 MiB shadow stack, TLS/stack-pointer exports.
   - link Kandelo's `sysroot/lib/crt1.o` + `sysroot/lib/libc.a` +
     `libc/glue/channel_syscall.c`.
-- os/family chosen so `std` selects `sys::pal::unix`.
+- `target-family = ["unix", "wasm"]` (BOTH, deliberately). `unix` makes
+  `std` select `sys::pal::unix`; `wasm` keeps `stdarch`'s wasm SIMD
+  (`core::arch::wasm32`) compiling, which is gated on
+  `target_family = "wasm"`. Declaring only `["unix"]` breaks the `core`
+  build (unresolved `core::arch::wasm32`, conflicting `Simd` impls).
+  Verified in the P2 spike below — this needs no `core`/`stdarch`
+  patch, only the two-element family list.
+- `.json` specs require `-Zjson-target-spec` on the pinned nightly, and
+  `-Zbuild-std` compiles `core`/`alloc`/`std` from `rust-src`.
 
 Invocation: a `wasm32posix-cargo` / `wasm32posix-rustc` SDK wrapper
 (mirroring `sdk/bin/wasm32posix-cc`) injects `--target <spec>.json`,
@@ -226,6 +234,59 @@ workarounds.
 - `pthread_cancel`.
 - Dynamic TLS across `dlopen`.
 - Orphan reparenting to init (kernel gap; may be closed opportunistically).
+
+## Validation log (spike, 2026-09-07)
+
+Executed under `scripts/dev-shell.sh` on the Node host via a minimal
+`NodeKernelHost` runner (see the `perl` finding below for why the stock
+`examples/run-example.ts` was not used). Spike artifacts live in the
+gitignored `.context/rust-p0/`.
+
+**P0 — `no_std` + `core`: PASS.** A `no_std` staticlib exporting
+`__main_argc_argv` (the symbol Kandelo's crt1 calls — Clang's mangling
+of `int main(int, char**)`, which Rust does not emit on its own),
+compiled for `wasm32-unknown-unknown` with
+`-C target-feature=+atomics,+bulk-memory` and
+`-Zbuild-std=core,compiler_builtins` (core rebuilt with atomics so
+`--shared-memory` linking does not reject a feature mismatch), linked by
+the SDK `wasm32posix-cc`, ran on the kernel and printed via `write(1,…)`,
+exit 0. Confirms Rust `wasm32` codegen is link- and run-compatible with
+Kandelo's musl + syscall channel.
+
+**P1 — `alloc`: PASS.** A malloc-backed `#[global_allocator]`
+(`malloc`/`free`/`realloc`, `posix_memalign` for over-aligned requests)
+lit up `Vec`/`String`/`format!`. Built with the custom
+`wasm32-unknown-kandelo.json` spec (`os = "kandelo"`, features in the
+spec) and `-Zbuild-std=core,alloc,compiler_builtins`; printed
+`sum(1..=5) = 15, vec = [1, 2, 3, 4, 5]`, exit 0. Confirms the custom
+target JSON and heap allocation through musl.
+
+**P2 — `std`: reconnaissance done, not yet passing.** Two walls found,
+in order:
+1. `core`/`stdarch` — solved by the `["unix","wasm"]` family list
+   (above); no core patch.
+2. The `libc` crate — `-Zbuild-std=std` now fails inside `libc`
+   (`cannot find linux_like in common`; missing `socklen_t`, `time_t`,
+   `mode_t`, `pthread`, …) because there is no `(wasm32, kandelo)` unix
+   module. std's unix pal is downstream of this and was not yet reached.
+   Strategy: base the fork on the existing `linux_like/.../musl/b32`
+   definitions (Kandelo is musl) and override only where the
+   `libc/musl-overlay/` headers differ. This is the `[patch.crates-io]`
+   libc fork; the `library/std` overlay comes after it compiles.
+
+## Findings surfaced by the spike
+
+- **Missing `kandelo.abi.contract` stamp.** Every SDK-`cc`-linked spike
+  binary drew a kernel warning: the program lacks the
+  `kandelo.abi.contract` custom section the local-build engine emits.
+  Non-fatal in the spike, but the real `wasm32-unknown-kandelo` build
+  step must emit that stamp. Belongs in the ABI-section work.
+- **Pre-existing `run-example` runner bug (not Rust-related).**
+  `examples/run-example.ts` crashes on *any* program — even stock
+  `hello` — because its builtin-program list references the flat
+  `programs/wasm32/perl.wasm`, but `perl` is now a multi-member package
+  requiring `programs/wasm32/perl/perl.wasm`. Worked around with a
+  minimal runner; worth filing/fixing separately.
 
 ## Open items to verify during implementation
 
