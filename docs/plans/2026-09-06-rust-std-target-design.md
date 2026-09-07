@@ -252,6 +252,10 @@ workarounds.
 - Dynamic TLS across `dlopen`.
 - Orphan reparenting to init (kernel gap; may be closed opportunistically).
 
+> **Execution:** this design is being executed via
+> `docs/plans/2026-09-07-rust-std-target-implementation.md`. P0/P1 now
+> live as in-repo fixtures under `programs/rust/`.
+
 ## Validation log (spike, 2026-09-07)
 
 Executed under `scripts/dev-shell.sh` on the Node host via a minimal
