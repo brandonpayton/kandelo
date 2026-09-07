@@ -65,6 +65,13 @@ import {
 } from "./fork-reference-transaction";
 import { ForkExternrefProvenanceTable } from "./fork-externref-provenance";
 import type { ForkReferenceCaptureModule } from "./fork-reference-capture-module";
+import type { ForkActivationExceptionProvider } from "./fork-reference-contracts";
+// Re-home (Path-A INC-C wiring, part 2): the per-activation exception provider
+// contract moved to staying glue so the staying reconstruction floor
+// (`fork-early-reference-provider.ts`) can reference it without importing this
+// deletable engine file. Re-exported so this module's existing importers see an
+// unchanged surface.
+export type { ForkActivationExceptionProvider } from "./fork-reference-contracts";
 import type {
   DecodedSegmentedForkReferenceTransaction,
 } from "./fork-reference-segments";
@@ -113,21 +120,6 @@ export interface ForkActivationTableReplication {
     length: number | bigint,
   ): void;
   /** Release mutation writer ownership after a non-mutating failure/no-op. */
-  abort(): void;
-}
-
-export interface ForkActivationExceptionProvider {
-  /** Throw the exact exception currently rooted in an activation-local slot. */
-  throwSlot(slot: number): never;
-  /** Throw an exception reconstructed from the process recipe graph. */
-  throwRecipe(recipeId: number): never;
-  /** Route a host/JSTag ingress token into the process recipe graph. */
-  encodeIngress(token: number): number;
-  /** Decode/cache a recipe without returning an `exnref` through JavaScript. */
-  materialize?(recipeId: number): void;
-  /** Release transient roots after the outermost replay frame is restored. */
-  clear(): void;
-  /** Release the same roots when capture or replay aborts. */
   abort(): void;
 }
 

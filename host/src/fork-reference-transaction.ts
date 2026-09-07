@@ -50,11 +50,26 @@ import {
   type ForkReferenceScratchAllocate,
   type ForkReferenceScratchDeallocate,
 } from "./fork-reference-scratch";
+import { FORK_HOST_EXCEPTION_ACTIVATION_ID } from "./fork-reference-wire";
+import type {
+  ForkExternrefRecipeProvider,
+  ForkReferenceChildReplayAdoption,
+} from "./fork-reference-contracts";
 
 export type {
   ForkReferenceScratchAllocate,
   ForkReferenceScratchDeallocate,
 } from "./fork-reference-scratch";
+// Re-home (Path-A INC-C wiring, part 2): the host-exception sentinel and the
+// reference-reconstruction contracts moved to staying glue so the staying
+// pre-instantiation floor (`fork-early-reference-provider.ts`) can stop
+// importing this deletable engine file. Re-exported here so this module's
+// existing importers see an unchanged surface.
+export { FORK_HOST_EXCEPTION_ACTIVATION_ID } from "./fork-reference-wire";
+export type {
+  ForkExternrefRecipeProvider,
+  ForkReferenceChildReplayAdoption,
+} from "./fork-reference-contracts";
 
 /**
  * Per-segment copy window for the module's `fm_capture_serialize` (bytes). A
@@ -70,36 +85,10 @@ const FORK_CAPTURE_SEGMENT_WINDOW = 1 << 16;
  */
 export const FORK_REFERENCE_TRANSACTION_OWNER_ID =
   WPK_FORK_REFERENCE_TRANSACTION_OWNER;
-export const FORK_HOST_EXCEPTION_ACTIVATION_ID = 0xffff_ffff;
 // Generated Wasm carries recipe IDs and vector ordinals as raw i32 bits. The
 // host import boundary normalizes signed JavaScript arguments with `>>> 0`, so
 // the complete u32 namespace is available; zero alone is the empty sentinel.
 const MAX_REFERENCE_VECTOR_ORDINAL = 0xffff_ffff;
-
-export interface ForkExternrefRecipeProvider {
-  /**
-   * Move an opaque value under process-owned lifetime management and return
-   * the scalar handle that is safe to copy through the continuation.
-   */
-  capture(value: unknown): number;
-
-  /**
-   * Produce this Worker's canonical token for a process-owned handle.
-   * The real host value remains with the provider's owner.
-   */
-  materialize(handle: number): unknown;
-
-  /**
-   * Lookup-only handle extraction: read a handle back from a value that is
-   * ALREADY self-describing (e.g. a canonical worker-local token), never
-   * minting a new handle for a value with none. Used by
-   * `ForkActivationRegistry.recordExternrefProvenance` (the
-   * `__wpk_fork_ref_provenance_externref` host-import body) so a sound,
-   * never-mint provenance recording never risks `capture()`'s unclaimed-value
-   * fallback.
-   */
-  tryEncode(value: unknown): number | undefined;
-}
 
 export interface ForkExceptionSlotProvider {
   /** Throw the exact exnref held in a Wasm-only scratch slot. */
@@ -145,19 +134,6 @@ export interface ForkTypedReferenceReplayOwner {
  * Adoption transfers those identities and typed-codec milestones so replay
  * never allocates a second object for a recipe already visible to Wasm.
  */
-export interface ForkReferenceChildReplayAdoption {
-  /** Exact decoded KFRV transaction object that produced this state. */
-  readonly transaction: DecodedSegmentedForkReferenceTransaction;
-  /**
-   * Sparse canonical values. A Map is required because `undefined` is a valid
-   * externref and must remain distinct from an unmaterialized recipe.
-   */
-  readonly materializedValues: ReadonlyMap<number, unknown>;
-  readonly allocatedTypedRecipes: ReadonlySet<number>;
-  readonly filledTypedRecipes: ReadonlySet<number>;
-  readonly materializedExceptionRecipes: ReadonlySet<number>;
-}
-
 export interface ForkGcDefinitionProvenance {
   readonly record: ForkGcConstructorProvenance;
   readonly recipeIds: readonly number[];

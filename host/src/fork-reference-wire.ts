@@ -42,6 +42,14 @@ import {
 export const FORK_REFERENCE_TRANSACTION_OWNER_ID =
   WPK_FORK_REFERENCE_TRANSACTION_OWNER;
 
+/**
+ * The reserved `moduleActivation` sentinel a decoded reference node carries when
+ * its exnref is host-owned (a host/JSTag exception) rather than owned by a guest
+ * activation. A wire-level graph sentinel, so it lives with the other reference
+ * wire constants; the deletable engine re-exports it for its existing importers.
+ */
+export const FORK_HOST_EXCEPTION_ACTIVATION_ID = 0xffff_ffff;
+
 export const FORK_REFERENCE_TRANSACTION_VERSION =
   WPK_FORK_REFERENCE_TRANSACTION_VERSION;
 export const FORK_REFERENCE_MANIFEST_SIZE =
