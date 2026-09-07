@@ -380,4 +380,36 @@ describe("ForkReferenceTransaction", () => {
     ).toThrow(/coordinate does not match/);
     child.finishReplay();
   });
+
+  it("fails loud when module capture returns a recipe id beyond the captured-value table", () => {
+    // Path B P3b hardening (finding A): the module assigns dense recipe ids, so
+    // a new node's id must equal the current captured-value length. An id BEYOND
+    // the table means the dense id<->value alignment broke — a later parent
+    // replay would hand the parent a WRONG live reference. That silent identity
+    // corruption must fail loud, never no-op.
+    const fn = makeWasmFunction();
+    // A stub capture module that returns a bogus (too-large) recipe id.
+    const badCaptureModule = {
+      begin(): void {},
+      internFuncref(): number {
+        return 5; // capturedValues.length is 1 after beginCapture — 5 is a gap.
+      },
+    } as unknown as ConstructorParameters<typeof ForkReferenceTransaction>[9];
+    const parent = new ForkReferenceTransaction(
+      makeFunctionCatalog(0, [fn]),
+      makeExternrefs().provider,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      badCaptureModule,
+    );
+    parent.beginCapture();
+    expect(() => parent.encodeFuncref(fn)).toThrow(
+      /alignment is broken/,
+    );
+  });
 });

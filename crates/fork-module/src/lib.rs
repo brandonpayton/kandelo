@@ -891,22 +891,23 @@ mod wasm {
         unsafe { &mut *CAPTURE_STATE.0.get() }
     }
 
-    // Whether a capture session has been ARMED by `fm_capture_begin` but the
-    // shared builder has not yet been created. The builder is created LAZILY on
-    // the first intern rather than eagerly in `fm_capture_begin`, because the
-    // per-fork bump-heap reset in `fm_begin_unwind` runs BETWEEN the host's
-    // `fm_capture_begin` (issued in the fork syscall handler, before the guest
-    // unwinds) and the first reference encode (issued during the unwind, after
-    // `fm_begin_unwind`). Creating the builder eagerly would place its `Vec`/
-    // `BTreeMap` backing in the bump region that `fm_begin_unwind` then reclaims,
-    // corrupting the graph. Arming + lazy creation guarantees the builder is
-    // allocated AFTER the fork's single bump reset, so it survives capture, seal,
-    // and the parent's own `fm_capture_vector_get` replay reads (no further reset
-    // occurs on the parent path).
+    // Whether a capture session is live for the current fork. `fm_capture_begin`
+    // sets this AND creates the builder EAGERLY (see there); `fm_begin_unwind`
+    // consumes it (`swap(0)`) to decide whether it, rather than
+    // `fm_capture_begin`, owns the fork's single bump-heap reset. The builder
+    // must be allocated from a bump that is reset exactly once per fork, at the
+    // true fork start (`fm_capture_begin`), because the guest encodes references
+    // BOTH before and after `fm_begin_unwind`; resetting again in
+    // `fm_begin_unwind` would reclaim the live builder mid-fork. So the builder
+    // survives capture, seal, and the parent's own `fm_capture_vector_get` replay
+    // reads (no further reset occurs on the parent path).
     static CAPTURE_ARMED: AtomicU32 = AtomicU32::new(0);
 
-    /// The resident capture builder, created lazily on first use once armed.
-    /// `Err(EINVAL)` if no capture session is armed (a misordered host call).
+    /// The resident capture builder for the current fork. `fm_capture_begin`
+    /// creates it eagerly; this is the accessor the capture exports use. As a
+    /// defensive fallback it also creates the builder if a session is armed but
+    /// the builder is somehow absent. `Err(EINVAL)` if no capture session is
+    /// armed (a misordered host call).
     #[allow(clippy::mut_from_ref)]
     fn capture_builder() -> Result<&'static mut ReferenceGraphBuilder, Errno> {
         let slot = capture_state();

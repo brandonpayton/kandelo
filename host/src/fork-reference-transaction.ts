@@ -314,6 +314,42 @@ export class ForkReferenceTransaction {
   private recordModuleCapturedValue(id: number, value: unknown): void {
     if (id === this.capturedValues.length) {
       this.capturedValues.push(value);
+      return;
+    }
+    if (id > this.capturedValues.length) {
+      // The module assigns dense recipe ids, so a NEW node's id must equal the
+      // current captured-value length and a dedup hit must be strictly below it.
+      // An id BEYOND the table means the dense id<->value alignment has broken:
+      // a later parent-replay decode would read `capturedValues[id]` and hand the
+      // parent a WRONG (or absent) live reference. That is exactly the silent
+      // identity corruption this whole path must never allow — fail loud.
+      throw new Error(
+        `fork module capture returned recipe id ${id} beyond the captured-value `
+        + `table length ${this.capturedValues.length}; the dense recipe-id / `
+        + `captured-value alignment is broken`,
+      );
+    }
+    // `id < length`: a dedup hit — the value is already recorded at this id.
+  }
+
+  /**
+   * Guard a Wasm-GC structural read that must NEVER be reached during the
+   * PARENT's own replay under module capture. In module mode the parent's GC
+   * values round-trip through the module-owned transit table (their ORIGINAL
+   * live identities), so `routeGc`/`gcPayloadLength` are child-reconstruction
+   * reads only; the module owns the graph and this class's `nodes` table is
+   * empty. Parent identity RELIES on these never firing here — enforce it with
+   * a loud failure rather than silently reading the empty `nodes` and handing
+   * back a wrong (missing) recipe. Mirrors the child-replay-only phase guard on
+   * `loadGc`.
+   */
+  private assertNotModuleParentReplay(operation: string): void {
+    if (this.moduleCapture && this.phase === "parent-replay") {
+      throw new Error(
+        `cannot ${operation} during module-capture parent replay: the parent `
+        + `round-trips Wasm-GC through the transit table, so this structural `
+        + `read must never be reached here`,
+      );
     }
   }
 
@@ -836,6 +872,7 @@ export class ForkReferenceTransaction {
   routeGc(recipeId: number, expectedActivation: number): number {
     assertRecipeId(recipeId);
     this.assertU32(expectedActivation, "GC route activation");
+    this.assertNotModuleParentReplay("route a Wasm-GC recipe");
     const node = this.recipeNode(recipeId);
     if (node?.kind === "i31") return 0;
     if (
@@ -857,6 +894,7 @@ export class ForkReferenceTransaction {
     assertRecipeId(recipeId);
     this.assertU32(expectedActivation, "GC payload activation");
     this.assertU31(expectedLayoutId, "GC payload layout");
+    this.assertNotModuleParentReplay("read a Wasm-GC payload length");
     const node = this.recipeNode(recipeId);
     if (node?.kind === "i31") {
       if (expectedLayoutId !== 0) {
