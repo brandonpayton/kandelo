@@ -10,6 +10,8 @@ link against musl → syscall channel → kernel).
 - `std-hello/` — P2: a full-`std` program with a normal `fn main`
   (bin crate, SDK-linked directly) exercising stdio, args, env, fs,
   time, and HashMap on the kernel.
+- `thread-demo/` — P4: std::thread + std::sync::Mutex/Arc (pthread ->
+  clone, futex-backed locking), deterministic shared-counter total.
 
 Build/run: see `sdk/rust/README.md`. Run with
 `npx tsx examples/run-wasm.ts <fixture>/<name>.wasm` (a self-contained
