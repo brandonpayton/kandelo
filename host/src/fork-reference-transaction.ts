@@ -38,6 +38,7 @@ import { ForkStaticRootCatalog } from "./fork-static-root-catalog";
 import type { ForkExternrefProvenanceTable } from "./fork-externref-provenance";
 import {
   FORK_CAPTURE_KIND_ARRAY,
+  FORK_CAPTURE_KIND_EXNREF,
   FORK_CAPTURE_KIND_STRUCT,
   type ForkReferenceCaptureModule,
 } from "./fork-reference-capture-module";
@@ -1477,6 +1478,13 @@ export class ForkReferenceTransaction {
     this.requirePhase("capture", "look up an exception identity");
     const value = this.exceptionValue(provider, slot);
     const known = this.lookupExceptionId(value);
+    if (this.moduleCapture) {
+      // The module owns the graph; a known id is an exnref iff it carries an
+      // exception cache index (assigned only to exnref recipes).
+      return known !== undefined && this.exceptionCacheIndexes.has(known)
+        ? known
+        : 0;
+    }
     return known !== undefined && this.nodes.get(known)?.node.kind === "exnref"
       ? known
       : 0;
@@ -1489,6 +1497,23 @@ export class ForkReferenceTransaction {
     this.requirePhase("capture", "claim an exception identity");
     const value = this.exceptionValue(provider, slot);
     const known = this.lookupExceptionId(value);
+    if (this.moduleCapture) {
+      // Already an exnref this capture (cache index assigned) — reuse its id.
+      if (known !== undefined && this.exceptionCacheIndexes.has(known)) {
+        return known;
+      }
+      // Claim a fresh placeholder in the shared builder (redefined as exnref by
+      // defineException). The externref->exnref upgrade-in-place case (a value
+      // first seen as externref, then as exnref) is not expressible against the
+      // module graph and is out of scope here; a fresh claim keeps the common
+      // path sound.
+      const id = this.captureModule!.claimGc();
+      this.recordModuleCapturedValue(id, value);
+      this.rememberExceptionId(value, id);
+      this.pendingExceptions.add(id);
+      this.exceptionCacheIndexes.set(id, this.exceptionCacheIndexes.size + 1);
+      return id;
+    }
     if (known !== undefined) {
       const existing = this.nodes.get(known)?.node;
       if (existing?.kind === "exnref") return known;
@@ -1648,6 +1673,46 @@ export class ForkReferenceTransaction {
     referenceCount: number,
   ): void {
     this.requirePhase("capture", "define an exception recipe");
+    if (this.moduleCapture) {
+      if (recipeId === 0) {
+        throw new Error("the null recipe cannot be defined as an exception");
+      }
+      this.assertU32(moduleActivation, "exception module activation");
+      this.assertU32(tagOrdinal, "exception tag ordinal");
+      this.assertU31(layoutId, "exception layout id");
+      if (!this.pendingExceptions.has(recipeId)) {
+        throw new Error(`fork exception recipe ${recipeId} is not pending definition`);
+      }
+      const payloads = this.readRecipeIds(
+        referenceIdsPointer,
+        referenceCount,
+        "fork exception reference payloads",
+      );
+      // Intern the payload recipe ids as a module vector (ordinal 0 = empty).
+      let vectorOrdinal = 0;
+      if (payloads.length > 0) {
+        const handle = this.captureModule!.beginVector();
+        for (const payload of payloads) {
+          this.captureModule!.appendVector(handle, payload);
+        }
+        vectorOrdinal = this.captureModule!.finishVector(handle);
+      }
+      this.captureModule!.defineGc({
+        recipeId,
+        activation: moduleActivation,
+        typeOrdinal: tagOrdinal,
+        layoutId,
+        kind: FORK_CAPTURE_KIND_EXNREF,
+        scalarPtr: Number(scalarPointer),
+        scalarLen: scalarByteLength,
+        referenceVectorOrdinal: vectorOrdinal,
+        hasProvenance: false,
+        provPtr: 0,
+        provCount: 0,
+      });
+      this.pendingExceptions.delete(recipeId);
+      return;
+    }
     this.assertExceptionCoordinate(
       recipeId,
       moduleActivation,

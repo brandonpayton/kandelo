@@ -29,6 +29,7 @@ export interface ForkCaptureRecord {
 /** GC aggregate kind discriminants `defineGc` accepts (mirror the module). */
 export const FORK_CAPTURE_KIND_STRUCT = 1;
 export const FORK_CAPTURE_KIND_ARRAY = 2;
+export const FORK_CAPTURE_KIND_EXNREF = 3;
 
 /**
  * Thin, stateful wrapper over the `fm_capture_*` exports of ONE resident
