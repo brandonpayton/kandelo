@@ -132,17 +132,34 @@ vendored monorepo.
 
 Two out-of-tree pieces, both small and both upstreamable.
 
-**`libc` crate fork** (via `[patch.crates-io]`): add a
-`(wasm32, kandelo)` module supplying the types, constants, and
-`extern "C"` signatures the unix pal references — `open/read/write`,
-`stat`/`dirent`, `sockaddr`/`socket` constants, `pthread_*`,
-`sigaction`/`siginfo_t`, `mmap` flags, `poll`/`epoll`, `clock_gettime`,
-`errno` values. These must match Kandelo's `libc/musl-overlay/` headers
-exactly — Kandelo defines its own syscall numbers, so another arch's
-table cannot be reused blindly. Strategy: start from musl's generic
-32-bit definitions, then reconcile each constant against the overlay
-headers. A generator that reads the overlay headers is worth
-considering; this is the single largest data-entry chunk.
+**`libc` crate fork.** Add a `(wasm32, kandelo)` module supplying the
+types, constants, and `extern "C"` signatures the unix pal references —
+`open/read/write`, `stat`/`dirent`, `sockaddr`/`socket` constants,
+`pthread_*`, `sigaction`/`siginfo_t`, `mmap` flags, `poll`/`epoll`,
+`clock_gettime`, `errno` values. These must match Kandelo's
+`libc/musl-overlay/` headers. Because Kandelo *is* musl, reuse the
+`linux_like → linux → musl → b32` definitions (add a `kandelo` arm to
+each dispatch: `src/lib.rs` already routes via `cfg(unix)`;
+`src/unix/mod.rs:2452` selects `linux_like`; the `new/` tree routes musl
+via `target_env = "musl"`), then author a `wasm32` arch leaf under
+`musl/b32` (no wasm32 arch exists there today) and override only the
+constants the overlay headers diverge on.
+
+**CORRECTION (spike, 2026-09-07): the fork CANNOT be delivered via
+`[patch.crates-io]`.** Under `-Zbuild-std`, `std`'s `libc` is resolved
+in a separate sysroot crate graph that a user-project `[patch]` does not
+reach. Verified: a user `[patch.crates-io] libc` warns "patch was not
+used in the crate graph"; even with a direct `libc` dependency added so
+the patch applies to the user crate, `std` still compiled the registry
+`libc` (all build errors pointed at the registry copy; the fork's
+injected `compile_error!` never fired). **Therefore the `libc` fork must
+be wired into the `rust-src` std build itself** — alongside the `std`
+overlay, by pointing `library/Cargo.toml`'s `libc` dependency at the
+vendored fork (or vendoring it into `rust-src`). The `libc` fork is thus
+part of the *same* `rust-src` overlay as the `std` patch, not an
+independent out-of-tree crate. This also means the spike's next step
+mutates a copy of the toolchain's `rust-src`; it must be done against a
+local, reversible copy, never the shared rustup toolchain in place.
 
 **std overlay** (patch to `library/std` in `rust-src`): the minimum to
 make `sys::pal::unix` accept `target_os = "kandelo"`:
@@ -270,9 +287,13 @@ in order:
    `mode_t`, `pthread`, …) because there is no `(wasm32, kandelo)` unix
    module. std's unix pal is downstream of this and was not yet reached.
    Strategy: base the fork on the existing `linux_like/.../musl/b32`
-   definitions (Kandelo is musl) and override only where the
-   `libc/musl-overlay/` headers differ. This is the `[patch.crates-io]`
-   libc fork; the `library/std` overlay comes after it compiles.
+   definitions (Kandelo is musl), add a `wasm32` arch leaf under
+   `musl/b32`, and override only where the `libc/musl-overlay/` headers
+   differ. **Delivery correction:** the fork must be wired into the
+   `rust-src` std build (see Section 2), NOT delivered via user
+   `[patch.crates-io]` — that was proven not to reach std's libc under
+   `-Zbuild-std`. The `library/std` overlay and the `libc` fork are one
+   combined `rust-src` overlay.
 
 ## Findings surfaced by the spike
 
