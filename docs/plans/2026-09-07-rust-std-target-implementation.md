@@ -352,17 +352,23 @@ Requires `RUST_LIBC_UNSTABLE_MUSL_V1_2_3=1`.
 **M4 first cut done** (`941fea22a`): `programs/rust/std-hello` (a `std`
 staticlib linked via the SDK) runs on the kernel — `std::println!`,
 formatting, and a `std::fs` write/read round-trip all succeed, exit 0.
-Verified working in the fixture: `std::println!`, `std::fs`
-round-trip, `std::time` (monotonic `Instant`), and `HashMap`
-(getrandom-seeded SipHash). **KNOWN GAP:** `std::env::args()` is empty
-because the staticlib entry bypasses std's `lang_start`, and on musl
-argv is captured by `lang_start` (musl does not pass argc/argv to
-`.init_array`, so glibc's arg-capture trick does not apply). The fix is
-a normal `fn main` bin entry, which requires SDK-driven linking (bin
-crates fail `rust-lld` on `-lc`/`-lgcc_s`). **This makes the SDK linker
-integration (Milestone 6, Task 6.1) a prerequisite for `std::env::args`
-and `fn main` ergonomics — pull it earlier if generic-CLI arg handling
-is needed before P3–P5.**
+**M4 DONE** (`679e137d3`): the SDK linker integration closed the args
+gap. The std target spec now sets `linker = wasm32posix-cc`,
+`linker-flavor = wasm-lld-cc`, and `entry-name = __main_argc_argv`, so
+rustc drives the SDK driver and a normal `fn main` → `lang_start` entry
+connects to Kandelo's crt1. `cargo build` produces a runnable `.wasm`
+directly (no staticlib / separate link step). The SDK driver drops a
+`-lgcc_s` request (no shared libgcc on wasm); `-lc` handling is
+unchanged; all 70 SDK unit tests pass and the C path is unaffected.
+`programs/rust/std-hello` is now a `fn main` bin crate. Verified on the
+kernel: `std::println!`, `std::env::args` (argc/argv populated),
+`std::env::var`, `std::fs` round-trip, `std::time` (monotonic), and
+`HashMap` (getrandom-seeded). Build requires `-Z unstable-options`
+(for the unstable `wasm-lld-cc` flavor) and
+`RUST_LIBC_UNSTABLE_MUSL_V1_2_3=1`.
+
+Remaining M6 linking work: fold these flags into a `wasm32posix-cargo`
+wrapper (Task 6.1) and emit the `kandelo.abi.contract` stamp (Task 6.2).
 
 ## Milestone 3 — `std` unix pal compiles for `kandelo`
 
