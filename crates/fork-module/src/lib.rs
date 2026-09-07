@@ -2528,6 +2528,115 @@ mod wasm {
         Ok(count)
     }
 
+    // -- Module-owned decoded-graph STRUCTURE readout (orchestration migration
+    //    increment C) -----------------------------------------------------------
+    //
+    // The host's fork wiring (`worker-main.ts`) keeps a `decodedChildReferences`
+    // decode ONLY for two structural consumers that the count/handle-scan
+    // surface above cannot serve: the HOST-owned exnref tag-validity admission
+    // gate (`assertForkModuleExnrefTagsDeclared`, needs each exnref node's
+    // `moduleActivation` + `tagOrdinal`) and the merged static-root catalog
+    // mirror seeding (needs each static-root node's `moduleActivation` +
+    // `staticRootOrdinal`, plus the per-activation max ordinal it derives from
+    // them). These per-node accessors expose exactly that decoded structure over
+    // the resident graph (`fm_decode_reference_graph`), so a later increment can
+    // retire the JS `decodeSegmentedForkReferenceTransaction` structural decode.
+    // The wire format is FROZEN and no new algorithm is introduced: they read
+    // the SAME decoded `ReferenceRecipeNode` the shared `reference_segments.rs`
+    // decode already produced.
+
+    /// The wire node-kind discriminant for a decoded node, mirroring the TS
+    /// `WireNodeKind` const enum (`fork-reference-recipes.ts`) and the writer's
+    /// `KIND_*` constants: null 0, funcref 1, externref 2, exnref 3, i31 4,
+    /// struct 5, array 6, static-root 7. This is the same mapping the segment
+    /// writer uses (`reference_segments_writer.rs`), read back off the decoded
+    /// node so the host can filter the graph by kind exactly as the JS decode's
+    /// `entry.node.kind` string does.
+    fn wire_node_kind(node: &ReferenceRecipeNode) -> u8 {
+        match node {
+            ReferenceRecipeNode::Null => 0,
+            ReferenceRecipeNode::Funcref { .. } => 1,
+            ReferenceRecipeNode::Externref { .. } => 2,
+            ReferenceRecipeNode::Exnref { .. } => 3,
+            ReferenceRecipeNode::I31 { .. } => 4,
+            ReferenceRecipeNode::Struct { .. } => 5,
+            ReferenceRecipeNode::Array { .. } => 6,
+            ReferenceRecipeNode::StaticRoot { .. } => 7,
+        }
+    }
+
+    /// Run `f` against the resident decoded graph node at `index`. A missing
+    /// resident graph or an out-of-range index is a truthful `EINVAL` — never a
+    /// fabricated or wrapped node. Bounded to a closure so the shared borrow of
+    /// the decoded-graph static never escapes.
+    fn with_decoded_node<T>(
+        index: usize,
+        f: impl FnOnce(&ReferenceRecipeNode) -> Result<T, Errno>,
+    ) -> Result<T, Errno> {
+        let transaction = decoded_graph().as_ref().ok_or(Errno::EINVAL)?;
+        let entry = transaction.nodes.get(index).ok_or(Errno::EINVAL)?;
+        f(&entry.node)
+    }
+
+    /// The wire node-kind discriminant (`0..=7`) of the resident decoded graph's
+    /// node at `index`. See `wire_node_kind`.
+    fn decoded_node_kind_impl(index: usize) -> Result<u8, Errno> {
+        with_decoded_node(index, |node| Ok(wire_node_kind(node)))
+    }
+
+    /// The `module_activation` coordinate of the resident decoded graph's node at
+    /// `index`. Defined for the kinds that carry one — funcref, exnref, struct,
+    /// array, static-root; a kind without an activation (null, externref, i31) is
+    /// a truthful `EINVAL`, so the host only queries it after filtering by kind
+    /// (exactly as the exnref gate and static-root seeding do).
+    fn decoded_node_module_activation_impl(index: usize) -> Result<u32, Errno> {
+        with_decoded_node(index, |node| match node {
+            ReferenceRecipeNode::Funcref {
+                module_activation, ..
+            }
+            | ReferenceRecipeNode::Exnref {
+                module_activation, ..
+            }
+            | ReferenceRecipeNode::Struct {
+                module_activation, ..
+            }
+            | ReferenceRecipeNode::Array {
+                module_activation, ..
+            }
+            | ReferenceRecipeNode::StaticRoot {
+                module_activation, ..
+            } => Ok(*module_activation),
+            ReferenceRecipeNode::Null
+            | ReferenceRecipeNode::Externref { .. }
+            | ReferenceRecipeNode::I31 { .. } => Err(Errno::EINVAL),
+        })
+    }
+
+    /// The kind-specific ordinal ("second word") of the resident decoded graph's
+    /// node at `index`: funcref `function_ordinal`, exnref `tag_ordinal`,
+    /// struct/array `type_ordinal`, static-root `static_root_ordinal` — the SAME
+    /// `second` word the segment writer emits (`reference_segments_writer.rs`).
+    /// A kind without an ordinal (null, externref, i31) is a truthful `EINVAL`.
+    /// This is what the host exnref gate reads as `tagOrdinal` and the static-root
+    /// mirror seeding reads as `staticRootOrdinal`.
+    fn decoded_node_ordinal_impl(index: usize) -> Result<u32, Errno> {
+        with_decoded_node(index, |node| match node {
+            ReferenceRecipeNode::Funcref {
+                function_ordinal, ..
+            } => Ok(*function_ordinal),
+            ReferenceRecipeNode::Exnref { tag_ordinal, .. } => Ok(*tag_ordinal),
+            ReferenceRecipeNode::Struct { type_ordinal, .. }
+            | ReferenceRecipeNode::Array { type_ordinal, .. } => Ok(*type_ordinal),
+            ReferenceRecipeNode::StaticRoot {
+                static_root_ordinal,
+                ..
+            } => Ok(*static_root_ordinal),
+            ReferenceRecipeNode::Null
+            | ReferenceRecipeNode::Externref { .. }
+            | ReferenceRecipeNode::I31 { .. } => Err(Errno::EINVAL),
+        })
+    }
+
     /// Seed the reference replay driver/feed from the KFMS arena rooted at
     /// `module_state_root` AND build the whole topological drive plan in ONE
     /// module call, returning the plan's guest address (the `plan_ptr` argument
@@ -4364,6 +4473,77 @@ mod wasm {
             Ok(count) if count <= i32::MAX as u32 => {
                 set_ok();
                 count as i32
+            }
+            Ok(_) => {
+                set_err(Errno::EINVAL);
+                -1
+            }
+            Err(e) => {
+                set_err(e);
+                -1
+            }
+        }
+    }
+
+    /// The wire node-kind discriminant (`0..=7`: null 0, funcref 1, externref 2,
+    /// exnref 3, i31 4, struct 5, array 6, static-root 7) of the resident decoded
+    /// graph's node at `index`, or `-1` (reason in `fm_last_errno`) if no graph is
+    /// resident or `index` is out of range. Mirrors the JS decode's
+    /// `entry.node.kind` so the host can filter the graph by kind. See
+    /// `decoded_node_kind_impl` / `wire_node_kind`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_decoded_node_kind(index: usize) -> i32 {
+        match decoded_node_kind_impl(index) {
+            Ok(kind) => {
+                set_ok();
+                kind as i32
+            }
+            Err(e) => {
+                set_err(e);
+                -1
+            }
+        }
+    }
+
+    /// The `module_activation` coordinate of the resident decoded graph's node at
+    /// `index` (funcref/exnref/struct/array/static-root), or `-1` (reason in
+    /// `fm_last_errno`) if no graph is resident, `index` is out of range, the
+    /// node's kind carries no activation (null/externref/i31), or the value
+    /// exceeds `i32::MAX`. This is the host's `moduleActivation` for the exnref
+    /// admission gate and the static-root catalog mirror seeding. See
+    /// `decoded_node_module_activation_impl`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_decoded_node_module_activation(index: usize) -> i32 {
+        match decoded_node_module_activation_impl(index) {
+            Ok(value) if value <= i32::MAX as u32 => {
+                set_ok();
+                value as i32
+            }
+            Ok(_) => {
+                set_err(Errno::EINVAL);
+                -1
+            }
+            Err(e) => {
+                set_err(e);
+                -1
+            }
+        }
+    }
+
+    /// The kind-specific ordinal of the resident decoded graph's node at `index`
+    /// (funcref `function_ordinal`, exnref `tag_ordinal`, struct/array
+    /// `type_ordinal`, static-root `static_root_ordinal`), or `-1` (reason in
+    /// `fm_last_errno`) if no graph is resident, `index` is out of range, the
+    /// node's kind carries no ordinal (null/externref/i31), or the value exceeds
+    /// `i32::MAX`. This is the host's `tagOrdinal` (exnref admission gate) and
+    /// `staticRootOrdinal` (static-root catalog mirror seeding). See
+    /// `decoded_node_ordinal_impl`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_decoded_node_ordinal(index: usize) -> i32 {
+        match decoded_node_ordinal_impl(index) {
+            Ok(value) if value <= i32::MAX as u32 => {
+                set_ok();
+                value as i32
             }
             Ok(_) => {
                 set_err(Errno::EINVAL);
