@@ -72,6 +72,10 @@ describe("Multi-node Wasm GC reference cycle in a fresh process Worker", () => {
       argv: ["gc-reference-cycle-fresh-worker"],
       timeout: 30_000,
       useDefaultRootfs: false,
+      // Path B flip (P5): the module is the DEFAULT reconstructor, so this
+      // JS-path coverage opts out explicitly (matching the comment above). The
+      // flag-on sibling proves the module reconstructs the same cycle.
+      forkModuleEnabled: false,
     });
 
     expect(

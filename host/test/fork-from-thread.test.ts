@@ -65,6 +65,10 @@ describe("fork-from-non-main-thread", () => {
         // touches the VFS. Keep the pthread fork proof independent of the
         // separately versioned rootfs package rebuild.
         useDefaultRootfs: false,
+        // Path B flip (P5): the module is the DEFAULT reconstructor, so this
+        // "Flag OFF" JS-path coverage opts out explicitly; the flag-on sibling
+        // below proves the module drives the pthread fork frames (proof > 0).
+        forkModuleEnabled: false,
       });
 
       expect(result.exitCode, `stderr=${result.stderr}\nstdout=${result.stdout}`).toBe(0);

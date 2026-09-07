@@ -55,6 +55,11 @@ describe("Wasm GC reference state in a fresh process Worker", () => {
       argv: ["gc-reference-state-fresh-worker"],
       timeout: 30_000,
       useDefaultRootfs: false,
+      // Path B flip (P5): the co-resident module is now the DEFAULT
+      // reconstructor, so this JS-path coverage must opt out explicitly. The
+      // flag-on sibling below proves the module reconstructs this same cyclic
+      // typed-GC identity (proof-of-use non-null).
+      forkModuleEnabled: false,
     });
 
     expect(

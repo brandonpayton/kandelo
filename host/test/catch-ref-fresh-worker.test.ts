@@ -123,11 +123,24 @@ describe("CatchRef fresh process worker replay", () => {
     // The first child calls a non-null funcref reconstructed from the child's
     // static function catalog. The second verifies a nullable externref
     // payload; both values originated in a caught exception recipe.
+    //
+    // Path B flip (P5) BOUNDARY: this is the "narrow, synthetic-only"
+    // exception-carried reference-payload path (docs/fork-reference-support.md
+    // "Host-exception externref payloads remain a narrow, synthetic-only path";
+    // real guest C++ exceptions are scalar). The co-resident module does NOT
+    // yet reconstruct exception-carried reference payloads: the module-capture
+    // branch of `ForkReferenceTransaction.defineExceptionRecipe`
+    // (fork-reference-transaction.ts) validates payload recipe ids against the
+    // JS-only `this.nodes` array, which is empty in module-capture mode, so any
+    // reference-bearing exception throws "fork exception reference payloads
+    // entry N names missing recipe M". Until that P3 capture gap is closed
+    // (tracked for P6), this JS-path coverage opts out of the module default.
     const result = await runCentralizedProgram({
       programPath: referencePayloadProgramPath,
       argv: ["reference-catch-payload-fresh-worker"],
       timeout: 30_000,
       useDefaultRootfs: false,
+      forkModuleEnabled: false,
     });
 
     expect(

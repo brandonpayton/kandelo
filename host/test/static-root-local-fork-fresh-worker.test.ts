@@ -56,6 +56,11 @@ describe("Wasm GC static-root binder in a fresh process Worker", () => {
       argv: ["static-root-local-fork-fresh-worker"],
       timeout: 30_000,
       useDefaultRootfs: false,
+      // Path B flip (P5): the co-resident module is now the DEFAULT
+      // reconstructor, so this JS-path coverage must opt out explicitly. The
+      // flag-on sibling below proves the module reconstructs the same
+      // immutable static root (proof-of-use non-null).
+      forkModuleEnabled: false,
     });
 
     expect(
