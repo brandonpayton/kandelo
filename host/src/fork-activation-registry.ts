@@ -1716,7 +1716,10 @@ export class ForkActivationRegistry {
     this.phase = "child-replay";
   }
 
-  restoreModuleState(typedDrive?: () => void): void {
+  restoreModuleState(
+    typedDrive?: () => void,
+    guestRestoreDriven = false,
+  ): void {
     if (this.phase !== "parent-replay" && this.phase !== "child-replay") {
       throw new Error(
         `${this.label}: cannot restore module state while registry is ${this.phase}`,
@@ -1733,14 +1736,26 @@ export class ForkActivationRegistry {
       // reconstructor — it drives the whole `drive_plan` walk (static-root
       // publish, EVERY externref transit publish, then the typed allocate/fill/
       // exn order), so no JS reconstruction (validation, PHASE A/B, or the
-      // sub-loop) runs on the module path.
+      // sub-loop) runs on the module path. When the drive plan is a module
+      // ATTACH plan (`fm_attach_child`), that same drive continues past the
+      // reconstruction steps into the two-phase guest restore/finish install
+      // below — see `guestRestoreDriven`.
       this.currentReferences().materializeAllTyped(typedDrive);
     }
-    for (const activation of this.activations()) {
-      activation.moduleState.restore(activation.activationId);
-    }
-    for (const activation of this.activations()) {
-      activation.moduleState.finishRestore(activation.activationId);
+    // Child-install SEQUENCING. On the module-on attach path the drive plan the
+    // module built (`fm_attach_child` / `fm_attach_borrowed_child`) already drove
+    // each activation's `restore` then `finishRestore` as `DRIVE_OP_RESTORE` /
+    // `DRIVE_OP_FINISH_RESTORE` steps through the host-bound drive table, so the
+    // MODULE owns the two-phase order and this JS loop must not run again (it
+    // would double-restore). `guestRestoreDriven` is set true only by that path;
+    // the flag-off / reference-free / parent-replay paths keep the JS loop.
+    if (!guestRestoreDriven) {
+      for (const activation of this.activations()) {
+        activation.moduleState.restore(activation.activationId);
+      }
+      for (const activation of this.activations()) {
+        activation.moduleState.finishRestore(activation.activationId);
+      }
     }
   }
 

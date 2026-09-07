@@ -683,17 +683,26 @@ mod wasm {
     /// `_gc_allocate` publishes into. That is a pure wasm `table.get` + `ref.is_null`
     /// in the shim (Rust holds no `anyref`), so this planner opens no host
     /// generation for it and stores no R1 state.
-    fn build_gc_plan_impl(_pid: u32) -> Result<usize, Errno> {
+    /// Build the topological reconstruction steps (Phase 0/0b/3/4/5) for the
+    /// resident reference graph. Shared by `build_gc_plan_impl` and the child-
+    /// install `attach_from_arena_impl` (which appends the restore/finish steps).
+    fn build_reconstruction_steps() -> Result<Vec<drive_plan::DriveStep>, Errno> {
         let driver = reference_state().as_ref().ok_or(Errno::EINVAL)?;
         let nodes = &driver.transaction().nodes;
 
         let gc_codecs = decoded_gc_codecs()?;
         let hints = fork_codec::GcCodecHints::new(nodes, &gc_codecs, host_exception_owner())?;
-        let steps = drive_plan::build_drive_plan(nodes, &hints)?;
+        drive_plan::build_drive_plan(nodes, &hints)
+    }
 
+    /// Serialize `steps` into the module-owned scratch buffer, root the bytes in
+    /// the `DRIVE_PLAN` cell, publish the count via `GC_PLAN_COUNT`, and return the
+    /// plan's guest address for `fm_drive_execute`. Shared by every plan producer
+    /// (only one plan is live at a time).
+    fn serialize_and_store_plan(steps: &[drive_plan::DriveStep]) -> Result<usize, Errno> {
         let mut buf = Vec::new();
         buf.resize(drive_plan::DRIVE_STEP_SIZE * steps.len(), 0u8);
-        drive_plan::serialize_plan(&steps, &mut buf)?;
+        drive_plan::serialize_plan(steps, &mut buf)?;
         let ptr = buf.as_ptr() as usize;
         GC_PLAN_COUNT.store(steps.len() as u32, Ordering::Relaxed);
         // SAFETY: single-threaded per worker; root the backing bytes so the returned
@@ -703,6 +712,11 @@ mod wasm {
             *DRIVE_PLAN.0.get() = Some(buf);
         }
         Ok(ptr)
+    }
+
+    fn build_gc_plan_impl(_pid: u32) -> Result<usize, Errno> {
+        let steps = build_reconstruction_steps()?;
+        serialize_and_store_plan(&steps)
     }
 
     // The step count of the plan `fm_build_gc_plan` last serialized (the `count`
@@ -2533,6 +2547,67 @@ mod wasm {
         build_gc_plan_impl(pid)
     }
 
+    /// The full ordered activation set of the fork, decoded from the inherited
+    /// KFMS arena's `Module` records (kind 1) — one per activation, even for an
+    /// activation that carries no references. Sorted + deduped so the child-install
+    /// restore/finish steps run in a deterministic per-activation order matching
+    /// the host's sorted activation binding. This is the module-owned equivalent of
+    /// the JS `records.filter(kind === Module).map(activationId)` the registry
+    /// validates the fresh child against.
+    fn arena_module_activations(module_state_root: u64) -> Result<Vec<u32>, Errno> {
+        let pw = FMT_POINTER_WIDTH.load(Ordering::Relaxed);
+        if pw == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let chunk_header_size =
+            abi::wpk_fork_module_state_chunk_header_size(pw as u8).ok_or(Errno::EINVAL)?;
+        let fmt = ModuleStateFormat {
+            pointer_width: pw as u8,
+            chunk_header_size,
+        };
+        let mem = unsafe { mem_ref() };
+        let module_state = decode_module_state(mem, module_state_root, &fmt)?;
+        let mut activations: Vec<u32> = module_state
+            .records
+            .iter()
+            .filter(|record| record.kind == abi::WPK_FORK_MODULE_STATE_RECORD_KIND_MODULE)
+            .map(|record| record.activation_id)
+            .collect();
+        activations.sort_unstable();
+        activations.dedup();
+        if activations.is_empty() {
+            // A sealed child arena always carries at least activation 0's Module
+            // record; none means a corrupt/empty arena, not a valid no-op.
+            return Err(Errno::EINVAL);
+        }
+        Ok(activations)
+    }
+
+    /// Child-install ENTRY (the module-owned `fm_attach_child` /
+    /// `fm_attach_borrowed_child`). Seeds the reference replay driver/feed AND
+    /// builds ONE drive plan that first reconstructs the reference graph
+    /// (Phase 0/0b/3/4/5, identical to `restore_from_arena_impl`) and THEN — as the
+    /// child-install tail — drives every activation's guest
+    /// `wpk_fork_module_state_restore` and `wpk_fork_module_state_finish_restore`
+    /// through the host-bound drive table (`append_attach_steps`). This moves the
+    /// JS `ForkActivationRegistry.restoreModuleState` two-phase install SEQUENCING
+    /// into the module: the guest's own layout-specific restore exports still place
+    /// the reconstructed identities into the live child (only the guest knows its
+    /// global/table layout), but the ORDER and DRIVE are now module-owned. Returns
+    /// the plan's guest address; the step count is read from `fm_gc_plan_count`.
+    ///
+    /// The COW (`fm_attach_child`) and vfork borrowed (`fm_attach_borrowed_child`)
+    /// children share this identical install plan: the only borrowed-specific work
+    /// is the host-side child-private replay-prefix reservation (raw memory floor,
+    /// no reference values), so both entries delegate here.
+    fn attach_from_arena_impl(module_state_root: u64, pid: u32) -> Result<usize, Errno> {
+        begin_reference_replay_impl(module_state_root, pid)?;
+        let mut steps = build_reconstruction_steps()?;
+        let activations = arena_module_activations(module_state_root)?;
+        drive_plan::append_attach_steps(&mut steps, &activations);
+        serialize_and_store_plan(&steps)
+    }
+
     // -- Reference RESTORE data-feed helpers (Phase 6 item 3a) ---------------
     //
     // Each helper borrows the immutable transaction from the resident driver and
@@ -4310,6 +4385,51 @@ mod wasm {
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_restore_from_arena(module_state_root: usize, pid: u32) -> usize {
         match restore_from_arena_impl(module_state_root as u64, pid) {
+            Ok(ptr) => {
+                set_ok();
+                ptr
+            }
+            Err(e) => {
+                set_err(e);
+                0
+            }
+        }
+    }
+
+    /// Child-install ENTRY for a COW (`fork`/`posix_spawn`) module-backed child:
+    /// seed the reference replay driver AND build the drive plan whose tail drives
+    /// every activation's guest restore/finish install through the module (see
+    /// `attach_from_arena_impl`). Returns the plan's guest address (0 on failure;
+    /// reason in `fm_last_errno`); the step count is read from `fm_gc_plan_count`.
+    /// Supersedes a separate `fm_restore_from_arena` call on the module-on child
+    /// attach path: it does the same reconstruction seed + plan build and then
+    /// appends the module-owned restore/finish sequencing.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_attach_child(module_state_root: usize, pid: u32) -> usize {
+        match attach_from_arena_impl(module_state_root as u64, pid) {
+            Ok(ptr) => {
+                set_ok();
+                ptr
+            }
+            Err(e) => {
+                set_err(e);
+                0
+            }
+        }
+    }
+
+    /// Child-install ENTRY for a vfork BORROWED module-backed child. The install
+    /// plan is byte-identical to `fm_attach_child`: the reconstructed reference
+    /// values and the guest restore/finish sequencing are the same for a borrowed
+    /// child as for a COW child. The only borrowed-specific work — reserving the
+    /// child-private replay prefix so the guest's rewind never writes the parked
+    /// parent's storage — is raw host memory management (no reference values), so it
+    /// stays on the host and this entry delegates to the shared install impl. It is
+    /// a distinct export so the host has a named borrowed entry point and any future
+    /// borrowed-specific install divergence has a home.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_attach_borrowed_child(module_state_root: usize, pid: u32) -> usize {
+        match attach_from_arena_impl(module_state_root as u64, pid) {
             Ok(ptr) => {
                 set_ok();
                 ptr

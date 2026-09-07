@@ -95,14 +95,46 @@ pub const DRIVE_OP_STATIC_ROOT: u32 = 3;
 /// externref (not reached by a GC/exnref consumer) needs NO step: the guest
 /// import `__wpk_fork_ref_decode_externref` resolves it lazily.
 pub const DRIVE_OP_EXTERNREF_TRANSIT: u32 = 4;
+/// `op` value: run one activation's guest `wpk_fork_module_state_restore(id)`
+/// (the child-install first phase). Like ALLOC/FILL/EXN this is a `(i32) -> ()`
+/// guest export the shim `call_indirect`s, but it drives NO transit and runs NO
+/// store-#2 assert: it reconstructs that activation's GLOBAL/TABLE reference
+/// state (funcref/externref/GC) by reading the values the reconstruction steps
+/// (Phase 0/0b/3/4/5, above) already rooted in the transit and the module's
+/// flipped decode imports. UNLIKE ALLOC/FILL/EXN its op value differs from its
+/// drive-table slot offset (`DRIVE_SLOT_RESTORE`), so the plan carries the slot
+/// explicitly rather than deriving `slot = base + op`. `arg` is the activation
+/// id. Mirrors the JS `restoreModuleState` `activation.moduleState.restore(id)`
+/// loop, moving the install SEQUENCING into the module-owned attach plan.
+pub const DRIVE_OP_RESTORE: u32 = 5;
+/// `op` value: run one activation's guest `wpk_fork_module_state_finish_restore(id)`
+/// (the child-install second phase). Same shape as `DRIVE_OP_RESTORE` (a
+/// `(i32) -> ()` guest export, no transit/assert, `arg` = activation id, slot
+/// carried explicitly via `DRIVE_SLOT_FINISH_RESTORE`). Emitted AFTER every
+/// activation's restore step so the two-phase order matches the JS loop
+/// (`for act: restore` then `for act: finishRestore`).
+pub const DRIVE_OP_FINISH_RESTORE: u32 = 6;
 
-/// Drive-table slots reserved per activation: one ALLOC + one FILL + one EXN.
-/// Each activation `a` binds its `_gc_allocate` at `base(a)+DRIVE_OP_ALLOC`, its
-/// `_gc_fill` at `base(a)+DRIVE_OP_FILL`, and its `__wpk_fork_exception_
-/// materialize` at `base(a)+DRIVE_OP_EXN`. The host reads `fm_drive_table_base`
-/// and binds the guest exports at these offsets, so bumping this count stays
-/// consistent as long as every side derives its slots from `drive_table_base`.
-pub const DRIVE_SLOTS_PER_ACTIVATION: u32 = 3;
+/// Drive-table slots reserved per activation, in slot-offset order:
+/// `DRIVE_OP_ALLOC` (0) + `DRIVE_OP_FILL` (1) + `DRIVE_OP_EXN` (2) +
+/// `DRIVE_SLOT_RESTORE` (3) + `DRIVE_SLOT_FINISH_RESTORE` (4). Each activation
+/// `a` binds its `_gc_allocate`/`_gc_fill`/`__wpk_fork_exception_materialize`/
+/// `wpk_fork_module_state_restore`/`wpk_fork_module_state_finish_restore` at
+/// `base(a)+offset`. The host reads `fm_drive_table_base` and binds the guest
+/// exports at these offsets, so bumping this count stays consistent as long as
+/// every side derives its slots from `drive_table_base`. This is an EPHEMERAL
+/// runtime host<->module table-binding contract (not a wire/ABI format, not
+/// serialized), so growing it is additive.
+pub const DRIVE_SLOTS_PER_ACTIVATION: u32 = 5;
+
+/// Drive-table slot offset (within an activation's slice) the host binds that
+/// activation's `wpk_fork_module_state_restore` into, and a `DRIVE_OP_RESTORE`
+/// step's `slot` field points at. Distinct from `DRIVE_OP_RESTORE` (the op tag)
+/// because ALLOC/FILL/EXN already occupy offsets 0/1/2.
+pub const DRIVE_SLOT_RESTORE: u32 = 3;
+/// Drive-table slot offset the host binds `wpk_fork_module_state_finish_restore`
+/// into (see `DRIVE_SLOT_RESTORE`).
+pub const DRIVE_SLOT_FINISH_RESTORE: u32 = 4;
 
 /// One drive step: which guest export to `call_indirect` (via `slot`) with which
 /// `arg`, tagged by `op` so the shim knows whether to run the R1 assert.
@@ -526,6 +558,41 @@ pub fn build_drive_plan<H: DrivePlanHints>(
     Ok(walk.steps)
 }
 
+/// Append the child-install steps (the module-owned `fm_attach_child` /
+/// `fm_attach_borrowed_child` tail) to a drive plan: one `DRIVE_OP_RESTORE` step
+/// per activation, THEN one `DRIVE_OP_FINISH_RESTORE` step per activation, in the
+/// caller's activation order. This reproduces the JS
+/// `ForkActivationRegistry.restoreModuleState` sequencing —
+/// `for act: moduleState.restore(id)` then `for act: moduleState.finishRestore(id)`
+/// — as module-driven `call_indirect`s over the host-bound drive table, so the
+/// guest's own layout-specific global/table restore exports place the
+/// reconstructed reference identities into the live child while the MODULE owns
+/// the two-phase order.
+///
+/// `activations` is the full ordered activation set (every `Module`-record
+/// activation, not only reference-bearing ones — a reference-free activation in a
+/// multi-activation dlopen fork still restores its globals/tables). The steps are
+/// appended AFTER the reconstruction steps so every restore reads identities the
+/// Phase 0/0b/3/4/5 steps already rooted.
+pub fn append_attach_steps(steps: &mut Vec<DriveStep>, activations: &[u32]) {
+    for &activation in activations {
+        steps.push(DriveStep {
+            op: DRIVE_OP_RESTORE,
+            slot: drive_table_base(activation) + DRIVE_SLOT_RESTORE,
+            recipe: 0,
+            arg: activation,
+        });
+    }
+    for &activation in activations {
+        steps.push(DriveStep {
+            op: DRIVE_OP_FINISH_RESTORE,
+            slot: drive_table_base(activation) + DRIVE_SLOT_FINISH_RESTORE,
+            recipe: 0,
+            arg: activation,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,11 +600,56 @@ mod tests {
 
     #[test]
     fn drive_table_base_reserves_slots_per_activation() {
-        // Three slots per activation (ALLOC, FILL, EXN).
-        assert_eq!(DRIVE_SLOTS_PER_ACTIVATION, 3);
+        // Five slots per activation (ALLOC, FILL, EXN, RESTORE, FINISH_RESTORE).
+        assert_eq!(DRIVE_SLOTS_PER_ACTIVATION, 5);
         assert_eq!(drive_table_base(0), 0);
-        assert_eq!(drive_table_base(1), 3);
-        assert_eq!(drive_table_base(3), 9);
+        assert_eq!(drive_table_base(1), 5);
+        assert_eq!(drive_table_base(3), 15);
+    }
+
+    #[test]
+    fn append_attach_steps_emits_restore_then_finish_per_activation() {
+        let mut steps = Vec::new();
+        append_attach_steps(&mut steps, &[0, 2]);
+        // Phase 1: restore for every activation, in order.
+        assert_eq!(
+            steps[0],
+            DriveStep {
+                op: DRIVE_OP_RESTORE,
+                slot: drive_table_base(0) + DRIVE_SLOT_RESTORE,
+                recipe: 0,
+                arg: 0,
+            }
+        );
+        assert_eq!(
+            steps[1],
+            DriveStep {
+                op: DRIVE_OP_RESTORE,
+                slot: drive_table_base(2) + DRIVE_SLOT_RESTORE,
+                recipe: 0,
+                arg: 2,
+            }
+        );
+        // Phase 2: finish-restore for every activation, in order.
+        assert_eq!(
+            steps[2],
+            DriveStep {
+                op: DRIVE_OP_FINISH_RESTORE,
+                slot: drive_table_base(0) + DRIVE_SLOT_FINISH_RESTORE,
+                recipe: 0,
+                arg: 0,
+            }
+        );
+        assert_eq!(
+            steps[3],
+            DriveStep {
+                op: DRIVE_OP_FINISH_RESTORE,
+                slot: drive_table_base(2) + DRIVE_SLOT_FINISH_RESTORE,
+                recipe: 0,
+                arg: 2,
+            }
+        );
+        assert_eq!(steps.len(), 4);
     }
 
     #[test]
@@ -555,10 +667,10 @@ mod tests {
 
     #[test]
     fn trivial_struct_plan_uses_the_activation_base_slots() {
-        // Activation 2 -> base 6 (3 slots/activation): ALLOC slot 6, FILL slot 7.
+        // Activation 2 -> base 10 (5 slots/activation): ALLOC slot 10, FILL slot 11.
         let plan = trivial_struct_plan(2, 9);
-        assert_eq!(plan[0].slot, 6);
-        assert_eq!(plan[1].slot, 7);
+        assert_eq!(plan[0].slot, 10);
+        assert_eq!(plan[1].slot, 11);
     }
 
     #[test]
@@ -892,9 +1004,10 @@ mod tests {
                 (DRIVE_OP_FILL, drive_table_base(2) + DRIVE_OP_FILL, 1),
             ]
         );
-        // Activation 5's base (15) and activation 2's base (6) do not overlap.
-        assert_eq!(drive_table_base(5), 15);
-        assert_eq!(drive_table_base(2), 6);
+        // Activation 5's base (25) and activation 2's base (10) do not overlap
+        // (five slots per activation).
+        assert_eq!(drive_table_base(5), 25);
+        assert_eq!(drive_table_base(2), 10);
     }
 
     #[test]

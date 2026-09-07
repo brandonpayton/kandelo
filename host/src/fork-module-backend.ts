@@ -338,6 +338,45 @@ export class ForkModuleContinuationBackend {
   }
 
   /**
+   * Child-install ENTRY for a COW module-backed child (Phase 6). Seeds the
+   * reference replay driver from the inherited KFMS arena AND builds ONE drive
+   * plan whose tail drives every activation's guest
+   * `wpk_fork_module_state_restore` / `wpk_fork_module_state_finish_restore`
+   * through the host-bound drive table — moving the JS `restoreModuleState`
+   * two-phase install SEQUENCING into the module. Supersedes `restoreFromArena`
+   * on the module-on child attach path: same reconstruction seed + plan build,
+   * plus the appended restore/finish steps. Returns the plan's guest address for
+   * `driveRestoredPlan` (the step count includes the restore/finish steps and is
+   * read from `fm_gc_plan_count`). A missing driver, un-seeded GC activation, or
+   * malformed arena is a truthful throw.
+   */
+  attachChild(moduleStateRoot: number): number {
+    this.requireSetup("attach child");
+    const planPtr = this.toNum(
+      this.exports.fm_attach_child(this.wptr(moduleStateRoot), this.pid),
+    );
+    this.requireOk("fm_attach_child");
+    return planPtr;
+  }
+
+  /**
+   * Child-install ENTRY for a vfork BORROWED module-backed child. The install
+   * plan is byte-identical to `attachChild`; the only borrowed-specific work (the
+   * child-private replay-prefix reservation) is raw host memory management handled
+   * by the coordinator, not this module call. Kept as a distinct entry so the
+   * borrowed path is explicit and future borrowed-specific install divergence has
+   * a home.
+   */
+  attachBorrowedChild(moduleStateRoot: number): number {
+    this.requireSetup("attach borrowed child");
+    const planPtr = this.toNum(
+      this.exports.fm_attach_borrowed_child(this.wptr(moduleStateRoot), this.pid),
+    );
+    this.requireOk("fm_attach_borrowed_child");
+    return planPtr;
+  }
+
+  /**
    * Execute a drive plan previously built by `restoreFromArena` through the
    * injected `fm_drive_execute` shim. Mirrors `driveTypedGraph`'s count/ptr
    * validation but consumes the PRE-BUILT plan rather than rebuilding it — the

@@ -114,6 +114,14 @@ const DRIVE_OP_STATIC_ROOT: i32 = 3;
 /// it with `any.convert_extern`, and `table.set`s it into the transit. MUST match
 /// `fork_codec::drive_plan::DRIVE_OP_EXTERNREF_TRANSIT`.
 const DRIVE_OP_EXTERNREF_TRANSIT: i32 = 4;
+/// op == the FIRST child-install op (`fork_codec::drive_plan::DRIVE_OP_RESTORE`).
+/// Every op `< DRIVE_OP_RESTORE` is a RECONSTRUCTION step (alloc/fill/exn/static-
+/// root/externref-transit) whose drive the `fm_drive_steps_executed` proof
+/// counts; ops `>= DRIVE_OP_RESTORE` (RESTORE / FINISH_RESTORE) are the
+/// module-owned guest install-sequencing steps, which are NOT reconstruction and
+/// must NOT bump that counter (it gates the "reference-free fork stays silent"
+/// diagnostic). The shim still `call_indirect`s them; it just skips the bump.
+const DRIVE_OP_RESTORE: i32 = 5;
 
 /// The Rust helper the injected shim calls to map a recipe id to a catalog
 /// ordinal (or the null sentinel). Exported by `crates/fork-module/src/lib.rs`.
@@ -480,10 +488,6 @@ fn inject_drive_execute(module: &mut Module) -> Result<()> {
             |_done| {},
             // i < count: drive one step, then re-enter the loop.
             |work| {
-                // Proof-of-use (Phase 6 item 3c): count every step the MODULE
-                // drives. A nonzero `fm_drive_steps_executed` after a flag-on fork
-                // proves the module drove the typed order, not a JS fallback.
-                work.call(bump_fn);
                 // step = plan + i * DRIVE_STEP_SIZE (pointer-width address math).
                 if is64 {
                     work.local_get(i)
@@ -509,6 +513,25 @@ fn inject_drive_execute(module: &mut Module) -> Result<()> {
                         MemArg { align: 4, offset: DRIVE_STEP_OFF_OP },
                     )
                     .local_set(op);
+                // Proof-of-use (Phase 6 item 3c): count every RECONSTRUCTION step
+                // the MODULE drives. A nonzero `fm_drive_steps_executed` after a
+                // flag-on fork proves the module drove the typed order, not a JS
+                // fallback. The child-install steps (RESTORE / FINISH_RESTORE, op
+                // `>= DRIVE_OP_RESTORE`) are NOT reconstruction, so they are excluded
+                // from this counter — it gates the "reference-free fork stays
+                // silent" diagnostic (a scalar-only fork drives only install steps
+                // and must leave every reference proof at zero).
+                //   if op < DRIVE_OP_RESTORE { fm_drive_bump() }
+                work.local_get(op)
+                    .i32_const(DRIVE_OP_RESTORE)
+                    .binop(BinaryOp::I32LtU)
+                    .if_else(
+                        None,
+                        |recon| {
+                            recon.call(bump_fn);
+                        },
+                        |_install| {},
+                    );
                 // Branch on the step op: a DRIVE_OP_STATIC_ROOT step drives NO
                 // guest export — it is the static-root binder, a pure `table.get`
                 // catalog + `table.set` transit. Every other op drives a guest

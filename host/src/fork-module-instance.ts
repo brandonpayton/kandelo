@@ -179,6 +179,19 @@ export const FORK_MODULE_REQUIRED_EXPORTS = [
   "fm_restore_from_arena",
   "fm_drive_bump",
   "fm_drive_steps_executed",
+  // Phase 6 (child-install ENTRY): the module-owned attach entries that build the
+  // reconstruction drive plan AND append the two-phase guest restore/finish
+  // install sequencing (`append_attach_steps` -> DRIVE_OP_RESTORE /
+  // DRIVE_OP_FINISH_RESTORE steps). Driving those steps through the existing
+  // `fm_drive_execute` shim (a plain `call_indirect` per step on the host-bound
+  // drive table, no transit assert) moves the JS `restoreModuleState` two-phase
+  // `for act: restore` / `for act: finishRestore` ORDER into the module; the
+  // guest's own layout-specific restore exports still place the reconstructed
+  // identities into the live child. `fm_attach_child` is the COW entry;
+  // `fm_attach_borrowed_child` the byte-identical vfork borrowed entry (its only
+  // borrowed-specific work, the child-private replay prefix, stays host floor).
+  "fm_attach_child",
+  "fm_attach_borrowed_child",
   // Static-root binder: admit static-root WasmGC graphs through the module. A
   // DRIVE_OP_STATIC_ROOT drive step publishes each immutable static root into the
   // anyref transit at slot `recipe + 1` via a wasm `table.get(static_root_catalog,
