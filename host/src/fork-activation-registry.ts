@@ -63,6 +63,10 @@ import {
   type ForkReferenceScratchAllocate,
   type ForkReferenceScratchDeallocate,
 } from "./fork-reference-transaction";
+import {
+  ForkCaptureSession,
+  type ForkReferenceCaptureSurface,
+} from "./fork-capture-session";
 import { ForkExternrefProvenanceTable } from "./fork-externref-provenance";
 import type { ForkReferenceCaptureModule } from "./fork-reference-capture-module";
 import type { ForkActivationExceptionProvider } from "./fork-reference-contracts";
@@ -684,7 +688,7 @@ export class ForkActivationRegistry {
   private readonly tablePatchFunctions = new ForkFunctionCatalog();
   private phase: RegistryPhase = "idle";
   private arena: ForkModuleStateArena | null = null;
-  private references: ForkReferenceTransaction | null = null;
+  private references: ForkReferenceCaptureSurface | null = null;
   private functions: ForkFunctionCatalog | null = null;
   private readonly staticRoots = new ForkStaticRootCatalog();
   // The process-worker-owned Wasm-GC transit table bound to every activation's
@@ -1082,7 +1086,7 @@ export class ForkActivationRegistry {
     return this.arena;
   }
 
-  currentReferences(): ForkReferenceTransaction {
+  currentReferences(): ForkReferenceCaptureSurface {
     if (!this.references) {
       throw new Error(`${this.label}: no fork reference transaction is active`);
     }
@@ -1474,18 +1478,33 @@ export class ForkActivationRegistry {
     this.unsupportedReferenceKind = null;
     this.gcTransit.clear();
     const functions = this.buildFunctionCatalog();
-    const references = new ForkReferenceTransaction(
-      functions,
-      this.externrefs,
-      this.memory,
-      this.allocateScratch,
-      this.deallocateScratch,
-      `${this.label}: references`,
-      this.staticRoots,
-      this.typedReplayOwner(),
-      this.externrefProvenance,
-      this.captureModule,
-    );
+    // Module-on fork capture: the co-resident module is the SOLE capture graph,
+    // so the capture floor runs in the staying `ForkCaptureSession` and NO JS
+    // reference-graph engine (`ForkReferenceTransaction`) is on this path. A
+    // flag-off / non-qualifying fork (no capture module) keeps the JS engine.
+    const references: ForkReferenceCaptureSurface = this.captureModule
+      ? new ForkCaptureSession(
+          functions,
+          this.externrefs,
+          this.captureModule,
+          this.staticRoots,
+          this.externrefProvenance,
+          this.memory,
+          this.allocateScratch,
+          this.deallocateScratch,
+          `${this.label}: capture session`,
+        )
+      : new ForkReferenceTransaction(
+          functions,
+          this.externrefs,
+          this.memory,
+          this.allocateScratch,
+          this.deallocateScratch,
+          `${this.label}: references`,
+          this.staticRoots,
+          this.typedReplayOwner(),
+          this.externrefProvenance,
+        );
     references.beginCapture();
     this.functions = functions;
     this.references = references;

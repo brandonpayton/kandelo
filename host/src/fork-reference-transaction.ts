@@ -31,7 +31,6 @@ import {
   ForkGcConstructorKind,
   type ForkGcCodecDescriptor,
   type ForkGcCodecProvider,
-  type ForkGcConstructorProvenance,
   type ForkGcLayoutDescriptor,
 } from "./fork-gc-codec";
 import { ForkStaticRootCatalog } from "./fork-static-root-catalog";
@@ -52,7 +51,9 @@ import {
 } from "./fork-reference-scratch";
 import { FORK_HOST_EXCEPTION_ACTIVATION_ID } from "./fork-reference-wire";
 import type {
+  ForkExceptionSlotProvider,
   ForkExternrefRecipeProvider,
+  ForkGcDefinitionProvenance,
   ForkReferenceChildReplayAdoption,
 } from "./fork-reference-contracts";
 
@@ -67,7 +68,9 @@ export type {
 // existing importers see an unchanged surface.
 export { FORK_HOST_EXCEPTION_ACTIVATION_ID } from "./fork-reference-wire";
 export type {
+  ForkExceptionSlotProvider,
   ForkExternrefRecipeProvider,
+  ForkGcDefinitionProvenance,
   ForkReferenceChildReplayAdoption,
 } from "./fork-reference-contracts";
 
@@ -89,13 +92,6 @@ export const FORK_REFERENCE_TRANSACTION_OWNER_ID =
 // host import boundary normalizes signed JavaScript arguments with `>>> 0`, so
 // the complete u32 namespace is available; zero alone is the empty sentinel.
 const MAX_REFERENCE_VECTOR_ORDINAL = 0xffff_ffff;
-
-export interface ForkExceptionSlotProvider {
-  /** Throw the exact exnref held in a Wasm-only scratch slot. */
-  throwSlot(slot: number): never;
-  /** Release every Wasm scratch-table root after replay or abort. */
-  clearSlots(): void;
-}
 
 /**
  * Late-bound process owner used only in a fresh child. Keeping this scalar
@@ -123,20 +119,6 @@ export interface ForkTypedReferenceReplayOwner {
   providers(): readonly ForkGcCodecProvider[];
   validateExceptionOwner(activationId: number): void;
   materializeException(recipeId: number, activationId: number): void;
-}
-
-/**
- * Canonical identities materialized before every fresh activation exists.
- *
- * Imported immutable reference globals must be supplied while their consumer
- * is instantiated. The early child provider therefore reconstructs a strict
- * prefix of the process graph before the full replay transaction can attach.
- * Adoption transfers those identities and typed-codec milestones so replay
- * never allocates a second object for a recipe already visible to Wasm.
- */
-export interface ForkGcDefinitionProvenance {
-  readonly record: ForkGcConstructorProvenance;
-  readonly recipeIds: readonly number[];
 }
 
 interface CaptureReferenceVector {

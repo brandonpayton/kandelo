@@ -2,10 +2,8 @@ import {
   type ForkActivationExceptionProvider,
   ForkActivationRegistry,
 } from "./fork-activation-registry";
-import {
-  FORK_HOST_EXCEPTION_ACTIVATION_ID,
-  type ForkExceptionSlotProvider,
-} from "./fork-reference-transaction";
+import type { ForkExceptionSlotProvider } from "./fork-reference-contracts";
+import { FORK_HOST_EXCEPTION_ACTIVATION_ID } from "./fork-reference-wire";
 import {
   WPK_FORK_EXCEPTION_CODEC_HEADER_SIZE,
   WPK_FORK_EXCEPTION_CODEC_SECTION,

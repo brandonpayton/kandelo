@@ -18,6 +18,35 @@
 // LOGIC moves — so nothing here is engine behavior.
 
 import type { DecodedSegmentedForkReferenceTransaction } from "./fork-reference-segments";
+import type { ForkGcConstructorProvenance } from "./fork-gc-codec";
+
+/**
+ * Provider for the exnref values held in Wasm-only scratch slots during capture
+ * and abort/replay. Kept scalar (slot indices, never `exnref` values) so no
+ * exception reference crosses the JavaScript boundary. Re-homed to staying glue
+ * (capture-session extraction) so both the deletable JS engine and the staying
+ * `fork-capture-session.ts` reference it without a cross-import.
+ */
+export interface ForkExceptionSlotProvider {
+  /** Throw the exact exnref held in a Wasm-only scratch slot. */
+  throwSlot(slot: number): never;
+  /** Release every Wasm scratch-table root after replay or abort. */
+  clearSlots(): void;
+}
+
+/**
+ * Canonical identities materialized before every fresh activation exists.
+ *
+ * Imported immutable reference globals must be supplied while their consumer
+ * is instantiated. The early child provider therefore reconstructs a strict
+ * prefix of the process graph before the full replay transaction can attach.
+ * Adoption transfers those identities and typed-codec milestones so replay
+ * never allocates a second object for a recipe already visible to Wasm.
+ */
+export interface ForkGcDefinitionProvenance {
+  readonly record: ForkGcConstructorProvenance;
+  readonly recipeIds: readonly number[];
+}
 
 /**
  * The externref recipe provider the reference reconstruction floor uses to move
