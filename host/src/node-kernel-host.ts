@@ -65,15 +65,6 @@ const DEFAULT_SSL_ENV = [
 ] as const;
 
 export interface NodeKernelHostOptions {
-  /**
-   * Enable the co-resident fork-module for qualifying forks. The kernel worker
-   * reads `WASM_POSIX_FORK_MODULE` and ships the module + `forkModuleEnabled` to
-   * each process worker's init. Path B flip: the module is the DEFAULT
-   * reconstructor, so leaving this unset enables it (the worker applies the
-   * default via `WASM_POSIX_FORK_MODULE !== "0"`); an explicit `false` forwards
-   * `WASM_POSIX_FORK_MODULE=0` to force the legacy JS path.
-   */
-  forkModuleEnabled?: boolean;
   /** Maximum concurrent workers (default: 4) */
   maxWorkers?: number;
   /** Maximum wasm memory pages per process (default: 16384 = 1GB). Initial
@@ -299,7 +290,7 @@ export class NodeKernelHost {
       throw new Error("sessionSeedTrees requires rootfsImage");
     }
 
-    this.worker = spawnKernelWorkerThread(this.options.forkModuleEnabled);
+    this.worker = spawnKernelWorkerThread();
     this.workerStarted = true;
     this.kernelWorkerExitExpected = false;
     this.workerTermination = null;
@@ -1269,29 +1260,21 @@ export function resolveRootfsArtifact(
 }
 
 /** Spawn a worker_thread running node-kernel-worker-entry.ts */
-function spawnKernelWorkerThread(forkModuleEnabled?: boolean): NodeThreadWorker {
+function spawnKernelWorkerThread(): NodeThreadWorker {
   const entryTs = join(MODULE_DIR, "node-kernel-worker-entry.ts");
   const entryJs = join(MODULE_DIR, "node-kernel-worker-entry.js");
   const distJs = entryTs.replace(/\/src\/([^/]+)\.ts$/, "/dist/$1.js");
 
-  // The kernel worker reads `WASM_POSIX_FORK_MODULE` to decide whether to ship
-  // the co-resident fork-module to process workers. Forward the host's EXPLICIT
-  // choice as a scoped env override (never mutate the shared `process.env`) so
-  // the decision is per-host. When the host option is unset (`undefined`), leave
-  // the env untouched so the worker applies the Path B default-ON decision in
-  // node-kernel-worker-entry (kill switch `WASM_POSIX_FORK_MODULE=0`); an
-  // explicit `false` forces the legacy JS path.
-  const workerEnv = forkModuleEnabled === undefined
-    ? undefined
-    : { ...process.env, WASM_POSIX_FORK_MODULE: forkModuleEnabled ? "1" : "0" };
-  const workerOptions = workerEnv ? { env: workerEnv } : undefined;
+  // The co-resident fork-module is the unconditional fork reconstructor, so the
+  // kernel worker always resolves and ships it to process workers; there is no
+  // per-host env override to forward.
 
   // Check for compiled .js version first (much faster startup)
   if (compiledWorkerEntryIsCurrent(entryTs, distJs)) {
-    return new NodeThreadWorker(distJs, workerOptions);
+    return new NodeThreadWorker(distJs);
   }
   if (compiledWorkerEntryIsCurrent(entryTs, entryJs)) {
-    return new NodeThreadWorker(entryJs, workerOptions);
+    return new NodeThreadWorker(entryJs);
   }
 
   // Fallback: tsx eval bootstrap
@@ -1304,5 +1287,5 @@ function spawnKernelWorkerThread(forkModuleEnabled?: boolean): NodeThreadWorker 
     `register();`,
     `await import('${entryUrl}');`,
   ].join("\n");
-  return new NodeThreadWorker(bootstrap, { eval: true, ...(workerEnv ? { env: workerEnv } : {}) });
+  return new NodeThreadWorker(bootstrap, { eval: true });
 }

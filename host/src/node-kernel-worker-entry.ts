@@ -164,27 +164,24 @@ if (!parentPort) {
 const port = parentPort;
 
 /**
- * Phase 6 D5: read the `WASM_POSIX_FORK_MODULE` decision ONCE at this kernel
- * host (the Node kernel worker builds every `centralized_init` message). When
- * enabled, resolve and compile the width-matching co-resident `fork-module`
- * once per pointer width and ship it to each fork-instrumented process worker.
- * Path B flip: the co-resident module is now the DEFAULT reconstructor+capturer.
- * Default (unset) enables it; set `WASM_POSIX_FORK_MODULE=0` as the kill switch
- * to force the legacy JS path.
+ * Phase 6 D5: resolve and compile the width-matching co-resident `fork-module`
+ * once per pointer width at this kernel host (the Node kernel worker builds
+ * every `centralized_init` message) and ship it to each fork-instrumented
+ * process worker. The co-resident module is the UNCONDITIONAL reconstructor +
+ * capturer for every fork — there is no kill switch and no JS reference engine
+ * behind it, so the module always ships.
  */
-const forkModuleEnabled = process.env.WASM_POSIX_FORK_MODULE !== "0";
 const forkModuleModuleByWidth = new Map<4 | 8, WebAssembly.Module>();
 function forkModuleInitFields(
   ptrWidth: 4 | 8,
-): { forkModuleEnabled?: true; forkModuleModule?: WebAssembly.Module } {
-  if (!forkModuleEnabled) return {};
+): { forkModuleModule: WebAssembly.Module } {
   let mod = forkModuleModuleByWidth.get(ptrWidth);
   if (!mod) {
     const name = `fork_module${ptrWidth === 8 ? 64 : 32}.wasm`;
     mod = new WebAssembly.Module(readFileSync(resolveBinary(name)));
     forkModuleModuleByWidth.set(ptrWidth, mod);
   }
-  return { forkModuleEnabled: true, forkModuleModule: mod };
+  return { forkModuleModule: mod };
 }
 
 // --- State ---

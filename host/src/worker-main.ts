@@ -3583,11 +3583,16 @@ export async function centralizedWorkerMain(
       // nothing is durably owned in the parent's restored address space. A
       // FOLLOW-UP (see ITEMS-4-7-PLAN.md) makes even the parent's instantiation
       // lazy until first fork so a worker that never forks pays nothing.
-      if (initData.forkModuleEnabled) {
+      {
+        // The co-resident fork-module is the UNCONDITIONAL fork reconstructor +
+        // capturer: there is no kill switch and no JS reference engine behind it,
+        // so every fork-instrumented worker MUST receive it. A missing module
+        // fails loud rather than silently dropping to a deleted JS path.
         const forkModuleModule = initData.forkModuleModule;
         if (!forkModuleModule) {
           throw new Error(
-            `pid=${pid}: forkModuleEnabled but no forkModuleModule was shipped`,
+            `pid=${pid}: fork-instrumented worker requires the co-resident ` +
+              "fork module",
           );
         }
         if (ptrWidth !== linkedFrameFormat.ptrWidth) {
@@ -3724,10 +3729,6 @@ export async function centralizedWorkerMain(
             forkModuleInstance.exports,
           );
         }
-      } else {
-        // Flag-off: no fork-module exists to own a table, so mint one here,
-        // exactly as before this change.
-        forkGcTransit = new ForkAnyrefTransitTable();
       }
       // Phase 6 item 3a (minimize host surface): the RESTORE data-feed FLIP. When
       // a child's whole reference graph is admitted through the module
@@ -6573,13 +6574,13 @@ export async function centralizedThreadWorkerMain(
       hasForkInstrumentation &&
       threadProcessContinuation &&
       threadForkContinuation &&
-      initData.forkModuleEnabled &&
       !hasDylinkForkRole
     ) {
       const forkModuleModule = initData.forkModuleModule;
       if (!forkModuleModule) {
         throw new Error(
-          `pid=${pid} tid=${tid}: forkModuleEnabled but no forkModuleModule was shipped`,
+          `pid=${pid} tid=${tid}: fork-instrumented worker requires the ` +
+            "co-resident fork module",
         );
       }
       const linkedFrameFormat = readLinkedFrameFormat(module);

@@ -39,17 +39,12 @@ export interface CentralizedWorkerInitMessage {
   /** Pre-compiled WebAssembly module (avoids recompilation in web workers) */
   programModule?: WebAssembly.Module;
   /**
-   * Phase 6 D5: whether this worker should instantiate the co-resident
-   * `fork-module` (gated by `WASM_POSIX_FORK_MODULE` at the kernel host).
-   * Browser workers cannot read `process.env`, so the kernel host forwards the
-   * decision as this boolean. Absent/false is the unchanged default path.
-   */
-  forkModuleEnabled?: boolean;
-  /**
    * Phase 6 D5: the pre-compiled `fork-module` matching this process's pointer
    * width. The kernel host resolves and compiles it once and ships it here so
-   * the worker instantiates without recompiling. Present only when
-   * `forkModuleEnabled` is set.
+   * the worker instantiates without recompiling. The co-resident module is the
+   * UNCONDITIONAL fork reconstructor + capturer, so it is always shipped to a
+   * fork-instrumented worker; a fork-instrumented worker that receives no module
+   * fails loud.
    */
   forkModuleModule?: WebAssembly.Module;
   /** Shared Memory for this process (also shared with CentralizedKernelWorker) */
@@ -158,18 +153,11 @@ export interface CentralizedThreadInitMessage {
   /** Distinct pthread mailbox; side modules in this pthread reuse it. */
   forkHostImports?: ForkHostImportWorkerInit;
   /**
-   * Phase 6 D7b: same co-resident `fork-module` decision the process worker
-   * receives (gated by `WASM_POSIX_FORK_MODULE` at the kernel host). A fork
-   * issued FROM this pthread must unwind/serialize/parent-replay through the
-   * module — the parent side of a fork-from-thread — so the pthread worker needs
-   * the same flag and pre-compiled module the process worker gets. Absent/false
-   * is the unchanged default path.
-   */
-  forkModuleEnabled?: boolean;
-  /**
    * Phase 6 D7b: the pre-compiled `fork-module` matching this process's pointer
-   * width, forwarded exactly as for the process worker. Present only when
-   * `forkModuleEnabled` is set.
+   * width, forwarded exactly as for the process worker. A fork issued FROM this
+   * pthread must unwind/serialize/parent-replay through the module — the parent
+   * side of a fork-from-thread — so the pthread worker always receives the same
+   * co-resident module the process worker gets.
    */
   forkModuleModule?: WebAssembly.Module;
   fnPtr: number;

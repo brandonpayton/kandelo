@@ -72,14 +72,6 @@ export interface BrowserKernelOptions {
   maxProcessMemoryBytes?: number;
   /** Host default pthread slots when a wasm binary declares -1 (default: 16). */
   defaultThreadSlots?: number;
-  /**
-   * Enable the co-resident `fork-module` for fork-instrumented process workers
-   * (mirrors `WASM_POSIX_FORK_MODULE` on the Node host). Path B flip: the module
-   * is now the DEFAULT reconstructor, so when this is unset the wasm32
-   * fork-module URL is fetched at boot and shipped to the kernel worker. Pass
-   * `false` explicitly to force the legacy JS path.
-   */
-  forkModuleEnabled?: boolean;
   /** Additional VFS mount points */
   extraMounts?: Array<{ mountPoint: string; backend: { open: Function } }>;
   /** Environment variables for spawned processes */
@@ -424,16 +416,12 @@ export class BrowserKernel {
     const closedLazyAssets = opts.closedLazyAssets === undefined
       ? undefined
       : snapshotClosedLazyAssets(opts.closedLazyAssets);
-    // Path B flip: the co-resident fork-module is the DEFAULT reconstructor on
-    // the browser V8 host too. This main-thread lever is the browser analog of
-    // Node's `WASM_POSIX_FORK_MODULE` default — it fetches the wasm32 module and
-    // ships it (plus the enabled flag) to the kernel worker so the worker's init
-    // handler actually receives the enabled flag. Pass `forkModuleEnabled: false`
-    // explicitly to force the legacy JS path.
-    const forkModuleEnabled = this.options.forkModuleEnabled !== false;
-    const forkModuleBytes = forkModuleEnabled
-      ? await fetchDefaultBrowserForkModule32()
-      : undefined;
+    // The co-resident fork-module is the UNCONDITIONAL fork reconstructor on the
+    // browser V8 host too: fetch the wasm32 module bytes and ship them to the
+    // kernel worker, which compiles them once and hands the compiled module to
+    // every fork-instrumented process worker. There is no kill switch and no JS
+    // reference engine behind it.
+    const forkModuleBytes = await fetchDefaultBrowserForkModule32();
     // Create the kernel worker
     this.kernelWorkerHandle = new Worker(kernelWorkerEntryUrl, { type: "module" });
     this.workerStarted = true;
@@ -506,9 +494,7 @@ export class BrowserKernel {
         const initMsg: MainToKernelMessage = {
           type: "init",
           kernelWasmBytes: transferBuf,
-          ...(forkModuleEnabled && forkModuleBytes
-            ? { forkModuleEnabled: true, forkModuleBytes }
-            : {}),
+          ...(forkModuleBytes ? { forkModuleBytes } : {}),
           vfsImage: opts.vfsImage,
           lazyUrlBase: opts.lazyUrlBase,
           closedLazyAssets,
@@ -532,7 +518,7 @@ export class BrowserKernel {
           },
         };
         const transfer: Transferable[] = [transferBuf];
-        if (forkModuleEnabled && forkModuleBytes) {
+        if (forkModuleBytes) {
           transfer.push(forkModuleBytes);
         }
         if (opts.takeVfsImageOwnership) {

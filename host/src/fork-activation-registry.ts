@@ -57,7 +57,6 @@ import {
 } from "./fork-gc-codec";
 import {
   FORK_HOST_EXCEPTION_ACTIVATION_ID,
-  ForkReferenceTransaction,
   type ForkExternrefRecipeProvider,
   type ForkGcDefinitionProvenance,
   type ForkReferenceScratchAllocate,
@@ -1483,33 +1482,29 @@ export class ForkActivationRegistry {
     this.unsupportedReferenceKind = null;
     this.gcTransit.clear();
     const functions = this.buildFunctionCatalog();
-    // Module-on fork capture: the co-resident module is the SOLE capture graph,
-    // so the capture floor runs in the staying `ForkCaptureSession` and NO JS
-    // reference-graph engine (`ForkReferenceTransaction`) is on this path. A
-    // flag-off / non-qualifying fork (no capture module) keeps the JS engine.
-    const references: ForkReferenceCaptureSurface = this.captureModule
-      ? new ForkCaptureSession(
-          functions,
-          this.externrefs,
-          this.captureModule,
-          this.staticRoots,
-          this.externrefProvenance,
-          this.memory,
-          this.allocateScratch,
-          this.deallocateScratch,
-          `${this.label}: capture session`,
-        )
-      : new ForkReferenceTransaction(
-          functions,
-          this.externrefs,
-          this.memory,
-          this.allocateScratch,
-          this.deallocateScratch,
-          `${this.label}: references`,
-          this.staticRoots,
-          this.typedReplayOwner(),
-          this.externrefProvenance,
-        );
+    // Fork capture is module-only: the co-resident fork module is the SOLE
+    // capture graph and the UNCONDITIONAL fork engine, so the capture floor runs
+    // in the staying `ForkCaptureSession` and NO JS reference-graph engine
+    // (`ForkReferenceTransaction`) exists behind it. A fork-instrumented worker
+    // always instantiates the module (`setCaptureModule`); a worker that reaches
+    // capture without it fails loud rather than silently running a deleted JS
+    // path.
+    if (!this.captureModule) {
+      throw new Error(
+        `${this.label}: fork capture requires the co-resident fork module`,
+      );
+    }
+    const references: ForkReferenceCaptureSurface = new ForkCaptureSession(
+      functions,
+      this.externrefs,
+      this.captureModule,
+      this.staticRoots,
+      this.externrefProvenance,
+      this.memory,
+      this.allocateScratch,
+      this.deallocateScratch,
+      `${this.label}: capture session`,
+    );
     references.beginCapture();
     this.functions = functions;
     this.references = references;
@@ -1743,32 +1738,33 @@ export class ForkActivationRegistry {
       );
     }
     const functions = this.buildFunctionCatalog();
-    // Module-on child reconstruction constructs NO JS reference-graph engine:
-    // the co-resident module owns the decode, the RESTORE data feed, and the
-    // whole topological drive order. The floor only sizes the shared anyref
-    // transit (from the module's resident `fm_decoded_node_count`) and is the
-    // validate-only early-provider adoption target. A flag-off child keeps the
-    // JS engine.
-    const references: ForkReferenceCaptureSurface = moduleDecodedNodeCount
-      ? new ForkModuleReconstructionFloor(
-          this.typedReplayOwner(),
-          moduleDecodedNodeCount,
-          this.memory,
-          this.allocateScratch,
-          this.deallocateScratch,
-          `${this.label}: module reconstruction`,
-        )
-      : new ForkReferenceTransaction(
-          functions,
-          this.externrefs,
-          this.memory,
-          this.allocateScratch,
-          this.deallocateScratch,
-          `${this.label}: references`,
-          this.staticRoots,
-          this.typedReplayOwner(),
-          this.externrefProvenance,
-        );
+    // Child reconstruction is module-only: the co-resident module is the
+    // UNCONDITIONAL reconstructor (decode + RESTORE data feed + the whole
+    // topological drive order run in Rust), so this path constructs the
+    // module-backed reconstruction FLOOR and NO JS reference-graph engine
+    // (`ForkReferenceTransaction`) exists behind it. The floor only sizes the
+    // shared anyref transit (from the module's resident `fm_decoded_node_count`)
+    // and is the validate-only early-provider adoption target. A module-backed
+    // fork always supplies the node-count source; a child that reaches
+    // reconstruction without it (a fork the module could not back — e.g. a
+    // resume catalog past the module cap, or a fork-from-thread child lacking the
+    // module's alternate resume entry) fails loud rather than silently running a
+    // deleted JS path.
+    if (!moduleDecodedNodeCount) {
+      throw new Error(
+        `${this.label}: child reconstruction requires the co-resident fork ` +
+          "module",
+      );
+    }
+    const references: ForkReferenceCaptureSurface =
+      new ForkModuleReconstructionFloor(
+        this.typedReplayOwner(),
+        moduleDecodedNodeCount,
+        this.memory,
+        this.allocateScratch,
+        this.deallocateScratch,
+        `${this.label}: module reconstruction`,
+      );
     references.attachChild(decodedReferences ?? records);
     this.functions = functions;
     this.references = references;

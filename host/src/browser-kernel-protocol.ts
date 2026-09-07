@@ -64,16 +64,10 @@ export interface InitMessage {
   type: "init";
   kernelWasmBytes: ArrayBuffer;
   /**
-   * Phase 6 D5: whether process workers should instantiate the co-resident
-   * `fork-module` (mirrors `WASM_POSIX_FORK_MODULE` on the Node host). Browser
-   * workers cannot read `process.env`, so the main thread forwards the decision
-   * here. Absent/false is the unchanged default path.
-   */
-  forkModuleEnabled?: boolean;
-  /**
    * Phase 6 D5: the wasm32 fork-module bytes. The kernel worker compiles them
    * once and ships the compiled module to each fork-instrumented process
-   * worker. Present only when `forkModuleEnabled` is set.
+   * worker. The co-resident module is the unconditional fork reconstructor, so
+   * the main thread always fetches and forwards these bytes.
    */
   forkModuleBytes?: ArrayBuffer;
   /**

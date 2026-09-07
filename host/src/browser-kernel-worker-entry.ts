@@ -145,23 +145,20 @@ const O_WRONLY_CREAT_TRUNC =
 // State
 let kernelWorker: CentralizedKernelWorker;
 // Phase 6 D5 / Path B flip: the co-resident wasm32 fork-module, compiled ONCE
-// at kernel init when the main thread forwards `WASM_POSIX_FORK_MODULE`. Browser
-// workers cannot read `process.env`, so the decision and bytes arrive in the
-// init message (handleInit, below). The module is the DEFAULT reconstructor, so
-// this defaults true — but it is INERT until `forkModuleModule32Browser` is
-// compiled from shipped bytes (see the `forkModuleInitFields` guard), so it can
-// never manufacture a false "enabled" without the module actually present.
-let forkModuleEnabledBrowser = true;
+// at kernel init from the bytes the main thread ships in the init message
+// (handleInit, below). The module is the UNCONDITIONAL fork reconstructor;
+// browser workers cannot read `process.env`, so there is no kill switch here.
 let forkModuleModule32Browser: WebAssembly.Module | null = null;
 function forkModuleInitFields(
   ptrWidth: 4 | 8,
-): { forkModuleEnabled?: true; forkModuleModule?: WebAssembly.Module } {
-  // Only the wasm32 module ships in the browser this step; wasm32 is the guest
-  // width. A wasm64 guest under the flag simply skips (unchanged path).
-  if (!forkModuleEnabledBrowser || ptrWidth !== 4 || !forkModuleModule32Browser) {
+): { forkModuleModule?: WebAssembly.Module } {
+  // Only the wasm32 module ships in the browser; wasm32 is the guest width. A
+  // wasm64 guest gets no module and a fork-instrumented wasm64 worker fails loud
+  // (browser guests are wasm32).
+  if (ptrWidth !== 4 || !forkModuleModule32Browser) {
     return {};
   }
-  return { forkModuleEnabled: true, forkModuleModule: forkModuleModule32Browser };
+  return { forkModuleModule: forkModuleModule32Browser };
 }
 let workerAdapter: BrowserWorkerAdapter;
 let memfs: MemoryFileSystem;
@@ -1371,13 +1368,9 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
   await kernelWorker.init(msg.kernelWasmBytes);
 
   // Phase 6 D5: compile the fork-module once here, at the kernel host, so each
-  // process worker instantiates from a pre-compiled module. Fail loud at init
-  // if enabled without bytes.
-  if (msg.forkModuleEnabled) {
-    if (!msg.forkModuleBytes) {
-      throw new Error("forkModuleEnabled but no forkModuleBytes were shipped");
-    }
-    forkModuleEnabledBrowser = true;
+  // process worker instantiates from a pre-compiled module. The module is the
+  // unconditional fork reconstructor, so the main thread always ships the bytes.
+  if (msg.forkModuleBytes) {
     forkModuleModule32Browser = await WebAssembly.compile(msg.forkModuleBytes);
   }
 
