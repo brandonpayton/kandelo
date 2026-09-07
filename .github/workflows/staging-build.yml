@@ -83,7 +83,7 @@ jobs:
       package_staging_reason: ${{ steps.route.outputs.package_staging_reason }}
       skip_staging_tests: ${{ steps.skip.outputs.skip_staging_tests }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
@@ -104,7 +104,7 @@ jobs:
         with:
           base-ref: origin/${{ github.event.pull_request.base.ref }}
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           path: abi-staging-authority
@@ -232,7 +232,7 @@ jobs:
       baseline_tag: ${{ steps.compute.outputs.baseline_tag }}
       reuse_staging: ${{ steps.compute.outputs.reuse_staging }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -587,7 +587,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
@@ -620,7 +620,7 @@ jobs:
         include: ${{ fromJSON(needs.preflight.outputs.library_matrix) }}
     steps:
       - id: checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -700,7 +700,7 @@ jobs:
         include: ${{ fromJSON(needs.preflight.outputs.program_matrix) }}
     steps:
       - id: checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -768,7 +768,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GITHUB_REPOSITORY: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -802,7 +802,7 @@ jobs:
       BINARY_MATERIALIZATION_CHANGED: ${{ needs.change-scope.outputs.binary_materialization_changed }}
       EXACT_ABI_STAGING_APPLICABLE: ${{ needs.change-scope.outputs.exact_abi_staging_applicable }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -901,7 +901,7 @@ jobs:
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.suite.outputs.skip != 'true'
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -933,7 +933,7 @@ jobs:
       actions: read
       contents: read
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -972,7 +972,7 @@ jobs:
               -o host/test/fixtures/deep-wasm-recursion.wasm
           '
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           path: abi-staging-authority
@@ -1039,7 +1039,7 @@ jobs:
             route: sortix runtime
             submodules: tests/sortix/os-test
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -1068,7 +1068,7 @@ jobs:
           name: exact-abi-source-test-workspace
           path: ${{ runner.temp }}/exact-abi-source-test-workspace
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           path: abi-staging-authority
@@ -1175,7 +1175,7 @@ jobs:
       PACKAGE_REUSE_STAGING: ${{ needs.preflight.outputs.reuse_staging }}
       SKIP_STAGING_TESTS: ${{ needs.change-scope.outputs.skip_staging_tests }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -1470,7 +1470,7 @@ jobs:
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.suite.outputs.skip != 'true'
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -1559,7 +1559,7 @@ jobs:
       TEST_SUITE_RESULT: ${{ needs.test-suite.result }}
       SKIP_STAGING_TESTS: ${{ needs.change-scope.outputs.skip_staging_tests }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.change-scope.outputs.package_staging_required == 'true'
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -1824,7 +1824,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
