@@ -3780,26 +3780,6 @@ mod wasm {
         set_ok();
     }
 
-    /// Monotonic count of frames this module has committed since worker start.
-    /// Proof-of-use: after a flag-on qualifying fork drives the continuation
-    /// through the module, this has advanced; a silent JS fallback leaves it
-    /// unchanged. Never resets (including across `fm_begin_unwind`).
-    #[unsafe(no_mangle)]
-    pub extern "C" fn fm_frames_committed() -> i64 {
-        FRAMES_COMMITTED.load(Ordering::Relaxed) as i64
-    }
-
-    /// Monotonic count of frames this module has REPLAYED (consuming rewind
-    /// advances) since worker start. Replay-side proof-of-use mirror of
-    /// `fm_frames_committed`: a replay-only forked child never commits a frame,
-    /// so this is the counter the child worker reports to prove it drove its
-    /// rewind through the module rather than a silent JS fallback (Phase 6 D7b).
-    /// Advances on the parent replay too; never resets.
-    #[unsafe(no_mangle)]
-    pub extern "C" fn fm_frames_replayed() -> i64 {
-        FRAMES_REPLAYED.load(Ordering::Relaxed) as i64
-    }
-
     /// Seed the reference graph for this fork from the KFMS module-state arena
     /// rooted at `module_state_root` and run its bookkeeping reconstruction pass
     /// (Phase 6 D6.2, widened from D6.1). The host calls this once on a qualifying
@@ -3959,77 +3939,6 @@ mod wasm {
         ref_exn_cache_index_impl(recipe_id)
     }
 
-    /// Monotonic count of RESTORE data-feed reads this module has served since
-    /// worker start (Phase 6 item 3a). Proof-of-use mirror of
-    /// `fm_gc_nodes_reconstructed` for the data-feed move: after a flag-on
-    /// GC/exnref fork drives its typed-graph reconstruction, the guest codec reads
-    /// the reference graph through this module's `fm_ref_*` exports and this has
-    /// advanced; a silent JS fallback (the imports stayed on the JS reference
-    /// provider) leaves it unchanged. Never resets.
-    #[unsafe(no_mangle)]
-    pub extern "C" fn fm_ref_feed_reads() -> i64 {
-        REFERENCE_FEED_READS.load(Ordering::Relaxed) as i64
-    }
-
-    /// Monotonic count of references (funcref or null) this module has
-    /// reconstructed since worker start. Proof-of-use mirror of
-    /// `fm_frames_committed`: after a flag-on funcref fork reconstructs its
-    /// references through the module, this has advanced; a silent JS fallback
-    /// leaves it unchanged. Never resets.
-    #[unsafe(no_mangle)]
-    pub extern "C" fn fm_references_reconstructed() -> i64 {
-        REFERENCES_RECONSTRUCTED.load(Ordering::Relaxed) as i64
-    }
-
-    /// Monotonic count of externrefs this module has re-rooted through the
-    /// `wpk_fork_host` engine-floor seam since worker start (Phase 6 D6.2).
-    /// Proof-of-use mirror of `fm_references_reconstructed` for the externref
-    /// path: after a flag-on externref fork drives reconstruction through the
-    /// module, this has advanced by the graph's externref-node count; a silent JS
-    /// fallback leaves it unchanged. Never resets.
-    #[unsafe(no_mangle)]
-    pub extern "C" fn fm_externrefs_resolved() -> i64 {
-        EXTERNREFS_RESOLVED.load(Ordering::Relaxed) as i64
-    }
-
-    /// Monotonic count of exnref nodes this module has admitted and driven since
-    /// worker start (Phase 6 D6.3a). Proof-of-use mirror of
-    /// `fm_externrefs_resolved` for the exnref path: after a flag-on
-    /// exnref-bearing fork drives reconstruction through the module, this has
-    /// advanced by the graph's exnref-node count; a silent JS fallback leaves it
-    /// unchanged. The exnref's reachable externref payloads are rooted through
-    /// the same transit path (`fm_externrefs_resolved` also advances), while the
-    /// exnref value itself is materialized by the guest export. Never resets.
-    #[unsafe(no_mangle)]
-    pub extern "C" fn fm_exnrefs_reconstructed() -> i64 {
-        EXNREFS_RECONSTRUCTED.load(Ordering::Relaxed) as i64
-    }
-
-    /// Monotonic count of typed-GC nodes (struct + array + i31) this module has
-    /// admitted and driven since worker start (Phase 6 D6.4a). Proof-of-use mirror
-    /// of `fm_exnrefs_reconstructed` for the typed-GC path: after a flag-on
-    /// typed-GC fork drives reconstruction through the module, this has advanced by
-    /// the graph's GC-node count; a silent JS fallback leaves it unchanged. The
-    /// struct/array-reachable externref leaves are rooted through the same transit
-    /// path (`fm_externrefs_resolved` also advances), while the GC allocate/fill is
-    /// driven by the guest export under the JS order (i31 is a scalar leaf). Never
-    /// resets.
-    #[unsafe(no_mangle)]
-    pub extern "C" fn fm_gc_nodes_reconstructed() -> i64 {
-        GC_NODES_RECONSTRUCTED.load(Ordering::Relaxed) as i64
-    }
-
-    /// Monotonic count of static roots the static-root binder has resolved for
-    /// publish since worker start. Proof-of-use for the static-root DRIVE step:
-    /// after a flag-on static-root fork, the injected shim published every
-    /// immutable root into the anyref transit through `fm_static_root_slot`
-    /// (`table.get` catalog + `table.set` transit), and this has advanced; a silent
-    /// JS `publishTransit` fallback leaves it unchanged. Never resets.
-    #[unsafe(no_mangle)]
-    pub extern "C" fn fm_static_roots_published() -> i64 {
-        STATIC_ROOTS_PUBLISHED.load(Ordering::Relaxed) as i64
-    }
-
     // -- GC drive-shim exports (Phase 6 item 3b) -----------------------------
 
     /// The first `env.__wpk_fork_drive_table` slot for `activation` (item 3b).
@@ -4110,17 +4019,6 @@ mod wasm {
         DRIVE_STEPS_EXECUTED.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Monotonic count of drive steps this module has executed since worker start
-    /// (Phase 6 item 3c). Proof-of-use for the production typed-GC drive flip: a
-    /// nonzero value proves the MODULE drove the typed allocate/fill/exn order via
-    /// `fm_drive_execute`, distinct from `fm_gc_nodes_reconstructed` (which
-    /// advances merely by admitting the graph in `fm_begin_reference_replay`). A
-    /// flag-on fork that fell back to the JS `materializeAllTyped` drive-order
-    /// leaves this at zero. Never resets.
-    #[unsafe(no_mangle)]
-    pub extern "C" fn fm_drive_steps_executed() -> i64 {
-        DRIVE_STEPS_EXECUTED.load(Ordering::Relaxed) as i64
-    }
 
     // -- Reference CAPTURE session exports (Path B P3) -----------------------
     //
@@ -4809,27 +4707,51 @@ mod wasm {
         }
     }
 
-    /// Monotonic count of reference graphs the module has DECODED from a KFMS
-    /// arena since worker start (orchestration migration increment 1).
-    /// Proof-of-use for the decode flip: a value greater than its pre-fork
-    /// reading proves the host routed wire-graph decode through the module; a
-    /// silent fallback to the TypeScript `decodeSegmentedForkReferenceTransaction`
-    /// leaves it unchanged. Never resets.
+    /// Read one field of the module's proof-of-use statistics record by index.
+    ///
+    /// This single export folds the former 11 individual counter exports
+    /// (`fm_frames_committed` … `fm_externref_handles_scanned`) into one
+    /// field-indexed accessor: the same monotonic-since-worker-start counts, one
+    /// export instead of eleven. Each counter is a proof-of-use oracle — it
+    /// advances only when the MODULE (not a silent JS fallback) performed the
+    /// corresponding work — so the module's unit tests read exact before/after
+    /// deltas to prove reconstruction did the right amount of work, and the host
+    /// diagnostic bridge reads the same fields.
+    ///
+    /// Field indices (see `FmStatField` in the host backend — the two must stay
+    /// in lockstep; both ship together in this crate + `fork-module-backend.ts`):
+    ///
+    /// - 0  `FRAMES_COMMITTED`         — frames committed
+    /// - 1  `FRAMES_REPLAYED`          — frames replayed (consuming rewind)
+    /// - 2  `REFERENCES_RECONSTRUCTED` — funcref/null references reconstructed
+    /// - 3  `EXTERNREFS_RESOLVED`      — externrefs re-rooted via engine-floor seam
+    /// - 4  `EXNREFS_RECONSTRUCTED`    — exnref nodes admitted + driven
+    /// - 5  `GC_NODES_RECONSTRUCTED`   — typed-GC nodes (struct/array/i31) driven
+    /// - 6  `STATIC_ROOTS_PUBLISHED`   — static roots published into transit
+    /// - 7  `DRIVE_STEPS_EXECUTED`     — typed-GC drive steps executed
+    /// - 8  `REF_FEED_READS`           — RESTORE data-feed reads served
+    /// - 9  `REFERENCE_GRAPHS_DECODED` — reference graphs decoded from KFMS arena
+    /// - 10 `EXTERNREF_HANDLES_SCANNED`— externref handles scanned out of graphs
+    ///
+    /// Returns the counter value, or `-1` for an unknown field index (the
+    /// counters are monotonic non-negative, so `-1` is an unambiguous sentinel).
     #[unsafe(no_mangle)]
-    pub extern "C" fn fm_reference_graphs_decoded() -> i64 {
-        REFERENCE_GRAPHS_DECODED.load(Ordering::Relaxed) as i64
-    }
-
-    /// Monotonic count of externref handles the module has SCANNED out of decoded
-    /// graphs since worker start (orchestration migration increment 1).
-    /// Proof-of-use for the scan flip: a value greater than its pre-fork reading
-    /// proves the host routed the pre-launch externref-handle scan through the
-    /// module; a silent fallback to the TypeScript
-    /// `scanSegmentedForkReferenceExternrefHandles` leaves it unchanged. Never
-    /// resets.
-    #[unsafe(no_mangle)]
-    pub extern "C" fn fm_externref_handles_scanned() -> i64 {
-        EXTERNREF_HANDLES_SCANNED.load(Ordering::Relaxed) as i64
+    pub extern "C" fn fm_stats(field: u32) -> i64 {
+        let value = match field {
+            0 => FRAMES_COMMITTED.load(Ordering::Relaxed),
+            1 => FRAMES_REPLAYED.load(Ordering::Relaxed),
+            2 => REFERENCES_RECONSTRUCTED.load(Ordering::Relaxed),
+            3 => EXTERNREFS_RESOLVED.load(Ordering::Relaxed),
+            4 => EXNREFS_RECONSTRUCTED.load(Ordering::Relaxed),
+            5 => GC_NODES_RECONSTRUCTED.load(Ordering::Relaxed),
+            6 => STATIC_ROOTS_PUBLISHED.load(Ordering::Relaxed),
+            7 => DRIVE_STEPS_EXECUTED.load(Ordering::Relaxed),
+            8 => REFERENCE_FEED_READS.load(Ordering::Relaxed),
+            9 => REFERENCE_GRAPHS_DECODED.load(Ordering::Relaxed),
+            10 => EXTERNREF_HANDLES_SCANNED.load(Ordering::Relaxed),
+            _ => return -1,
+        };
+        value as i64
     }
 
     /// The sticky errno of the most recent export call (0 == success).

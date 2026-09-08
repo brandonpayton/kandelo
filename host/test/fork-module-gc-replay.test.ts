@@ -48,6 +48,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import { resolveBinary } from "../src/binary-resolver";
+import { FmStatField } from "../src/fork-module-backend";
 import { instantiateForkModule } from "../src/fork-module-instance";
 import { createForkModuleHostCapabilities } from "../src/fork-module-host-capabilities";
 import { ForkExternrefTokenCache } from "../src/fork-reference-broker";
@@ -155,17 +156,14 @@ interface ForkModuleRefExports {
   fm_set_format: (pw: number, fixedPrefix: number) => void;
   fm_set_activation_gc_codec: (act: number, ptr: number, len: number) => void;
   fm_begin_reference_replay: (root: number, pid: number) => void;
-  fm_externrefs_resolved: () => bigint;
-  fm_exnrefs_reconstructed: () => bigint;
-  fm_gc_nodes_reconstructed: () => bigint;
+  // The single folded proof-of-use counter accessor (replaced the former 11
+  // individual counter exports); read via the `FmStatField` enum.
+  fm_stats: (field: number) => bigint;
   fm_last_errno: () => number;
   fm_build_gc_plan: (pid: number) => number;
   fm_gc_plan_count: () => number;
   fm_drive_execute: (ptr: number, count: number) => void;
   fm_drive_table_base: (act: number) => number;
-  // Phase 6 item 3a RESTORE data-feed exports (the seven the guest codec's
-  // imports flip to, plus the proof-of-use counter).
-  fm_ref_feed_reads: () => bigint;
   fm_ref_gc_route: (recipeId: number, expectedActivation: number) => number;
   fm_ref_gc_payload_len: (
     recipeId: number,
@@ -240,9 +238,9 @@ describe("fork-module typed-GC (struct/array/i31) admission + leaf rooting throu
     x.fm_set_activation_gc_codec(0, codecPtr, GC_CODEC.byteLength);
     expect(x.fm_last_errno()).toBe(0);
 
-    const externrefsBefore = Number(x.fm_externrefs_resolved());
-    const gcNodesBefore = Number(x.fm_gc_nodes_reconstructed());
-    const exnrefsBefore = Number(x.fm_exnrefs_reconstructed());
+    const externrefsBefore = Number(x.fm_stats(FmStatField.ExternrefsResolved));
+    const gcNodesBefore = Number(x.fm_stats(FmStatField.GcNodesReconstructed));
+    const exnrefsBefore = Number(x.fm_stats(FmStatField.ExnrefsReconstructed));
 
     // Seed the reference graph (bookkeeping only).
     x.fm_begin_reference_replay(root, PID);
@@ -250,9 +248,9 @@ describe("fork-module typed-GC (struct/array/i31) admission + leaf rooting throu
 
     // (b) PROOF OF USE (graph admission) — two typed-GC nodes admitted (struct +
     // array), one externref leaf counted, and NO exnref.
-    expect(Number(x.fm_gc_nodes_reconstructed()) - gcNodesBefore).toBe(2);
-    expect(Number(x.fm_externrefs_resolved()) - externrefsBefore).toBe(1);
-    expect(Number(x.fm_exnrefs_reconstructed()) - exnrefsBefore).toBe(0);
+    expect(Number(x.fm_stats(FmStatField.GcNodesReconstructed)) - gcNodesBefore).toBe(2);
+    expect(Number(x.fm_stats(FmStatField.ExternrefsResolved)) - externrefsBefore).toBe(1);
+    expect(Number(x.fm_stats(FmStatField.ExnrefsReconstructed)) - exnrefsBefore).toBe(0);
 
     // Build + execute the real drive plan: Phase 0 publishes the aliased
     // externref leaf into the REAL anyref transit ONCE (dedup) with the
@@ -339,7 +337,7 @@ describe("fork-module typed-GC (struct/array/i31) admission + leaf rooting throu
     x.fm_begin_reference_replay(root, PID);
     expect(x.fm_last_errno()).toBe(0);
 
-    const readsBefore = Number(x.fm_ref_feed_reads());
+    const readsBefore = Number(x.fm_stats(FmStatField.RefFeedReads));
 
     // struct id 1: activation 0, type 0, layout 1, scalars [0x78,0x56,0x34,0x12],
     // fields [2, 3]. array id 2: activation 0, type 3, layout 4, no scalars,
@@ -375,6 +373,6 @@ describe("fork-module typed-GC (struct/array/i31) admission + leaf rooting throu
 
     // PROOF OF USE: the module served every one of these feed reads. A silent JS
     // fallback (imports left on the reference provider) would leave this at 0.
-    expect(Number(x.fm_ref_feed_reads()) - readsBefore).toBeGreaterThan(0);
+    expect(Number(x.fm_stats(FmStatField.RefFeedReads)) - readsBefore).toBeGreaterThan(0);
   });
 });

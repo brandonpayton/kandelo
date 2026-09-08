@@ -103,32 +103,27 @@ export const FORK_MODULE_REQUIRED_EXPORTS = [
   // begun by `fm_begin_child_replay`, at its inherited continuation anchor.
   "fm_add_activation_child_replay",
   "fm_finish_replay",
-  "fm_frames_committed",
-  // Phase 6 D7b: replay-side proof-of-use counter. A replay-only forked child
-  // never commits a frame, so this (not `fm_frames_committed`) is what proves a
-  // fork-from-thread child drove its rewind through the module.
-  "fm_frames_replayed",
   "fm_last_errno",
+  // The single folded proof-of-use counter accessor (fm_stats(field) -> i64),
+  // replacing the former 11 individual fm_* counter exports (frames committed/
+  // replayed, references/externrefs/exnrefs/GC-nodes reconstructed, static roots
+  // published, drive steps executed, ref-feed reads, graphs decoded, handles
+  // scanned). Field indices are the `FmStatField` enum in fork-module-backend.ts.
+  "fm_stats",
   // Phase 6 D6.1 reference reconstruction (funcref + null):
   //  - `__wpk_fork_ref_decode_funcref` is the funcref-returning export the
   //    walrus injector adds (Rust cannot emit it); it reads the imported
   //    `__wpk_fork_function_catalog` table with `table.get`.
   //  - `fm_begin_reference_replay` seeds the funcref/null reference graph.
-  //  - `fm_references_reconstructed` is the proof-of-use counter.
+  //  - the folded `fm_stats` accessor's REFERENCES_RECONSTRUCTED field is the
+  //    proof-of-use counter.
   "__wpk_fork_ref_decode_funcref",
   "fm_begin_reference_replay",
-  "fm_references_reconstructed",
-  // Phase 6 D6.2 externref reconstruction proof-of-use counter.
-  "fm_externrefs_resolved",
   // M2 task 3: the walrus-injected externref decode export — mirrors
   // `__wpk_fork_ref_decode_funcref` but calls the host `env.resolve_externref`
   // import instead of `table.get` (a Wasm module cannot hold a live
   // `externref`, so it cannot decode one without asking the host for it).
   "__wpk_fork_ref_decode_externref",
-  // Phase 6 D6.3a exnref reconstruction proof-of-use counter.
-  "fm_exnrefs_reconstructed",
-  // Phase 6 D6.4a typed-GC (struct/array/i31) reconstruction proof-of-use counter.
-  "fm_gc_nodes_reconstructed",
   // Phase 6 item 3a (minimize host surface): the seven RESTORE data-feed exports
   // the host flips the guest's `__wpk_fork_ref_{vector_get,gc_route,
   // gc_payload_len,gc_load,exn_route,exn_load,exn_cache_index}` imports to
@@ -143,10 +138,6 @@ export const FORK_MODULE_REQUIRED_EXPORTS = [
   "fm_ref_exn_route",
   "fm_ref_exn_load",
   "fm_ref_exn_cache_index",
-  // Proof-of-use counter: advances once per data-feed read the module served, so
-  // a test can prove the guest codec read the graph THROUGH the module rather
-  // than the JS provider.
-  "fm_ref_feed_reads",
   // Phase 6 item 3b (minimize host surface): the call_indirect drive-shim
   // mechanism for driving the guest's typed-GC `_gc_allocate`/`_gc_fill` exports
   // from the module.
@@ -176,9 +167,9 @@ export const FORK_MODULE_REQUIRED_EXPORTS = [
   //    activation (the JS `directOwner` for a host exnref).
   //  - `fm_build_gc_plan` serializes the topological plan; `fm_gc_plan_count`
   //    is its step count (the `fm_drive_execute` count argument).
-  //  - `fm_drive_bump` / `fm_drive_steps_executed` are the DRIVE proof-of-use
-  //    counter (the walrus-injected shim `call`s `fm_drive_bump` once per driven
-  //    step), distinct from the item-3a `fm_gc_nodes_reconstructed` feed count.
+  //  - `fm_drive_bump` bumps the DRIVE proof-of-use counter (the walrus-injected
+  //    shim `call`s it once per driven step), read via `fm_stats`'s
+  //    DRIVE_STEPS_EXECUTED field, distinct from the item-3a GC-nodes feed count.
   "fm_set_activation_gc_codec",
   "fm_set_host_exception_owner",
   "fm_build_gc_plan",
@@ -194,7 +185,6 @@ export const FORK_MODULE_REQUIRED_EXPORTS = [
   // module cannot grow the anyref transit table from Rust.
   "fm_restore_from_arena",
   "fm_drive_bump",
-  "fm_drive_steps_executed",
   // Phase 6 (child-install ENTRY): the module-owned attach entries that build the
   // reconstruction drive plan AND append the two-phase guest restore/finish
   // install sequencing (`append_attach_steps` -> DRIVE_OP_RESTORE /
@@ -235,10 +225,9 @@ export const FORK_MODULE_REQUIRED_EXPORTS = [
   //    (per-activation base + ordinal); the injected drive shim `table.get`s it.
   //  - `fm_set_activation_static_root_base` seeds ONE activation's merged-catalog
   //    base (the funcref merged-catalog mechanism, for static roots).
-  //  - `fm_static_roots_published` is the DRIVE proof-of-use counter.
+  //  - `fm_stats`'s STATIC_ROOTS_PUBLISHED field is the DRIVE proof-of-use counter.
   "fm_static_root_slot",
   "fm_set_activation_static_root_base",
-  "fm_static_roots_published",
   // M1 task 2: the fork-module now DEFINES and EXPORTS the shared Wasm-GC
   // transit table (STORE #2) instead of importing a host-minted one. The
   // guest still imports `env.__wpk_fork_ref_gc_transit`; the host binds the

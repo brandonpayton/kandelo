@@ -464,6 +464,38 @@ pub struct ForkProofOfUse {
     pub drive_steps_executed: i64,
 }
 
+/// Best-effort, additive fold of one fork-module instance's proof-of-use
+/// counters (read via the single folded `fm_stats(field)` accessor) into the
+/// shared accumulator. A failing `fm_stats` call is skipped (best-effort);
+/// each counter is additive so a `run_guest` call folding many instances
+/// (boot + descendants) never overwrites. See the call sites' doc comments.
+fn fold_fork_proof_of_use(fm: &ForkModule, store: &mut Store<()>, acc: &mut ForkProofOfUse) {
+    if let Ok(v) = fm.fm_stats.call(&mut *store, FM_STAT_FRAMES_COMMITTED) {
+        acc.frames_committed += v;
+    }
+    if let Ok(v) = fm.fm_stats.call(&mut *store, FM_STAT_FRAMES_REPLAYED) {
+        acc.frames_replayed += v;
+    }
+    if let Ok(v) = fm.fm_stats.call(&mut *store, FM_STAT_REFERENCES_RECONSTRUCTED) {
+        acc.references_reconstructed += v;
+    }
+    if let Ok(v) = fm.fm_stats.call(&mut *store, FM_STAT_EXTERNREFS_RESOLVED) {
+        acc.externrefs_resolved += v;
+    }
+    if let Ok(v) = fm.fm_stats.call(&mut *store, FM_STAT_EXNREFS_RECONSTRUCTED) {
+        acc.exnrefs_reconstructed += v;
+    }
+    if let Ok(v) = fm.fm_stats.call(&mut *store, FM_STAT_GC_NODES_RECONSTRUCTED) {
+        acc.gc_nodes_reconstructed += v;
+    }
+    if let Ok(v) = fm.fm_stats.call(&mut *store, FM_STAT_STATIC_ROOTS_PUBLISHED) {
+        acc.static_roots_published += v;
+    }
+    if let Ok(v) = fm.fm_stats.call(&mut *store, FM_STAT_DRIVE_STEPS_EXECUTED) {
+        acc.drive_steps_executed += v;
+    }
+}
+
 // --- Raw shared-memory access helpers ---------------------------------------
 //
 // `SharedMemory` pre-reserves its maximum virtual size, so the base pointer is
@@ -3914,6 +3946,20 @@ fn read_gc_codec_descriptor_section(wasm_bytes: &[u8]) -> anyhow::Result<Option<
     Ok(None)
 }
 
+/// Field indices for `fm_stats(field) -> i64`, the single folded proof-of-use
+/// counter accessor (replacing the former 11 individual `fm_*` counter
+/// exports). These MUST match `fm_stats`'s match arms in
+/// `crates/fork-module/src/lib.rs` and `FmStatField` in
+/// `host/src/fork-module-backend.ts`; all three ship in lockstep.
+pub const FM_STAT_FRAMES_COMMITTED: u32 = 0;
+pub const FM_STAT_FRAMES_REPLAYED: u32 = 1;
+pub const FM_STAT_REFERENCES_RECONSTRUCTED: u32 = 2;
+pub const FM_STAT_EXTERNREFS_RESOLVED: u32 = 3;
+pub const FM_STAT_EXNREFS_RECONSTRUCTED: u32 = 4;
+pub const FM_STAT_GC_NODES_RECONSTRUCTED: u32 = 5;
+pub const FM_STAT_STATIC_ROOTS_PUBLISHED: u32 = 6;
+pub const FM_STAT_DRIVE_STEPS_EXECUTED: u32 = 7;
+
 /// The co-resident fork-module (`crates/fork-module`), instantiated sharing a
 /// guest's linear memory. See this file's "N1-I4 Task 1" section doc comment.
 ///
@@ -3993,14 +4039,10 @@ pub struct ForkModule {
     /// `run_fork_capable_entry`'s `ForkEntry::ChildBorrowedReplay` arm.
     pub fm_begin_borrowed_child_replay: wasmtime::TypedFunc<(u32, u32, u32, u32), ()>,
     pub fm_last_errno: wasmtime::TypedFunc<(), i32>,
-    /// Proof-of-use counter: frames committed (unwind) since worker start.
-    pub fm_frames_committed: wasmtime::TypedFunc<(), i64>,
-    /// Proof-of-use counter: frames replayed (rewind) since worker start.
-    pub fm_frames_replayed: wasmtime::TypedFunc<(), i64>,
-    pub fm_references_reconstructed: wasmtime::TypedFunc<(), i64>,
-    pub fm_externrefs_resolved: wasmtime::TypedFunc<(), i64>,
-    pub fm_exnrefs_reconstructed: wasmtime::TypedFunc<(), i64>,
-    pub fm_gc_nodes_reconstructed: wasmtime::TypedFunc<(), i64>,
+    /// Proof-of-use statistics: the single folded counter accessor
+    /// (`fm_stats(field) -> i64`), replacing the former 11 individual `fm_*`
+    /// counter exports. Field indices are the `FM_STAT_*` constants above.
+    pub fm_stats: wasmtime::TypedFunc<u32, i64>,
 
     // -- N1-I5 Task 1: the module's reference-replay `fm_*` exports, bound
     // here for the same reason as the frame-coordinator exports above (one
@@ -4061,12 +4103,6 @@ pub struct ForkModule {
     /// NOT guest-facing: resolves an externref recipe to its captured
     /// broker `handle`; TRAPS on inconsistency.
     pub fm_externref_handle: wasmtime::TypedFunc<u32, i32>,
-    /// Proof-of-use counter: static roots published into the anyref transit
-    /// since worker start.
-    pub fm_static_roots_published: wasmtime::TypedFunc<(), i64>,
-    /// Proof-of-use counter: drive steps `fm_drive_execute` has executed
-    /// since worker start.
-    pub fm_drive_steps_executed: wasmtime::TypedFunc<(), i64>,
     /// The module's own module-defined, module-EXPORTED `(ref null any)`
     /// transit table (STORE #2) a guest's `_gc_allocate` publishes into and
     /// `_gc_fill` consumes. Bound into a fork-instrumented guest's own
@@ -4484,12 +4520,7 @@ pub(crate) fn instantiate_fork_module(
         fm_begin_child_replay: fm_func!("fm_begin_child_replay": (u32, u32, u32) => ()),
         fm_begin_borrowed_child_replay: fm_func!("fm_begin_borrowed_child_replay": (u32, u32, u32, u32) => ()),
         fm_last_errno: fm_func!("fm_last_errno": () => i32),
-        fm_frames_committed: fm_func!("fm_frames_committed": () => i64),
-        fm_frames_replayed: fm_func!("fm_frames_replayed": () => i64),
-        fm_references_reconstructed: fm_func!("fm_references_reconstructed": () => i64),
-        fm_externrefs_resolved: fm_func!("fm_externrefs_resolved": () => i64),
-        fm_exnrefs_reconstructed: fm_func!("fm_exnrefs_reconstructed": () => i64),
-        fm_gc_nodes_reconstructed: fm_func!("fm_gc_nodes_reconstructed": () => i64),
+        fm_stats: fm_func!("fm_stats": u32 => i64),
         fm_begin_reference_replay: fm_func!("fm_begin_reference_replay": (u32, u32) => ()),
         fm_set_activation_catalog_base: fm_func!("fm_set_activation_catalog_base": (u32, u32) => ()),
         fm_set_activation_static_root_base: fm_func!("fm_set_activation_static_root_base": (u32, u32) => ()),
@@ -4509,8 +4540,6 @@ pub(crate) fn instantiate_fork_module(
         fm_funcref_ordinal: fm_func!("fm_funcref_ordinal": u32 => i32),
         fm_static_root_slot: fm_func!("fm_static_root_slot": u32 => i32),
         fm_externref_handle: fm_func!("fm_externref_handle": u32 => i32),
-        fm_static_roots_published: fm_func!("fm_static_roots_published": () => i64),
-        fm_drive_steps_executed: fm_func!("fm_drive_steps_executed": () => i64),
         gc_transit_table,
         function_catalog_table,
         drive_table,
@@ -6890,30 +6919,7 @@ fn spawn_guest_thread(
         // each with its OWN, independent counters that all start at `0`.
         if let Some(fm) = fork_module.as_ref() {
             let mut acc = fork_proof_of_use.lock().unwrap();
-            if let Ok(v) = fm.fm_frames_committed.call(&mut store, ()) {
-                acc.frames_committed += v;
-            }
-            if let Ok(v) = fm.fm_frames_replayed.call(&mut store, ()) {
-                acc.frames_replayed += v;
-            }
-            if let Ok(v) = fm.fm_references_reconstructed.call(&mut store, ()) {
-                acc.references_reconstructed += v;
-            }
-            if let Ok(v) = fm.fm_externrefs_resolved.call(&mut store, ()) {
-                acc.externrefs_resolved += v;
-            }
-            if let Ok(v) = fm.fm_exnrefs_reconstructed.call(&mut store, ()) {
-                acc.exnrefs_reconstructed += v;
-            }
-            if let Ok(v) = fm.fm_gc_nodes_reconstructed.call(&mut store, ()) {
-                acc.gc_nodes_reconstructed += v;
-            }
-            if let Ok(v) = fm.fm_static_roots_published.call(&mut store, ()) {
-                acc.static_roots_published += v;
-            }
-            if let Ok(v) = fm.fm_drive_steps_executed.call(&mut store, ()) {
-                acc.drive_steps_executed += v;
-            }
+            fold_fork_proof_of_use(fm, &mut store, &mut acc);
         }
     })
 }
@@ -8480,30 +8486,7 @@ fn run_worker_thread(
     // best-effort, additive fold (see that call site's doc comment).
     if let Some(fm) = fork_module.as_ref() {
         let mut acc = fork_proof_of_use.lock().unwrap();
-        if let Ok(v) = fm.fm_frames_committed.call(&mut store, ()) {
-            acc.frames_committed += v;
-        }
-        if let Ok(v) = fm.fm_frames_replayed.call(&mut store, ()) {
-            acc.frames_replayed += v;
-        }
-        if let Ok(v) = fm.fm_references_reconstructed.call(&mut store, ()) {
-            acc.references_reconstructed += v;
-        }
-        if let Ok(v) = fm.fm_externrefs_resolved.call(&mut store, ()) {
-            acc.externrefs_resolved += v;
-        }
-        if let Ok(v) = fm.fm_exnrefs_reconstructed.call(&mut store, ()) {
-            acc.exnrefs_reconstructed += v;
-        }
-        if let Ok(v) = fm.fm_gc_nodes_reconstructed.call(&mut store, ()) {
-            acc.gc_nodes_reconstructed += v;
-        }
-        if let Ok(v) = fm.fm_static_roots_published.call(&mut store, ()) {
-            acc.static_roots_published += v;
-        }
-        if let Ok(v) = fm.fm_drive_steps_executed.call(&mut store, ()) {
-            acc.drive_steps_executed += v;
-        }
+        fold_fork_proof_of_use(fm, &mut store, &mut acc);
     }
 
     result

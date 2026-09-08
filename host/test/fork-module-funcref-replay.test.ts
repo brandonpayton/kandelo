@@ -30,6 +30,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { resolveBinary } from "../src/binary-resolver";
+import { FmStatField } from "../src/fork-module-backend";
 import { instantiateForkModule } from "../src/fork-module-instance";
 import { ForkFunctionCatalog } from "../src/fork-function-catalog";
 import { ForkModuleStateArena } from "../src/fork-module-state";
@@ -149,7 +150,7 @@ describe("fork-module funcref reference reconstruction (Phase 6 D6.1)", () => {
     const x = fm.exports as unknown as {
       fm_set_format: (pw: number, fixedPrefix: number) => void;
       fm_begin_reference_replay: (root: number) => void;
-      fm_references_reconstructed: () => bigint;
+      fm_stats: (field: number) => bigint;
       fm_last_errno: () => number;
       __wpk_fork_ref_decode_funcref: (recipeId: number) => unknown;
     };
@@ -157,7 +158,7 @@ describe("fork-module funcref reference reconstruction (Phase 6 D6.1)", () => {
     x.fm_set_format(PTR_WIDTH, 0);
     expect(x.fm_last_errno()).toBe(0);
 
-    const before = x.fm_references_reconstructed();
+    const before = x.fm_stats(FmStatField.ReferencesReconstructed);
 
     x.fm_begin_reference_replay(root);
     expect(x.fm_last_errno()).toBe(0);
@@ -184,7 +185,7 @@ describe("fork-module funcref reference reconstruction (Phase 6 D6.1)", () => {
 
     // Proof of use: the module reconstructed exactly the 5 references decoded
     // (4 funcrefs + 1 null), so this ran through the module, not a JS fallback.
-    const after = x.fm_references_reconstructed();
+    const after = x.fm_stats(FmStatField.ReferencesReconstructed);
     expect(Number(after - before)).toBe(funcrefRecipes.length + 1);
     expect(Number(after)).toBeGreaterThan(0);
   });

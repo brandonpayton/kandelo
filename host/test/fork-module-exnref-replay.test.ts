@@ -40,6 +40,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import { resolveBinary } from "../src/binary-resolver";
+import { FmStatField } from "../src/fork-module-backend";
 import { instantiateForkModule } from "../src/fork-module-instance";
 import { createForkModuleHostCapabilities } from "../src/fork-module-host-capabilities";
 import { ForkExternrefTokenCache } from "../src/fork-reference-broker";
@@ -123,15 +124,13 @@ function buildExnrefArena(memory: WebAssembly.Memory): number {
 interface ForkModuleRefExports {
   fm_set_format: (pw: number, fixedPrefix: number) => void;
   fm_begin_reference_replay: (root: number, pid: number) => void;
-  fm_externrefs_resolved: () => bigint;
-  fm_exnrefs_reconstructed: () => bigint;
+  // The single folded proof-of-use counter accessor; read via `FmStatField`.
+  fm_stats: (field: number) => bigint;
   fm_last_errno: () => number;
   fm_build_gc_plan: (pid: number) => number;
   fm_gc_plan_count: () => number;
   fm_drive_execute: (ptr: number, count: number) => void;
   fm_drive_table_base: (act: number) => number;
-  // Phase 6 item 3a RESTORE data-feed exports.
-  fm_ref_feed_reads: () => bigint;
   fm_ref_exn_route: (recipeId: number, expectedActivation: number) => number;
   fm_ref_exn_load: (
     recipeId: number,
@@ -203,8 +202,8 @@ describe("fork-module exnref reference reconstruction + transit into production 
     x.fm_set_format(PTR_WIDTH, 0);
     expect(x.fm_last_errno()).toBe(0);
 
-    const externrefsBefore = Number(x.fm_externrefs_resolved());
-    const exnrefsBefore = Number(x.fm_exnrefs_reconstructed());
+    const externrefsBefore = Number(x.fm_stats(FmStatField.ExternrefsResolved));
+    const exnrefsBefore = Number(x.fm_stats(FmStatField.ExnrefsReconstructed));
 
     // Seed the reference graph (bookkeeping only).
     x.fm_begin_reference_replay(root, PID);
@@ -212,8 +211,8 @@ describe("fork-module exnref reference reconstruction + transit into production 
 
     // (b) PROOF OF USE (graph admission) — one exnref admitted, one externref
     // node counted, purely from bookkeeping.
-    expect(Number(x.fm_exnrefs_reconstructed()) - exnrefsBefore).toBe(1);
-    expect(Number(x.fm_externrefs_resolved()) - externrefsBefore).toBe(1);
+    expect(Number(x.fm_stats(FmStatField.ExnrefsReconstructed)) - exnrefsBefore).toBe(1);
+    expect(Number(x.fm_stats(FmStatField.ExternrefsResolved)) - externrefsBefore).toBe(1);
 
     // Build + execute the real drive plan: PHASE 0 publishes the reachable
     // externref payload into the anyref transit; the EXN step then drives the
@@ -290,7 +289,7 @@ describe("fork-module exnref reference reconstruction + transit into production 
     x.fm_begin_reference_replay(root, PID);
     expect(x.fm_last_errno()).toBe(0);
 
-    const readsBefore = Number(x.fm_ref_feed_reads());
+    const readsBefore = Number(x.fm_stats(FmStatField.RefFeedReads));
 
     // exnref id 2: activation 0, tag 0, layout 0, no scalars, payload edge [1].
     expect(x.fm_ref_exn_route(2, 0)).toBe(0); // layout id
@@ -303,6 +302,6 @@ describe("fork-module exnref reference reconstruction + transit into production 
     expect(new Uint32Array(memory.buffer, refIdsDst, 1)[0]).toBe(1);
 
     // PROOF OF USE: the module served every one of these feed reads.
-    expect(Number(x.fm_ref_feed_reads()) - readsBefore).toBeGreaterThan(0);
+    expect(Number(x.fm_stats(FmStatField.RefFeedReads)) - readsBefore).toBeGreaterThan(0);
   });
 });

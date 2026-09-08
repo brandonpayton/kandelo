@@ -31,6 +31,28 @@ import type { ForkModuleExports } from "./fork-module-instance";
 export const FORK_MODULE_RESUME_CATALOG_CAP = 65_536;
 
 /**
+ * Field indices for the module's single folded proof-of-use counter accessor
+ * `fm_stats(field) -> i64`, which replaced the former 11 individual `fm_*`
+ * counter exports. MUST match `fm_stats`'s match arms in
+ * `crates/fork-module/src/lib.rs`, the `FM_STAT_*` constants in
+ * `crates/host-native/src/guest.rs`, and `FM_STAT` in
+ * `crates/fork-module/tests/harness.mjs`; all ship in lockstep.
+ */
+export enum FmStatField {
+  FramesCommitted = 0,
+  FramesReplayed = 1,
+  ReferencesReconstructed = 2,
+  ExternrefsResolved = 3,
+  ExnrefsReconstructed = 4,
+  GcNodesReconstructed = 5,
+  StaticRootsPublished = 6,
+  DriveStepsExecuted = 7,
+  RefFeedReads = 8,
+  ReferenceGraphsDecoded = 9,
+  ExternrefHandlesScanned = 10,
+}
+
+/**
  * The guest offset + byte length of the serialized replay-event (KFRE) journal
  * image the module channel-mmap'd (Option B). `finishUnwindAndSerialize`
  * returns this; the coordinator records it in a `JournalImage` KFMS record so
@@ -168,7 +190,7 @@ export class ForkModuleContinuationBackend {
 
   /** Number of frames the module has committed since worker start (proof-of-use). */
   framesCommitted(): bigint {
-    return BigInt(this.exports.fm_frames_committed() as number | bigint);
+    return this.readStat(FmStatField.FramesCommitted);
   }
 
   /**
@@ -179,7 +201,7 @@ export class ForkModuleContinuationBackend {
    * that its rewind ran through the module, not a silent JS fallback.
    */
   framesReplayed(): bigint {
-    return BigInt(this.exports.fm_frames_replayed() as number | bigint);
+    return this.readStat(FmStatField.FramesReplayed);
   }
 
   /**
@@ -189,9 +211,7 @@ export class ForkModuleContinuationBackend {
    * fallback leaves it unchanged.
    */
   referencesReconstructed(): bigint {
-    return BigInt(
-      this.exports.fm_references_reconstructed() as number | bigint,
-    );
+    return this.readStat(FmStatField.ReferencesReconstructed);
   }
 
   /**
@@ -201,7 +221,7 @@ export class ForkModuleContinuationBackend {
    * module; a silent JS fallback leaves it unchanged.
    */
   externrefsResolved(): bigint {
-    return BigInt(this.exports.fm_externrefs_resolved() as number | bigint);
+    return this.readStat(FmStatField.ExternrefsResolved);
   }
 
   /**
@@ -211,7 +231,7 @@ export class ForkModuleContinuationBackend {
    * leaves it unchanged.
    */
   exnrefsReconstructed(): bigint {
-    return BigInt(this.exports.fm_exnrefs_reconstructed() as number | bigint);
+    return this.readStat(FmStatField.ExnrefsReconstructed);
   }
 
   /**
@@ -221,7 +241,7 @@ export class ForkModuleContinuationBackend {
    * silent JS fallback leaves it unchanged.
    */
   gcNodesReconstructed(): bigint {
-    return BigInt(this.exports.fm_gc_nodes_reconstructed() as number | bigint);
+    return this.readStat(FmStatField.GcNodesReconstructed);
   }
 
   /**
@@ -232,7 +252,7 @@ export class ForkModuleContinuationBackend {
    * unchanged.
    */
   staticRootsPublished(): bigint {
-    return BigInt(this.exports.fm_static_roots_published() as number | bigint);
+    return this.readStat(FmStatField.StaticRootsPublished);
   }
 
   /**
@@ -245,7 +265,25 @@ export class ForkModuleContinuationBackend {
    * exn topological order. Never resets.
    */
   driveStepsExecuted(): bigint {
-    return BigInt(this.exports.fm_drive_steps_executed() as number | bigint);
+    return this.readStat(FmStatField.DriveStepsExecuted);
+  }
+
+  /**
+   * Read one field of the module's folded proof-of-use statistics record via
+   * the single `fm_stats(field)` export (which replaced the former 11
+   * individual counter exports). Returns the monotonic-since-worker-start
+   * count. Throws on the module's `-1` unknown-field sentinel.
+   */
+  private readStat(field: FmStatField): bigint {
+    const value = BigInt(
+      (this.exports.fm_stats as (field: number) => number | bigint)(field),
+    );
+    if (value < 0n) {
+      throw new RangeError(
+        `${this.label}: fm_stats returned ${value} for unknown field ${field}`,
+      );
+    }
+    return value;
   }
 
   /**

@@ -285,24 +285,24 @@ export interface ForkModuleChildFramesMessage {
 export interface ForkModuleReferencesMessage {
   type: "fork_module_references";
   pid: number;
-  /** Funcref/null count (`fm_references_reconstructed`). */
+  /** Funcref/null count (`fm_stats` ReferencesReconstructed field). */
   references: number;
-  /** Externref count (`fm_externrefs_resolved`). */
+  /** Externref count (`fm_stats` ExternrefsResolved field). */
   externrefs: number;
-  /** Exnref-node count (`fm_exnrefs_reconstructed`). */
+  /** Exnref-node count (`fm_stats` ExnrefsReconstructed field). */
   exnrefs: number;
-  /** Typed-GC node count — struct/array/i31 (`fm_gc_nodes_reconstructed`). */
+  /** Typed-GC node count — struct/array/i31 (`fm_stats` GcNodesReconstructed). */
   gcNodes: number;
   /**
-   * Typed-GC DRIVE step count (`fm_drive_steps_executed`, Phase 6 item 3c).
-   * Distinct from `gcNodes`: this advances only when the module actually drove
-   * the typed allocate/fill/exn order (`fm_build_gc_plan` + `fm_drive_execute`),
-   * so a nonzero value proves the module — not the JS `materializeAllTyped`
-   * fallback — reconstructed the typed graph.
+   * Typed-GC DRIVE step count (`fm_stats` DriveStepsExecuted field, Phase 6
+   * item 3c). Distinct from `gcNodes`: this advances only when the module
+   * actually drove the typed allocate/fill/exn order (`fm_build_gc_plan` +
+   * `fm_drive_execute`), so a nonzero value proves the module — not the JS
+   * `materializeAllTyped` fallback — reconstructed the typed graph.
    */
   driveSteps: number;
   /**
-   * Static-root publish count (`fm_static_roots_published`, the static-root
+   * Static-root publish count (`fm_stats` StaticRootsPublished field, the
    * binder). Advances only when the module's DRIVE_OP_STATIC_ROOT step
    * republished an immutable static root into the anyref transit, so a nonzero
    * value proves the module — not the JS `publishTransit` fallback — reconstructed

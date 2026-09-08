@@ -33,6 +33,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import { resolveBinary } from "../src/binary-resolver";
+import { FmStatField } from "../src/fork-module-backend";
 import { instantiateForkModule } from "../src/fork-module-instance";
 import { createForkModuleHostCapabilities } from "../src/fork-module-host-capabilities";
 import { ForkExternrefTokenCache } from "../src/fork-reference-broker";
@@ -116,9 +117,7 @@ interface ForkModuleExports {
   fm_begin_reference_replay: (root: number, pid: number) => void;
   fm_build_gc_plan: (pid: number) => number;
   fm_gc_plan_count: () => number;
-  fm_reference_graphs_decoded: () => bigint;
-  fm_externref_handles_scanned: () => bigint;
-  fm_externrefs_resolved: () => bigint;
+  fm_stats: (field: number) => bigint;
   fm_last_errno: () => number;
 }
 
@@ -168,17 +167,17 @@ describe("fork-module decode / scan / restore (orchestration migration increment
     const root = buildExternrefArena(memory);
     const { x } = instantiate(memory);
 
-    const before = Number(x.fm_reference_graphs_decoded());
+    const before = Number(x.fm_stats(FmStatField.ReferenceGraphsDecoded));
     const nodeCount = x.fm_decode_reference_graph(root);
     expect(x.fm_last_errno()).toBe(0);
     // One canonical null + one node per distinct externref handle.
     expect(nodeCount).toBe(1 + HANDLES.length);
     expect(x.fm_decoded_node_count()).toBe(1 + HANDLES.length);
-    expect(Number(x.fm_reference_graphs_decoded()) - before).toBe(1);
+    expect(Number(x.fm_stats(FmStatField.ReferenceGraphsDecoded)) - before).toBe(1);
 
     // A second decode makes the graph resident again and advances the counter.
     expect(x.fm_decode_reference_graph(root)).toBe(1 + HANDLES.length);
-    expect(Number(x.fm_reference_graphs_decoded()) - before).toBe(2);
+    expect(Number(x.fm_stats(FmStatField.ReferenceGraphsDecoded)) - before).toBe(2);
   });
 
   it("fm_decode_reference_graph fails cleanly on a malformed arena root", () => {
@@ -201,7 +200,7 @@ describe("fork-module decode / scan / restore (orchestration migration increment
     x.fm_decode_reference_graph(root);
     const cap = x.fm_decoded_node_count();
 
-    const before = Number(x.fm_externref_handles_scanned());
+    const before = Number(x.fm_stats(FmStatField.ExternrefHandlesScanned));
     const count = x.fm_scan_externref_handles(SCAN_SCRATCH, cap);
     expect(x.fm_last_errno()).toBe(0);
     expect(count).toBe(HANDLES.length);
@@ -211,7 +210,7 @@ describe("fork-module decode / scan / restore (orchestration migration increment
       view.getUint32(SCAN_SCRATCH + i * 4, true),
     );
     expect(scanned).toEqual([...HANDLES]);
-    expect(Number(x.fm_externref_handles_scanned()) - before).toBe(HANDLES.length);
+    expect(Number(x.fm_stats(FmStatField.ExternrefHandlesScanned)) - before).toBe(HANDLES.length);
   });
 
   it("fm_scan_externref_handles fails cleanly on a too-small buffer", () => {
@@ -240,7 +239,7 @@ describe("fork-module decode / scan / restore (orchestration migration increment
     const { x } = instantiate(memory);
 
     // (1) The single restore entry: seed + build in one call.
-    const beforeResolved = Number(x.fm_externrefs_resolved());
+    const beforeResolved = Number(x.fm_stats(FmStatField.ExternrefsResolved));
     const planPtr = x.fm_restore_from_arena(root, PID);
     expect(x.fm_last_errno()).toBe(0);
     expect(planPtr).not.toBe(0);
@@ -249,7 +248,7 @@ describe("fork-module decode / scan / restore (orchestration migration increment
     // Every externref recipe gets a Phase-0b transit-publish step.
     expect(count).toBe(HANDLES.length);
     // Restore seeded the driver AND admitted the graph (bookkeeping advanced).
-    expect(Number(x.fm_externrefs_resolved()) - beforeResolved).toBe(HANDLES.length);
+    expect(Number(x.fm_stats(FmStatField.ExternrefsResolved)) - beforeResolved).toBe(HANDLES.length);
 
     // The plan is exactly the externref-transit steps, one per recipe (1..N).
     const steps = readPlan(memory, planPtr, count);

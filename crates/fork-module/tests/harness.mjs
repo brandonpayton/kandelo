@@ -143,16 +143,13 @@ for (const name of [
   // Phase 6 D6.1 reference reconstruction (funcref + null).
   "__wpk_fork_ref_decode_funcref",
   "fm_begin_reference_replay",
-  "fm_references_reconstructed",
-  // Phase 6 D6.2 externref reconstruction proof-of-use + the seam anchor.
-  "fm_externrefs_resolved",
+  // The single folded proof-of-use counter accessor (fm_stats(field) -> i64),
+  // replacing the former 11 individual fm_* counter exports (D6.1 references,
+  // D6.2 externrefs, D6.3a exnrefs, D6.4a typed-GC nodes, ...).
+  "fm_stats",
   // M2: the injected binder's helper for the externref recipe -> broker handle
   // lookup (mirrors fm_funcref_ordinal/fm_static_root_slot).
   "fm_externref_handle",
-  // Phase 6 D6.3a exnref reconstruction proof-of-use counter.
-  "fm_exnrefs_reconstructed",
-  // Phase 6 D6.4a typed-GC (struct/array/i31) reconstruction proof-of-use counter.
-  "fm_gc_nodes_reconstructed",
 ]) {
   assert.ok(exportNames.has(name), `module must export ${name}`);
 }
@@ -168,6 +165,22 @@ const readU32 = (off) => view().getUint32(off, true);
 const writeU32 = (off, val) => view().setUint32(off, val >>> 0, true);
 const readByte = (off) => u8()[off];
 const errno = () => x.fm_last_errno();
+
+// Field indices for the folded fm_stats(field) accessor. MUST match fm_stats's
+// match arms in crates/fork-module/src/lib.rs.
+const FM_STAT = {
+  FRAMES_COMMITTED: 0,
+  FRAMES_REPLAYED: 1,
+  REFERENCES_RECONSTRUCTED: 2,
+  EXTERNREFS_RESOLVED: 3,
+  EXNREFS_RECONSTRUCTED: 4,
+  GC_NODES_RECONSTRUCTED: 5,
+  STATIC_ROOTS_PUBLISHED: 6,
+  DRIVE_STEPS_EXECUTED: 7,
+  REF_FEED_READS: 8,
+  REFERENCE_GRAPHS_DECODED: 9,
+  EXTERNREF_HANDLES_SCANNED: 10,
+};
 
 // -- M2: fm_externref_handle traps outside a seeded reference replay -----------
 //
@@ -203,7 +216,7 @@ const errno = () => x.fm_last_errno();
 // arena with the production TypeScript KFMS/KFRV encoder (the same Node/V8 engine
 // this harness runs in) rather than hand-encoding it here.
 assert.equal(
-  x.fm_exnrefs_reconstructed(),
+  x.fm_stats(FM_STAT.EXNREFS_RECONSTRUCTED),
   0n,
   "exnref counter is inert until fm_begin_reference_replay admits an exnref graph",
 );
@@ -220,7 +233,7 @@ console.log("  ok: fm_exnrefs_reconstructed present and inert (0) outside a refe
 // counter advances -> no tag minted) is validated in
 // `host/test/fork-module-gc-replay.test.ts`.
 assert.equal(
-  x.fm_gc_nodes_reconstructed(),
+  x.fm_stats(FM_STAT.GC_NODES_RECONSTRUCTED),
   0n,
   "typed-GC counter is inert until fm_begin_reference_replay admits a GC graph",
 );

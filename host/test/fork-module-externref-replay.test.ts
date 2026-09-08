@@ -31,6 +31,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import { resolveBinary } from "../src/binary-resolver";
+import { FmStatField } from "../src/fork-module-backend";
 import { instantiateForkModule } from "../src/fork-module-instance";
 import { createForkModuleHostCapabilities } from "../src/fork-module-host-capabilities";
 import { ForkExternrefTokenCache } from "../src/fork-reference-broker";
@@ -98,7 +99,7 @@ function buildExternrefArena(memory: WebAssembly.Memory): number {
 interface ForkModuleRefExports {
   fm_set_format: (pw: number, fixedPrefix: number) => void;
   fm_begin_reference_replay: (root: number, pid: number) => void;
-  fm_externrefs_resolved: () => bigint;
+  fm_stats: (field: number) => bigint;
   fm_last_errno: () => number;
   __wpk_fork_ref_decode_externref: (recipeId: number) => unknown;
 }
@@ -141,7 +142,7 @@ describe("fork-module externref reference reconstruction (Phase 6 D6.2 / M2)", (
     x.fm_set_format(PTR_WIDTH, 0);
     expect(x.fm_last_errno()).toBe(0);
 
-    const before = Number(x.fm_externrefs_resolved());
+    const before = Number(x.fm_stats(FmStatField.ExternrefsResolved));
 
     // Seed the reference graph (bookkeeping only — since M2 this does NOT call
     // the host seam; see `fm_begin_reference_replay`'s doc).
@@ -150,7 +151,7 @@ describe("fork-module externref reference reconstruction (Phase 6 D6.2 / M2)", (
 
     // (b) PROOF OF USE (graph admission) — the module's bookkeeping counter
     // advanced by the externref node count purely from admitting the graph.
-    const after = Number(x.fm_externrefs_resolved());
+    const after = Number(x.fm_stats(FmStatField.ExternrefsResolved));
     expect(after - before).toBe(HANDLES.length);
     // Admission alone calls the host seam zero times (M2: host-free bookkeeping).
     expect(resolveCalls).toBe(0);
