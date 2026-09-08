@@ -1157,34 +1157,63 @@ mod wasm {
         offset: AtomicUsize::new(0),
     };
 
+    /// Clear a resident bump-backed static WITHOUT running its `Drop`.
+    ///
+    /// This is the reclaim primitive for the module's resident fork statics
+    /// (`DECODED_GRAPH`, `REFERENCE_STATE`, `RECONSTRUCTION_STATE`,
+    /// `REFERENCE_FEED`) at the sites the HOST may reach on a COW child before
+    /// that child's own `fm_begin_child_replay` bump reset. Each of these statics
+    /// lives in the module's BSS at `__memory_base` inside the shared linear
+    /// memory, so a COW child's fresh fork-module instance inherits the PARENT's
+    /// populated value (wasm does not re-zero BSS on instantiation). By fork time
+    /// the parent has already reset and REUSED the low bump addresses those
+    /// values' `Vec`/`BTreeMap` interiors point into, so the inherited value is
+    /// clobbered: its tree/vector child pointers are garbage. A plain `*slot =
+    /// None` would run `Drop`, walking those clobbered nodes and dereferencing
+    /// garbage pointers — the fault behind the real pipeline-in-command-
+    /// substitution trap (`echo $(echo a | cat)`), seen as "memory access out of
+    /// bounds" (a child pointer landing outside guest memory) or `unreachable`.
+    ///
+    /// `forget` is safe here and frees no real resource: these types own ONLY
+    /// bump memory (reclaimed wholesale by the next `ALLOC.reset()`; `dealloc` is
+    /// a no-op) plus trivially-droppable scalar leaves. On a NON-COW second fork
+    /// in the same worker the slot holds this worker's own live value; forgetting
+    /// it merely defers reclaim to the next bump reset, which is exactly what the
+    /// bump model already does. So this is a universally-safe replacement for a
+    /// reclaiming `*slot = None`, minus the unsafe walk of clobbered inheritance.
+    fn abandon_resident<T>(slot: &mut Option<T>) {
+        core::mem::forget(slot.take());
+    }
+
     /// Reclaim the module bump heap for a fresh fork, first DROPPING every
-    /// bump-allocated static that owns a non-trivial `Drop` while its backing
-    /// store is still valid.
+    /// bump-allocated static WITHOUT running its `Drop`.
     ///
     /// `ALLOC.reset()` only rewinds the bump cursor; it neither frees nor zeroes
     /// the bytes, and the next allocations REUSE those low addresses. A value
     /// left resident in a static (`state()`'s `ForkModule`, `capture_state()`'s
     /// `ReferenceGraphBuilder`) owns `BTreeMap`s/`Vec`s whose `Drop` WALKS their
     /// nodes in place. If such a value is dropped AFTER the reset+realloc has
-    /// overwritten its nodes, the walk follows clobbered child pointers and traps
-    /// (`unreachable`). This bit real command-substitution / pipeline forks: a COW
-    /// child inherits the parent's live `capture_state` through the memory clone,
-    /// and a parent's second capture kept the prior builder resident — in both
-    /// cases a later reset invalidated the resident builder and the next drop
-    /// trapped. Clearing the statics here drops them while their bump memory is
-    /// still intact (`dealloc` is a no-op), so the reset is safe.
+    /// overwritten its nodes — or, for a COW child, after the PARENT reused the
+    /// bump those inherited nodes point into — the walk follows clobbered child
+    /// pointers and traps (`unreachable` or "memory access out of bounds"). This
+    /// bit real command-substitution / pipeline forks in several places (capture
+    /// builder, decoded graph, replay driver/feed). None of these resident types
+    /// has a side-effecting `Drop` — they own ONLY bump memory (reclaimed
+    /// wholesale by `ALLOC.reset()` below) plus trivially-droppable scalar leaves
+    /// — so `abandon_resident` (`forget`) clears them with zero semantic change
+    /// and no unsafe walk. See `abandon_resident`.
     ///
     /// Callers that must KEEP a value live across the reset (an armed capture
     /// builder) skip the reset entirely (see `fm_begin_unwind`'s `CAPTURE_ARMED`
     /// gate) rather than calling this.
     fn reset_bump_heap() {
-        *state() = None;
-        *capture_state() = None;
+        abandon_resident(state());
+        abandon_resident(capture_state());
         CAPTURE_ARMED.store(0, Ordering::Relaxed);
         // SAFETY: single-threaded per worker; only one fork drives these at a time.
         unsafe {
-            *CAPTURE_SERIALIZED.0.get() = None;
-            *DRIVE_PLAN.0.get() = None;
+            abandon_resident(&mut *CAPTURE_SERIALIZED.0.get());
+            abandon_resident(&mut *DRIVE_PLAN.0.get());
         }
         ALLOC.reset();
     }
@@ -2460,10 +2489,15 @@ mod wasm {
     }
 
     fn begin_reference_replay_impl(module_state_root: u64, _pid: u32) -> Result<(), Errno> {
-        // Reclaim any prior fork's reference state.
-        *reference_state() = None;
-        *reconstruction_state() = None;
-        *reference_feed() = None;
+        // Reclaim any prior fork's reference state WITHOUT running Drop: a COW
+        // child inherits these statics (each owning a `SegmentedReferenceTransaction`
+        // or replay feed whose `Vec`/`BTreeMap` interiors point into the parent's
+        // since-reused bump), so dropping the inherited value walks clobbered nodes
+        // and traps. See `abandon_resident`. This was the pipeline-in-command-
+        // substitution replay-setup trap that remained after the decode-site fix.
+        abandon_resident(reference_state());
+        abandon_resident(reconstruction_state());
+        abandon_resident(reference_feed());
 
         // Decode the sealed module-state arena into the canonical transaction
         // (shared arena->transaction path; see the helper).
@@ -2564,7 +2598,14 @@ mod wasm {
     /// seeds NO driver/feed — it only makes the decoded graph resident for
     /// `fm_scan_externref_handles` and host inspection. Reclaims any prior graph.
     fn decode_reference_graph_impl(module_state_root: u64) -> Result<u32, Errno> {
-        *decoded_graph() = None;
+        // Clear any prior resident graph WITHOUT running its `Drop`: the host runs
+        // `fm_decode_reference_graph` during child setup (for the exnref-tag and
+        // static-root gates; see `worker-main.ts`), BEFORE the child's own
+        // `fm_begin_child_replay` bump reset, so a COW child's inherited
+        // `DECODED_GRAPH` is clobbered and dropping it traps. See
+        // `abandon_resident`. This was the ORIGINAL pipeline-in-command-substitution
+        // decode trap (`echo $(echo a | cat)` -> "memory access out of bounds").
+        abandon_resident(decoded_graph());
         let transaction = decode_reference_transaction_from_arena(module_state_root)?;
         let node_count = u32::try_from(transaction.nodes.len()).map_err(|_| Errno::EINVAL)?;
         *decoded_graph() = Some(transaction);
