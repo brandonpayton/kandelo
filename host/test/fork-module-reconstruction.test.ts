@@ -25,18 +25,22 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { ForkActivationRegistry } from "../src/fork-activation-registry";
-import { ForkFunctionCatalog } from "../src/fork-function-catalog";
 import { ForkModuleReconstructionFloor } from "../src/fork-module-reconstruction";
 import {
-  ForkReferenceTransaction,
-  decodeForkReferenceTransactionRecord,
-  type ForkExternrefRecipeProvider,
-} from "../src/fork-reference-transaction";
+  decodeSegmentedForkReferenceTransaction,
+  encodeSegmentedForkReferenceRecords,
+  PagedForkReferenceVector,
+  type DecodedSegmentedForkReferenceTransaction,
+} from "../src/fork-reference-segments";
+import { FORK_REFERENCE_TRANSACTION_OWNER_ID } from "../src/fork-reference-wire";
 import {
   ForkModuleStateArena,
   type ForkModuleStateRecord,
 } from "../src/fork-module-state";
-import type { ForkReferenceChildReplayAdoption } from "../src/fork-reference-contracts";
+import type {
+  ForkExternrefRecipeProvider,
+  ForkReferenceChildReplayAdoption,
+} from "../src/fork-reference-contracts";
 
 function makeExternrefs(): ForkExternrefRecipeProvider {
   return {
@@ -183,31 +187,20 @@ function emptyReconstructionArena(): ForkModuleStateArena {
 }
 
 // A real, empty decoded reference transaction (only the canonical null node) so
-// the flag-off `ForkReferenceTransaction.attachChild` has valid wire to attach.
-function emptyDecodedTransaction() {
-  const memory = new WebAssembly.Memory({ initial: 16 });
-  let next = 0x1_0000;
-  const arena = new ForkModuleStateArena(
-    memory,
-    4,
-    (size) => {
-      const addr = next;
-      next += Number(size);
-      return addr;
-    },
-    () => {},
-    "module reconstruction test",
+// the child-reconstruction path has valid wire to attach. The engine that once
+// produced this (`ForkReferenceTransaction`) is deleted; the canonical empty
+// graph is encoded directly through the staying segments wire codec.
+function emptyDecodedTransaction(): DecodedSegmentedForkReferenceTransaction {
+  const records = encodeSegmentedForkReferenceRecords(
+    FORK_REFERENCE_TRANSACTION_OWNER_ID,
+    [{ id: 0, node: { kind: "null" } }],
+    [PagedForkReferenceVector.empty],
+    { segmentDataBytes: 19 },
   );
-  arena.begin();
-  arena.appendModule({ activationId: 0, templateId: new Uint8Array(32) });
-  const parent = new ForkReferenceTransaction(
-    new ForkFunctionCatalog(),
-    makeExternrefs(),
+  return decodeSegmentedForkReferenceTransaction(
+    records,
+    FORK_REFERENCE_TRANSACTION_OWNER_ID,
   );
-  parent.beginCapture();
-  parent.sealInto(arena);
-  arena.seal();
-  return decodeForkReferenceTransactionRecord(arena.records());
 }
 
 describe("ForkActivationRegistry module-on child reconstruction", () => {
@@ -222,7 +215,6 @@ describe("ForkActivationRegistry module-on child reconstruction", () => {
     registry.attachChild(emptyReconstructionArena(), undefined, () => 5);
     const references = registry.currentReferences();
     expect(references).toBeInstanceOf(ForkModuleReconstructionFloor);
-    expect(references).not.toBeInstanceOf(ForkReferenceTransaction);
 
     const drive = vi.fn();
     registry.restoreModuleState(drive, true);

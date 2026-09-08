@@ -23,7 +23,6 @@ import {
   ForkGcLayoutKind,
   type ForkGcCodecProvider,
 } from "../src/fork-gc-codec";
-import { ForkFunctionCatalog } from "../src/fork-function-catalog";
 import {
   encodeForkImportedGlobalBindings,
   ForkImportedGlobalBindingKind,
@@ -43,10 +42,12 @@ import {
 import {
   FORK_HOST_EXCEPTION_ACTIVATION_ID,
   FORK_REFERENCE_TRANSACTION_OWNER_ID,
-  ForkReferenceTransaction,
-  type ForkExternrefRecipeProvider,
-  type ForkTypedReferenceReplayOwner,
-} from "../src/fork-reference-transaction";
+} from "../src/fork-reference-wire";
+import type {
+  ForkExternrefRecipeProvider,
+  ForkReferenceChildReplayAdoption,
+  ForkReferenceReplayAdoptionTarget,
+} from "../src/fork-reference-contracts";
 
 function recordsFor(
   graph: ForkReferenceRecipeGraph,
@@ -520,43 +521,48 @@ describe("early child reference provider", () => {
       WPK_FORK_MODULE_STATE_GLOBAL_TYPE_ANYREF,
     );
     expect(events).toEqual(["allocate:2", "fill:2"]);
-
-    const typedOwner: ForkTypedReferenceReplayOwner = {
-      prepareTransit: () => {},
-      publishTransit: () => {},
-      publishExternref: (recipeId, value) => {
-        transit.publish(recipeId, value);
-        events.push(`publish-externref:${recipeId}`);
-      },
-      provider: () => typed,
-      providers: () => [typed],
-      validateExceptionOwner: () => {},
-      materializeException: () => {},
-    };
-    const transaction = new ForkReferenceTransaction(
-      new ForkFunctionCatalog(),
-      refs.provider,
-      options.memory,
-      options.allocateScratch,
-      options.deallocateScratch,
-      "adopted transaction",
-      undefined,
-      typedOwner,
-    );
-    transaction.attachChild(options.transaction);
-    early.adoptInto(transaction);
-
-    expect(transaction.decodeExternref(1)).toBeUndefined();
-    transaction.materializeAllTyped();
-    expect(events).toEqual([
-      "allocate:2",
-      "fill:2",
-      "publish-externref:1",
-    ]);
-    expect(transit.read(2)).toBe(typedValue);
+    // The floor reconstructed the externref exactly once during
+    // pre-instantiation; the module-owned reconstruction owner adopts that
+    // cached identity rather than materializing it again.
     expect(refs.materializations).toEqual([44]);
-    transaction.finishReplay();
-    expect(() => early.adoptInto(transaction)).toThrow("was adopted");
+
+    // The reconstruction owner the floor hands its prefix to. The deleted JS
+    // `ForkReferenceTransaction` used to be this target; the floor's contract
+    // is the minimal `ForkReferenceReplayAdoptionTarget`, asserted directly.
+    const adoptions: ForkReferenceChildReplayAdoption[] = [];
+    const adoptionTarget: ForkReferenceReplayAdoptionTarget = {
+      adoptChildReplay: (adoption) => {
+        // Snapshot at handoff: the owner takes ownership here, and `adoptInto`
+        // then clears the floor's live collections (the real engine likewise
+        // copied every value before the floor released them).
+        adoptions.push({
+          transaction: adoption.transaction,
+          materializedValues: new Map(adoption.materializedValues),
+          allocatedTypedRecipes: new Set(adoption.allocatedTypedRecipes),
+          filledTypedRecipes: new Set(adoption.filledTypedRecipes),
+          materializedExceptionRecipes: new Set(
+            adoption.materializedExceptionRecipes,
+          ),
+        });
+      },
+    };
+    early.adoptInto(adoptionTarget);
+
+    expect(adoptions).toHaveLength(1);
+    const [adoption] = adoptions;
+    // Cached identities cross into the owner without re-reconstruction: the
+    // externref value (recipe 1) is already resolved to `undefined` and the
+    // typed struct (recipe 2) is already filled. `refs.materialize` is not
+    // called a second time.
+    expect(adoption.materializedValues.has(1)).toBe(true);
+    expect(adoption.materializedValues.get(1)).toBeUndefined();
+    expect(adoption.materializedValues.get(2)).toBe(typedValue);
+    expect(adoption.filledTypedRecipes.has(2)).toBe(true);
+    expect(refs.materializations).toEqual([44]);
+    expect(transit.read(2)).toBe(typedValue);
+
+    // The one-shot owner rejects a second adoption.
+    expect(() => early.adoptInto(adoptionTarget)).toThrow("was adopted");
   });
 
   it("allocates defaultable shells before filling cyclic and aliased GC edges", () => {
