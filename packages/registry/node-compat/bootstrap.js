@@ -2313,26 +2313,54 @@ const stream = (() => {
         constructor(options) {
             super();
             this.writable = true;
-            this._writableState = { ended: false };
+            this._writableState = { ended: false, ending: false, pending: 0 };
             if (options && options.write) this._write = options.write;
+            // `final` (Node's Writable option): invoked once `end()` has been
+            // called AND every in-flight `_write` callback has fired, right
+            // before 'finish'. child_process's stdin pipe relies on this to
+            // close the write fd only after the last chunk has actually gone
+            // through fdWrite — closing it eagerly (or before an async write
+            // settles) would either lose data or deliver EOF too early.
+            if (options && options.final) this._final = options.final;
         }
         _write(chunk, encoding, cb) { cb(); }
         write(chunk, encoding, cb) {
             if (typeof encoding === 'function') { cb = encoding; encoding = undefined; }
+            this._writableState.pending++;
             this._write(chunk, encoding || 'utf8', (err) => {
+                this._writableState.pending--;
                 if (err) this.emit('error', err);
                 if (cb) cb(err);
+                this._maybeFinish();
             });
             return true;
         }
         end(chunk, encoding, cb) {
             if (typeof chunk === 'function') { cb = chunk; chunk = undefined; }
             if (typeof encoding === 'function') { cb = encoding; encoding = undefined; }
+            if (cb) this.once('finish', cb);
+            this._writableState.ending = true;
             if (chunk) this.write(chunk, encoding);
-            this._writableState.ended = true;
-            this.emit('finish');
-            if (cb) cb();
+            this._maybeFinish();
             return this;
+        }
+        // Gate 'finish' (and `_final`) on every write callback having
+        // settled, not just on `end()` having been called. Without this an
+        // `end()` that races an in-flight async `_write` (e.g. a pending
+        // `__kandeloFdWrite` promise) would fire `_final`/'finish' before the
+        // data landed.
+        _maybeFinish() {
+            const st = this._writableState;
+            if (!st.ending || st.pending > 0 || st.ended) return;
+            st.ended = true;
+            if (this._final) {
+                this._final((err) => {
+                    if (err) this.emit('error', err);
+                    this.emit('finish');
+                });
+            } else {
+                this.emit('finish');
+            }
         }
         destroy() { this.emit('close'); return this; }
     }
@@ -2760,56 +2788,144 @@ const child_process = (() => {
         }
     }
 
-    function exec(command, options, cb) {
-        if (typeof options === 'function') { cb = options; options = {}; }
-        try {
-            const result = execSync(command, { ...options, encoding: 'utf8' });
-            queueMicrotask(() => cb(null, result, ''));
-        } catch (e) {
-            queueMicrotask(() => cb(e, e.stdout || '', e.stderr || ''));
-        }
-    }
+    // ------------------------------------------------------------------
+    // Real async spawn on the Task-1 POSIX seam (posix_spawn + async pipe
+    // fds). execSync/execFileSync/spawnSync above stay popen-based (a
+    // follow-up); spawn/exec/execFile below are real streaming subprocesses.
+    // ------------------------------------------------------------------
+    const _nn = _nodeNative;
+    function _spawn(command, args, options) {
+        // Node signature: spawn(cmd, [args], [options]) — args may be omitted and
+        // options passed in its place. Extract options BEFORE normalizing args.
+        if (args && !Array.isArray(args)) { options = args; args = []; }
+        args = Array.isArray(args) ? args : [];
+        options = options || {};
+        let file = command, argv;
+        if (options.shell) { file = '/bin/sh'; argv = ['/bin/sh', '-c', [command].concat(args).join(' ')]; }
+        else { argv = [command].concat(args); }
+        const env = options.env
+            ? Object.keys(options.env).map(k => k + '=' + options.env[k])
+            : Object.keys(process.env).map(k => k + '=' + process.env[k]);
 
-    function execFile(file, args, options, cb) {
-        if (typeof args === 'function') { cb = args; args = []; options = {}; }
-        else if (typeof options === 'function') { cb = options; options = {}; }
-        const cmd = file + ' ' + (args || []).map(a => `'${a}'`).join(' ');
-        try {
-            const result = execSync(cmd, { ...options, encoding: 'utf8' });
-            queueMicrotask(() => cb && cb(null, result, ''));
-        } catch (e) {
-            queueMicrotask(() => cb && cb(e, e.stdout || '', e.stderr || ''));
-        }
-    }
+        // Normalize stdio to a 3-entry array of 'pipe'|'ignore'|'inherit'|<int fd>.
+        let stdio = options.stdio;
+        if (stdio === 'inherit' || stdio === 'ignore' || stdio === 'pipe') stdio = [stdio, stdio, stdio];
+        if (!Array.isArray(stdio)) stdio = ['pipe', 'pipe', 'pipe'];
+        while (stdio.length < 3) stdio.push('pipe');
 
-    function spawn(command, args, options) {
-        // Return a minimal ChildProcess-like object
-        const child = new events.EventEmitter();
-        child.pid = 0;
-        child.stdin = new stream.Writable();
-        child.stdout = new stream.Readable();
-        child.stderr = new stream.Readable();
-
-        queueMicrotask(() => {
-            try {
-                const cmd = command + ' ' + (args || []).map(a => `'${a}'`).join(' ');
-                const result = execSync(cmd, { encoding: 'utf8' });
-                child.stdout.push(Buffer.from(result));
-                child.stdout.push(null);
-                child.stderr.push(null);
-                child.emit('close', 0);
-                child.emit('exit', 0);
-            } catch (e) {
-                child.emit('error', e);
-                child.emit('close', 1);
-                child.emit('exit', 1);
+        const actions = [];
+        const parentClose = [];         // fds to close in the parent after spawn
+        const legs = [null, null, null]; // parent-side fd per stdio index (for 'pipe')
+        for (let i = 0; i < 3; i++) {
+            const s = stdio[i];
+            if (s === 'pipe') {
+                const [r, w] = _nn.__kandeloPipe();
+                // fd 0: child reads r, parent writes w. fds 1/2: child writes w, parent reads r.
+                const childEnd = (i === 0) ? r : w;
+                const parentEnd = (i === 0) ? w : r;
+                legs[i] = parentEnd;
+                actions.push({ op: 'dup2', from: childEnd, to: i });
+                actions.push({ op: 'close', fd: r });
+                actions.push({ op: 'close', fd: w });
+                parentClose.push(childEnd);
+            } else if (s === 'ignore') {
+                actions.push({ op: 'open', fd: i, path: '/dev/null', flags: (i === 0 ? 0 : 1), mode: 0 });
+            } else if (s === 'inherit') {
+                actions.push({ op: 'dup2', from: i, to: i });
+            } else if (typeof s === 'number') {
+                actions.push({ op: 'dup2', from: s, to: i });
             }
+        }
+        if (options.cwd) actions.push({ op: 'chdir', path: String(options.cwd) });
+
+        const child = new events.EventEmitter();
+        child.stdin = null; child.stdout = null; child.stderr = null; child.pid = 0;
+
+        let pid;
+        try { pid = _nn.__kandeloSpawn(file, argv, env, actions, {}); }
+        catch (err) {
+            // Node: spawn error is delivered asynchronously as an 'error' event.
+            queueMicrotask(() => child.emit('error', err));
+            // still provide stream objects so consumers don't crash
+            child.stdin = new stream.Writable({ write(c, e, cb) { cb(); } });
+            child.stdout = new stream.Readable({ read() {} }); child.stdout.push(null);
+            child.stderr = new stream.Readable({ read() {} }); child.stderr.push(null);
+            return child;
+        }
+        child.pid = pid;
+        for (const fd of parentClose) { try { _nn.__kandeloFdClose(fd); } catch (_) {} }
+
+        // stdin (fd 0 pipe): Writable -> fdWrite; end -> fdClose delivers EOF.
+        if (legs[0] != null) {
+            const wfd = legs[0];
+            child.stdin = new stream.Writable({
+                write(chunk, enc, cb) {
+                    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, enc);
+                    _nn.__kandeloFdWrite(wfd, buf).then(() => cb(null), cb);
+                },
+                final(cb) { try { _nn.__kandeloFdClose(wfd); } catch (_) {} cb(); },
+            });
+        } else { child.stdin = null; }
+
+        // stdout/stderr: Readable pumped by an fdRead loop; empty ArrayBuffer = EOF.
+        // 'close' fires once, after the process has exited AND every opened
+        // stdout/stderr read stream has reached its terminal state. openReads is
+        // incremented once per opened read stream and decremented exactly once
+        // (in that stream's EOF or error branch); _maybeClose is the single gate.
+        let openReads = 0, exited = false, exitInfo = null;
+        function _maybeClose() { if (exited && openReads === 0) child.emit('close', exitInfo.code, exitInfo.signal); }
+        function _pumpReadable(fd) {
+            const rs = new stream.Readable({ read() {} });
+            openReads++;
+            let counted = false;
+            const finish = () => { try { _nn.__kandeloFdClose(fd); } catch (_) {} if (!counted) { counted = true; openReads--; _maybeClose(); } };
+            (function loop() {
+                _nn.__kandeloFdRead(fd, 65536).then((ab) => {
+                    if (ab.byteLength === 0) { rs.push(null); finish(); return; }
+                    rs.push(Buffer.from(ab)); loop();
+                }, (err) => { rs.destroy(err); finish(); });
+            })();
+            return rs;
+        }
+        child.stdout = legs[1] != null ? _pumpReadable(legs[1]) : null;
+        child.stderr = legs[2] != null ? _pumpReadable(legs[2]) : null;
+
+        _nn.__kandeloWaitPid(pid).then((st) => {
+            exited = true; exitInfo = st;
+            child.emit('exit', st.code, st.signal);
+            _maybeClose();
         });
 
+        child.kill = function (sig) {
+            const signum = typeof sig === 'number' ? sig : (nodeOs.constants.signals[sig || 'SIGTERM'] | 0);
+            try { _nn.__kandeloKill(pid, signum || 15); return true; } catch (_) { return false; }
+        };
         return child;
     }
 
-    return { execSync, execFileSync, spawnSync, exec, execFile, spawn };
+    function exec(command, options, cb) {
+        if (typeof options === 'function') { cb = options; options = {}; }
+        const child = _spawn(command, [], { ...(options || {}), shell: true });
+        let out = '', err = '';
+        if (child.stdout) child.stdout.on('data', d => out += d);
+        if (child.stderr) child.stderr.on('data', d => err += d);
+        child.on('error', e => cb && cb(e, out, err));
+        child.on('exit', (code) => cb && cb(code ? Object.assign(new Error('Command failed: ' + command), { code }) : null, out, err));
+        return child;
+    }
+    function execFile(file, args, options, cb) {
+        if (typeof args === 'function') { cb = args; args = []; options = {}; }
+        else if (typeof options === 'function') { cb = options; options = {}; }
+        const child = _spawn(file, args || [], options || {});
+        let out = '', err = '';
+        if (child.stdout) child.stdout.on('data', d => out += d);
+        if (child.stderr) child.stderr.on('data', d => err += d);
+        child.on('error', e => cb && cb(e, out, err));
+        child.on('exit', (code) => cb && cb(code ? Object.assign(new Error('Command failed: ' + file), { code }) : null, out, err));
+        return child;
+    }
+
+    return { execSync, execFileSync, spawnSync, exec, execFile, spawn: _spawn };
 })();
 
 // child_process.ChildProcess — spawn() above already returns an
