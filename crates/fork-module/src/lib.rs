@@ -598,6 +598,52 @@ mod wasm {
         let byte_len = usize::try_from(byte_len).map_err(|_| Errno::EINVAL)?;
         let act_count = ACT_GC_CODEC_ACT_COUNT.load(Ordering::Relaxed) as usize;
         let used = ACT_GC_CODEC_BYTES_USED.load(Ordering::Relaxed) as usize;
+        // Bound the incoming section against guest memory FIRST, so the identical-
+        // re-seed comparison below can read it safely.
+        let start = usize::try_from(ptr).map_err(|_| Errno::EINVAL)?;
+        let end = start.checked_add(byte_len).ok_or(Errno::EINVAL)?;
+        if end > mem_len_bytes() {
+            return Err(Errno::EINVAL); // section region past the end of guest memory
+        }
+        // The raw incoming section bytes in guest linear memory.
+        // SAFETY: `[start, end)` is within guest linear memory (checked above). An
+        // empty section uses a valid empty slice rather than a possibly-null raw
+        // part (`from_raw_parts` requires a non-null base even for len 0).
+        let incoming: &[u8] = if byte_len == 0 {
+            &[]
+        } else {
+            unsafe {
+                core::slice::from_raw_parts(core::hint::black_box(start) as *const u8, byte_len)
+            }
+        };
+        // Idempotent re-seed of an already-present activation. A COW fork CHILD
+        // inherits the parent's already-seeded catalog through the memory clone
+        // (the module's BSS lives inside the shared linear memory and is NOT
+        // re-zeroed on instantiation), yet the production Node/browser host
+        // RE-SEEDS every activation's GC codec on the child (`worker-main.ts`'s
+        // per-activation `setActivationGcCodec`), while the native host relies on
+        // inheritance and does NOT re-seed. A GC codec is the activation module's
+        // invariant KFGC section, so a re-seed is byte-IDENTICAL by construction:
+        // accept it as a no-op here so BOTH hosts converge on the same (correct)
+        // catalog. This replaces a blanket `fm_set_format` GC-codec reset that
+        // destroyed the inherited catalog on the host that never re-seeds, which
+        // broke `fm_build_gc_plan` (`errno 22`) for every GC / static-root fork. A
+        // CONFLICTING re-seed (same activation, DIFFERENT bytes) is still a
+        // truthful `EINVAL` — the guard's real purpose.
+        // SAFETY: single-threaded; the index/bytes are static buffers read here.
+        let index = unsafe { &*ACT_GC_CODEC_INDEX.0.get() };
+        let stored_bytes = unsafe { &*ACT_GC_CODEC_BYTES.0.get() };
+        for entry in index.iter().take(act_count) {
+            if entry[0] == activation_id {
+                let off = entry[1] as usize;
+                let len = entry[2] as usize;
+                let stored = stored_bytes.get(off..off + len).ok_or(Errno::EINVAL)?;
+                if stored == incoming {
+                    return Ok(()); // identical re-seed: no-op
+                }
+                return Err(Errno::EINVAL); // conflicting re-seed of the same activation
+            }
+        }
         if act_count >= ACT_GC_CODEC_MAX_ACTS {
             return Err(Errno::E2BIG); // too many distinct activations
         }
@@ -605,27 +651,13 @@ mod wasm {
         if end_used > ACT_GC_CODEC_BYTES_CAP {
             return Err(Errno::E2BIG); // combined catalogs exceed the arena
         }
-        // Reject a re-seeded activation (each is seeded once per worker).
-        // SAFETY: single-threaded; the index is a static buffer read here only.
-        let index = unsafe { &*ACT_GC_CODEC_INDEX.0.get() };
-        for entry in index.iter().take(act_count) {
-            if entry[0] == activation_id {
-                return Err(Errno::EINVAL);
-            }
-        }
-        let start = usize::try_from(ptr).map_err(|_| Errno::EINVAL)?;
-        let end = start.checked_add(byte_len).ok_or(Errno::EINVAL)?;
-        if end > mem_len_bytes() {
-            return Err(Errno::EINVAL); // section region past the end of guest memory
-        }
         // Copy the raw section bytes out of guest memory into the flat static arena
         // (the same aliasing-safe idiom the resume catalog uses).
-        // SAFETY: `[start, end)` is within guest linear memory (checked above); the
-        // destination is the distinct static byte arena slice `[used, end_used)`.
+        // SAFETY: the destination is the distinct static byte arena slice
+        // `[used, end_used)`; `incoming` is a distinct guest-memory region.
         let bytes = unsafe { &mut *ACT_GC_CODEC_BYTES.0.get() };
-        let src = core::hint::black_box(start) as *const u8;
         unsafe {
-            core::ptr::copy(src, bytes.as_mut_ptr().add(used), byte_len);
+            core::ptr::copy(incoming.as_ptr(), bytes.as_mut_ptr().add(used), byte_len);
         }
         // Publish the index entry, then bump the counters.
         // SAFETY: single-threaded; `act_count < MAX_ACTS` by the check above.
@@ -1052,25 +1084,32 @@ mod wasm {
         // per-worker "seeded once" catalogs here so a COW child starts clean.
         //
         // These catalogs (funcref catalog, funcref/static-root activation bases,
-        // GC codec, host-exception owner, resume catalog) live in the module's
-        // BSS, which sits INSIDE the guest's shared linear memory at
-        // `__memory_base` (the PIC placement). A COW child's memory is a CLONE of
-        // the parent's, so the child's fresh fork-module instance sees the
-        // PARENT's already-populated catalogs — and BSS is not re-zeroed on
-        // instantiation. Each catalog rejects a re-seed of an already-present
-        // activation with `EINVAL`, so without this reset the child's own
-        // per-activation seeding (which happens AFTER `fm_set_format`) fails as a
-        // spurious re-seed. This surfaced as `fm_set_activation_gc_codec` errno 22
-        // on real command-substitution/pipeline forks once the capture-builder
-        // trap that previously masked it was fixed. Resetting the counters is
-        // enough: the backing arenas are addressed by these offsets and are
-        // overwritten by the fresh seeds.
+        // host-exception owner, resume catalog) live in the module's BSS, which
+        // sits INSIDE the guest's shared linear memory at `__memory_base` (the PIC
+        // placement). A COW child's memory is a CLONE of the parent's, so the
+        // child's fresh fork-module instance sees the PARENT's already-populated
+        // catalogs — and BSS is not re-zeroed on instantiation. Each catalog
+        // rejects a re-seed of an already-present activation with `EINVAL`, so
+        // without this reset the child's own per-activation seeding (which happens
+        // AFTER `fm_set_format`) fails as a spurious re-seed. This surfaced as
+        // errno 22 on real command-substitution/pipeline forks once the
+        // capture-builder trap that previously masked it was fixed. Resetting the
+        // counters is enough: the backing arenas are addressed by these offsets and
+        // are overwritten by the fresh seeds.
+        //
+        // The GC codec catalog (`ACT_GC_CODEC_*`) is DELIBERATELY NOT reset here.
+        // Unlike the capture-side catalogs above, the native host does NOT re-seed
+        // it on a COW child — it relies on inheriting the parent's already-seeded
+        // codec — while the Node/browser host DOES re-seed it. A reset here
+        // destroyed the inherited codec on the native host, breaking
+        // `fm_build_gc_plan` (`errno 22`) for every GC / static-root fork. Instead
+        // `set_activation_gc_codec_impl` is idempotent on an identical re-seed, so
+        // both a re-seeding host and an inheriting host converge on the same codec
+        // without a reset. See that function.
         ACT_CATALOG_ACT_COUNT.store(0, Ordering::Relaxed);
         ACT_CATALOG_ORD_USED.store(0, Ordering::Relaxed);
         ACT_FUNC_CATALOG_BASE_COUNT.store(0, Ordering::Relaxed);
         ACT_STATIC_ROOT_BASE_COUNT.store(0, Ordering::Relaxed);
-        ACT_GC_CODEC_ACT_COUNT.store(0, Ordering::Relaxed);
-        ACT_GC_CODEC_BYTES_USED.store(0, Ordering::Relaxed);
         HOST_EXCEPTION_OWNER.store(u32::MAX, Ordering::Relaxed);
         RESUME_CATALOG_LEN.store(0, Ordering::Relaxed);
         FMT_POINTER_WIDTH.store(pointer_width, Ordering::Relaxed);
