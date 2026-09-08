@@ -18,7 +18,10 @@ import {
   type ForkModuleExports,
   instantiateForkModule,
 } from "../src/fork-module-instance";
-import { ForkModuleContinuationBackend } from "../src/fork-module-backend";
+import {
+  ForkFixedFrameArena,
+  ForkModuleContinuationBackend,
+} from "../src/fork-module-backend";
 import { ForkModuleTrampolines } from "../src/fork-module-trampoline";
 import type { LinkedFrameFormatDescriptor } from "../src/fork-continuation";
 import {
@@ -230,6 +233,14 @@ describe("ForkModuleContinuationBackend multi-activation", () => {
     const px = fm.exports as ForkModuleExports;
     const perr = (): number => Number((px.fm_last_errno as () => number)());
 
+    // Fix X: the module bump-allocates each activation's frame chunks + the
+    // journal image from this bounded, pre-reserved arena (part of the module
+    // region), so no channel mmap and no memory growth occurs.
+    const parentFrameArena = new ForkFixedFrameArena(
+      fm.frameArenaBase,
+      fm.frameArenaBytes,
+      "backend-parent frame arena",
+    );
     const backend = new ForkModuleContinuationBackend({
       exports: px,
       memory: parentMemory,
@@ -237,6 +248,7 @@ describe("ForkModuleContinuationBackend multi-activation", () => {
       format: format(128),
       catalogOrdinals: CATALOG0,
       channelBase: CHANNEL_BASE,
+      frameArena: parentFrameArena,
       reserveRegion: alloc.reserve,
       releaseRegion: () => {},
       pid: 1,
@@ -253,10 +265,11 @@ describe("ForkModuleContinuationBackend multi-activation", () => {
     const parentTrampolines = new ForkModuleTrampolines(px);
     driveUnwind(parentTrampolines, parentMemory, perr);
     const image = backend.finishUnwindAndSerialize();
-    // The image was channel-mmap'd out of the frame region (>= 48 MiB), proving
-    // the module owns its allocation via the channel rather than a fixed host
-    // arena the coordinator carved.
-    expect(image.ptr).toBeGreaterThanOrEqual(FRAME_REGION_BASE);
+    // Fix X: the image lives in a slab of the pre-reserved fork-frame arena
+    // (inside the module region), NOT a channel-mmap'd high chunk — proving the
+    // journal no longer grows guest memory at fork.
+    expect(image.ptr).toBeGreaterThanOrEqual(fm.frameArenaBase);
+    expect(image.ptr).toBeLessThan(fm.frameArenaBase + fm.frameArenaBytes);
     expect(image.len).toBeGreaterThan(0);
     expect(Number(backend.framesCommitted())).toBe(COMMITS.length);
 
@@ -288,9 +301,15 @@ describe("ForkModuleContinuationBackend multi-activation", () => {
       ptrWidth: 4,
       format: format(128),
       catalogOrdinals: CATALOG0,
-      // Replay-only child mmaps nothing; a channel base is still required by the
-      // backend contract but is never used for allocation.
+      // Replay-only child allocates nothing; a channel base + frame arena are
+      // required by the backend contract but are never used for allocation (the
+      // child reads the inherited frame/journal bytes at their copied addresses).
       channelBase: CHANNEL_BASE,
+      frameArena: new ForkFixedFrameArena(
+        childFm.frameArenaBase,
+        childFm.frameArenaBytes,
+        "backend-child frame arena",
+      ),
       reserveRegion: childAlloc.reserve,
       releaseRegion: () => {},
       pid: 2,
