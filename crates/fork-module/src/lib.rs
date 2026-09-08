@@ -1604,9 +1604,19 @@ mod wasm {
 
     fn begin_unwind_fixed_arena_impl(activation_id: u32, base: u64, len: u64) -> Result<u64, Errno> {
         let fmt = format()?;
-        // Reclaim the previous fork's state and heap before this fork.
+        // Reclaim the previous fork's state before this fork. Mirror the channel
+        // `begin_unwind_impl`'s bump-heap discipline EXACTLY: when a reference
+        // capture is armed (`fm_capture_begin` ran first and stored
+        // `CAPTURE_ARMED`), the live capture builder lives in this same bump heap,
+        // so consuming the arming here and SKIPPING `ALLOC.reset()` is what keeps
+        // the builder alive across `fm_begin_unwind`. An unconditional reset (as
+        // this in-realm sibling originally did, when it was harness-only and no
+        // production capture ran before it) would wipe the builder the moment the
+        // production fixed-arena path issues `fm_capture_begin` before unwind.
         *state() = None;
-        ALLOC.reset();
+        if CAPTURE_ARMED.swap(0, Ordering::Relaxed) == 0 {
+            ALLOC.reset();
+        }
         let mut module = ForkModule {
             activations: BTreeMap::new(),
             channel_base: 0,

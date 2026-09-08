@@ -12,11 +12,112 @@
 // forks never construct this and are byte-identical to today.
 
 import { WASM_PAGE_SIZE } from "./constants";
-import type { LinkedFrameFormatDescriptor } from "./fork-continuation";
+import {
+  ContinuationAllocationError,
+  type LinkedFrameFormatDescriptor,
+} from "./fork-continuation";
 import type { ForkModuleExports } from "./fork-module-instance";
 
 /** The fork-module's static resume-catalog cap (mirrors `RESUME_CATALOG_CAP`). */
 export const FORK_MODULE_RESUME_CATALOG_CAP = 16_384;
+
+/** POSIX `ENOMEM` — the truthful failure mode for fork-frame arena exhaustion. */
+const ENOMEM = 12;
+
+/**
+ * Per-activation frame-chunk slab handed to `fm_begin_unwind_fixed_arena` /
+ * `fm_add_activation_unwind_fixed_arena`. The module bump-allocates its linked
+ * frame chunks WITHIN this slab on demand. 2 pages (128 KiB) roughly doubles the
+ * historical Asyncify-era `FORK_SAVE_BUFFER_SIZE` (60 KiB) and holds far more
+ * than the worst observed fork stack (lxpanel's ~21.5 KiB GLib double-fork). A
+ * frame stack that overflows the slab is a truthful module `ENOMEM`.
+ */
+export const FORK_MODULE_FRAME_SLAB_BYTES = 2 * WASM_PAGE_SIZE;
+
+/**
+ * The journal-image slab handed to `fm_serialize_journal_fixed_arena`. The KFRE
+ * image grows with the total committed-frame count across every activation; 4
+ * pages (256 KiB) is generous for realistic forks. Too small a region is a
+ * truthful `ENOMEM` from the module, never a silent overrun.
+ */
+export const FORK_MODULE_JOURNAL_SLAB_BYTES = 4 * WASM_PAGE_SIZE;
+
+/**
+ * A bounded cursor sub-allocator over the fork-module's pre-reserved in-guest
+ * fork-frame arena (Fix X; see `FORK_MODULE_FRAME_ARENA_BYTES` in
+ * `fork-module-instance.ts`). All THREE growing fork-time allocations — each
+ * activation's frame chunk, the journal image, and the host-side module-state
+ * arena chunks — draw page-aligned slabs from this ONE region instead of
+ * channel-mmapping fresh, memory-growing regions.
+ *
+ * The owner (`worker-main`) calls `reset()` once at the START of each parent
+ * fork, before any of the three consumers allocate, so sequential forks reuse
+ * the region. A COW child is replay-only and allocates nothing, so only one
+ * in-flight fork ever uses the arena; nested fork depth does not multiply usage.
+ * On exhaustion `allocate` throws `ContinuationAllocationError(ENOMEM)`, which
+ * the fork syscall handler turns into a truthful `-ENOMEM` — it NEVER falls back
+ * to growing guest memory.
+ */
+export class ForkFixedFrameArena {
+  private cursor: number;
+
+  constructor(
+    private readonly base: number,
+    private readonly bytes: number,
+    private readonly label: string,
+  ) {
+    if (
+      !Number.isSafeInteger(base)
+      || base <= 0
+      || base % WASM_PAGE_SIZE !== 0
+    ) {
+      throw new RangeError(
+        `${label}: fork-frame arena base must be a positive page multiple`,
+      );
+    }
+    if (
+      !Number.isSafeInteger(bytes)
+      || bytes <= 0
+      || bytes % WASM_PAGE_SIZE !== 0
+    ) {
+      throw new RangeError(
+        `${label}: fork-frame arena size must be a positive page multiple`,
+      );
+    }
+    this.cursor = base;
+  }
+
+  /** Reset the cursor to the region base — called once per fork by the owner. */
+  reset(): void {
+    this.cursor = this.base;
+  }
+
+  /**
+   * Bump-allocate a page-aligned slab of at least `size` bytes. The base stays
+   * page-aligned (the region base is, and every slab is a page multiple), which
+   * the module-state arena's chunk validation requires. Exhaustion is a truthful
+   * `ENOMEM`, never a fallback to growing guest memory.
+   */
+  allocate(size: number): number {
+    if (!Number.isSafeInteger(size) || size <= 0) {
+      throw new RangeError(`${this.label}: invalid fork-frame slab size ${size}`);
+    }
+    const need = alignUpPage(size);
+    const addr = this.cursor;
+    const end = addr + need;
+    if (end > this.base + this.bytes) {
+      throw new ContinuationAllocationError(
+        ENOMEM,
+        need,
+        `${this.label}: fork-frame arena exhausted (need ${need} bytes, ` +
+          `${this.base + this.bytes - addr} of ${this.bytes} remaining); ` +
+          `the bounded arena is full`,
+      );
+    }
+    this.cursor = end;
+    return addr;
+  }
+}
 
 /**
  * The guest offset + byte length of the serialized replay-event (KFRE) journal
@@ -45,12 +146,22 @@ export interface ForkModuleBackendOptions {
    */
   readonly catalogOrdinals: readonly number[];
   /**
-   * The guest syscall channel base (Option B). The module issues each frame
-   * chunk's `SYS_MMAP` through this channel, growing memory on demand — so the
-   * host no longer reserves or threads a per-fork frame arena. Must be
+   * The guest syscall channel base. Retained for the small pre-fork catalog
+   * scratch fallback only; Fix X moved the per-fork frame/journal allocations
+   * off the channel and onto the pre-reserved fork-frame arena (`frameArena`),
+   * so the module no longer channel-mmaps growing frame chunks. Must be
    * page-aligned and nonzero.
    */
   readonly channelBase: number;
+  /**
+   * The bounded, pre-reserved in-guest fork-frame arena (Fix X). The backend
+   * bump-allocates each activation's frame slab and the journal-image slab from
+   * here (via the module's `fm_*_fixed_arena` exports) instead of growing guest
+   * memory per fork. `worker-main` resets its cursor once per fork and shares the
+   * SAME instance with the module-state arena so all three fork-time allocations
+   * live in this one reserved region.
+   */
+  readonly frameArena: ForkFixedFrameArena;
   /**
    * Reserve a small page-aligned guest region for PRE-FORK CATALOG SCRATCH only
    * (production: channel `continuationMmap`). This is unrelated to frame
@@ -85,6 +196,7 @@ export class ForkModuleContinuationBackend {
   private readonly format: LinkedFrameFormatDescriptor;
   private readonly catalogOrdinals: readonly number[];
   private readonly channelBase: number;
+  private readonly frameArena: ForkFixedFrameArena;
   private readonly reserveRegion: (size: number) => number;
   private readonly releaseRegion: (addr: number, size: number) => void;
   private readonly pid: number;
@@ -102,6 +214,7 @@ export class ForkModuleContinuationBackend {
     this.format = options.format;
     this.catalogOrdinals = options.catalogOrdinals;
     this.channelBase = options.channelBase;
+    this.frameArena = options.frameArena;
     this.reserveRegion = options.reserveRegion;
     this.releaseRegion = options.releaseRegion;
     this.pid = options.pid;
@@ -501,20 +614,27 @@ export class ForkModuleContinuationBackend {
   }
 
   /**
-   * Parent: begin the module unwind (Option B: the module owns its frame
-   * allocation, mmap'ing chunks through the channel; no host arena to reserve).
-   * Returns the module-buffer anchor (the continuation root) the coordinator
-   * writes into the module-state prefix and passes to `wpk_fork_unwind_begin`.
+   * Parent: begin the module unwind over a slab of the pre-reserved fork-frame
+   * arena (Fix X). The module bump-allocates its linked frame chunks WITHIN this
+   * slab, so the unwind never grows guest memory. Returns the module-buffer
+   * anchor (the continuation root) the coordinator writes into the module-state
+   * prefix and passes to `wpk_fork_unwind_begin`. The caller (`worker-main`)
+   * resets the arena cursor once, before this fork's first allocation.
    */
   beginUnwind(): number {
     this.requireSetup("begin unwind");
     if (this.unwindActive) {
       throw new Error(`${this.label}: fork-module unwind already active`);
     }
+    const slab = this.frameArena.allocate(FORK_MODULE_FRAME_SLAB_BYTES);
     const moduleBuffer = this.toNum(
-      this.exports.fm_begin_unwind(0, this.wptr(this.channelBase)),
+      this.exports.fm_begin_unwind_fixed_arena(
+        0,
+        this.wptr(slab),
+        this.wptr(FORK_MODULE_FRAME_SLAB_BYTES),
+      ),
     );
-    this.requireOk("fm_begin_unwind");
+    this.requireOk("fm_begin_unwind_fixed_arena");
     if (!Number.isSafeInteger(moduleBuffer) || moduleBuffer <= 0) {
       throw new Error(`${this.label}: fm_begin_unwind returned invalid anchor`);
     }
@@ -534,14 +654,22 @@ export class ForkModuleContinuationBackend {
   finishUnwindAndSerialize(): ForkModuleJournalImage {
     this.exports.fm_finish_unwind();
     this.requireOk("fm_finish_unwind");
+    // Fix X: serialize the journal into a slab of the pre-reserved fork-frame
+    // arena (the fixed-arena unwind left the module's `channel_base = 0`, so the
+    // channel serializer is unusable), so the journal image does not grow guest
+    // memory. An image larger than the slab is a truthful module `ENOMEM`.
+    const journalSlab = this.frameArena.allocate(FORK_MODULE_JOURNAL_SLAB_BYTES);
     const ptr = this.toNum(
-      this.exports.fm_serialize_journal_alloc(this.wptr(this.channelBase)),
+      this.exports.fm_serialize_journal_fixed_arena(
+        this.wptr(journalSlab),
+        this.wptr(FORK_MODULE_JOURNAL_SLAB_BYTES),
+      ),
     );
-    this.requireOk("fm_serialize_journal_alloc");
+    this.requireOk("fm_serialize_journal_fixed_arena");
     const len = this.toNum(this.exports.fm_journal_image_len());
     if (!Number.isSafeInteger(ptr) || ptr <= 0) {
       throw new Error(
-        `${this.label}: fm_serialize_journal_alloc returned invalid image ptr ${ptr}`,
+        `${this.label}: fm_serialize_journal_fixed_arena returned invalid image ptr ${ptr}`,
       );
     }
     if (!Number.isSafeInteger(len) || len <= 0) {
@@ -737,19 +865,24 @@ export class ForkModuleContinuationBackend {
     if (activationId === 0) {
       throw new Error(`${this.label}: activation 0 uses beginUnwind, not addActivationUnwind`);
     }
-    // Option B: this activation mmaps its own frame chunks through the shared
-    // channel; no host arena to reserve.
+    // Fix X: this activation bump-allocates its frame chunks within its OWN slab
+    // of the pre-reserved fork-frame arena — disjoint from activation 0's slab
+    // and every other activation's, since the shared cursor only advances. No
+    // channel mmap, so a multi-activation (dlopen) fork does not grow guest
+    // memory either.
+    const slab = this.frameArena.allocate(FORK_MODULE_FRAME_SLAB_BYTES);
     const moduleBuffer = this.toNum(
-      this.exports.fm_add_activation_unwind(
+      this.exports.fm_add_activation_unwind_fixed_arena(
         this.wptr(activationId),
-        this.wptr(this.channelBase),
+        this.wptr(slab),
+        this.wptr(FORK_MODULE_FRAME_SLAB_BYTES),
         this.wptr(fixedPrefix),
       ),
     );
-    this.requireOk("fm_add_activation_unwind");
+    this.requireOk("fm_add_activation_unwind_fixed_arena");
     if (!Number.isSafeInteger(moduleBuffer) || moduleBuffer <= 0) {
       throw new Error(
-        `${this.label}: fm_add_activation_unwind returned invalid anchor for `
+        `${this.label}: fm_add_activation_unwind_fixed_arena returned invalid anchor for `
           + `activation ${activationId}`,
       );
     }
