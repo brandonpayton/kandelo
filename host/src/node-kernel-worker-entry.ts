@@ -172,13 +172,24 @@ const port = parentPort;
  * behind it, so the module always ships.
  */
 const forkModuleModuleByWidth = new Map<4 | 8, WebAssembly.Module>();
+// Explicit per-boot fork-module bytes (see `InitMessage.forkModuleBytesByWidth`
+// and `NodeKernelHostOptions.forkModuleBytesByWidth`). Seeded from the init
+// message; consulted only on a compiled-module cache miss. The fork module is
+// identical regardless of source, so caching by width stays sound whether a
+// width was first compiled from injected bytes or from the resolver.
+let injectedForkModuleBytesByWidth: Partial<Record<4 | 8, ArrayBuffer>> = {};
 function forkModuleInitFields(
   ptrWidth: 4 | 8,
 ): { forkModuleModule: WebAssembly.Module } {
   let mod = forkModuleModuleByWidth.get(ptrWidth);
   if (!mod) {
-    const name = `fork_module${ptrWidth === 8 ? 64 : 32}.wasm`;
-    mod = new WebAssembly.Module(readFileSync(resolveBinary(name)));
+    const injected = injectedForkModuleBytesByWidth[ptrWidth];
+    if (injected !== undefined) {
+      mod = new WebAssembly.Module(new Uint8Array(injected));
+    } else {
+      const name = `fork_module${ptrWidth === 8 ? 64 : 32}.wasm`;
+      mod = new WebAssembly.Module(readFileSync(resolveBinary(name)));
+    }
     forkModuleModuleByWidth.set(ptrWidth, mod);
   }
   return { forkModuleModule: mod };
@@ -1497,6 +1508,8 @@ async function handleInit(msg: InitMessage) {
       rootfsNosuid,
     );
   }
+
+  injectedForkModuleBytesByWidth = msg.forkModuleBytesByWidth ?? {};
 
   await kernelWorker.init(msg.kernelWasmBytes);
 

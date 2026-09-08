@@ -217,6 +217,15 @@ export interface RunProgramOptions {
    * the kernel artifact — e.g. a build-time step that cannot rely on the
    * source-only program projection — passes it here to avoid resolution. */
   kernelWasmBytes?: ArrayBuffer | Uint8Array;
+  /** Explicit co-resident fork-module wasm bytes keyed by pointer width. The
+   * fork module is the UNCONDITIONAL fork reconstructor, so every process
+   * launch needs it; a build-time boot that runs under the source-only
+   * resolution policy but has no source-only binary root (deps arrive via
+   * `WASM_POSIX_DEP_*_DIR`, not projection) passes the artifact here — exactly
+   * as `kernelWasmBytes` injects the kernel — so `centralizedForkModuleFields`
+   * never re-enters the binary resolver. Omitted resolves the fork module
+   * through the normal binary resolver. */
+  forkModuleBytesByWidth?: Partial<Record<4 | 8, ArrayBuffer | Uint8Array>>;
   /** Observe process lifecycle events emitted by NodeKernelHost. Worker-thread mode only. */
   onProcessEvent?: (event: {
     kind: "spawn" | "exec" | "exit";
@@ -272,13 +281,29 @@ export interface RunProgramResult {
  * production kernel host does.
  */
 const forkModuleModuleByWidth = new Map<4 | 8, WebAssembly.Module>();
+// Per-run explicit fork-module bytes (see `RunProgramOptions.forkModuleBytesBy
+// Width`). Seeded at each run entry; consulted only on a compiled-module cache
+// miss. The fork module is identical regardless of source, so caching by width
+// stays sound whether a given width was first compiled from injected bytes or
+// from the resolver.
+let injectedForkModuleBytesByWidth: Partial<
+  Record<4 | 8, ArrayBuffer | Uint8Array>
+> = {};
 function centralizedForkModuleFields(
   ptrWidth: 4 | 8,
 ): { forkModuleModule: WebAssembly.Module } {
   let mod = forkModuleModuleByWidth.get(ptrWidth);
   if (!mod) {
-    const name = `fork_module${ptrWidth === 8 ? 64 : 32}.wasm`;
-    mod = new WebAssembly.Module(readFileSync(resolveBinary(name)));
+    const injected = injectedForkModuleBytesByWidth[ptrWidth];
+    if (injected !== undefined) {
+      const view = injected instanceof Uint8Array
+        ? injected
+        : new Uint8Array(injected);
+      mod = new WebAssembly.Module(view);
+    } else {
+      const name = `fork_module${ptrWidth === 8 ? 64 : 32}.wasm`;
+      mod = new WebAssembly.Module(readFileSync(resolveBinary(name)));
+    }
     forkModuleModuleByWidth.set(ptrWidth, mod);
   }
   return { forkModuleModule: mod };
@@ -305,6 +330,7 @@ export async function runCentralizedProgram(
 // ---------------------------------------------------------------------------
 
 async function runInWorkerThread(options: RunProgramOptions): Promise<RunProgramResult> {
+  injectedForkModuleBytesByWidth = options.forkModuleBytesByWidth ?? {};
   const programBytes = loadProgramWasm(options.programPath);
   const timeout = options.timeout ?? 30_000;
 
@@ -348,6 +374,7 @@ async function runInWorkerThread(options: RunProgramOptions): Promise<RunProgram
     execPrograms,
     rootfsImage,
     enableTcpNetwork: options.enableTcpNetwork,
+    forkModuleBytesByWidth: options.forkModuleBytesByWidth,
     onStdout: (_pid: number, data: Uint8Array) => {
       stdout += new TextDecoder().decode(data);
       stdoutChunks.push(new Uint8Array(data));
@@ -521,6 +548,7 @@ interface ForkReplayContext {
 }
 
 async function runOnMainThread(options: RunProgramOptions): Promise<RunProgramResult> {
+  injectedForkModuleBytesByWidth = options.forkModuleBytesByWidth ?? {};
   const kernelWasmBytes = loadKernelWasm();
   const programBytes = loadProgramWasm(options.programPath);
   const timeout = options.timeout ?? 30_000;

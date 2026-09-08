@@ -109,6 +109,17 @@ export interface NodeKernelHostOptions {
   /** Attach a real-TCP backend in the worker so wasm programs can dial
    *  external hosts via Node `net.Socket`. */
   enableTcpNetwork?: boolean;
+  /**
+   * Explicit co-resident fork-module wasm bytes keyed by pointer width. The
+   * fork module is the unconditional fork reconstructor the kernel worker ships
+   * to every process worker; it is normally resolved through the binary
+   * resolver. A build-time boot that runs under the source-only resolution
+   * policy without a source-only binary root (its declared inputs arrive as
+   * explicit bytes, not a finalized projection) passes the artifact here —
+   * exactly as `kernelWasmBytes` injects the kernel — so the kernel worker
+   * never re-enters the resolver. Omitted resolves the fork module normally.
+   */
+  forkModuleBytesByWidth?: Partial<Record<4 | 8, ArrayBuffer | Uint8Array>>;
   /** Called when a process writes to stdout */
   onStdout?: (pid: number, data: Uint8Array) => void;
   /** Called when a process writes to stderr */
@@ -403,9 +414,13 @@ export class NodeKernelHost {
         const maxProcessMemoryBytes =
           this.options.maxProcessMemoryBytes
           ?? maxWorkers * maxPages * WASM_PAGE_SIZE;
+        const forkModuleBytesByWidth = snapshotForkModuleBytesByWidth(
+          this.options.forkModuleBytesByWidth,
+        );
         const initMsg: MainToKernelMessage = {
           type: "init",
           kernelWasmBytes: wasmBytes,
+          forkModuleBytesByWidth,
           config: {
             maxWorkers,
             maxPages,
@@ -1239,6 +1254,32 @@ function resolveRootfsImage(
     return out;
   }
   return override;
+}
+
+/**
+ * Copy each injected fork-module artifact into a fresh, non-shared ArrayBuffer
+ * so the worker init protocol accepts it (the source may be a pooled Buffer
+ * view or a SharedArrayBuffer). Returns undefined when nothing was injected, so
+ * the kernel worker keeps resolving the fork module through the binary
+ * resolver as usual.
+ */
+function snapshotForkModuleBytesByWidth(
+  injected: Partial<Record<4 | 8, ArrayBuffer | Uint8Array>> | undefined,
+): Partial<Record<4 | 8, ArrayBuffer>> | undefined {
+  if (injected === undefined) return undefined;
+  const out: Partial<Record<4 | 8, ArrayBuffer>> = {};
+  for (const width of [4, 8] as const) {
+    const src = injected[width];
+    if (src === undefined) continue;
+    if (src instanceof Uint8Array) {
+      const copy = new ArrayBuffer(src.byteLength);
+      new Uint8Array(copy).set(src);
+      out[width] = copy;
+    } else {
+      out[width] = src.slice(0);
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 export interface ResolvedRootfsArtifact {

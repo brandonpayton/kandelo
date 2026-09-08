@@ -38,6 +38,15 @@ KERNEL_WASM="$KERNEL_DIR/kandelo-kernel.wasm"
 ROOTFS_DIR="${WASM_POSIX_DEP_ROOTFS_DIR:?rootfs dependency dir required}"
 ROOTFS_VFS="$ROOTFS_DIR/rootfs.vfs"
 [ -f "$ROOTFS_VFS" ] || { echo "rootfs.vfs not found under $ROOTFS_DIR" >&2; exit 2; }
+# The co-resident fork module is the unconditional fork reconstructor every
+# process launch needs. It is not a registry package (built out-of-band by
+# crates/fork-module/build-wasm.sh, which the local-build engine runs before any
+# package build and stages into host/wasm/), so pass its exact artifact
+# explicitly, exactly like the kernel/rootfs above: mid-build this boot runs
+# under the source-only resolution policy with no source-only binary root, so
+# resolving the fork module through the binary resolver would fail.
+FORK_MODULE32_WASM="$REPO_ROOT/host/wasm/fork_module32.wasm"
+[ -f "$FORK_MODULE32_WASM" ] || { echo "fork_module32.wasm not found at $FORK_MODULE32_WASM (run crates/fork-module/build-wasm.sh)" >&2; exit 2; }
 
 CAP="$WORK/help-capture"; rm -rf "$CAP"
 # Point TMPDIR at a short /tmp scratch dir so tsx's IPC socket path stays
@@ -48,7 +57,7 @@ trap 'rm -rf -- "$TSX_TMP"' EXIT
 # Capture --help/--version from the real wasm binary running inside Kandelo.
 TMPDIR="$TSX_TMP" node "$REPO_ROOT/node_modules/tsx/dist/cli.mjs" \
     "$REPO_ROOT/images/vfs/scripts/generate-coreutils-man.ts" \
-    "$COREUTILS_WASM" "$CAP" "$KERNEL_WASM" "$ROOTFS_VFS"
+    "$COREUTILS_WASM" "$CAP" "$KERNEL_WASM" "$ROOTFS_VFS" "$FORK_MODULE32_WASM"
 
 STAGE="$WORK/stage"; rm -rf "$STAGE"; mkdir -p "$STAGE/share/man/man1"
 WRAP="$WORK/wrap"; rm -rf "$WRAP"; mkdir -p "$WRAP"

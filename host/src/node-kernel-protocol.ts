@@ -32,6 +32,13 @@ export type { HostDiagnostic } from "./host-diagnostic";
 export interface InitMessage {
   type: "init";
   kernelWasmBytes: ArrayBuffer;
+  /**
+   * Explicit co-resident fork-module wasm bytes keyed by pointer width. Present
+   * only for build-time boots that inject the fork module rather than let the
+   * kernel worker resolve it through the binary resolver (which fails under the
+   * source-only resolution policy when no source-only binary root is set).
+   */
+  forkModuleBytesByWidth?: Partial<Record<4 | 8, ArrayBuffer>>;
   config: {
     maxWorkers: number;
     maxPages?: number;

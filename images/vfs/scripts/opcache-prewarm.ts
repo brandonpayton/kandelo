@@ -34,9 +34,9 @@
  * `KANDELO_OPCACHE_PREWARM_STRICT=1` to make them fatal.
  */
 import { readFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { NodeKernelHost } from "../../../host/src/node-kernel-host";
-import { resolveBinary } from "../../../host/src/binary-resolver";
+import { findRepoRoot, resolveBinary } from "../../../host/src/binary-resolver";
 import type { MemoryFileSystem } from "../../../host/src/vfs/memory-fs";
 import { writeVfsBinary, ensureDirRecursive } from "../../../host/src/vfs/image-helpers";
 
@@ -108,6 +108,13 @@ export async function prewarmOpcache(
     let activeStdoutSink: ((data: Uint8Array) => void) | null = null;
     const host = new NodeKernelHost({
       rootfsImage: imageBytes,
+      // PHP-FPM forks, so this build-time boot exercises the co-resident fork
+      // module — the unconditional fork reconstructor the kernel worker ships
+      // to every process worker. Inject the staged artifact explicitly (like
+      // the kernel above): this boot runs under the source-only resolution
+      // policy with no source-only binary root, so the kernel worker resolving
+      // the fork module through the binary resolver would fail.
+      forkModuleBytesByWidth: { 4: loadStagedForkModule32() },
       onStdout: (_pid, data) => {
         activeStdoutSink?.(new Uint8Array(data));
       },
@@ -194,6 +201,21 @@ export async function prewarmOpcache(
     );
     return 0;
   }
+}
+
+/**
+ * Read the wasm32 co-resident fork module from its repo-staged location. The
+ * fork module is built out-of-band by `crates/fork-module/build-wasm.sh` (the
+ * local-build engine runs it before any package build) and staged into both
+ * `local-binaries/` and `host/wasm/`; it is not a registry package, so there is
+ * no `WASM_POSIX_DEP_*_DIR` for it. Loading the staged artifact directly keeps
+ * this build-time boot independent of the source-only program projection, which
+ * is not finalized mid-build.
+ */
+function loadStagedForkModule32(): Uint8Array {
+  const repoRoot = findRepoRoot();
+  const staged = join(repoRoot, "host/wasm/fork_module32.wasm");
+  return new Uint8Array(readFileSync(staged));
 }
 
 function exactProgramBuffer(bytes: Uint8Array, label: string): ArrayBuffer {
