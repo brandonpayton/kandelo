@@ -24,10 +24,11 @@
    KandeloSocketWatch* next = nullptr;
  
    KandeloSocketWatch(JSContext* cx, int fd, KandeloSocketWatchKind kind,
-@@ -850,15 +853,118 @@
+@@ -849,16 +852,119 @@
+   RootedObject array(cx, KandeloNewUint8ArrayCopy(cx, bytes, length));
    if (!array) return false;
    RootedValue resolved(cx, ObjectValue(*array));
-   return JS::ResolvePromise(cx, promise, resolved);
++  return JS::ResolvePromise(cx, promise, resolved);
 +}
 +
 +// Canonical POSIX signal name (e.g. "SIGTERM") for a signal number, used to
@@ -86,9 +87,9 @@
 +    return false;
 +  }
 +  RootedValue resolved(cx, ObjectValue(*result));
-+  return JS::ResolvePromise(cx, promise, resolved);
-+}
-+
+   return JS::ResolvePromise(cx, promise, resolved);
+ }
+ 
 +// Resolve a __kandeloWaitPid promise from a raw waitpid() status word.
 +static bool KandeloResolveChildFromStatus(JSContext* cx, HandleObject promise,
 +                                          int status) {
@@ -101,8 +102,8 @@
 +  }
 +  // Stopped/continued or otherwise not terminated: report no code yet.
 +  return KandeloResolveChild(cx, promise, true, 0, nullptr);
- }
- 
++}
++
  static int KandeloSocketDispatch(JSContext* cx) {
 +  int processed = 0;
 +
@@ -155,10 +156,13 @@
    KandeloSocketWatch* watch = gKandeloSocketWatches;
    size_t index = 0;
    while (watch && index < pollfds.size()) {
-@@ -1075,6 +1180,370 @@
-   return true;
- }
- 
+@@ -1072,6 +1177,370 @@
+     close(fd);
+   }
+   args.rval().setUndefined();
++  return true;
++}
++
 +// ---------------------------------------------------------------------------
 +// Native async subprocess + fd seam (Phase K). Generalizes the socket watch
 +// list / job-queue poll loop above to arbitrary fds (pipes) and child reaping,
@@ -520,12 +524,9 @@
 +    return false;
 +  }
 +  args.rval().setInt32(0);
-+  return true;
-+}
-+
- struct KandeloTlsHandle {
-   bool active = false;
-   int fd = -1;
+   return true;
+ }
+ 
 @@ -2034,6 +2503,13 @@
        JS_FN("tlsRead", KandeloNativeTlsRead, 2, 0),
        JS_FN("tlsWrite", KandeloNativeTlsWrite, 2, 0),
@@ -629,3 +630,21 @@
      }
    }
  }
+@@ -14211,6 +14754,17 @@
+   int result;
+ 
+   setlocale(LC_ALL, "");
++
++#ifndef __wasi__
++  // Ignore SIGPIPE, exactly as Node does at startup. Writing to a pipe or
++  // socket whose read end has closed (e.g. child.stdin.write() after the
++  // child exited, or a peer-closed TLS socket) raises SIGPIPE, whose default
++  // disposition is Terminate — that would kill this process instead of
++  // surfacing the write's EPIPE as a stream 'error'. The kernel already
++  // returns EPIPE alongside the signal, so ignoring the signal is the correct
++  // faithful-Node behavior for the async subprocess/socket write seams.
++  signal(SIGPIPE, SIG_IGN);
++#endif
+ 
+   if (IsKandeloNodeProgramName(argc > 0 ? argv[0] : nullptr) && argc == 2 &&
+       (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-v") == 0)) {

@@ -2369,13 +2369,21 @@ const stream = (() => {
         constructor(options) {
             super(options);
             // Inline Writable's init — ES class constructors can't be .call()'d.
+            // Mirror Writable's full `_writableState` shape (ending/pending) so
+            // the shared write/end/_maybeFinish machinery below behaves
+            // identically on every Duplex-derived stream (net.Socket,
+            // tls.TLSSocket, Transform, PassThrough, zlib). Omitting these left
+            // `pending` NaN and `ending` undefined and `_maybeFinish` missing,
+            // which made the base write/end throw on those streams.
             this.writable = true;
-            this._writableState = { ended: false };
+            this._writableState = { ended: false, ending: false, pending: 0 };
             if (options && options.write) this._write = options.write;
+            if (options && options.final) this._final = options.final;
         }
     }
-    // Mixin Writable methods
-    for (const method of ['write', 'end', 'destroy']) {
+    // Mixin Writable methods — include `_maybeFinish` so `write`/`end`, which
+    // both call it, resolve to the same implementation on the Duplex chain.
+    for (const method of ['write', 'end', 'destroy', '_maybeFinish']) {
         if (!Duplex.prototype[method] || method === 'destroy') {
             Duplex.prototype[method] = Writable.prototype[method];
         }
@@ -2845,6 +2853,13 @@ const child_process = (() => {
         let pid;
         try { pid = _nn.__kandeloSpawn(file, argv, env, actions, {}); }
         catch (err) {
+            // Close every pipe fd already created for this (failed) spawn — both
+            // the child ends (parentClose) and the parent ends (legs). Without
+            // this, a failed spawn (e.g. ENOENT for a missing binary) leaks up
+            // to 6 fds on default 3x'pipe' stdio; a retry loop against a missing
+            // tool then exhausts fds (EMFILE).
+            for (const fd of parentClose) { try { _nn.__kandeloFdClose(fd); } catch (_) {} }
+            for (const fd of legs) { if (fd != null) { try { _nn.__kandeloFdClose(fd); } catch (_) {} } }
             // Node: spawn error is delivered asynchronously as an 'error' event.
             queueMicrotask(() => child.emit('error', err));
             // still provide stream objects so consumers don't crash
@@ -2922,6 +2937,14 @@ const child_process = (() => {
     // the reaped values, `.killed` reflects whether this ChildProcess's own
     // `.kill()` was called.
     function _runWithCallback(child, label, cb) {
+        // exec/execFile never write to the child's stdin. End it immediately:
+        // this both delivers stdin EOF to the child (matching Node, whose exec
+        // closes stdin) AND closes the parent-side write fd (legs[0]) via the
+        // stdin stream's `final` — otherwise that fd leaks one per successful
+        // call, accumulating to EMFILE under heavy shell-out. `.end()` runs
+        // `_maybeFinish` exactly once (guarded by `_writableState.ended`), so
+        // the fd is closed exactly once — no double-close.
+        if (child.stdin) child.stdin.end();
         let out = '', err = '';
         if (child.stdout) child.stdout.on('data', d => out += d);
         if (child.stderr) child.stderr.on('data', d => err += d);

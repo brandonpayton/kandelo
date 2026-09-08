@@ -104,6 +104,34 @@ const FIXTURES: Record<string, string> = {
   "mainexecfail.cjs":
     '(()=>{const cp=require("child_process");' +
     'cp.exec("exit 7",(err,stdout,stderr)=>{console.log("EXECFAIL",err&&err.code,err&&err.signal,typeof stdout,typeof stderr);});})();',
+  // FIX 1 regression guard: the shared `Writable.write`/`end` now call
+  // `this._maybeFinish()` and read `_writableState.ending`/`pending`. Every
+  // Duplex-derived stream (net.Socket, tls.TLSSocket, Transform, PassThrough,
+  // zlib) inherits `write`/`end` through the Duplex mixin; if the mixin does
+  // not also carry `_maybeFinish` and the full `_writableState` shape, those
+  // `.write()`/`.end()` calls throw `TypeError: this._maybeFinish is not a
+  // function`, silently regressing http/https `socket.write` and
+  // `.pipe(createGunzip())`. A PassThrough exercises exactly that mixin path
+  // (PassThrough -> Transform -> Duplex), so a clean write+end+finish here
+  // proves the base Writable contract holds for all Duplex streams.
+  "mainduplex.cjs":
+    '(()=>{try{const {PassThrough}=require("stream");const pt=new PassThrough();' +
+    'let got="";pt.on("data",d=>got+=d);' +
+    'pt.on("error",e=>console.log("DUPLEXERR",e&&e.message));' +
+    'pt.on("finish",()=>console.log("DUPLEX",JSON.stringify(got),"finish"));' +
+    'pt.write("ab");pt.write("cd");pt.end();}' +
+    'catch(e){console.log("DUPLEXERR",(e&&e.message)||e);}})();',
+  // FIX 4 SIGPIPE hardening guard: writing to the parent stdin fd after the
+  // child has exited (its read end is gone) raises SIGPIPE, whose default
+  // disposition is Terminate. node.wasm must ignore SIGPIPE (like Node) so
+  // this surfaces as an EPIPE stream 'error'/no-op instead of killing the
+  // whole process. Success = the final marker prints (via a real-delay timer,
+  // which also proves the process stayed alive); a killed process prints
+  // nothing.
+  "mainsigpipe.cjs":
+    '(()=>{const cp=require("child_process");const c=cp.spawn("/bin/sh",["-c","exit 0"]);' +
+    'c.on("exit",()=>{if(c.stdin){c.stdin.on("error",()=>{});try{c.stdin.write("x");}catch(_){}}' +
+    'setTimeout(()=>console.log("SIGPIPE survived"),40);});})();',
 };
 
 function stageFixtures(): string {
@@ -222,5 +250,20 @@ describe("spidermonkey-node child_process (real async spawn)", () => {
     // eslint-disable-next-line no-console
     console.log("EXECFAIL STDOUT:", JSON.stringify(r.stdout.trim()), "STDERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
     expect(r.stdout).toContain("EXECFAIL 7 null string string");
+  }, 90_000);
+
+  it.runIf(ready)("Duplex Writable: PassThrough write+end+finish does not throw (base Writable regression guard)", async () => {
+    const r = await runOne("/app/mainduplex.cjs");
+    // eslint-disable-next-line no-console
+    console.log("DUPLEX STDOUT:", JSON.stringify(r.stdout.trim()), "STDERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
+    expect(r.stdout).toContain('DUPLEX "abcd" finish');
+    expect(r.stdout).not.toContain("DUPLEXERR");
+  }, 90_000);
+
+  it.runIf(ready)("SIGPIPE: stdin.write after the child exited does not kill the process", async () => {
+    const r = await runOne("/app/mainsigpipe.cjs");
+    // eslint-disable-next-line no-console
+    console.log("SIGPIPE STDOUT:", JSON.stringify(r.stdout.trim()), "STDERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
+    expect(r.stdout).toContain("SIGPIPE survived");
   }, 90_000);
 });
