@@ -30,9 +30,15 @@
 //! ```text
 //!   +0  op      u32   DRIVE_OP_ALLOC (0) | DRIVE_OP_FILL (1) | DRIVE_OP_EXN (2)
 //!                     | DRIVE_OP_STATIC_ROOT (3) | DRIVE_OP_EXTERNREF_TRANSIT (4)
+//!                     | DRIVE_OP_RESTORE (5) | DRIVE_OP_FINISH_RESTORE (6)
+//!                     | DRIVE_OP_REWIND_BEGIN (7) | DRIVE_OP_ABORT_BEGIN (8)
 //!   +4  slot    u32   absolute drive-table index = base(activation) + op
-//!   +8  recipe  u32   reference recipe id (shim reads GC transit slot recipe+1)
-//!   +12 arg     u32   the i32 argument passed to the guest export via call_indirect
+//!   +8  recipe  u32   reference recipe id (shim reads GC transit slot recipe+1);
+//!                     REUSED as the high 32 bits of the continuation root for a
+//!                     REWIND_BEGIN / ABORT_BEGIN step (see `pack_root`)
+//!   +12 arg     u32   the i32 argument passed to the guest export via
+//!                     call_indirect; for a REWIND_BEGIN / ABORT_BEGIN step it is
+//!                     the low 32 bits of the (ptr) root the shim recombines
 //! ```
 
 use wasm_posix_shared::Errno;
@@ -114,18 +120,41 @@ pub const DRIVE_OP_RESTORE: u32 = 5;
 /// activation's restore step so the two-phase order matches the JS loop
 /// (`for act: restore` then `for act: finishRestore`).
 pub const DRIVE_OP_FINISH_RESTORE: u32 = 6;
+/// `op` value: run one activation's guest `wpk_fork_rewind_begin(root)` — the
+/// parent/child REPLAY begin drive. UNLIKE every op above it drives a guest
+/// export whose single parameter is a POINTER (the continuation `root`), so it
+/// is `(ptr) -> ()` (`i32` on wasm32, `i64` on wasm64) rather than `(i32) -> ()`.
+/// The injected shim reconstructs the pointer from the step's `recipe`/`arg`
+/// fields (see [`pack_root`]): on wasm32 `arg` alone carries the `i32` root; on
+/// wasm64 `recipe` is the high 32 bits and `arg` the low 32 bits of the `i64`
+/// root. `slot` is `base(activation) + DRIVE_SLOT_REWIND_BEGIN`. It runs NO
+/// transit publish and NO store-#2 assert, and — being `>= DRIVE_OP_RESTORE` —
+/// is excluded from the reconstruction drive-step counter (it is a control
+/// state-flip, not a reference reconstruction). Mirrors the host loop that
+/// called `wpk_fork_rewind_begin` per activation, moving the guest DRIVE into
+/// the module.
+pub const DRIVE_OP_REWIND_BEGIN: u32 = 7;
+/// `op` value: run one activation's guest `wpk_fork_abort_begin(root)` — the
+/// ABORT-replay begin drive. Same shape and pointer-argument convention as
+/// [`DRIVE_OP_REWIND_BEGIN`] (`(ptr) -> ()`, root packed in `recipe`/`arg`), but
+/// bound at `base(activation) + DRIVE_SLOT_ABORT_BEGIN` and driving the guest's
+/// abort-tagged state flip. Mirrors the host loop that called
+/// `wpk_fork_abort_begin` per activation.
+pub const DRIVE_OP_ABORT_BEGIN: u32 = 8;
 
 /// Drive-table slots reserved per activation, in slot-offset order:
 /// `DRIVE_OP_ALLOC` (0) + `DRIVE_OP_FILL` (1) + `DRIVE_OP_EXN` (2) +
-/// `DRIVE_SLOT_RESTORE` (3) + `DRIVE_SLOT_FINISH_RESTORE` (4). Each activation
+/// `DRIVE_SLOT_RESTORE` (3) + `DRIVE_SLOT_FINISH_RESTORE` (4) +
+/// `DRIVE_SLOT_REWIND_BEGIN` (5) + `DRIVE_SLOT_ABORT_BEGIN` (6). Each activation
 /// `a` binds its `_gc_allocate`/`_gc_fill`/`__wpk_fork_exception_materialize`/
-/// `wpk_fork_module_state_restore`/`wpk_fork_module_state_finish_restore` at
-/// `base(a)+offset`. The host reads `fm_drive_table_base` and binds the guest
-/// exports at these offsets, so bumping this count stays consistent as long as
-/// every side derives its slots from `drive_table_base`. This is an EPHEMERAL
-/// runtime host<->module table-binding contract (not a wire/ABI format, not
-/// serialized), so growing it is additive.
-pub const DRIVE_SLOTS_PER_ACTIVATION: u32 = 5;
+/// `wpk_fork_module_state_restore`/`wpk_fork_module_state_finish_restore`/
+/// `wpk_fork_rewind_begin`/`wpk_fork_abort_begin` at `base(a)+offset`. The host
+/// reads `fm_drive_table_base` and binds the guest exports at these offsets, so
+/// bumping this count stays consistent as long as every side derives its slots
+/// from `drive_table_base`. This is an EPHEMERAL runtime host<->module
+/// table-binding contract (not a wire/ABI format, not serialized), so growing it
+/// is additive.
+pub const DRIVE_SLOTS_PER_ACTIVATION: u32 = 7;
 
 /// Drive-table slot offset (within an activation's slice) the host binds that
 /// activation's `wpk_fork_module_state_restore` into, and a `DRIVE_OP_RESTORE`
@@ -135,6 +164,14 @@ pub const DRIVE_SLOT_RESTORE: u32 = 3;
 /// Drive-table slot offset the host binds `wpk_fork_module_state_finish_restore`
 /// into (see `DRIVE_SLOT_RESTORE`).
 pub const DRIVE_SLOT_FINISH_RESTORE: u32 = 4;
+/// Drive-table slot offset the host binds `wpk_fork_rewind_begin` into, and a
+/// `DRIVE_OP_REWIND_BEGIN` step's `slot` field points at (see
+/// `DRIVE_SLOT_RESTORE`). Distinct from the op tag so it never collides with the
+/// ALLOC/FILL/EXN/RESTORE/FINISH offsets.
+pub const DRIVE_SLOT_REWIND_BEGIN: u32 = 5;
+/// Drive-table slot offset the host binds `wpk_fork_abort_begin` into (see
+/// `DRIVE_SLOT_REWIND_BEGIN`).
+pub const DRIVE_SLOT_ABORT_BEGIN: u32 = 6;
 
 /// One drive step: which guest export to `call_indirect` (via `slot`) with which
 /// `arg`, tagged by `op` so the shim knows whether to run the R1 assert.
@@ -593,6 +630,56 @@ pub fn append_attach_steps(steps: &mut Vec<DriveStep>, activations: &[u32]) {
     }
 }
 
+/// Split a continuation `root` pointer into the `(recipe, arg)` step fields the
+/// injected shim reads to reconstruct a `(ptr)`-argument guest export call
+/// (`DRIVE_OP_REWIND_BEGIN` / `DRIVE_OP_ABORT_BEGIN`). `arg` is the low 32 bits,
+/// `recipe` the high 32 bits. On wasm32 a root is always `< 2^32`, so `recipe`
+/// is 0 and `arg` is the whole `i32` pointer — byte-identical to how the shim's
+/// generic `(i32) -> ()` drive would have read `arg`. On wasm64 the shim
+/// recombines `(recipe << 32) | arg` into the `i64` pointer.
+///
+/// WHY split across two fields rather than widen the step: the serialized step
+/// layout (`DRIVE_STEP_SIZE`, four u32s) is SHARED with the injected shim and the
+/// host; reusing the otherwise-unused `recipe` field for a rewind/abort step
+/// keeps that 16-byte layout — and every existing op's parsing — unchanged.
+pub fn pack_root(root: u64) -> (u32, u32) {
+    ((root >> 32) as u32, (root & 0xffff_ffff) as u32)
+}
+
+/// Append one `DRIVE_OP_REWIND_BEGIN` step per `(activation, root)` — the
+/// module-owned parent/child REPLAY begin drive that replaces the host loop
+/// calling `wpk_fork_rewind_begin(root)` on each activation. Steps are appended
+/// AFTER any reconstruction / restore steps so every guest rewind reads state
+/// the earlier steps already installed. `roots` carries each activation's
+/// continuation anchor (the module's per-activation `module_buffer`).
+pub fn append_rewind_begin_steps(steps: &mut Vec<DriveStep>, roots: &[(u32, u64)]) {
+    for &(activation, root) in roots {
+        let (recipe, arg) = pack_root(root);
+        steps.push(DriveStep {
+            op: DRIVE_OP_REWIND_BEGIN,
+            slot: drive_table_base(activation) + DRIVE_SLOT_REWIND_BEGIN,
+            recipe,
+            arg,
+        });
+    }
+}
+
+/// Append one `DRIVE_OP_ABORT_BEGIN` step per `(activation, root)` — the
+/// module-owned ABORT-replay begin drive that replaces the host loop calling
+/// `wpk_fork_abort_begin(root)` on each activation. Same packing/order contract
+/// as [`append_rewind_begin_steps`].
+pub fn append_abort_begin_steps(steps: &mut Vec<DriveStep>, roots: &[(u32, u64)]) {
+    for &(activation, root) in roots {
+        let (recipe, arg) = pack_root(root);
+        steps.push(DriveStep {
+            op: DRIVE_OP_ABORT_BEGIN,
+            slot: drive_table_base(activation) + DRIVE_SLOT_ABORT_BEGIN,
+            recipe,
+            arg,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,11 +687,72 @@ mod tests {
 
     #[test]
     fn drive_table_base_reserves_slots_per_activation() {
-        // Five slots per activation (ALLOC, FILL, EXN, RESTORE, FINISH_RESTORE).
-        assert_eq!(DRIVE_SLOTS_PER_ACTIVATION, 5);
+        // Seven slots per activation (ALLOC, FILL, EXN, RESTORE, FINISH_RESTORE,
+        // REWIND_BEGIN, ABORT_BEGIN).
+        assert_eq!(DRIVE_SLOTS_PER_ACTIVATION, 7);
         assert_eq!(drive_table_base(0), 0);
-        assert_eq!(drive_table_base(1), 5);
-        assert_eq!(drive_table_base(3), 15);
+        assert_eq!(drive_table_base(1), 7);
+        assert_eq!(drive_table_base(3), 21);
+    }
+
+    #[test]
+    fn pack_root_splits_low_and_high_words() {
+        // wasm32: root < 2^32 -> recipe (high) is 0, arg (low) is the whole ptr.
+        assert_eq!(pack_root(0x1234), (0, 0x1234));
+        assert_eq!(pack_root(0xffff_ffff), (0, 0xffff_ffff));
+        // wasm64: high word populated, recombination is (recipe << 32) | arg.
+        let (hi, lo) = pack_root(0x1_2345_6789_abcd);
+        assert_eq!(hi, 0x1_2345);
+        assert_eq!(lo, 0x6789_abcd);
+        assert_eq!(((hi as u64) << 32) | (lo as u64), 0x1_2345_6789_abcd);
+    }
+
+    #[test]
+    fn append_rewind_begin_steps_emits_one_ptr_step_per_activation() {
+        let mut steps = Vec::new();
+        // Activation 0 at a wasm32-range root; activation 2 at a wasm64-range root.
+        append_rewind_begin_steps(&mut steps, &[(0, 0x2000), (2, 0x1_0000_3000)]);
+        assert_eq!(
+            steps[0],
+            DriveStep {
+                op: DRIVE_OP_REWIND_BEGIN,
+                slot: drive_table_base(0) + DRIVE_SLOT_REWIND_BEGIN,
+                recipe: 0,
+                arg: 0x2000,
+            }
+        );
+        assert_eq!(
+            steps[1],
+            DriveStep {
+                op: DRIVE_OP_REWIND_BEGIN,
+                slot: drive_table_base(2) + DRIVE_SLOT_REWIND_BEGIN,
+                recipe: 1,
+                arg: 0x3000,
+            }
+        );
+        assert_eq!(steps.len(), 2);
+        // The step slot never collides with a restore/finish slot for the same
+        // activation (distinct offsets within the 7-slot slice).
+        assert_ne!(steps[0].slot, drive_table_base(0) + DRIVE_SLOT_RESTORE);
+        assert_ne!(steps[0].slot, drive_table_base(0) + DRIVE_SLOT_FINISH_RESTORE);
+    }
+
+    #[test]
+    fn append_abort_begin_steps_uses_the_abort_slot() {
+        let mut steps = Vec::new();
+        append_abort_begin_steps(&mut steps, &[(0, 0x4000)]);
+        assert_eq!(
+            steps[0],
+            DriveStep {
+                op: DRIVE_OP_ABORT_BEGIN,
+                slot: drive_table_base(0) + DRIVE_SLOT_ABORT_BEGIN,
+                recipe: 0,
+                arg: 0x4000,
+            }
+        );
+        // REWIND and ABORT bind to distinct slots so the same drive table can
+        // hold both a rewind and an abort target for one activation.
+        assert_ne!(DRIVE_SLOT_REWIND_BEGIN, DRIVE_SLOT_ABORT_BEGIN);
     }
 
     #[test]
@@ -667,10 +815,10 @@ mod tests {
 
     #[test]
     fn trivial_struct_plan_uses_the_activation_base_slots() {
-        // Activation 2 -> base 10 (5 slots/activation): ALLOC slot 10, FILL slot 11.
+        // Activation 2 -> base 14 (7 slots/activation): ALLOC slot 14, FILL slot 15.
         let plan = trivial_struct_plan(2, 9);
-        assert_eq!(plan[0].slot, 10);
-        assert_eq!(plan[1].slot, 11);
+        assert_eq!(plan[0].slot, 14);
+        assert_eq!(plan[1].slot, 15);
     }
 
     #[test]
@@ -1004,10 +1152,10 @@ mod tests {
                 (DRIVE_OP_FILL, drive_table_base(2) + DRIVE_OP_FILL, 1),
             ]
         );
-        // Activation 5's base (25) and activation 2's base (10) do not overlap
-        // (five slots per activation).
-        assert_eq!(drive_table_base(5), 25);
-        assert_eq!(drive_table_base(2), 10);
+        // Activation 5's base (35) and activation 2's base (14) do not overlap
+        // (seven slots per activation).
+        assert_eq!(drive_table_base(5), 35);
+        assert_eq!(drive_table_base(2), 14);
     }
 
     #[test]
