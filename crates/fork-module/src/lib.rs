@@ -758,6 +758,31 @@ mod wasm {
         serialize_and_store_plan(&steps)
     }
 
+    /// Build a REPLAY-begin drive plan: one `DRIVE_OP_REWIND_BEGIN` (`abort`
+    /// false) or `DRIVE_OP_ABORT_BEGIN` (`abort` true) step per open activation,
+    /// each carrying that activation's stored continuation root
+    /// (`ActivationFrames::module_buffer`) so the injected shim can
+    /// `call_indirect` the guest's `wpk_fork_rewind_begin` / `wpk_fork_abort_begin`
+    /// with the correct pointer-width argument. Activations iterate in ascending
+    /// id order (activation 0 first), matching the host's former per-activation
+    /// begin-drive loop. Serialized through the shared plan scratch, so the step
+    /// count is read back via `fm_gc_plan_count` exactly as a GC plan.
+    fn build_rewind_plan_impl(abort: bool) -> Result<usize, Errno> {
+        let st = state().as_ref().ok_or(Errno::EINVAL)?;
+        let roots: alloc::vec::Vec<(u32, u64)> = st
+            .activations
+            .iter()
+            .map(|(id, act)| (*id, act.module_buffer))
+            .collect();
+        let mut steps = alloc::vec::Vec::new();
+        if abort {
+            drive_plan::append_abort_begin_steps(&mut steps, &roots);
+        } else {
+            drive_plan::append_rewind_begin_steps(&mut steps, &roots);
+        }
+        serialize_and_store_plan(&steps)
+    }
+
     // The step count of the plan `fm_build_gc_plan` last serialized (the `count`
     // argument for `fm_drive_execute`).
     static GC_PLAN_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -4005,6 +4030,29 @@ mod wasm {
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_gc_plan_count() -> i32 {
         GC_PLAN_COUNT.load(Ordering::Relaxed) as i32
+    }
+
+    /// Build the REPLAY-begin drive plan for the current fork's activations and
+    /// return its guest address for `fm_drive_execute` (Phase 6 — the abort/rewind
+    /// drive move). `abort` selects `wpk_fork_abort_begin` (nonzero) vs
+    /// `wpk_fork_rewind_begin` (zero) per activation; each step carries the
+    /// activation's stored continuation root. This moves the per-activation guest
+    /// begin drive the host used to issue directly (`wpk_fork_rewind_begin` /
+    /// `wpk_fork_abort_begin` on each activation) into the co-resident module. The
+    /// step count is read via `fm_gc_plan_count` (shared single-live-plan scratch).
+    /// Returns 0 on failure (check `fm_last_errno`).
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_build_rewind_plan(abort: u32) -> usize {
+        match build_rewind_plan_impl(abort != 0) {
+            Ok(ptr) => {
+                set_ok();
+                ptr
+            }
+            Err(errno) => {
+                set_err(errno);
+                0
+            }
+        }
     }
 
     /// Bump the drive-step proof-of-use counter by one (Phase 6 item 3c). NOT a
