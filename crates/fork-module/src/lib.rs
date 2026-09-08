@@ -1046,6 +1046,33 @@ mod wasm {
         if abi::wpk_fork_linked_chunk_header_size(pointer_width as u8).is_none() {
             return Err(Errno::EINVAL);
         }
+        // `fm_set_format` is the FIRST module call of a worker's setup (see the
+        // "once-per-worker fm_set_format / fm_set_resume_catalog contract"), run
+        // once before any fork drives capture or reconstruction. Reset the
+        // per-worker "seeded once" catalogs here so a COW child starts clean.
+        //
+        // These catalogs (funcref catalog, funcref/static-root activation bases,
+        // GC codec, host-exception owner, resume catalog) live in the module's
+        // BSS, which sits INSIDE the guest's shared linear memory at
+        // `__memory_base` (the PIC placement). A COW child's memory is a CLONE of
+        // the parent's, so the child's fresh fork-module instance sees the
+        // PARENT's already-populated catalogs — and BSS is not re-zeroed on
+        // instantiation. Each catalog rejects a re-seed of an already-present
+        // activation with `EINVAL`, so without this reset the child's own
+        // per-activation seeding (which happens AFTER `fm_set_format`) fails as a
+        // spurious re-seed. This surfaced as `fm_set_activation_gc_codec` errno 22
+        // on real command-substitution/pipeline forks once the capture-builder
+        // trap that previously masked it was fixed. Resetting the counters is
+        // enough: the backing arenas are addressed by these offsets and are
+        // overwritten by the fresh seeds.
+        ACT_CATALOG_ACT_COUNT.store(0, Ordering::Relaxed);
+        ACT_CATALOG_ORD_USED.store(0, Ordering::Relaxed);
+        ACT_FUNC_CATALOG_BASE_COUNT.store(0, Ordering::Relaxed);
+        ACT_STATIC_ROOT_BASE_COUNT.store(0, Ordering::Relaxed);
+        ACT_GC_CODEC_ACT_COUNT.store(0, Ordering::Relaxed);
+        ACT_GC_CODEC_BYTES_USED.store(0, Ordering::Relaxed);
+        HOST_EXCEPTION_OWNER.store(u32::MAX, Ordering::Relaxed);
+        RESUME_CATALOG_LEN.store(0, Ordering::Relaxed);
         FMT_POINTER_WIDTH.store(pointer_width, Ordering::Relaxed);
         FMT_FIXED_PREFIX.store(fixed_prefix_size, Ordering::Relaxed);
         Ok(())
@@ -1129,6 +1156,38 @@ mod wasm {
     static ALLOC: Bump = Bump {
         offset: AtomicUsize::new(0),
     };
+
+    /// Reclaim the module bump heap for a fresh fork, first DROPPING every
+    /// bump-allocated static that owns a non-trivial `Drop` while its backing
+    /// store is still valid.
+    ///
+    /// `ALLOC.reset()` only rewinds the bump cursor; it neither frees nor zeroes
+    /// the bytes, and the next allocations REUSE those low addresses. A value
+    /// left resident in a static (`state()`'s `ForkModule`, `capture_state()`'s
+    /// `ReferenceGraphBuilder`) owns `BTreeMap`s/`Vec`s whose `Drop` WALKS their
+    /// nodes in place. If such a value is dropped AFTER the reset+realloc has
+    /// overwritten its nodes, the walk follows clobbered child pointers and traps
+    /// (`unreachable`). This bit real command-substitution / pipeline forks: a COW
+    /// child inherits the parent's live `capture_state` through the memory clone,
+    /// and a parent's second capture kept the prior builder resident — in both
+    /// cases a later reset invalidated the resident builder and the next drop
+    /// trapped. Clearing the statics here drops them while their bump memory is
+    /// still intact (`dealloc` is a no-op), so the reset is safe.
+    ///
+    /// Callers that must KEEP a value live across the reset (an armed capture
+    /// builder) skip the reset entirely (see `fm_begin_unwind`'s `CAPTURE_ARMED`
+    /// gate) rather than calling this.
+    fn reset_bump_heap() {
+        *state() = None;
+        *capture_state() = None;
+        CAPTURE_ARMED.store(0, Ordering::Relaxed);
+        // SAFETY: single-threaded per worker; only one fork drives these at a time.
+        unsafe {
+            *CAPTURE_SERIALIZED.0.get() = None;
+            *DRIVE_PLAN.0.get() = None;
+        }
+        ALLOC.reset();
+    }
 
     #[panic_handler]
     fn panic(_info: &core::panic::PanicInfo) -> ! {
@@ -1560,9 +1619,17 @@ mod wasm {
         // here would reclaim that live builder mid-fork. `swap(0)` consumes the
         // arming so a later non-capture fork (or a flag-off fork that never calls
         // `fm_capture_begin`) still reclaims the heap here as before.
-        *state() = None;
         if CAPTURE_ARMED.swap(0, Ordering::Relaxed) == 0 {
-            ALLOC.reset();
+            // No live capture builder in the bump: reclaim the whole heap,
+            // dropping every resident bump-allocated static (including any stale
+            // capture builder) BEFORE the reset so a later drop never walks
+            // clobbered memory (see `reset_bump_heap`).
+            reset_bump_heap();
+        } else {
+            // A capture is armed: `fm_capture_begin` already reset the bump and the
+            // live builder must survive across this unwind, so reclaim only the
+            // previous fork's `ForkModule` and leave the bump (and builder) intact.
+            *state() = None;
         }
 
         let mut module = ForkModule {
@@ -1613,9 +1680,12 @@ mod wasm {
         // this in-realm sibling originally did, when it was harness-only and no
         // production capture ran before it) would wipe the builder the moment the
         // production fixed-arena path issues `fm_capture_begin` before unwind.
-        *state() = None;
         if CAPTURE_ARMED.swap(0, Ordering::Relaxed) == 0 {
-            ALLOC.reset();
+            // See `begin_unwind_impl`: reclaim the whole bump heap, dropping every
+            // resident bump-allocated static before the reset.
+            reset_bump_heap();
+        } else {
+            *state() = None;
         }
         let mut module = ForkModule {
             activations: BTreeMap::new(),
@@ -1956,8 +2026,16 @@ mod wasm {
         // BORROWED (vfork) child must NOT do this (it shares the parked parent's
         // memory and its module instance is fresh + single-use), so the reclaim
         // lives here in the COW entry rather than in the shared builder.
-        *state() = None;
-        ALLOC.reset();
+        //
+        // A COW child INHERITS the parent's live `capture_state` builder through
+        // the memory clone. It lives in this same bump heap, so it must be dropped
+        // BEFORE the reset (via `reset_bump_heap`) — otherwise the child's next
+        // `fm_capture_begin` would drop the inherited builder AFTER this reset had
+        // clobbered its `BTreeMap` nodes, trapping. This was the real
+        // command-substitution / pipeline fork failure: the subshell (a COW child)
+        // trapped on its second fork because its inherited builder was corrupted
+        // here and never cleared.
+        reset_bump_heap();
 
         let (module, activation_id) =
             build_child_replay_module(module_buffer, image_ptr, image_len)?;
@@ -4070,7 +4148,24 @@ mod wasm {
         // capture builder. Empirically the guest encodes references BOTH before
         // and after `fm_begin_unwind`, so the builder must be allocated from a
         // bump that is reset exactly once, at the true fork start — here.
-        ALLOC.reset();
+        // Drop the PREVIOUS fork's capture builder and serialized record stream
+        // BEFORE resetting the bump. Both live in the bump heap `ALLOC.reset()`
+        // is about to reclaim. `ReferenceGraphBuilder` owns `BTreeMap`s whose
+        // `Drop` WALKS their tree nodes in place, so if we reset first and then
+        // allocate the fresh builder (which reuses the same low bump addresses),
+        // the old builder's nodes are overwritten and dropping it later walks
+        // clobbered pointers and traps (`unreachable`). Every fork after the
+        // first therefore trapped here: the resident builder from the prior fork
+        // was still `Some(..)` when the reassignment below dropped it, AFTER the
+        // reset+realloc had corrupted its backing store. Clearing the statics
+        // first drops those values while their bump memory is still valid (a
+        // no-op `dealloc`), so the subsequent reset is safe.
+        // Drop the PREVIOUS fork's capture builder + serialized record stream
+        // BEFORE `ALLOC.reset()` reclaims the bump they live in (see
+        // `reset_bump_heap`): a `ReferenceGraphBuilder` owns `BTreeMap`s whose
+        // `Drop` walks their nodes in place, so dropping one after the reset has
+        // reused its low bump addresses walks clobbered pointers and traps.
+        reset_bump_heap();
         // Create the builder EAGERLY, now that the bump is fresh for this fork:
         // the guest may issue its first reference encode BEFORE `fm_begin_unwind`,
         // and `fm_begin_unwind` consumes the arming (so it won't reset the bump),
@@ -4079,10 +4174,6 @@ mod wasm {
         // for the rest of the fork.
         *capture_state() = Some(ReferenceGraphBuilder::begin());
         CAPTURE_ARMED.store(1, Ordering::Relaxed);
-        // SAFETY: single-threaded per worker; only one capture is live at a time.
-        unsafe {
-            *CAPTURE_SERIALIZED.0.get() = None;
-        }
         set_ok();
     }
 
