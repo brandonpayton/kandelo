@@ -17,14 +17,18 @@ import { SingleActivationForkRuntime } from "./fork-instrument-runtime-harness";
 
 const PAGE_SIZE = 65_536;
 
-// SKIP (fork-module kill-switch removal): the parent side drives fork capture
-// in-process through `SingleActivationForkRuntime`, which now requires the
-// co-resident capture module (no JS `ForkReferenceTransaction` fallback), and
-// the child side runs a separate worker harness that likewise needs module
-// wiring. Borrowed (vfork) child-replay-before-parent is covered end-to-end by
-// the module-driven `vfork-fork-module.test.ts`. Re-home this in-process +
-// worker harness onto the module capture/reconstruct path with the A5
-// registry/coordinator relocation.
+// A5 residual (carried to A6): the parent side drives fork capture in-process
+// through `SingleActivationForkRuntime`, which now requires the co-resident
+// capture module (no JS `ForkReferenceTransaction` fallback). This fixture uses
+// a deliberately tiny, MAXIMUM-8-page shared memory (`memory 8 8 shared`) to
+// model the vfork address space, with the borrowed child's private prefix
+// pinned at page 7 and the assertions depending on that exact page layout. The
+// co-resident fork module reserves ~5.4 MiB HIGH in the same memory, which does
+// not fit within 8 pages and would break the fixture's address model, so it
+// cannot be wired here without redesigning the memory layout the test exists to
+// verify. Borrowed (vfork) child-replay-before-parent is covered end-to-end by
+// the module-driven `vfork-fork-module.test.ts`; a module-hosting in-process
+// re-home is deferred to A6 rather than dropping coverage silently.
 describe.skip("borrowed fork replay", () => {
   it("lets a fresh ABI 43 shared-memory Worker replay before its parent", async () => {
     const dir = mkdtempSync(join(tmpdir(), "kandelo-fork-borrow-"));

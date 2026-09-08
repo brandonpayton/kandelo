@@ -12,6 +12,7 @@ import {
   ForkModuleStateArena,
   readForkModuleStateRoot,
 } from "../src/fork-module-state";
+import { installTestForkCaptureModule } from "./fork-capture-module-fixture";
 import { SingleActivationForkRuntime } from "./fork-instrument-runtime-harness";
 
 const FIRST_PAYLOAD = 0x1234;
@@ -25,17 +26,19 @@ const SCRATCH_ARM_OFFSET = 8;
 const SCRATCH_PAYLOAD_OFFSET = 12;
 const SENTINEL = 0xa5a5a5a5;
 
-// SKIP (fork-module kill-switch removal): this suite drives fork capture (and
-// a fresh-child reconstruction) in-process through `SingleActivationForkRuntime`
-// against a NON-shared-memory instrumented guest fixture. The co-resident fork
-// module is now the unconditional capture/reconstruct engine (no JS
-// `ForkReferenceTransaction` fallback) and imports a SHARED memory, which cannot
-// coexist with this non-shared guest in one memory. Plain/catch_ref payload
-// lifetime + reconstruction are covered end-to-end by the shared-memory worker
-// e2e suites (catch-ref / exnref fresh-worker). Re-home this in-process unit
-// coverage onto a shared-memory guest fixture (or the worker harness) with the
-// A5 registry/coordinator relocation.
-describe.skip("plain-catch payload lifetime", () => {
+// A5 re-home: the co-resident fork module is now the unconditional capture
+// engine (no JS `ForkReferenceTransaction` fallback) and imports a SHARED
+// memory. The two CAPTURE tests below run against a shared guest memory with a
+// real capture module wired (`setCaptureModule`), exactly as a production
+// worker does; their forks carry no references, so the module graph is empty
+// and the assertions exercise plain/catch payload ownership across capture,
+// abort-free unwind, and continuation release. The third test drives a fresh
+// CHILD reconstruction, which additionally needs the module as the decode
+// BACKEND against a freshly instantiated child instance (not just the capture
+// floor); that path is exercised end-to-end by the module-driven catch-ref /
+// exnref fresh-worker + dlopen e2e suites and stays skipped as an in-process
+// unit (see the `it.skip` note and A6).
+describe("plain-catch payload lifetime", () => {
   it("keeps capture state activation-owned before the first fork and after release", () => {
     const dir = mkdtempSync(join(tmpdir(), "kandelo-plain-catch-lifetime-"));
     try {
@@ -44,7 +47,7 @@ describe.skip("plain-catch payload lifetime", () => {
       const instrumentedPath = join(dir, "plain-catch-lifetime.instrumented.wasm");
       writeFileSync(watPath, `(module
         (import "kernel" "kernel_fork" (func $fork (result i32)))
-        (import "env" "memory" (memory 4))
+        (import "env" "memory" (memory 4 1024 shared))
         (tag $payload (param i32))
         (func (export "run") (param $payload i32) (result i32)
           (local $caught i32)
@@ -60,6 +63,7 @@ describe.skip("plain-catch payload lifetime", () => {
           i32.add))`);
       execFileSync("wat2wasm", [
         "--enable-exceptions",
+        "--enable-threads",
         watPath,
         "-o",
         rawPath,
@@ -71,7 +75,7 @@ describe.skip("plain-catch payload lifetime", () => {
 
       const instrumentedBytes = readFileSync(instrumentedPath);
       const module = new WebAssembly.Module(instrumentedBytes);
-      const memory = new WebAssembly.Memory({ initial: 4 });
+      const memory = new WebAssembly.Memory({ initial: 4, maximum: 1024, shared: true });
       const view = new DataView(memory.buffer);
       let instance: WebAssembly.Instance;
       let moduleBuffer = 0;
@@ -105,6 +109,9 @@ describe.skip("plain-catch payload lifetime", () => {
         ),
         label: "plain-catch-lifetime",
       });
+      runtime.registry.setCaptureModule(
+        installTestForkCaptureModule(memory, "plain-catch-lifetime"),
+      );
 
       const scratchIsSentinel = (base: number): boolean =>
         view.getUint32(base + SCRATCH_ARM_OFFSET, true) === SENTINEL &&
@@ -186,7 +193,7 @@ describe.skip("plain-catch payload lifetime", () => {
       );
       writeFileSync(watPath, `(module
         (import "kernel" "kernel_fork" (func $fork (result i32)))
-        (import "env" "memory" (memory 4))
+        (import "env" "memory" (memory 4 1024 shared))
         (tag $payload (param i32))
         (func $recurse (export "run") (param $depth i32) (result i32)
           (local $caught i32)
@@ -222,6 +229,7 @@ describe.skip("plain-catch payload lifetime", () => {
           i32.add))`);
       execFileSync("wat2wasm", [
         "--enable-exceptions",
+        "--enable-threads",
         watPath,
         "-o",
         rawPath,
@@ -233,7 +241,7 @@ describe.skip("plain-catch payload lifetime", () => {
 
       const instrumentedBytes = readFileSync(instrumentedPath);
       const module = new WebAssembly.Module(instrumentedBytes);
-      const memory = new WebAssembly.Memory({ initial: 4 });
+      const memory = new WebAssembly.Memory({ initial: 4, maximum: 1024, shared: true });
       const view = new DataView(memory.buffer);
       let instance: WebAssembly.Instance;
       let normalForkCalls = 0;
@@ -259,6 +267,9 @@ describe.skip("plain-catch payload lifetime", () => {
         ),
         label: "plain-catch-recursion",
       });
+      runtime.registry.setCaptureModule(
+        installTestForkCaptureModule(memory, "plain-catch-recursion"),
+      );
 
       instance = new WebAssembly.Instance(module, {
         env: {
@@ -313,7 +324,17 @@ describe.skip("plain-catch payload lifetime", () => {
     }
   });
 
-  it("reconstructs mixed plain and catch_ref state in a fresh child instance", () => {
+  // A5 residual (carried to A6): this case drives a fresh CHILD reconstruction
+  // (`childRuntime.coordinator.attachChild`) in-process. Unlike capture, child
+  // reconstruction needs the co-resident fork module as the decode BACKEND that
+  // drives the recipe graph into a freshly instantiated child instance — not
+  // just the capture floor — so a faithful in-process re-home would have to
+  // instantiate a second module against the child's copied memory and drive
+  // `fm_restore_from_arena`. That end-to-end path is already covered by the
+  // module-driven catch-ref / exnref fresh-worker + fork-from-dlopen-side-module
+  // e2e suites; keeping it as an in-process unit is deferred to A6 rather than
+  // dropping coverage silently.
+  it.skip("reconstructs mixed plain and catch_ref state in a fresh child instance", () => {
     const dir = mkdtempSync(join(tmpdir(), "kandelo-mixed-catch-lifetime-"));
     try {
       const watPath = join(dir, "mixed-catch-lifetime.wat");
@@ -354,6 +375,7 @@ describe.skip("plain-catch payload lifetime", () => {
             br $done)))`);
       execFileSync("wat2wasm", [
         "--enable-exceptions",
+        "--enable-threads",
         watPath,
         "-o",
         rawPath,

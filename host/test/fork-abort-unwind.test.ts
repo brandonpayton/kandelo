@@ -10,19 +10,18 @@ import {
   readLinkedFrameFormat,
 } from "../src/fork-continuation";
 import { ForkModuleStateArena } from "../src/fork-module-state";
+import { installTestForkCaptureModule } from "./fork-capture-module-fixture";
 import { SingleActivationForkRuntime } from "./fork-instrument-runtime-harness";
 
-// SKIP (fork-module kill-switch removal): this suite drives fork capture
-// in-process through `SingleActivationForkRuntime` against a NON-shared-memory
-// instrumented guest fixture. The co-resident fork module is now the
-// unconditional capture engine (no JS `ForkReferenceTransaction` fallback), and
-// it imports a SHARED memory, which cannot coexist with this non-shared guest
-// in one memory. Abort/unwind frame reconstruction + post-abort re-fork are
-// covered end-to-end by the shared-memory worker e2e suites (externref-gated
-// parent-survives, catch-ref/exnref fresh-worker). Re-home this in-process unit
-// coverage onto a shared-memory guest fixture (or the worker harness) with the
-// A5 registry/coordinator relocation.
-describe.skip("instrumented ABORT_UNWINDING", () => {
+// A5 re-home: the co-resident fork module is now the unconditional capture
+// engine (no JS `ForkReferenceTransaction` fallback), and it imports a SHARED
+// memory. These reference-free abort/unwind forks therefore run against a
+// shared guest memory with a real capture module wired exactly as a production
+// worker does (`setCaptureModule`). The module reference graph is empty for
+// these forks; the assertions below exercise continuation frame reconstruction,
+// abort recovery, and payload ownership, which are independent of the (empty)
+// reference graph.
+describe("instrumented ABORT_UNWINDING", () => {
   it("reconstructs committed inner frames and permits a later successful fork", () => {
     const dir = mkdtempSync(join(tmpdir(), "kandelo-fork-abort-"));
     try {
@@ -38,7 +37,7 @@ describe.skip("instrumented ABORT_UNWINDING", () => {
       ).join("\n");
       const wat = `(module
         (import "kernel" "kernel_fork" (func $fork (result i32)))
-        (import "env" "memory" (memory 8))
+        (import "env" "memory" (memory 8 1024 shared))
         (func $leaf (result i32) call $fork)
         (func $outer (result i32) (local ${"i64 ".repeat(outerLocalCount)})
           ${outerLocalInit}
@@ -51,7 +50,7 @@ describe.skip("instrumented ABORT_UNWINDING", () => {
           i32.add))`;
       const watPath = join(dir, "abort.wat");
       writeFileSync(watPath, wat);
-      execFileSync("wat2wasm", [watPath, "-o", rawPath]);
+      execFileSync("wat2wasm", ["--enable-threads", watPath, "-o", rawPath]);
       execFileSync(fileURLToPath(new URL(
         "../../tools/bin/wasm-fork-instrument",
         import.meta.url,
@@ -63,7 +62,7 @@ describe.skip("instrumented ABORT_UNWINDING", () => {
 
       const bytes = readFileSync(instrumentedPath);
       const module = new WebAssembly.Module(bytes);
-      const memory = new WebAssembly.Memory({ initial: 8 });
+      const memory = new WebAssembly.Memory({ initial: 8, maximum: 1024, shared: true });
       let instance: WebAssembly.Instance;
       let forkResult = 0;
       let failGrowth = true;
@@ -104,6 +103,9 @@ describe.skip("instrumented ABORT_UNWINDING", () => {
         ),
         label: "abort-e2e",
       });
+      runtime.registry.setCaptureModule(
+        installTestForkCaptureModule(memory, "abort-e2e"),
+      );
 
       const imports = {
         env: {
@@ -176,7 +178,7 @@ describe.skip("instrumented ABORT_UNWINDING", () => {
       ).join("\n");
       const wat = `(module
         (import "kernel" "kernel_fork" (func $fork (result i32)))
-        (import "env" "memory" (memory 8))
+        (import "env" "memory" (memory 8 1024 shared))
         (tag $payload (param i32))
         (func $recurse (param $depth i32) (result i32)
           (local $caught i32)
@@ -214,6 +216,7 @@ describe.skip("instrumented ABORT_UNWINDING", () => {
       writeFileSync(watPath, wat);
       execFileSync("wat2wasm", [
         "--enable-exceptions",
+        "--enable-threads",
         watPath,
         "-o",
         rawPath,
@@ -229,7 +232,7 @@ describe.skip("instrumented ABORT_UNWINDING", () => {
 
       const bytes = readFileSync(instrumentedPath);
       const module = new WebAssembly.Module(bytes);
-      const memory = new WebAssembly.Memory({ initial: 8 });
+      const memory = new WebAssembly.Memory({ initial: 8, maximum: 1024, shared: true });
       const view = new DataView(memory.buffer);
       let instance: WebAssembly.Instance;
       let moduleBuffer = 0;
@@ -294,6 +297,9 @@ describe.skip("instrumented ABORT_UNWINDING", () => {
         ),
         label: "abort-catch-e2e",
       });
+      runtime.registry.setCaptureModule(
+        installTestForkCaptureModule(memory, "abort-catch-e2e"),
+      );
       const coordinatedCommit = runtime.envImports.__wpk_fork_frame_commit as
         (payload: number) => void;
 
