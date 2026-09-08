@@ -83,6 +83,7 @@ changes, package artifacts, or performance claims.
 | Browser demos, VFS images, sharing, users | `docs/agent-guidance/browser-and-user.md` | `docs/browser-support.md` |
 | Performance claims and benchmarks | `docs/agent-guidance/performance.md` | `docs/profiling.md` |
 | Dev shell, docs, PR/final reports | `docs/agent-guidance/build-docs-and-prs.md` | `docs/repository-organization.md`, `README.md` |
+| Rust-first kernel & fork control flow | `docs/agent-guidance/host-runtime.md`, `docs/agent-guidance/debugging-and-posix.md` | `docs/plans/2026-09-08-fork-controlflow-into-module-scope.md`, `docs/plans/2026-09-08-rust-first-fork-point-of-no-return.md` |
 | Rust-first kernel migration (in progress) | — | `docs/plans/2026-09-04-rust-first-remaining-purpose-framed.md` (remaining work + the decision Bar), `docs/plans/2026-08-25-rust-first-runtime-design.md` |
 
 ## Validation Contract
@@ -182,6 +183,22 @@ Node and browser consideration even when only one host-specific file changed.
 
 See `docs/agent-guidance/host-runtime.md` before changing host runtime,
 worker protocol, or Node/browser adapter behavior.
+
+## Rust-First Kernel And Fork Contract
+
+Kernel and fork control flow are Rust-first. Do NOT add kernel or fork
+control-flow TypeScript unless it is the irreducible host floor: worker spawn,
+the `fork()` syscall + syscall-channel transport, `resolve_externref` identity
+materialization, anyref-transit `Table.grow` sizing, PIC placement globals, the
+resume `WebAssembly.Table`, and the Node/browser platform bridges. New
+capture/replay/orchestration logic belongs in the Rust fork-module
+(`crates/fork-module`) and `crates/fork-codec`, driven through the `fm_*`
+host↔module contract, not in new TypeScript sequencing.
+
+When you face a dilemma about whether something must be TypeScript, STOP and
+discuss with the maintainer rather than growing the host surface. The direction
+of travel is one way: TS fork/kernel glue shrinks toward the floor over time; it
+does not grow.
 
 ## Package And Build Contract
 

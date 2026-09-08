@@ -55,3 +55,35 @@ Node and browser consideration even when only one host-specific file changed.
 `BrowserKernel` is host/runtime code. Browser demos consume it; they do not own
 it. Fix runtime bugs in `host/src`, not inside demo pages, unless the bug is
 truly presentation-specific.
+
+## Rust-first for kernel and fork control flow
+
+Kernel and fork control flow are Rust-first. Do NOT add kernel or fork
+control-flow TypeScript unless it is the irreducible host floor:
+
+- worker spawn and lifecycle,
+- the `fork()`/`vfork()` syscall + the syscall-channel transport,
+- `resolve_externref(handle) -> externref` identity materialization (the one
+  true engine-floor seam),
+- anyref-transit `Table.grow` sizing (host must grow STORE #2 before drive),
+- PIC placement globals (`__memory_base`/`__stack_pointer`/`__table_base`/
+  `__indirect_function_table`) chosen at instantiation,
+- the resume `WebAssembly.Table` (host-built import of guest funcref thunks),
+- the guest run-loop + the fork-unwind exception catch (a JS-level throw a Wasm
+  module cannot `try/catch`), and
+- the Node/browser worker-message bridges.
+
+New capture/replay/orchestration logic belongs in the Rust fork-module
+(`crates/fork-module`) and `crates/fork-codec`, driven through the `fm_*`
+host↔module contract — not in new TypeScript sequencing in
+`host/src/fork-module-backend.ts`, `host/src/fork-process-continuation.ts`, or
+the fork paths of `host/src/worker-main.ts`. The `fm_*` surface is the internal
+host↔module contract (rebuilt in lockstep with the module), NOT the guest ABI;
+the frozen guest contract is the `__wpk_fork_*` exports and `kandelo.wpk_fork.*`
+custom sections. Prefer a coarse module entry that sequences guest-export drive
+steps over a new host-side call sequence.
+
+The direction of travel is one way: this TS glue shrinks toward the floor over
+time (see `docs/plans/2026-09-08-fork-controlflow-into-module-scope.md`); it does
+not grow. When you face a dilemma about whether something must be TypeScript,
+STOP and discuss with the maintainer rather than growing the host surface.

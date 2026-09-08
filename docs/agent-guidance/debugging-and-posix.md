@@ -125,3 +125,21 @@ Devices are kernel/platform behavior. PTYs, framebuffer, mouse, audio, random,
 null/zero/full, procfs, shm, sockets, and service-worker bridges should behave
 through normal file/syscall/device paths. Demo code may present devices, but
 must not implement substitute device semantics.
+
+## Rust-first for kernel and fork control flow
+
+When debugging or extending fork, exec, clone, or kernel behavior, keep new
+logic in Rust. Kernel and fork control flow are Rust-first: do NOT add kernel or
+fork control-flow TypeScript unless it is the irreducible host floor (worker
+spawn, the `fork()` syscall + syscall-channel transport, `resolve_externref`
+identity materialization, anyref-transit `Table.grow` sizing, PIC placement
+globals, the resume `WebAssembly.Table`, the guest run-loop + fork-unwind
+exception catch, and the Node/browser platform bridges). New
+capture/replay/orchestration logic belongs in the Rust fork-module
+(`crates/fork-module`) and `crates/fork-codec`, driven through the `fm_*`
+host↔module contract, not in new TypeScript sequencing.
+
+A fork bug that seems to need more host-side sequencing is usually a signal that
+the module should own that step. When you face a dilemma about whether something
+must be TypeScript, STOP and discuss with the maintainer rather than growing the
+host surface. See `docs/agent-guidance/host-runtime.md` for the full floor list.
