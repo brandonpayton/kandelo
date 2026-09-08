@@ -83,7 +83,7 @@ describe("fork-from-non-main-thread", () => {
       // frames through the module (replayed > 0). A silent JS fallback on either
       // side would leave that side's counter absent — flag being on is not
       // enough; the module must actually drive both the parent and the child.
-      const proof = forkModuleProof(result.hostDiagnostics);
+      const proof = forkModuleProof(result.forkModuleDiagnostics);
       expect(
         proof.parentFrames.length,
         "expected a pthread-parent fork-module frame proof-of-use diagnostic; " +
@@ -134,7 +134,7 @@ describe("fork-from-non-main-thread", () => {
 
       // Proof of use, both sides: the concurrent pthread PARENTS unwound through
       // the module and the fork CHILDREN rewound through it.
-      const proof = forkModuleProof(result.hostDiagnostics);
+      const proof = forkModuleProof(result.forkModuleDiagnostics);
       expect(Math.max(0, ...proof.parentFrames)).toBeGreaterThan(0);
       expect(Math.max(0, ...proof.childFrames)).toBeGreaterThan(0);
     },

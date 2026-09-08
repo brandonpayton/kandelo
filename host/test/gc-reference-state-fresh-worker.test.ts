@@ -55,7 +55,7 @@ describe("Wasm GC reference state in a fresh process Worker", () => {
       `GC fork exited unexpectedly\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
     ).toBe(0);
     expect(result.stderr).toBe("");
-    const gcNodes = moduleReferenceProof(result.hostDiagnostics, "gc");
+    const gcNodes = moduleReferenceProof(result.forkModuleDiagnostics, "gc");
     expect(
       gcNodes,
       "expected a fork-module typed-GC proof-of-use diagnostic; the module " +

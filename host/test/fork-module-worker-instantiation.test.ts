@@ -55,7 +55,7 @@ describe("fork-module worker instantiation", () => {
     // construction (the module registers the SAME full resume catalog the JS
     // `__wpk_fork_resume_table` uses): a wrong slot would dispatch the wrong
     // resume thunk and diverge from "PASS: D-01".
-    const frames = moduleFramesCommitted(result.hostDiagnostics);
+    const frames = moduleFramesCommitted(result.forkModuleDiagnostics);
     expect(
       frames,
       "expected a fork-module proof-of-use diagnostic; the module did not drive the fork",

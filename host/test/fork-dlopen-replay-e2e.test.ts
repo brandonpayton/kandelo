@@ -397,7 +397,7 @@ describe.skipIf(!hasSysroot || !hasKernel)("fork after dlopen end-to-end", () =>
     // main-thread harness, where the fork parent does not reach the worker tail
     // — the same reason the flag-off cases here report only the child; the child
     // proof is the strongest signal this mode exposes.)
-    const committed = await pollFramesCommitted(result.hostDiagnostics);
+    const committed = await pollFramesCommitted(result.forkModuleDiagnostics);
     expect(
       committed,
       "expected the fork parent to report module-committed frames; it fell back to JS (useForkModule=false)",
@@ -483,7 +483,7 @@ describe.skipIf(!hasSysroot || !hasKernel)("fork after dlopen end-to-end", () =>
     // activation's frames to have been driven through its trampoline into the
     // shared module (a per-activation JS fallback would desync the shared journal
     // and trap instead of returning 0 in the side module's `fork()`).
-    const committed = await pollFramesCommitted(result.hostDiagnostics);
+    const committed = await pollFramesCommitted(result.forkModuleDiagnostics);
     expect(
       committed,
       "expected the fork parent to report module-committed frames for the side-module fork",

@@ -9,7 +9,11 @@ import type {
   LazyDownloadEvent,
   SerializedLazyArchiveEntry,
 } from "./vfs/memory-fs";
-import type { HostDiagnostic, HostDiagnosticMessage } from "./host-diagnostic";
+import type {
+  ForkModuleProofMessage,
+  HostDiagnostic,
+  HostDiagnosticMessage,
+} from "./host-diagnostic";
 import type { ClosedLazyAsset } from "./vfs/closed-lazy-assets";
 import type { PcmTransportDescriptor } from "./audio/pcm-transport";
 import type { MountSpec } from "./vfs/default-mounts";
@@ -645,6 +649,7 @@ export type KernelToMainMessage =
   | StdoutMessage
   | StderrMessage
   | HostDiagnosticMessage
+  | ForkModuleProofMessage
   | PtyOutputMessage
   | ListenTcpMessage
   | FbBindMessage

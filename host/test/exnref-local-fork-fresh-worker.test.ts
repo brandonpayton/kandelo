@@ -70,7 +70,7 @@ describe("exnref fork through the co-resident module (Phase 6 D6.5)", () => {
     ).toBe(0);
     expect(result.stderr).toBe("");
     // (b) PROOF OF USE: the module reconstructed the carried exnref.
-    const exnrefs = moduleReferenceProof(result.hostDiagnostics, "exnref");
+    const exnrefs = moduleReferenceProof(result.forkModuleDiagnostics, "exnref");
     expect(
       exnrefs,
       "expected a fork-module exnref proof-of-use diagnostic; the module did " +

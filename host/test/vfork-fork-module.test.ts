@@ -45,7 +45,7 @@ describe("vfork borrowed replay through the fork-module (flag on)", () => {
     ]);
     // Surface the fork-module diagnostics so the proof-of-use is legible even if
     // the assertion below needs adjusting to the program's child-exit shape.
-    const fm = result.hostDiagnostics.filter((d) => d.source === "fork-module");
+    const fm = result.forkModuleDiagnostics.filter((d) => d.source === "fork-module");
     // A borrowed child that drove its replay through the module reports a
     // replayed-frame count; a silent JS fallback would report nothing.
     expect(

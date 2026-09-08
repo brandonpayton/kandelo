@@ -115,6 +115,11 @@ export interface NodeKernelHostOptions {
   onStderr?: (pid: number, data: Uint8Array) => void;
   /** Called for host-runtime diagnostics that are not guest stderr. */
   onHostDiagnostic?: (diagnostic: HostDiagnostic) => void;
+  /** Called for co-resident fork-module proof-of-use telemetry (frame/reference
+   *  reconstruction counts). This is an informational success signal, NOT a
+   *  problem, so it rides a channel separate from `onHostDiagnostic`; a caller
+   *  that does not opt in never sees a fork emit proof-of-use. */
+  onForkModuleProof?: (diagnostic: HostDiagnostic) => void;
   /** Called as lazy VFS files or trees are fetched on demand. */
   onLazyDownload?: (event: LazyDownloadEvent) => void;
   /** Called when a process writes PTY output */
@@ -1097,6 +1102,15 @@ export class NodeKernelHost {
         break;
       case "host_diagnostic": {
         this.options.onHostDiagnostic?.({
+          pid: msg.pid,
+          source: msg.source,
+          message: msg.message,
+          ...(msg.status === undefined ? {} : { status: msg.status }),
+        });
+        break;
+      }
+      case "fork_module_proof": {
+        this.options.onForkModuleProof?.({
           pid: msg.pid,
           source: msg.source,
           message: msg.message,

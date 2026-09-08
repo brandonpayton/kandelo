@@ -126,7 +126,7 @@ describe("externref fork through the co-resident module (Phase 6 D6.5)", () => {
     // through the broker seam (`externrefs_resolved` > 0), not a silent JS
     // fallback.
     const externrefsResolved = moduleReferenceProof(
-      result.hostDiagnostics,
+      result.forkModuleDiagnostics,
       "externref",
     );
     expect(

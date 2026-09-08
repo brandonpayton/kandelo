@@ -90,7 +90,7 @@ describe("Multi-node Wasm GC reference cycle in a fresh process Worker", () => {
     ).toBe(0);
     expect(result.stderr).toBe("");
 
-    const gcNodes = moduleReferenceProof(result.hostDiagnostics, "gc");
+    const gcNodes = moduleReferenceProof(result.forkModuleDiagnostics, "gc");
     expect(
       gcNodes,
       "expected a fork-module typed-GC proof-of-use diagnostic; the module did " +
@@ -99,7 +99,7 @@ describe("Multi-node Wasm GC reference cycle in a fresh process Worker", () => {
     expect(gcNodes!).toBeGreaterThan(0);
 
     // The item 3c DRIVE proof: the module executed the typed-GC drive plan.
-    const driveSteps = moduleReferenceProof(result.hostDiagnostics, "drive");
+    const driveSteps = moduleReferenceProof(result.forkModuleDiagnostics, "drive");
     expect(
       driveSteps,
       "expected a fork-module DRIVE proof-of-use diagnostic; the module admitted " +

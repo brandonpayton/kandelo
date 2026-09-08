@@ -694,6 +694,16 @@ function reportHostDiagnostic(
   post({ type: "host_diagnostic", ...diagnostic });
 }
 
+// Forward co-resident fork-module proof-of-use on its OWN channel. This is an
+// informational success signal, not a host PROBLEM, so it must not ride the
+// `host_diagnostic` stream a caller inspects for failures (a clean fork would
+// otherwise pollute `onHostDiagnostic` on every process). Only a consumer that
+// opts in via `onForkModuleProof` receives it. Mirrors node-kernel-worker-entry
+// so both hosts report identically.
+function postForkModuleProof(diagnostic: HostDiagnostic): void {
+  post({ type: "fork_module_proof", ...diagnostic });
+}
+
 function terminatePoisonedKernelWorker(error: Error): void {
   if (kernelFatalReported) return;
   kernelFatalReported = true;
@@ -1846,53 +1856,43 @@ function installProcessWorkerListeners(
     } else if (m.type === "fork_host_import") {
       dispatchForkHostImport(worker, m);
     } else if (m.type === "fork_module_frames" && m.pid === pid) {
-      // Surface the co-resident fork-module's proof-of-use as a host
-      // diagnostic (Phase 6 D5): a nonzero frame count confirms the qualifying
-      // fork ran its continuation through the module, not the JS fallback.
-      // Mirrors node-kernel-worker-entry so both hosts report identically.
-      reportHostDiagnostic(
-        {
-          pid,
-          source: "fork-module",
-          message: `fork_module_frames=${m.frames}`,
-        },
-        "warn",
-      );
+      // Forward the co-resident fork-module's proof-of-use (Phase 6 D5): a
+      // nonzero frame count confirms the qualifying fork ran its continuation
+      // through the module. Proof-of-use is informational success telemetry, not
+      // a host problem, so it rides the dedicated `fork_module_proof` channel and
+      // never pollutes `onHostDiagnostic`. Mirrors node-kernel-worker-entry.
+      postForkModuleProof({
+        pid,
+        source: "fork-module",
+        message: `fork_module_frames=${m.frames}`,
+      });
     } else if (m.type === "fork_module_child_frames" && m.pid === pid) {
-      // Surface the co-resident fork-module's REPLAY-side proof-of-use as a host
-      // diagnostic (Phase 6 D7b): a nonzero count confirms a fork CHILD (e.g. a
-      // fork-from-thread child) drove its rewind through the module, not the JS
-      // fallback — the child never commits, so `fork_module_frames` cannot show
-      // this. Mirrors node-kernel-worker-entry so both hosts report identically.
-      reportHostDiagnostic(
-        {
-          pid,
-          source: "fork-module",
-          message: `fork_module_child_frames=${m.frames}`,
-        },
-        "warn",
-      );
+      // Forward the co-resident fork-module's REPLAY-side proof-of-use (Phase 6
+      // D7b): a nonzero count confirms a fork CHILD (e.g. a fork-from-thread
+      // child) drove its rewind through the module — the child never commits, so
+      // `fork_module_frames` cannot show this. Mirrors node-kernel-worker-entry.
+      postForkModuleProof({
+        pid,
+        source: "fork-module",
+        message: `fork_module_child_frames=${m.frames}`,
+      });
     } else if (m.type === "fork_module_references" && m.pid === pid) {
-      // Surface the co-resident fork-module's PER-KIND REFERENCE proof-of-use as
-      // a host diagnostic (Phase 6 D6.5): a nonzero count for a kind confirms the
-      // child's carried references of that kind were reconstructed through the
-      // module, not the JS fallback. All kinds ride one diagnostic string so a
-      // reader can extract any of funcref/externref/exnref/typed-GC. Mirrors
-      // node-kernel-worker-entry so both hosts report identically.
-      reportHostDiagnostic(
-        {
-          pid,
-          source: "fork-module",
-          message:
-            `fork_module_references=${m.references} ` +
-            `externrefs_resolved=${m.externrefs} ` +
-            `exnrefs_reconstructed=${m.exnrefs} ` +
-            `gc_nodes_reconstructed=${m.gcNodes} ` +
-            `drive_steps_executed=${m.driveSteps} ` +
-            `static_roots_published=${m.staticRoots}`,
-        },
-        "warn",
-      );
+      // Forward the co-resident fork-module's PER-KIND REFERENCE proof-of-use
+      // (Phase 6 D6.5): a nonzero count for a kind confirms the child's carried
+      // references of that kind were reconstructed through the module. All kinds
+      // ride one string so a reader can extract any of funcref/externref/exnref/
+      // typed-GC. Mirrors node-kernel-worker-entry.
+      postForkModuleProof({
+        pid,
+        source: "fork-module",
+        message:
+          `fork_module_references=${m.references} ` +
+          `externrefs_resolved=${m.externrefs} ` +
+          `exnrefs_reconstructed=${m.exnrefs} ` +
+          `gc_nodes_reconstructed=${m.gcNodes} ` +
+          `drive_steps_executed=${m.driveSteps} ` +
+          `static_roots_published=${m.staticRoots}`,
+      });
     }
   });
 }
@@ -3694,19 +3694,16 @@ async function handleClone(
     } else if (m.type === "fork_host_import") {
       dispatchForkHostImport(threadWorker, m);
     } else if (m.type === "fork_module_frames" && m.pid === pid) {
-      // Phase 6 D7b: surface the pthread PARENT worker's fork-module proof-of-use
+      // Phase 6 D7b: forward the pthread PARENT worker's fork-module proof-of-use
       // (the parent side of a fork-from-thread). The process-worker handler above
       // forwards the same message for the main worker; the pthread worker has its
       // own handler, so mirror it here or the parent-frame proof is dropped.
       // Mirrors node-kernel-worker-entry so both hosts report identically.
-      reportHostDiagnostic(
-        {
-          pid,
-          source: "fork-module",
-          message: `fork_module_frames=${m.frames}`,
-        },
-        "warn",
-      );
+      postForkModuleProof({
+        pid,
+        source: "fork-module",
+        message: `fork_module_frames=${m.frames}`,
+      });
     }
   });
   threadWorker.on("error", (err: Error) => {

@@ -243,8 +243,15 @@ export interface RunProgramResult {
   exitCode: number;
   stdout: string;
   stderr: string;
-  /** Host-owned lifecycle/protocol diagnostics, never guest fd 2 bytes. */
+  /** Host-owned lifecycle/protocol diagnostics, never guest fd 2 bytes. This is
+   *  the PROBLEM channel: a clean run leaves it empty. Co-resident fork-module
+   *  proof-of-use (an informational success signal) is delivered separately on
+   *  `forkModuleDiagnostics`, so a successful fork never pollutes this. */
   hostDiagnostics: HostDiagnostic[];
+  /** Co-resident fork-module proof-of-use telemetry (`fork_module_frames=`,
+   *  `fork_module_child_frames=`, `fork_module_references=`). Proof tests read
+   *  this; ordinary tests asserting a clean `hostDiagnostics` ignore it. */
+  forkModuleDiagnostics: HostDiagnostic[];
   /** Raw stdout bytes (for binary output like compressed data) */
   stdoutBytes: Uint8Array;
   /** Per-process fork-counter snapshots captured after guest child-creation
@@ -304,6 +311,7 @@ async function runInWorkerThread(options: RunProgramOptions): Promise<RunProgram
   let stdout = "";
   let stderr = "";
   const hostDiagnostics: HostDiagnostic[] = [];
+  const forkModuleDiagnostics: HostDiagnostic[] = [];
   const stdoutChunks: Uint8Array[] = [];
   let capturedPid: number | undefined;
   const forkCountSamplePromises: Promise<bigint>[] = [];
@@ -349,6 +357,9 @@ async function runInWorkerThread(options: RunProgramOptions): Promise<RunProgram
     },
     onHostDiagnostic: (diagnostic) => {
       hostDiagnostics.push(diagnostic);
+    },
+    onForkModuleProof: (diagnostic) => {
+      forkModuleDiagnostics.push(diagnostic);
     },
     onProcessEvent: (event) => {
       // A top-level host spawn has event.pid === capturedPid (or arrives
@@ -448,6 +459,7 @@ async function runInWorkerThread(options: RunProgramOptions): Promise<RunProgram
     stdout,
     stderr,
     hostDiagnostics,
+    forkModuleDiagnostics,
     stdoutBytes,
     forkCountSamples,
     spawnScratchCapacity,
@@ -545,15 +557,16 @@ async function runOnMainThread(options: RunProgramOptions): Promise<RunProgramRe
   // seam.
   options.forkHostImportRegistrar?.(forkHostImportOwnerRuntime);
   // Capture the co-resident fork-module's per-kind reference proof-of-use posted
-  // by a fork CHILD Worker, mirroring how the Node/browser worker entries forward
-  // it as a `fork-module` host diagnostic. Main-thread mode otherwise returns no
-  // host diagnostics.
-  const mainThreadHostDiagnostics: HostDiagnostic[] = [];
+  // by a fork CHILD Worker. This is informational success telemetry, not a host
+  // problem, so it is surfaced on `forkModuleDiagnostics` (mirroring the
+  // Node/browser worker entries' dedicated `fork_module_proof` channel), NOT on
+  // `hostDiagnostics`. Main-thread mode otherwise returns no host diagnostics.
+  const mainThreadForkModuleDiagnostics: HostDiagnostic[] = [];
   const recordForkModuleReferences = (
     forPid: number,
     message: Extract<WorkerToHostMessage, { type: "fork_module_references" }>,
   ): void => {
-    mainThreadHostDiagnostics.push({
+    mainThreadForkModuleDiagnostics.push({
       pid: forPid,
       source: "fork-module",
       message:
@@ -574,7 +587,7 @@ async function runOnMainThread(options: RunProgramOptions): Promise<RunProgramRe
       { type: "fork_module_frames" | "fork_module_child_frames" }
     >,
   ): void => {
-    mainThreadHostDiagnostics.push({
+    mainThreadForkModuleDiagnostics.push({
       pid: forPid,
       source: "fork-module",
       message:
@@ -1468,7 +1481,10 @@ async function runOnMainThread(options: RunProgramOptions): Promise<RunProgramRe
     exitCode,
     stdout,
     stderr,
-    hostDiagnostics: mainThreadHostDiagnostics,
+    // Main-thread mode surfaces no host PROBLEM diagnostics; fork-module
+    // proof-of-use rides its own channel below.
+    hostDiagnostics: [],
+    forkModuleDiagnostics: mainThreadForkModuleDiagnostics,
     stdoutBytes,
     forkCount: mainThreadForkCount,
     spawnScratchCapacity,

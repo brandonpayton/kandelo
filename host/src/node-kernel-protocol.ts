@@ -12,7 +12,10 @@
  * See docs/plans/2026-04-30-external-kernel-http-request-interface.md.
  */
 import type { HttpRequest, HttpResponse } from "./networking/in-kernel-http";
-import type { HostDiagnosticMessage } from "./host-diagnostic";
+import type {
+  ForkModuleProofMessage,
+  HostDiagnosticMessage,
+} from "./host-diagnostic";
 import type { LazyDownloadEvent } from "./vfs/memory-fs";
 import type {
   ClosedLazyAsset,
@@ -448,6 +451,7 @@ export type KernelToMainMessage =
   | StdoutMessage
   | StderrMessage
   | HostDiagnosticMessage
+  | ForkModuleProofMessage
   | PtyOutputMessage
   | ResolveExecRequestMessage
   | ProcEventMessage

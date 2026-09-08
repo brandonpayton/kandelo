@@ -63,7 +63,7 @@ describe("Wasm GC bare static-root fork in a fresh process Worker", () => {
     ).toBe(0);
     expect(result.stderr).toBe("");
     const staticRootsPublished = moduleReferenceProof(
-      result.hostDiagnostics,
+      result.forkModuleDiagnostics,
       "static-root",
     );
     expect(

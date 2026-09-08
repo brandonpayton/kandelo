@@ -158,7 +158,7 @@ describe("module-mode gated externref fork aborts cleanly (P4)", () => {
     // emit no `fork-module` frame diagnostic at all (null here). This is what
     // distinguishes "aborted through the module" from "aborted through the JS
     // engine that P6 deletes".
-    const framesCommitted = forkModuleFramesCommitted(result.hostDiagnostics);
+    const framesCommitted = forkModuleFramesCommitted(result.forkModuleDiagnostics);
     expect(
       framesCommitted,
       "expected a fork-module frame proof-of-use diagnostic; the module did " +

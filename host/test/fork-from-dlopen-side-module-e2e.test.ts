@@ -350,7 +350,7 @@ describe.skipIf(!hasPrerequisites)("fork from a dlopened side module", () => {
       // Proof the borrowed child rewound through the module (not a silent JS
       // fallback): a nonzero replayed-frame count. A multi-activation borrowed
       // child that failed to add its side activation would crash, not pass.
-      const fm = result.hostDiagnostics.filter((d) => d.source === "fork-module");
+      const fm = result.forkModuleDiagnostics.filter((d) => d.source === "fork-module");
       expect(
         fm.some((d) => /fork_module_child_frames=\d+/.test(d.message)),
         `expected a fork-module borrowed proof-of-use; saw: ${JSON.stringify(fm)}`,

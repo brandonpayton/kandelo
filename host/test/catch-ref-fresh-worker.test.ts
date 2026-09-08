@@ -115,7 +115,7 @@ describe("CatchRef fresh process worker replay", () => {
 
     // (b) No exnref is carried across the fork, so the module reconstructs none
     // and the per-kind exnref proof-of-use stays silent.
-    expect(moduleReferenceProof(result.hostDiagnostics, "exnref")).toBeNull();
+    expect(moduleReferenceProof(result.forkModuleDiagnostics, "exnref")).toBeNull();
   });
 
   it("reconstructs reference-bearing catches through the module (default)", async () => {
@@ -150,6 +150,6 @@ describe("CatchRef fresh process worker replay", () => {
     // The module reconstructed the caught exception recipe (payload references
     // are carried by an exnref node), proving the module path — not the deleted-
     // in-P6 JS twin — handled the reference-bearing exception.
-    expect(moduleReferenceProof(result.hostDiagnostics, "exnref")).not.toBeNull();
+    expect(moduleReferenceProof(result.forkModuleDiagnostics, "exnref")).not.toBeNull();
   });
 });

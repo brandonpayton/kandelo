@@ -56,7 +56,7 @@ describe("Wasm GC static-root binder in a fresh process Worker", () => {
     ).toBe(0);
     expect(result.stderr).toBe("");
     const staticRootsPublished = moduleReferenceProof(
-      result.hostDiagnostics,
+      result.forkModuleDiagnostics,
       "static-root",
     );
     expect(
