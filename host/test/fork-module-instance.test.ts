@@ -73,6 +73,55 @@ describe("instantiateForkModule", () => {
     );
   });
 
+  it("registers a resume catalog larger than the old 16384 cap and fails loud past the new cap", () => {
+    // Phase 3 proof: the resume-catalog cap is raised (RESUME_CATALOG_CAP =
+    // 65536) so the co-resident module backs EVERY real fork — php-fpm (19190),
+    // php (19026), and node/spidermonkey (16555) all previously EXCEEDED the old
+    // 16384 cap and silently fell to the JS continuation twin. A catalog past
+    // the raised cap fails loud (`E2BIG`), never silently drops to JS.
+    const module = loadForkModule32();
+    const memory = sharedMemory(256); // 16 MiB
+    const reserveBase = 8 * 1024 * 1024;
+    const fm = instantiateForkModule({
+      module,
+      memory,
+      ptrWidth: 4,
+      reserve: () => reserveBase,
+      label: "test",
+    });
+    const setFormat = fm.exports.fm_set_format as (
+      ptrWidth: number,
+      fixedPrefix: number,
+    ) => void;
+    const setCatalog = fm.exports.fm_set_resume_catalog as (
+      ptr: number,
+      count: number,
+    ) => void;
+    const lastErrno = fm.exports.fm_last_errno as () => number;
+    setFormat(4, 0);
+    // Stage the ordinals well below the host-reserved region at `reserveBase`.
+    const catalogAddr = 1 * 1024 * 1024; // 1 MiB
+    const seed = (count: number): void => {
+      const view = new DataView(memory.buffer);
+      for (let i = 0; i < count; i++) {
+        view.setUint32(catalogAddr + i * 4, i, true);
+      }
+      setCatalog(catalogAddr, count);
+    };
+    const E2BIG = 7;
+    const CAP = 65_536;
+    // A catalog exceeding the OLD 16384 cap now registers cleanly.
+    seed(20_000);
+    expect(lastErrno()).toBe(0);
+    // Exactly at the raised cap: still accepted.
+    seed(CAP);
+    expect(lastErrno()).toBe(0);
+    // One past the raised cap: a truthful E2BIG (fail-loud module-capacity
+    // boundary), not a silent JS fallback.
+    seed(CAP + 1);
+    expect(lastErrno()).toBe(E2BIG);
+  });
+
   it("exposes the module-owned GC transit table without minting a provider", () => {
     const module = loadForkModule32();
     const memory = sharedMemory(256); // 16 MiB
