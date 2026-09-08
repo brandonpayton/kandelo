@@ -441,14 +441,17 @@ const FORK_MODULE_SHADOW_STACK_BYTES = 1 << 20;
  * (child `memory.size` must equal the parent's). Staging into a slab that is
  * part of the single reused fork-module region makes it symmetric: the parent
  * and child reuse the SAME slab (a COPIED child reuses the whole region via
- * `forkModuleInheritedBase`), so no staging `mmap` grows either one. One page
- * holds the full resume catalog (`FORK_MODULE_RESUME_CATALOG_CAP` = 16384
- * ordinals * 4 bytes = 65536). A staging request larger than the slab (a large
- * GC codec) falls back to the growing channel `mmap` — that path never asserts
- * an exact memory size, so its growth is invisible; see `worker-main`'s backend
- * `reserveRegion`.
+ * `forkModuleInheritedBase`), so no staging `mmap` grows either one. The slab
+ * holds the full resume catalog (`FORK_MODULE_RESUME_CATALOG_CAP` = 65536
+ * ordinals * 4 bytes = 262144 = 4 pages); it MUST stay >= that size so a COPIED
+ * child stages its (identical) catalog into the inherited slab in place rather
+ * than falling back to a growing `mmap` at its higher inherited cursor, which
+ * would break the fork memory-clone size invariant. A staging request larger
+ * than the slab (a large GC codec) falls back to the growing channel `mmap` —
+ * that path never asserts an exact memory size, so its growth is invisible; see
+ * `worker-main`'s backend `reserveRegion`.
  */
-const FORK_MODULE_STAGING_BYTES = 1 << 16;
+const FORK_MODULE_STAGING_BYTES = 1 << 18;
 
 const WASM_DYLINK_MEM_INFO = 1;
 

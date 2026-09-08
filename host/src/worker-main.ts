@@ -3697,27 +3697,34 @@ export async function centralizedWorkerMain(
           };
         }
 
-        // QUALIFYING PREDICATE for the module-backed continuation. All of:
-        //  - the module instantiated and its width matches the guest;
-        //  - the program cannot add fork activations at runtime (no dlopen fork
-        //    role) => the fork is single-activation (activation 0 only);
-        //  - a fork-from-thread CHILD is admitted (Phase 6 D7b): it is still
-        //    single-activation, so it reuses all the D5/D6 module machinery
-        //    unchanged. It replays through the alternate `wpk_fork_resume_thread`
-        //    entry (selected below at the child-entry site) instead of
-        //    `wpk_fork_resume_start`, and its continuation is rooted in the
-        //    CALLER's channel page (the launch anchor the child wrote under
-        //    activation zero above), which `readProcessLaunchRoot` already
-        //    returns — so `attachModuleChild` seeds the module from that root.
-        //    Require the alternate entry export so a thread child never flips its
-        //    frame imports to the module without a way to resume; if it is
-        //    missing, keep the byte-identical JS path.
-        //  - the full resume catalog fits the module's static cap, so the
-        //    module can register it and match the JS resume-slot numbering.
-        // Single-thread and not-vfork hold by construction here: this is the
-        // main process worker path (the pthread coordinator is separate) and a
-        // borrowed vfork child never reaches this branch (`!borrowedForkChild`).
-        // Any miss keeps `useForkModule=false` => byte-identical JS path.
+        // Phase 3 (rust-first fork point-of-no-return): the co-resident module
+        // is the UNCONDITIONAL reconstructor + capturer, so it backs EVERY fork
+        // on this worker path. The three former `useForkModule=false` fallbacks
+        // that silently dropped to the byte-identical JS continuation twin are
+        // now closed; the only reason a fork does not go through the module is a
+        // genuine impossibility, which FAILS LOUD (never silent JS):
+        //  - Case 1 (pointer width): the CORRECT-width module is instantiated on
+        //    demand per guest (`forkModuleInitFields(ptrWidth)` in the kernel
+        //    worker entries selects `fork_module32` vs `fork_module64`), and a
+        //    genuine width mismatch already threw above. No fallback remains.
+        //  - Case 2 (resume catalog > cap): raised to hold every real guest's
+        //    catalog (php-fpm/node were the only programs past the old 16384
+        //    cap). The cap is a module-BSS structure, enforced loudly by the
+        //    backend constructor below; a catalog past the (raised) cap is a
+        //    fail-loud module-capacity boundary, not a JS fallback.
+        //  - Case 3 (fork-from-thread child): its module replay path needs the
+        //    guest's `wpk_fork_resume_thread` export, which fork-instrument emits
+        //    for any guest exporting `__indirect_function_table` — i.e. every
+        //    pthread-capable (hence fork-from-thread-capable) guest. A thread
+        //    child missing it is a stale / mis-instrumented artifact; fail loud
+        //    so it is rebuilt through the current fork-instrument path.
+        // Single-activation admission is UNCHANGED (Phase 6 D7a.1a): a dlopen
+        // fork's side activations seed their OWN resume catalogs through the
+        // module, and multi-activation REFERENCES still take the JS reference
+        // path via `moduleReferenceKindsSupported` (gated below). Single-thread
+        // and not-vfork hold by construction here: this is the main process
+        // worker path (the pthread coordinator is separate) and a borrowed vfork
+        // child is admitted like any other (item 4).
         const catalogOrdinals = readForkResumeCatalog(module).map(
           (entry) => entry.functionOrdinal,
         );
@@ -3734,20 +3741,17 @@ export async function centralizedWorkerMain(
         const hasResumeThreadExport = wasmModuleExports(module).some(
           (entry) => entry.name === "wpk_fork_resume_thread",
         );
-        // Phase 6 D7a.1a: POSITIVE multi-activation admission — a dlopen fork
-        // (`hasDylinkForkRole`) is NO LONGER excluded. Activation 0 is admitted
-        // here on width + its own resume-catalog cap; each dlopen'd SIDE
-        // activation seeds its OWN resume catalog through the module at
-        // instantiation (`backend.setActivationResumeCatalog`), which fails loud
-        // if that activation's catalog overflows the module cap. Multi-activation
-        // REFERENCES stay on the JS path this slice (see `moduleReferenceKindsSupported`
-        // below, gated to a single activation), so a dlopen fork drives only its
-        // FRAMES through the module. A single-activation program keeps its
-        // byte-identical behavior.
-        useForkModule =
-          ptrWidth === linkedFrameFormat.ptrWidth &&
-          (!isForkFromThreadChild || hasResumeThreadExport) &&
-          catalogOrdinals.length <= FORK_MODULE_RESUME_CATALOG_CAP;
+        // Case 3 fail-loud (see the block comment above): a fork-from-thread
+        // child without the module resume export is a stale/mis-instrumented
+        // artifact, not a routine fallback.
+        if (isForkFromThreadChild && !hasResumeThreadExport) {
+          throw new Error(
+            `pid=${pid}: fork-from-thread child is missing the ` +
+              "`wpk_fork_resume_thread` module resume export; rebuild the " +
+              "program through the current fork-instrument path",
+          );
+        }
+        useForkModule = true;
         // Phase 6 item 4: a borrowed (vfork) child is admitted like any other —
         // single-activation via `beginBorrowedChildReplay`, and multi-activation
         // dlopen-vfork ("mode-1") via `addActivationBorrowedChildReplay`. The
@@ -6677,9 +6681,10 @@ export async function centralizedThreadWorkerMain(
     // so `resolve_externref` is wired (below, for identity parity) but expected
     // to stay idle here. (The `wpk_fork_host.*` seam this comment used to
     // describe was deleted, H3, 2026-09-06 — the module no longer declares those
-    // imports at all.) A catalog past the module cap keeps `threadForkModuleInstance`
-    // null; such a pthread fork then fails loud rather than silently running a
-    // deleted JS path.
+    // imports at all.) Phase 3: a catalog past the (raised) module cap now FAILS
+    // LOUD here — the cap is a module-BSS structure that holds every real guest's
+    // catalog, so an overflow is a genuine module-capacity boundary, never a
+    // silent drop to the (Phase 4: to-be-deleted) JS continuation twin.
     let threadForkModuleInstance: ForkModuleInstance | null = null;
     let threadForkModuleBackend: ForkModuleContinuationBackend | null = null;
     if (
@@ -6704,7 +6709,13 @@ export async function centralizedThreadWorkerMain(
       const catalogOrdinals = readForkResumeCatalog(module).map(
         (entry) => entry.functionOrdinal,
       );
-      if (catalogOrdinals.length <= FORK_MODULE_RESUME_CATALOG_CAP) {
+      if (catalogOrdinals.length > FORK_MODULE_RESUME_CATALOG_CAP) {
+        throw new Error(
+          `pid=${pid} tid=${tid}: resume catalog of ${catalogOrdinals.length} ` +
+            `exceeds the fork-module cap ${FORK_MODULE_RESUME_CATALOG_CAP}`,
+        );
+      }
+      {
         // M2: wire the same `resolve_externref` body as the process/parent
         // path (using this pthread's own externref token cache, established
         // above alongside `threadHostImportRuntime`). The pthread-parent

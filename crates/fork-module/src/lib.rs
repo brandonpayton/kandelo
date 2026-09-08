@@ -198,9 +198,16 @@ mod wasm {
     //
     // A fixed BSS buffer holds the catalog so it survives the per-fork heap
     // reset (`fm_begin_unwind` clears the bump heap). A catalog larger than the
-    // cap yields a truthful `E2BIG`; the host then declines the module path and
-    // keeps the byte-identical JavaScript continuation for that program.
-    const RESUME_CATALOG_CAP: usize = 16_384;
+    // cap yields a truthful `E2BIG`, which the host surfaces as a FAIL-LOUD
+    // module-capacity boundary (Phase 3: the module backs every fork; there is
+    // no JS continuation fallback to decline to). The cap holds every real
+    // guest's catalog with headroom — the largest shipped programs (php-fpm
+    // 19190, php 19026, node/spidermonkey 16555) all fit; keep this value >=
+    // `FORK_MODULE_RESUME_CATALOG_CAP` in `host/src/fork-module-backend.ts`,
+    // `crates/host-native/src/guest.rs`, and the staging slab in
+    // `host/src/fork-module-instance.ts` (`FORK_MODULE_STAGING_BYTES` must hold
+    // `RESUME_CATALOG_CAP * 4` bytes).
+    const RESUME_CATALOG_CAP: usize = 65_536;
 
     #[repr(C, align(4))]
     struct CatalogCell(UnsafeCell<[u32; RESUME_CATALOG_CAP]>);
@@ -272,7 +279,7 @@ mod wasm {
     // mapping each activation id to its `[offset, len)` slice. Both the ordinal
     // arena and the index are capped; overflow is a truthful `E2BIG` and the host
     // keeps the JavaScript continuation for that program.
-    const ACTIVATION_CATALOG_ORD_CAP: usize = 16_384; // total ordinals, all activations
+    const ACTIVATION_CATALOG_ORD_CAP: usize = 65_536; // total ordinals, all activations
     const ACTIVATION_CATALOG_MAX_ACTS: usize = 64; // distinct activations
 
     #[repr(C, align(4))]

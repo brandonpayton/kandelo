@@ -15,8 +15,17 @@ import { WASM_PAGE_SIZE } from "./constants";
 import type { LinkedFrameFormatDescriptor } from "./fork-continuation";
 import type { ForkModuleExports } from "./fork-module-instance";
 
-/** The fork-module's static resume-catalog cap (mirrors `RESUME_CATALOG_CAP`). */
-export const FORK_MODULE_RESUME_CATALOG_CAP = 16_384;
+/**
+ * The fork-module's static resume-catalog cap (mirrors `RESUME_CATALOG_CAP` in
+ * `crates/fork-module/src/lib.rs` and `crates/host-native/src/guest.rs`). Sized
+ * to hold every real guest's catalog with headroom (largest shipped: php-fpm
+ * 19190, php 19026, node/spidermonkey 16555). A catalog past this cap FAILS LOUD
+ * via the backend constructor — Phase 3 removed the silent JS-continuation
+ * fallback. `FORK_MODULE_STAGING_BYTES` (fork-module-instance.ts) must hold
+ * `FORK_MODULE_RESUME_CATALOG_CAP * 4` bytes so a COPIED fork child stages the
+ * catalog into the inherited slab without growing memory.
+ */
+export const FORK_MODULE_RESUME_CATALOG_CAP = 65_536;
 
 /**
  * The guest offset + byte length of the serialized replay-event (KFRE) journal

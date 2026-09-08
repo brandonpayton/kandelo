@@ -3075,9 +3075,16 @@ fn define_funcref_call_probe(linker: &mut Linker<()>) -> anyhow::Result<()> {
 /// `WASM_DYLINK_MEM_INFO`.
 const WASM_DYLINK_MEM_INFO: u8 = 1;
 
-/// The fork-module's static resume-catalog cap, mirroring TypeScript's
-/// `FORK_MODULE_RESUME_CATALOG_CAP` (`host/src/fork-module-backend.ts`).
-const FORK_MODULE_RESUME_CATALOG_CAP: usize = 16_384;
+/// The fork-module's static resume-catalog cap, mirroring `RESUME_CATALOG_CAP`
+/// in `crates/fork-module/src/lib.rs` and TypeScript's
+/// `FORK_MODULE_RESUME_CATALOG_CAP` (`host/src/fork-module-backend.ts`). Sized
+/// to hold every real guest's catalog with headroom; a catalog past it fails
+/// loud (Phase 3: the module backs every fork, no JS fallback). The scratch
+/// below scales with it and is carved from the module's 1 MiB shadow-stack
+/// padding, so this must stay small enough that the padding still covers the
+/// catalog scratch plus the three single-page scratch regions and a workable
+/// shadow stack (256 KiB catalog scratch + 3 * 64 KiB pages leaves ~576 KiB).
+const FORK_MODULE_RESUME_CATALOG_CAP: usize = 65_536;
 
 /// N1-I4 Task 3: a small, fixed-size, host-owned scratch region — big enough
 /// to hold [`FORK_MODULE_RESUME_CATALOG_CAP`] `u32` ordinals (exactly 64 KiB)
