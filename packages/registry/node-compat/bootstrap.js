@@ -207,6 +207,15 @@ function _checkErrno(errno, syscall, path) {
     if (errno !== 0) _throwErrno(errno, syscall, path);
 }
 
+// Honest throwing stub for builtin surface we expose for link-time
+// completeness but have not implemented. Calling it fails loudly instead
+// of silently succeeding — see docs/posix-status.md for the tracked gap.
+function _notImpl(mod, name) {
+    return function () {
+        throw new Error(mod + '.' + name + ' is not implemented on spidermonkey-node');
+    };
+}
+
 // ============================================================
 // path module
 // ============================================================
@@ -471,6 +480,16 @@ const events = (() => {
     };
     return EventEmitter;
 })();
+
+// events.setMaxListeners(n, ...emitters) — Claude Code's undici transport
+// calls this at startup to raise the default cap; forward it to each
+// target emitter (or is a no-op for the process-wide default we don't
+// track separately).
+events.setMaxListeners = function (n, ...emitters) {
+    for (const em of emitters) {
+        if (em && typeof em.setMaxListeners === 'function') em.setMaxListeners(n);
+    }
+};
 
 // ============================================================
 // Buffer class
@@ -1733,6 +1752,10 @@ const fs = (() => {
         fchmodSync,
         fchownSync,
         futimesSync,
+        // No fsync/ftruncate primitive in the qjs:os native module (see
+        // truncateSync above) — honest throwing stubs, not silent no-ops.
+        fsyncSync: _notImpl('fs', 'fsyncSync'),
+        ftruncateSync: _notImpl('fs', 'ftruncateSync'),
         FileHandle,
         mkdtempSync,
 
@@ -1879,6 +1902,13 @@ const fs = (() => {
     mod.promises.fchown = async (fd, u, g) => fchownSync(fd, u, g);
     mod.promises.futimes = async (fd, a, m) => futimesSync(fd, a, m);
     mod.promises.open = async (p, flags, mode) => new FileHandle(openSync(p, flags, mode), _pathToString(p));
+    mod.promises.constants = constants;
+    // Throwing stubs: link-time completeness for the Claude Code import
+    // surface without a real implementation. See docs/posix-status.md.
+    mod.promises.link = _notImpl('fs/promises', 'link');
+    mod.promises.lutimes = _notImpl('fs/promises', 'lutimes');
+    mod.promises.opendir = _notImpl('fs/promises', 'opendir');
+    mod.promises.statfs = _notImpl('fs/promises', 'statfs');
 
     return mod;
 })();
@@ -1943,6 +1973,15 @@ const nodeOs = (() => {
         },
     };
 })();
+
+nodeOs.availableParallelism = function () {
+    try { return Math.max(1, (nodeOs.cpus && nodeOs.cpus().length) || 1); }
+    catch (_) { return 1; }
+};
+nodeOs.devNull = '/dev/null';
+nodeOs.version = function () { return ''; };
+nodeOs.getPriority = function () { return 0; };
+nodeOs.setPriority = function () { /* no-op */ };
 
 // ============================================================
 // util module
@@ -2110,6 +2149,19 @@ const util = (() => {
     };
 })();
 
+util.stripVTControlCharacters = function (s) {
+    return String(s).replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+};
+util.getSystemErrorName = function (err) {
+    const e = Math.abs(err | 0);
+    try {
+        const t = (nodeOs.constants && nodeOs.constants.errno) || {};
+        for (const k in t) if (Math.abs(t[k]) === e) return k;
+    } catch (_) { /* fall through to generic name */ }
+    return 'Unknown system error ' + err;
+};
+util.types.isProxy = function () { return false; };
+
 // ============================================================
 // assert module
 // ============================================================
@@ -2261,26 +2313,54 @@ const stream = (() => {
         constructor(options) {
             super();
             this.writable = true;
-            this._writableState = { ended: false };
+            this._writableState = { ended: false, ending: false, pending: 0 };
             if (options && options.write) this._write = options.write;
+            // `final` (Node's Writable option): invoked once `end()` has been
+            // called AND every in-flight `_write` callback has fired, right
+            // before 'finish'. child_process's stdin pipe relies on this to
+            // close the write fd only after the last chunk has actually gone
+            // through fdWrite — closing it eagerly (or before an async write
+            // settles) would either lose data or deliver EOF too early.
+            if (options && options.final) this._final = options.final;
         }
         _write(chunk, encoding, cb) { cb(); }
         write(chunk, encoding, cb) {
             if (typeof encoding === 'function') { cb = encoding; encoding = undefined; }
+            this._writableState.pending++;
             this._write(chunk, encoding || 'utf8', (err) => {
+                this._writableState.pending--;
                 if (err) this.emit('error', err);
                 if (cb) cb(err);
+                this._maybeFinish();
             });
             return true;
         }
         end(chunk, encoding, cb) {
             if (typeof chunk === 'function') { cb = chunk; chunk = undefined; }
             if (typeof encoding === 'function') { cb = encoding; encoding = undefined; }
+            if (cb) this.once('finish', cb);
+            this._writableState.ending = true;
             if (chunk) this.write(chunk, encoding);
-            this._writableState.ended = true;
-            this.emit('finish');
-            if (cb) cb();
+            this._maybeFinish();
             return this;
+        }
+        // Gate 'finish' (and `_final`) on every write callback having
+        // settled, not just on `end()` having been called. Without this an
+        // `end()` that races an in-flight async `_write` (e.g. a pending
+        // `__kandeloFdWrite` promise) would fire `_final`/'finish' before the
+        // data landed.
+        _maybeFinish() {
+            const st = this._writableState;
+            if (!st.ending || st.pending > 0 || st.ended) return;
+            st.ended = true;
+            if (this._final) {
+                this._final((err) => {
+                    if (err) this.emit('error', err);
+                    this.emit('finish');
+                });
+            } else {
+                this.emit('finish');
+            }
         }
         destroy() { this.emit('close'); return this; }
     }
@@ -2289,13 +2369,21 @@ const stream = (() => {
         constructor(options) {
             super(options);
             // Inline Writable's init — ES class constructors can't be .call()'d.
+            // Mirror Writable's full `_writableState` shape (ending/pending) so
+            // the shared write/end/_maybeFinish machinery below behaves
+            // identically on every Duplex-derived stream (net.Socket,
+            // tls.TLSSocket, Transform, PassThrough, zlib). Omitting these left
+            // `pending` NaN and `ending` undefined and `_maybeFinish` missing,
+            // which made the base write/end throw on those streams.
             this.writable = true;
-            this._writableState = { ended: false };
+            this._writableState = { ended: false, ending: false, pending: 0 };
             if (options && options.write) this._write = options.write;
+            if (options && options.final) this._final = options.final;
         }
     }
-    // Mixin Writable methods
-    for (const method of ['write', 'end', 'destroy']) {
+    // Mixin Writable methods — include `_maybeFinish` so `write`/`end`, which
+    // both call it, resolve to the same implementation on the Duplex chain.
+    for (const method of ['write', 'end', 'destroy', '_maybeFinish']) {
         if (!Duplex.prototype[method] || method === 'destroy') {
             Duplex.prototype[method] = Writable.prototype[method];
         }
@@ -2544,6 +2632,8 @@ const url = (() => {
     };
 })();
 
+url.domainToASCII = function (d) { return String(d); };
+
 // ============================================================
 // querystring module
 // ============================================================
@@ -2706,56 +2796,195 @@ const child_process = (() => {
         }
     }
 
-    function exec(command, options, cb) {
-        if (typeof options === 'function') { cb = options; options = {}; }
-        try {
-            const result = execSync(command, { ...options, encoding: 'utf8' });
-            queueMicrotask(() => cb(null, result, ''));
-        } catch (e) {
-            queueMicrotask(() => cb(e, e.stdout || '', e.stderr || ''));
-        }
-    }
+    // ------------------------------------------------------------------
+    // Real async spawn on the Task-1 POSIX seam (posix_spawn + async pipe
+    // fds). execSync/execFileSync/spawnSync above stay popen-based (a
+    // follow-up); spawn/exec/execFile below are real streaming subprocesses.
+    // ------------------------------------------------------------------
+    const _nn = _nodeNative;
+    function _spawn(command, args, options) {
+        // Node signature: spawn(cmd, [args], [options]) — args may be omitted and
+        // options passed in its place. Extract options BEFORE normalizing args.
+        if (args && !Array.isArray(args)) { options = args; args = []; }
+        args = Array.isArray(args) ? args : [];
+        options = options || {};
+        let file = command, argv;
+        if (options.shell) { file = '/bin/sh'; argv = ['/bin/sh', '-c', [command].concat(args).join(' ')]; }
+        else { argv = [command].concat(args); }
+        const env = options.env
+            ? Object.keys(options.env).map(k => k + '=' + options.env[k])
+            : Object.keys(process.env).map(k => k + '=' + process.env[k]);
 
-    function execFile(file, args, options, cb) {
-        if (typeof args === 'function') { cb = args; args = []; options = {}; }
-        else if (typeof options === 'function') { cb = options; options = {}; }
-        const cmd = file + ' ' + (args || []).map(a => `'${a}'`).join(' ');
-        try {
-            const result = execSync(cmd, { ...options, encoding: 'utf8' });
-            queueMicrotask(() => cb && cb(null, result, ''));
-        } catch (e) {
-            queueMicrotask(() => cb && cb(e, e.stdout || '', e.stderr || ''));
-        }
-    }
+        // Normalize stdio to a 3-entry array of 'pipe'|'ignore'|'inherit'|<int fd>.
+        let stdio = options.stdio;
+        if (stdio === 'inherit' || stdio === 'ignore' || stdio === 'pipe') stdio = [stdio, stdio, stdio];
+        if (!Array.isArray(stdio)) stdio = ['pipe', 'pipe', 'pipe'];
+        while (stdio.length < 3) stdio.push('pipe');
 
-    function spawn(command, args, options) {
-        // Return a minimal ChildProcess-like object
-        const child = new events.EventEmitter();
-        child.pid = 0;
-        child.stdin = new stream.Writable();
-        child.stdout = new stream.Readable();
-        child.stderr = new stream.Readable();
-
-        queueMicrotask(() => {
-            try {
-                const cmd = command + ' ' + (args || []).map(a => `'${a}'`).join(' ');
-                const result = execSync(cmd, { encoding: 'utf8' });
-                child.stdout.push(Buffer.from(result));
-                child.stdout.push(null);
-                child.stderr.push(null);
-                child.emit('close', 0);
-                child.emit('exit', 0);
-            } catch (e) {
-                child.emit('error', e);
-                child.emit('close', 1);
-                child.emit('exit', 1);
+        const actions = [];
+        const parentClose = [];         // fds to close in the parent after spawn
+        const legs = [null, null, null]; // parent-side fd per stdio index (for 'pipe')
+        for (let i = 0; i < 3; i++) {
+            const s = stdio[i];
+            if (s === 'pipe') {
+                const [r, w] = _nn.__kandeloPipe();
+                // fd 0: child reads r, parent writes w. fds 1/2: child writes w, parent reads r.
+                const childEnd = (i === 0) ? r : w;
+                const parentEnd = (i === 0) ? w : r;
+                legs[i] = parentEnd;
+                actions.push({ op: 'dup2', from: childEnd, to: i });
+                actions.push({ op: 'close', fd: r });
+                actions.push({ op: 'close', fd: w });
+                parentClose.push(childEnd);
+            } else if (s === 'ignore') {
+                actions.push({ op: 'open', fd: i, path: '/dev/null', flags: (i === 0 ? 0 : 1), mode: 0 });
+            } else if (s === 'inherit') {
+                actions.push({ op: 'dup2', from: i, to: i });
+            } else if (typeof s === 'number') {
+                actions.push({ op: 'dup2', from: s, to: i });
             }
+        }
+        if (options.cwd) actions.push({ op: 'chdir', path: String(options.cwd) });
+
+        const child = new events.EventEmitter();
+        child.stdin = null; child.stdout = null; child.stderr = null; child.pid = 0;
+        child.killed = false;
+
+        let pid;
+        try { pid = _nn.__kandeloSpawn(file, argv, env, actions, {}); }
+        catch (err) {
+            // Close every pipe fd already created for this (failed) spawn — both
+            // the child ends (parentClose) and the parent ends (legs). Without
+            // this, a failed spawn (e.g. ENOENT for a missing binary) leaks up
+            // to 6 fds on default 3x'pipe' stdio; a retry loop against a missing
+            // tool then exhausts fds (EMFILE).
+            for (const fd of parentClose) { try { _nn.__kandeloFdClose(fd); } catch (_) {} }
+            for (const fd of legs) { if (fd != null) { try { _nn.__kandeloFdClose(fd); } catch (_) {} } }
+            // Node: spawn error is delivered asynchronously as an 'error' event.
+            queueMicrotask(() => child.emit('error', err));
+            // still provide stream objects so consumers don't crash
+            child.stdin = new stream.Writable({ write(c, e, cb) { cb(); } });
+            child.stdout = new stream.Readable({ read() {} }); child.stdout.push(null);
+            child.stderr = new stream.Readable({ read() {} }); child.stderr.push(null);
+            return child;
+        }
+        child.pid = pid;
+        for (const fd of parentClose) { try { _nn.__kandeloFdClose(fd); } catch (_) {} }
+
+        // stdin (fd 0 pipe): Writable -> fdWrite; end -> fdClose delivers EOF.
+        if (legs[0] != null) {
+            const wfd = legs[0];
+            child.stdin = new stream.Writable({
+                write(chunk, enc, cb) {
+                    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, enc);
+                    _nn.__kandeloFdWrite(wfd, buf).then(() => cb(null), cb);
+                },
+                final(cb) { try { _nn.__kandeloFdClose(wfd); } catch (_) {} cb(); },
+            });
+        } else { child.stdin = null; }
+
+        // stdout/stderr: Readable pumped by an fdRead loop; empty ArrayBuffer = EOF.
+        // 'close' fires once, after the process has exited AND every opened
+        // stdout/stderr read stream has reached its terminal state. openReads is
+        // incremented once per opened read stream and decremented exactly once
+        // (in that stream's EOF or error branch); _maybeClose is the single gate.
+        let openReads = 0, exited = false, exitInfo = null;
+        function _maybeClose() { if (exited && openReads === 0) child.emit('close', exitInfo.code, exitInfo.signal); }
+        function _pumpReadable(fd) {
+            const rs = new stream.Readable({ read() {} });
+            openReads++;
+            let counted = false;
+            const finish = () => { try { _nn.__kandeloFdClose(fd); } catch (_) {} if (!counted) { counted = true; openReads--; _maybeClose(); } };
+            (function loop() {
+                _nn.__kandeloFdRead(fd, 65536).then((ab) => {
+                    if (ab.byteLength === 0) { rs.push(null); finish(); return; }
+                    rs.push(Buffer.from(ab)); loop();
+                }, (err) => { rs.destroy(err); finish(); });
+            })();
+            return rs;
+        }
+        child.stdout = legs[1] != null ? _pumpReadable(legs[1]) : null;
+        child.stderr = legs[2] != null ? _pumpReadable(legs[2]) : null;
+
+        _nn.__kandeloWaitPid(pid).then((st) => {
+            exited = true; exitInfo = st;
+            child.emit('exit', st.code, st.signal);
+            _maybeClose();
         });
 
+        child.kill = function (sig) {
+            const signum = typeof sig === 'number' ? sig : (nodeOs.constants.signals[sig || 'SIGTERM'] | 0);
+            try { _nn.__kandeloKill(pid, signum || 15); child.killed = true; return true; } catch (_) { return false; }
+        };
         return child;
     }
 
-    return { execSync, execFileSync, spawnSync, exec, execFile, spawn };
+    // Shared by exec/execFile: accumulate stdout/stderr and invoke `cb` once
+    // the child is fully done. Callers MUST wait for 'close', not 'exit':
+    // 'exit' fires as soon as the child is reaped, independently of whether
+    // the async pipe-read promises filling `out`/`err` have settled yet, so
+    // reading accumulated output from an 'exit' handler risks delivering
+    // TRUNCATED stdout/stderr to the callback (a real race, confirmed
+    // directly — see child-process-guest.test.ts's header comment).
+    // 'close' only fires after the process has been reaped AND every stdio
+    // stream has reached EOF/error (`_spawn`'s `_maybeClose` gate), which is
+    // exactly when the accumulated strings are guaranteed complete.
+    //
+    // A non-zero exit code OR a non-null termination signal is a failure —
+    // `code` is `null` when the child was killed by a signal, so a naive
+    // `code ? err : null` check would misreport a signal-killed child as
+    // success. Mirrors Node's own exec() error shape: `.code`/`.signal` are
+    // the reaped values, `.killed` reflects whether this ChildProcess's own
+    // `.kill()` was called.
+    function _runWithCallback(child, label, cb) {
+        // exec/execFile never write to the child's stdin. End it immediately:
+        // this both delivers stdin EOF to the child (matching Node, whose exec
+        // closes stdin) AND closes the parent-side write fd (legs[0]) via the
+        // stdin stream's `final` — otherwise that fd leaks one per successful
+        // call, accumulating to EMFILE under heavy shell-out. `.end()` runs
+        // `_maybeFinish` exactly once (guarded by `_writableState.ended`), so
+        // the fd is closed exactly once — no double-close.
+        if (child.stdin) child.stdin.end();
+        let out = '', err = '';
+        if (child.stdout) child.stdout.on('data', d => out += d);
+        if (child.stderr) child.stderr.on('data', d => err += d);
+        child.on('error', e => cb && cb(e, out, err));
+        child.on('close', (code, signal) => {
+            if (!cb) return;
+            if (code !== 0 || signal !== null) {
+                const e = Object.assign(new Error('Command failed: ' + label), {
+                    code: code, signal: signal, killed: !!child.killed,
+                });
+                cb(e, out, err);
+            } else {
+                cb(null, out, err);
+            }
+        });
+        return child;
+    }
+    function exec(command, options, cb) {
+        if (typeof options === 'function') { cb = options; options = {}; }
+        const child = _spawn(command, [], { ...(options || {}), shell: true });
+        return _runWithCallback(child, command, cb);
+    }
+    function execFile(file, args, options, cb) {
+        if (typeof args === 'function') { cb = args; args = []; options = {}; }
+        else if (typeof options === 'function') { cb = options; options = {}; }
+        const child = _spawn(file, args || [], options || {});
+        return _runWithCallback(child, file, cb);
+    }
+
+    return { execSync, execFileSync, spawnSync, exec, execFile, spawn: _spawn };
+})();
+
+// child_process.ChildProcess — spawn() above already returns an
+// EventEmitter-shaped object; this class exists for code that does
+// `instanceof ChildProcess` or subclasses it directly.
+child_process.ChildProcess = (function () {
+    function ChildProcess() { events.EventEmitter.call(this); }
+    ChildProcess.prototype = Object.create(events.EventEmitter.prototype);
+    ChildProcess.prototype.constructor = ChildProcess;
+    return ChildProcess;
 })();
 
 // ============================================================
@@ -2822,6 +3051,33 @@ const crypto = (() => {
             return buf;
         },
     };
+})();
+
+crypto.timingSafeEqual = function (a, b) {
+    a = Buffer.from(a);
+    b = Buffer.from(b);
+    if (a.length !== b.length) throw new RangeError('Input buffers must have the same byte length');
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+    return diff === 0;
+};
+// Throwing stubs: no libcrypto cipher/asymmetric-key surface wired through
+// the wasm sysroot yet. See docs/posix-status.md.
+crypto.randomFillSync = _notImpl('crypto', 'randomFillSync');
+crypto.createCipheriv = _notImpl('crypto', 'createCipheriv');
+crypto.createDecipheriv = _notImpl('crypto', 'createDecipheriv');
+crypto.createPrivateKey = _notImpl('crypto', 'createPrivateKey');
+crypto.createPublicKey = _notImpl('crypto', 'createPublicKey');
+crypto.generateKeyPairSync = _notImpl('crypto', 'generateKeyPairSync');
+crypto.sign = _notImpl('crypto', 'sign');
+crypto.verify = _notImpl('crypto', 'verify');
+// Constructable class stub: throws only when actually instantiated, so
+// `import { X509Certificate } from "crypto"` still links.
+crypto.X509Certificate = (function () {
+    function X509Certificate() {
+        throw new Error('crypto.X509Certificate is not implemented on spidermonkey-node');
+    }
+    return X509Certificate;
 })();
 
 // ============================================================
@@ -2980,6 +3236,17 @@ const net = (() => {
     };
 })();
 
+// net.BlockList — no-op class stub (used with `new net.BlockList()` and
+// instanceof checks); check() always reports "not blocked".
+net.BlockList = (function () {
+    function BlockList() {}
+    BlockList.prototype.addAddress = function () {};
+    BlockList.prototype.addRange = function () {};
+    BlockList.prototype.addSubnet = function () {};
+    BlockList.prototype.check = function () { return false; };
+    return BlockList;
+})();
+
 // ============================================================
 // tls module — TLSSocket via libssl in the wasm sysroot
 // ============================================================
@@ -3115,6 +3382,12 @@ const tls = (() => {
 
     return { connect, TLSSocket };
 })();
+
+// No bundled CA store or pluggable SecureContext surface — tlsConnect
+// (libssl in the wasm sysroot) manages certificate verification itself.
+tls.rootCertificates = [];
+tls.checkServerIdentity = function () { return undefined; };
+tls.createSecureContext = _notImpl('tls', 'createSecureContext');
 
 // ============================================================
 // http / https modules — real HTTP/1.1 over net.Socket (http) and tls.TLSSocket (https)
@@ -3903,16 +4176,68 @@ const _builtinModules = {
         }
         // minipass-fetch / tar instantiate via `new zlib.Gunzip()` / `new zlib.Unzip()`.
         class Gunzip extends ZlibTransform { constructor(opts) { super(z.createGunzip(), opts); } }
+        // Node's Unzip auto-detects a zlib or gzip header. The native backend's
+        // createGunzip already sniffs both (windowBits 47 / auto), so Unzip is
+        // backed by it too.
         class Unzip extends ZlibTransform { constructor(opts) { super(z.createGunzip(), opts); } }
+        // Brotli: there is no Brotli codec in the native backend (patch 0012
+        // wires libz only, no libbrotli). Provide an honest fail-loud stream:
+        // it constructs (so module-init that builds a Brotli stream succeeds)
+        // but errors on the first byte of data instead of silently returning
+        // wrong bytes. Real Brotli is tracked future work (docs/posix-status.md).
+        const _brotliMsg = 'zlib Brotli is not implemented on spidermonkey-node';
+        class BrotliUnsupported extends stream.Transform {
+            _transform(_chunk, _enc, cb) { cb(new Error(_brotliMsg)); }
+        }
+        // Real Node zlib/Brotli numeric constants. Only Z_SYNC_FLUSH and
+        // BROTLI_OPERATION_FLUSH are read by the app today, but expose the
+        // standard set so consumers that read other flush/level/param codes
+        // work. Values match Node's zlib.constants.
+        const constants = {
+            Z_NO_FLUSH: 0, Z_PARTIAL_FLUSH: 1, Z_SYNC_FLUSH: 2, Z_FULL_FLUSH: 3,
+            Z_FINISH: 4, Z_BLOCK: 5, Z_TREES: 6,
+            Z_OK: 0, Z_STREAM_END: 1, Z_NEED_DICT: 2, Z_ERRNO: -1,
+            Z_STREAM_ERROR: -2, Z_DATA_ERROR: -3, Z_MEM_ERROR: -4,
+            Z_BUF_ERROR: -5, Z_VERSION_ERROR: -6,
+            Z_NO_COMPRESSION: 0, Z_BEST_SPEED: 1, Z_BEST_COMPRESSION: 9,
+            Z_DEFAULT_COMPRESSION: -1,
+            Z_FILTERED: 1, Z_HUFFMAN_ONLY: 2, Z_RLE: 3, Z_FIXED: 4,
+            Z_DEFAULT_STRATEGY: 0,
+            Z_BINARY: 0, Z_TEXT: 1, Z_ASCII: 1, Z_UNKNOWN: 2,
+            Z_DEFLATED: 8,
+            Z_DEFAULT_CHUNK: 16384, Z_MIN_CHUNK: 64, Z_MAX_CHUNK: Infinity,
+            Z_DEFAULT_LEVEL: -1, Z_MIN_LEVEL: -1, Z_MAX_LEVEL: 9,
+            Z_DEFAULT_MEMLEVEL: 8, Z_MIN_MEMLEVEL: 1, Z_MAX_MEMLEVEL: 9,
+            Z_MIN_WINDOWBITS: 8, Z_MAX_WINDOWBITS: 15, Z_DEFAULT_WINDOWBITS: 15,
+            BROTLI_OPERATION_PROCESS: 0, BROTLI_OPERATION_FLUSH: 1,
+            BROTLI_OPERATION_FINISH: 2, BROTLI_OPERATION_EMIT_METADATA: 3,
+            BROTLI_PARAM_MODE: 0, BROTLI_MODE_GENERIC: 0, BROTLI_MODE_TEXT: 1,
+            BROTLI_MODE_FONT: 2, BROTLI_PARAM_QUALITY: 1, BROTLI_PARAM_LGWIN: 2,
+            BROTLI_PARAM_LGBLOCK: 3,
+            BROTLI_PARAM_DISABLE_LITERAL_CONTEXT_MODELING: 4,
+            BROTLI_PARAM_SIZE_HINT: 5, BROTLI_PARAM_LARGE_WINDOW: 6,
+            BROTLI_PARAM_NPOSTFIX: 7, BROTLI_PARAM_NDIRECT: 8,
+            BROTLI_MIN_QUALITY: 0, BROTLI_MAX_QUALITY: 11, BROTLI_DEFAULT_QUALITY: 11,
+            BROTLI_MIN_WINDOW_BITS: 10, BROTLI_MAX_WINDOW_BITS: 24,
+            BROTLI_DEFAULT_WINDOW: 22, BROTLI_LARGE_MAX_WINDOW_BITS: 30,
+            BROTLI_MIN_INPUT_BLOCK_BITS: 16, BROTLI_MAX_INPUT_BLOCK_BITS: 24,
+        };
         return {
             createGzip:    (opts) => new ZlibTransform(z.createGzip(opts?.level), opts),
             createGunzip:  (opts) => new Gunzip(opts),
+            createUnzip:   (opts) => new Unzip(opts),
             createDeflate: (opts) => new ZlibTransform(z.createDeflate(opts?.level), opts),
             createInflate: (opts) => new ZlibTransform(z.createInflate(), opts),
             gzipSync:    (b, opts) => Buffer.from(z.gzipSync(toU8(b), opts?.level)),
             gunzipSync:  (b)       => Buffer.from(z.gunzipSync(toU8(b))),
             deflateSync: (b, opts) => Buffer.from(z.deflateSync(toU8(b), opts?.level)),
             inflateSync: (b)       => Buffer.from(z.inflateSync(toU8(b))),
+            // Brotli: honest fail-loud stubs (construct OK, error on data).
+            createBrotliCompress:   (opts) => new BrotliUnsupported(opts),
+            createBrotliDecompress: (opts) => new BrotliUnsupported(opts),
+            brotliCompressSync:   _notImpl('zlib', 'brotliCompressSync'),
+            brotliDecompressSync: _notImpl('zlib', 'brotliDecompressSync'),
+            constants,
             Gunzip, Unzip,
         };
     })(),
@@ -4098,11 +4423,61 @@ const _builtinModules = {
             return { heap_size_limit: 256 * 1024 * 1024 };
         },
     },
-    'vm': {
-        runInThisContext(code) { return eval(code); },
-        createContext(sandbox) { return sandbox || {}; },
-        Script: class Script { constructor(code) { this.code = code; } runInThisContext() { return eval(this.code); } },
-    },
+    'vm': (() => {
+        const N = _nodeNative;
+        function checkTimeout(o) {
+            // Interrupt callbacks are unavailable on spidermonkey-node, so a
+            // timeout cannot be honored. Fail loudly rather than silently
+            // ignore it (see docs/posix-status.md).
+            if (o && o.timeout != null) {
+                throw new Error('vm timeout is not supported on spidermonkey-node');
+            }
+        }
+        function normOpts(o) {
+            if (typeof o === 'string') o = { filename: o };
+            o = o || {};
+            checkTimeout(o);
+            return { filename: o.filename, lineOffset: o.lineOffset | 0,
+                     columnOffset: o.columnOffset | 0,
+                     displayErrors: o.displayErrors !== false };
+        }
+        function cgFlags(o) {
+            const cg = (o && o.codeGeneration) || {};
+            return { strings: cg.strings, wasm: cg.wasm };
+        }
+        function createContext(sandbox, options) {
+            return N.__kandeloVmMakeContext(sandbox || {}, cgFlags(options));
+        }
+        function isContext(obj) { return N.__kandeloVmIsContext(obj); }
+        function runInContext(code, ctx, options) {
+            return N.__kandeloVmRunInContext(String(code), ctx, normOpts(options));
+        }
+        function runInNewContext(code, sandbox, options) {
+            const ctx = createContext(sandbox, options);
+            return runInContext(code, ctx, options);
+        }
+        function runInThisContext(code, options) {
+            // Real top-level compile+eval in the caller realm (not bare eval),
+            // so filenames/stack frames are faithful.
+            const o = normOpts(options);
+            const h = N.__kandeloVmCompile(String(code), o);
+            return N.__kandeloVmRunInContext(h, globalThis, o);
+        }
+        class Script {
+            constructor(code, options) { this._h = N.__kandeloVmCompile(String(code), normOpts(options)); }
+            runInContext(ctx, options) { return N.__kandeloVmRunInContext(this._h, ctx, normOpts(options)); }
+            runInNewContext(sandbox, options) { return this.runInContext(createContext(sandbox, options), options); }
+            runInThisContext(options) { return N.__kandeloVmRunInContext(this._h, globalThis, normOpts(options)); }
+        }
+        function compileFunction(code, params, options) {
+            const o = options || {};
+            const body = '(function(' + ((params || []).join(',')) + '){' + String(code) + '})';
+            const ctx = o.parsingContext && isContext(o.parsingContext) ? o.parsingContext : globalThis;
+            return N.__kandeloVmRunInContext(body, ctx, normOpts(o));
+        }
+        return { createContext, isContext, runInContext, runInNewContext,
+                 runInThisContext, Script, compileFunction };
+    })(),
     // Minimal stubs — undici/file-type/anthropic-sdk import these at module
     // init even when their stream code paths aren't exercised by the agent's
     // actual HTTP transport (which goes through our native socket/tls shim).
@@ -4159,6 +4534,123 @@ const _builtinModules = {
         },
     },
 };
+
+// ------------------------------------------------------------
+// Post-registration: builtin exports added for the Claude Code link
+// surface (Milestone 2 Phase A, task 1). These mutate the module
+// objects/registry entries built above rather than restructure the
+// `_builtinModules` object literal, mirroring the `stream/web` patch
+// further down (search for `_builtinModules['stream/web']`).
+// ------------------------------------------------------------
+_builtinModules['path/posix'] = path.posix;
+// `path/win32` mirrors `path/posix`: cross-platform code (e.g. Claude Code's
+// shell-detection chunk) statically imports both variants and only *calls*
+// the win32 one under `process.platform === 'win32'` guards, which are false
+// on Kandelo (platform is `linux`). The subpath must still resolve for the
+// static import. `path.win32` is a POSIX approximation with `sep: '\\'` (see
+// its definition above); real win32 path semantics are tracked future work
+// (docs/posix-status.md, node-compat approximate implementations).
+_builtinModules['path/win32'] = path.win32;
+
+const _dnsPromises = { lookup: util.promisify(_builtinModules['dns'].lookup) };
+_builtinModules['dns'].promises = _dnsPromises;
+_builtinModules['dns/promises'] = _dnsPromises;
+
+// `ws` — the WebSocket npm package. Bun ships a native ws-compatible module,
+// so Bun-bundled apps (Claude Code) mark `ws` external and expect the runtime
+// to provide it; it is not in the bundle or the package. node-compat is that
+// runtime layer, so it provides `ws` here. This is a MINIMAL honest module:
+// the module object IS the `WebSocket` class (real ws's `module.exports`), so
+// `import WebSocket from "ws"` and `require("ws")` resolve and the class,
+// static ready-state constants, `instanceof`, and subclassing all work at
+// module scope; but *constructing a live WebSocket throws* -- real WebSocket
+// I/O over TLS is tracked future work (docs/posix-status.md). Verified via a
+// scope probe: `claude -p` imports `ws` but never opens a socket, so this
+// unblocks it without faking WebSocket behavior. Graduating this to a full,
+// real ws client/server is the deferred follow-up.
+_builtinModules['ws'] = (() => {
+    function WebSocket() {
+        throw new Error('ws (WebSocket client) is not implemented on spidermonkey-node');
+    }
+    // Static ready-state constants (read at module scope by consumers).
+    WebSocket.CONNECTING = 0;
+    WebSocket.OPEN = 1;
+    WebSocket.CLOSING = 2;
+    WebSocket.CLOSED = 3;
+    function WebSocketServer() {
+        throw new Error('ws (WebSocketServer) is not implemented on spidermonkey-node');
+    }
+    function createWebSocketStream() {
+        throw new Error('ws (createWebSocketStream) is not implemented on spidermonkey-node');
+    }
+    // real ws attaches these onto the exported WebSocket function.
+    WebSocket.WebSocket = WebSocket;
+    WebSocket.WebSocketServer = WebSocketServer;
+    WebSocket.Server = WebSocketServer;
+    WebSocket.createWebSocketStream = createWebSocketStream;
+    return WebSocket;
+})();
+
+_builtinModules['perf_hooks'].monitorEventLoopDelay = function () {
+    return {
+        enable() {}, disable() {}, reset() {},
+        percentile() { return 0; },
+        get min() { return 0; },
+        get max() { return 0; },
+        get mean() { return 0; },
+        get stddev() { return 0; },
+        get exceeds() { return 0; },
+    };
+};
+
+// zlib: async callback wrappers over the existing *Sync implementations,
+// plus a throwing stub for raw-inflate, and real zstd DECOMPRESSION backed by
+// the native __kandeloZstdDecompress seam (a decompress-only libzstd linked
+// into node.wasm). zstd compression stays an honest not-impl (see below).
+_builtinModules['zlib'].deflate = function (buf, opts, cb) {
+    if (typeof opts === 'function') { cb = opts; opts = undefined; }
+    try {
+        const out = _builtinModules['zlib'].deflateSync(buf, opts);
+        queueMicrotask(() => cb(null, out));
+    } catch (e) { queueMicrotask(() => cb(e)); }
+};
+_builtinModules['zlib'].inflate = function (buf, opts, cb) {
+    if (typeof opts === 'function') { cb = opts; opts = undefined; }
+    try {
+        const out = _builtinModules['zlib'].inflateSync(buf);
+        queueMicrotask(() => cb(null, out));
+    } catch (e) { queueMicrotask(() => cb(e)); }
+};
+_builtinModules['zlib'].inflateRawSync = _notImpl('zlib', 'inflateRawSync');
+// zstd DECOMPRESSION: real, backed by the native __kandeloZstdDecompress seam
+// (a decompress-only libzstd linked into node.wasm). Fail-loud on a corrupt
+// frame — the native seam throws "zstd decompression failed: ...".
+_builtinModules['zlib'].zstdDecompressSync = function (buf) {
+    const u8 = buf instanceof Uint8Array ? buf
+        : buf instanceof ArrayBuffer ? new Uint8Array(buf)
+        : Buffer.from(buf);
+    return Buffer.from(_nodeNative.__kandeloZstdDecompress(u8));
+};
+_builtinModules['zlib'].createZstdDecompress = function () {
+    const t = new stream.Transform();
+    const parts = [];
+    t._transform = function (chunk, _enc, cb) {
+        parts.push(chunk instanceof Uint8Array ? chunk : Buffer.from(chunk));
+        cb();
+    };
+    t._flush = function (cb) {
+        try {
+            const all = Buffer.concat(parts);
+            this.push(Buffer.from(_nodeNative.__kandeloZstdDecompress(all)));
+            cb();
+        } catch (e) { cb(e); }
+    };
+    return t;
+};
+// zstd COMPRESSION is intentionally not implemented (the linked libzstd is
+// decompress-only). Honest fail-loud stubs, never a silent no-op.
+_builtinModules['zlib'].createZstdCompress = _notImpl('zlib', 'createZstdCompress');
+_builtinModules['zlib'].zstdCompressSync = _notImpl('zlib', 'zstdCompressSync');
 
 // Node exposes `node:module` as the CJS Module class itself: a
 // constructor that doubles as the namespace for createRequire / _cache
@@ -4352,12 +4844,66 @@ function _makeRequire(filename) {
             err.code = 'MODULE_NOT_FOUND';
             throw err;
         }
+
+        // Bun loader dispatch (M2 Phase J). bun-run installs
+        // globalThis.__kandeloAssetLoaders (abs cache path -> class) from the
+        // extract manifest. Honor it BEFORE shebang-strip, the .json-extension
+        // check, and the ESM/CJS dispatch, so the loader byte is authoritative.
+        // With no map present this is a no-op and require() behaves as before.
+        const _assetLoader = globalThis.__kandeloAssetLoaders &&
+            globalThis.__kandeloAssetLoaders[resolved];
+        if (_assetLoader === 'text') {
+            // Bun text loader: module.exports IS the raw file contents (no
+            // shebang strip -- a .txt/.md may legitimately begin "#!").
+            _moduleCache[resolved] = { exports: source };
+            return source;
+        }
+        if (_assetLoader === 'file') {
+            // Bun file loader: module.exports IS the absolute on-disk path.
+            _moduleCache[resolved] = { exports: resolved };
+            return resolved;
+        }
+        if (_assetLoader === 'json') {
+            const exports = JSON.parse(source);
+            _moduleCache[resolved] = { exports };
+            return exports;
+        }
+        if (_assetLoader === 'napi') {
+            throw new Error(`${id}: native Node addons (.node) are not ` +
+                `supported on spidermonkey-node`);
+        }
+        // 'js', 'unknown', or no map -> fall through to the existing behavior.
+
         source = _stripShebang(source);
 
         if (resolved.endsWith('.json')) {
             const exports = JSON.parse(source);
             _moduleCache[resolved] = { exports };
             return exports;
+        }
+
+        // ESM target: an ES module cannot be CJS-wrapped (its top-level
+        // import/export declarations are only valid in module goal, so the
+        // wrapper below throws "import declarations may only appear at top
+        // level of a module"). Route it through the native module loader so it
+        // is CompileModule'd and shares one instance (dedup-safe via the
+        // per-path registry) with import and dynamic import(), then return its
+        // namespace -- Node require(esm) semantics (named exports as props,
+        // default as .default). A ".cjs" file is always CommonJS regardless of
+        // the nearest package "type", so it keeps the CJS wrapper below.
+        if ((resolved.endsWith('.mjs') || _nearestPackageType(resolved) === 'module') && !resolved.endsWith('.cjs')) {
+            // Pass the pre-realpath `resolvedPath`, not the realpath'd
+            // `resolved`, to the native seam. The shell ModuleLoader keys its
+            // per-path registry by a purely *lexical* normalizePath (no symlink
+            // resolution), and `import`/dynamic `import()` reach it with the
+            // same pre-realpath specifier path. Realpath'ing here would key the
+            // registry differently from import under a symlinked module dir and
+            // double-instantiate the module, defeating the shared-instance
+            // dedup. The JS-side `_moduleCache` stays realpath-keyed (its own
+            // cache, consistent with the check above).
+            const ns = _nodeNative.__kandeloRequireModule(resolvedPath);
+            _moduleCache[resolved] = { exports: ns };
+            return ns;
         }
 
         // Create module object
@@ -4584,6 +5130,152 @@ globalThis.require = _makeRequire(
         ? process.argv[1]
         : process.cwd() + '/repl'
 );
+
+// --- Native ESM bare-specifier bridge ---------------------------------------
+// The SpiderMonkey shell module loader resolves every import specifier as a
+// file path. A bare specifier such as `import ... from "fs"` therefore becomes
+// `//fs` and fails with "can't open //fs". Node treats a bare specifier (one
+// that does not start with "./", "../", or "/") as a builtin or a node_modules
+// package. We route those through the existing node-compat resolver so that a
+// natively-loaded ES module receives the same object `require()` would return.
+//
+// The C shell loader (js/src/shell/ModuleLoader.cpp, patched via
+// patches/0015-kandelo-esm-bare-specifier.patch) calls __kandeloResolveBare for
+// any bare specifier. We return a synthetic module *path* (a stable token) and
+// stash the generated ES-module source in __kandeloBareSources under that same
+// token; the loader's fetchSource() serves it instead of reading a file. The
+// synthetic source reads the real module object back out of __kandeloBareModules
+// so the namespace's `default` and named exports are live references to the
+// object require() produced. All namespace generation stays here in JS.
+globalThis.__kandeloBareModules = Object.create(null);
+globalThis.__kandeloBareSources = Object.create(null);
+
+// Identifiers that cannot appear after `export const` (reserved words). Own
+// enumerable keys that collide with these are exposed only via the default
+// export, matching the safe subset Node's ESM interop provides for CJS.
+const _esmReservedNames = new Set([
+    'break', 'case', 'catch', 'class', 'const', 'continue', 'debugger',
+    'default', 'delete', 'do', 'else', 'enum', 'export', 'extends', 'false',
+    'finally', 'for', 'function', 'if', 'import', 'in', 'instanceof', 'new',
+    'null', 'return', 'super', 'switch', 'this', 'throw', 'true', 'try',
+    'typeof', 'var', 'void', 'while', 'with', 'yield', 'let', 'static',
+    'implements', 'interface', 'package', 'private', 'protected', 'public',
+    'await',
+]);
+
+function _makeBareEsmSource(token, obj) {
+    const keyJson = JSON.stringify(token);
+    let src = 'const __m = globalThis.__kandeloBareModules[' + keyJson + '];\n' +
+        'export default __m;\n';
+    if (obj !== null && (typeof obj === 'object' || typeof obj === 'function')) {
+        const seen = Object.create(null);
+        let keys;
+        try {
+            keys = Object.keys(obj);
+        } catch (_e) {
+            keys = [];
+        }
+        for (const key of keys) {
+            if (key === 'default') continue;
+            if (seen[key]) continue;
+            if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key)) continue;
+            if (_esmReservedNames.has(key)) continue;
+            seen[key] = true;
+            src += 'export const ' + key + ' = __m[' + JSON.stringify(key) + '];\n';
+        }
+    }
+    return src;
+}
+
+globalThis.__kandeloResolveBare = function (specifier, referrerPath) {
+    if (typeof specifier !== 'string' || specifier.length === 0) return null;
+    // Only bare specifiers reach here, but guard against relative/absolute in
+    // case a caller passes them: those are not our responsibility.
+    if (specifier.startsWith('./') || specifier.startsWith('../') ||
+        specifier.startsWith('/')) {
+        return null;
+    }
+
+    let bareName = specifier;
+    if (bareName.startsWith('node:')) bareName = bareName.slice(5);
+
+    let token;
+    let obj;
+    if (_builtinModules[bareName] !== undefined) {
+        // Node builtin (with or without the `node:` prefix). Dedup `fs` and
+        // `node:fs` onto a single synthetic module.
+        token = '/__kandelo_bare__/builtin/' + bareName;
+        obj = _builtinModules[bareName];
+    } else {
+        // node_modules package. Resolve the concrete file so the token (and the
+        // native loader's module registry) dedups by real path, then load the
+        // object through the ordinary node-compat require so CJS interop and the
+        // process-global module cache apply.
+        const base = (typeof referrerPath === 'string' && referrerPath.length > 0)
+            ? referrerPath
+            : (process.cwd() + '/repl');
+        const basedir = path.dirname(base);
+        let resolvedPath = null;
+        try {
+            resolvedPath = _resolveFile(specifier, basedir);
+        } catch (_e) {
+            resolvedPath = null;
+        }
+        if (!resolvedPath) return null;
+
+        // ESM target: hand the real path back to the native loader so it
+        // CompileModules the file (dedup-safe via the native per-path module
+        // registry) instead of CJS-wrapping it as a classic script. A CJS
+        // wrapper (`_makeRequire`) evaluates the file body as a plain
+        // function, so a top-level `import` declaration inside it throws
+        // "import declarations may only appear at top level of a module".
+        // Returning an absolute path here is handled natively by
+        // ModuleLoader.cpp (confirmed: absolute paths bypass the bare-token
+        // synthesis below and are read + compiled as a module directly).
+        if ((resolvedPath.endsWith('.mjs') || _nearestPackageType(resolvedPath) === 'module') && !resolvedPath.endsWith('.cjs')) {
+            return resolvedPath;
+        }
+
+        token = '/__kandelo_bare__/pkg' + resolvedPath;
+        try {
+            obj = _makeRequire(base)(specifier);
+        } catch (_e) {
+            return null;
+        }
+    }
+
+    if (globalThis.__kandeloBareSources[token] === undefined) {
+        globalThis.__kandeloBareModules[token] = obj;
+        globalThis.__kandeloBareSources[token] = _makeBareEsmSource(token, obj);
+    }
+    return token;
+};
+
+// The native ES-module metadata hook (SpiderMonkey shell ModuleLoader.cpp,
+// patches/0016-kandelo-import-meta.patch) calls __kandeloModuleMeta with the
+// resolved module path and copies the returned url/dirname/require onto
+// import.meta. This is the NATIVE import() module system's import.meta — it is
+// distinct from _runEsmMain's regex-based import.meta.url string replacement.
+// Extracted Bun apps read import.meta.require and import.meta.dirname, so
+// populating them here lets those apps run without any source rewriting.
+// Returning null lets the C hook keep its default (url = raw path) behavior so
+// an unresolvable path stays a visible boundary rather than a silent success.
+globalThis.__kandeloModuleMeta = function (resolvedPath) {
+    if (typeof resolvedPath !== 'string' || resolvedPath.length === 0) {
+        return null;
+    }
+    let href;
+    try {
+        href = url.pathToFileURL(resolvedPath).href;
+    } catch (_e) {
+        return null;
+    }
+    return {
+        url: href,
+        dirname: path.dirname(resolvedPath),
+        require: _makeRequire(resolvedPath),
+    };
+};
 
 // Node.js globals
 globalThis.process = process;

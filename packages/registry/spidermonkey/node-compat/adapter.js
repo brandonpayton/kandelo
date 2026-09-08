@@ -369,6 +369,29 @@
         },
         decodeUtf8(bytes) { return decodeUtf8(bytes); },
         jsonParse(text) { return nativeJsonParse(text); },
+        __kandeloRequireModule(path) {
+            if (typeof native.__kandeloRequireModule !== 'function') {
+                throw new Error('native __kandeloRequireModule is unavailable');
+            }
+            return native.__kandeloRequireModule(path);
+        },
+        __kandeloZstdDecompress(bytes) {
+            if (typeof native.__kandeloZstdDecompress !== 'function') throw new Error('native __kandeloZstdDecompress is unavailable');
+            return native.__kandeloZstdDecompress(bytes);
+        },
+        __kandeloVmMakeContext(sandbox, opts) {
+            if (typeof native.__kandeloVmMakeContext !== 'function') throw new Error('native __kandeloVmMakeContext is unavailable');
+            return native.__kandeloVmMakeContext(sandbox, opts);
+        },
+        __kandeloVmIsContext(obj) { return typeof native.__kandeloVmIsContext === 'function' && native.__kandeloVmIsContext(obj); },
+        __kandeloVmRunInContext(codeOrScript, ctx, opts) {
+            if (typeof native.__kandeloVmRunInContext !== 'function') throw new Error('native __kandeloVmRunInContext is unavailable');
+            return native.__kandeloVmRunInContext(codeOrScript, ctx, opts);
+        },
+        __kandeloVmCompile(code, opts) {
+            if (typeof native.__kandeloVmCompile !== 'function') throw new Error('native __kandeloVmCompile is unavailable');
+            return native.__kandeloVmCompile(code, opts);
+        },
         setRawMode(fd, raw) { if (typeof native.setRawMode === 'function') return native.setRawMode(fd, raw); },
         createHash(algorithm) { return native.createHash(algorithm); },
         createHmac(algorithm, key) { return native.createHmac(algorithm, key); },
@@ -384,6 +407,13 @@
         socketRead(fd, length) { return native.socketRead(fd, length); },
         socketWrite(fd, bytes) { return native.socketWrite(fd, bytes); },
         socketClose(fd) { return native.socketClose(fd); },
+        __kandeloPipe() { return native.__kandeloPipe(); },
+        __kandeloSpawn(file, argv, env, actions, attrs) { return native.__kandeloSpawn(file, argv, env, actions, attrs); },
+        __kandeloFdRead(fd, max) { return native.__kandeloFdRead(fd, max); },
+        __kandeloFdWrite(fd, bytes) { return native.__kandeloFdWrite(fd, bytes); },
+        __kandeloFdClose(fd) { return native.__kandeloFdClose(fd); },
+        __kandeloWaitPid(pid) { return native.__kandeloWaitPid(pid); },
+        __kandeloKill(pid, sig) { return native.__kandeloKill(pid, sig); },
         tlsConnect(fd, servername, options) { return native.tlsConnect(fd, servername, options); },
         tlsRead(handle, length) { return native.tlsRead(handle, length); },
         tlsWrite(handle, bytes) { return native.tlsWrite(handle, bytes); },

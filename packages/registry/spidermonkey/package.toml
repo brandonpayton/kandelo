@@ -2,7 +2,7 @@ kind = "program"
 name = "spidermonkey"
 version = "140.11.0esr"
 kernel_abi = 7
-depends_on = ["libcxx@21.1.7", "openssl@3.3.2", "zlib@1.3.1"]
+depends_on = ["libcxx@21.1.7", "openssl@3.3.2", "zlib@1.3.1", "libzstd@1.5.6"]
 
 [source]
 url = "https://ftp.mozilla.org/pub/firefox/releases/140.11.0esr/source/firefox-140.11.0esr.source.tar.xz"

@@ -1,0 +1,32 @@
+Enable Explicit Resource Management by default in the Kandelo shell.
+
+ESR 140 ships the Explicit Resource Management implementation (`using` /
+`await using`) behind the compile-time macro
+ENABLE_EXPLICIT_RESOURCE_MANAGEMENT, which the Kandelo mozconfig now turns
+on with `--enable-explicit-resource-management`. The frontend still gates the
+`using` keyword on the runtime pref
+`javascript.options.experimental.explicit_resource_management`, which the
+StaticPrefList defaults to `false` on the ESR (non-Nightly) channel. Because
+node.wasm is invoked as `node <script>` and never receives the shell's
+`--enable-explicit-resource-management` CLI flag, that default left the parser
+rejecting `using`.
+
+node.wasm targets modern Node semantics, where Explicit Resource Management is
+enabled by default. Turn the engine pref on by default here so the frontend
+parses `using`. An explicit `--disable-explicit-resource-management` still wins
+because it is applied afterward.
+
+--- a/js/src/shell/js.cpp
++++ b/js/src/shell/js.cpp
+@@ -13053,6 +13053,11 @@
+   }
+ #endif
+ #ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
++  // Kandelo: node.wasm targets modern Node semantics where Explicit Resource
++  // Management (`using`/`await using`) is enabled by default. Turn the engine
++  // pref on so the frontend parses `using`; an explicit
++  // --disable-explicit-resource-management below still overrides this.
++  JS::Prefs::set_experimental_explicit_resource_management(true);
+   if (op.getBoolOption("enable-explicit-resource-management")) {
+     JS::Prefs::set_experimental_explicit_resource_management(true);
+   }

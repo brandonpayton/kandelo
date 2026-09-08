@@ -1,0 +1,101 @@
+--- a/js/src/shell/ModuleLoader.cpp
++++ b/js/src/shell/ModuleLoader.cpp
+@@ -185,6 +185,77 @@
+   }
+ 
+   return loadAndParse(cx, path, moduleRequest);
++}
++
++// Kandelo: populate import.meta.{url,dirname,require} for a native ES module by
++// calling globalThis.__kandeloModuleMeta(resolvedPath), which returns
++// { url, dirname, require } (a file: URL string, the parent dir path, and the
++// node-compat require bound to that module's dir). Extracted Bun apps read
++// import.meta.require/dirname, so populating them here lets those apps run
++// without any source rewriting. The helper returns null (and *applied stays
++// false) when it is not installed or cannot resolve, in which case the caller
++// keeps the shell's default url-only behavior so the boundary stays honest.
++static bool KandeloPopulateImportMeta(JSContext* cx,
++                                      Handle<JSLinearString*> path,
++                                      JS::HandleObject metaObject,
++                                      bool* applied) {
++  *applied = false;
++
++  RootedObject global(cx, JS::CurrentGlobalOrNull(cx));
++  if (!global) {
++    return true;
++  }
++
++  RootedValue fnVal(cx);
++  if (!JS_GetProperty(cx, global, "__kandeloModuleMeta", &fnVal)) {
++    return false;
++  }
++  if (!fnVal.isObject() || !JS::IsCallable(&fnVal.toObject())) {
++    return true;
++  }
++
++  JS::RootedValueArray<1> args(cx);
++  args[0].setString(path);
++
++  RootedValue rval(cx);
++  RootedValue callee(cx, fnVal);
++  if (!JS_CallFunctionValue(cx, global, callee, args, &rval)) {
++    return false;
++  }
++  if (!rval.isObject()) {
++    return true;
++  }
++
++  RootedObject meta(cx, &rval.toObject());
++
++  RootedValue urlVal(cx);
++  if (!JS_GetProperty(cx, meta, "url", &urlVal)) {
++    return false;
++  }
++  if (!JS_DefineProperty(cx, metaObject, "url", urlVal, JSPROP_ENUMERATE)) {
++    return false;
++  }
++
++  RootedValue dirnameVal(cx);
++  if (!JS_GetProperty(cx, meta, "dirname", &dirnameVal)) {
++    return false;
++  }
++  if (!JS_DefineProperty(cx, metaObject, "dirname", dirnameVal,
++                         JSPROP_ENUMERATE)) {
++    return false;
++  }
++
++  RootedValue requireVal(cx);
++  if (!JS_GetProperty(cx, meta, "require", &requireVal)) {
++    return false;
++  }
++  if (!JS_DefineProperty(cx, metaObject, "require", requireVal,
++                         JSPROP_ENUMERATE)) {
++    return false;
++  }
++
++  *applied = true;
++  return true;
+ }
+ 
+ bool ModuleLoader::populateImportMeta(JSContext* cx,
+@@ -204,9 +275,18 @@
+     }
+   }
+ 
+-  RootedValue pathValue(cx, StringValue(path));
+-  if (!JS_DefineProperty(cx, metaObject, "url", pathValue, JSPROP_ENUMERATE)) {
++  // Kandelo: try node-compat's import.meta population (url/dirname/require)
++  // first; fall back to the shell default (url = raw path) when unavailable.
++  bool metaApplied = false;
++  if (!KandeloPopulateImportMeta(cx, path, metaObject, &metaApplied)) {
+     return false;
++  }
++  if (!metaApplied) {
++    RootedValue pathValue(cx, StringValue(path));
++    if (!JS_DefineProperty(cx, metaObject, "url", pathValue,
++                           JSPROP_ENUMERATE)) {
++      return false;
++    }
+   }
+ 
+   JSFunction* resolveFunc = js::DefineFunctionWithReserved(

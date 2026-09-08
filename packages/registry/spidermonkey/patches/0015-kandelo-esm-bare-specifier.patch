@@ -1,0 +1,147 @@
+--- a/js/src/shell/ModuleLoader.cpp
++++ b/js/src/shell/ModuleLoader.cpp
+@@ -13,12 +13,15 @@
+ #include "NamespaceImports.h"
+ 
+ #include "builtin/TestingUtility.h"  // js::CreateScriptPrivate
++#include "js/CallAndConstruct.h"     // JS_CallFunctionValue, JS::IsCallable
+ #include "js/Conversions.h"
++#include "js/GlobalObject.h"  // JS::CurrentGlobalOrNull
+ #include "js/MapAndSet.h"
+ #include "js/Modules.h"
+ #include "js/PropertyAndElement.h"  // JS_DefineProperty, JS_GetProperty
+ #include "js/SourceText.h"
+ #include "js/StableStringChars.h"
++#include "js/ValueArray.h"  // JS::RootedValueArray
+ #include "shell/jsshell.h"
+ #include "shell/OSObject.h"
+ #include "shell/StringUtils.h"
+@@ -46,6 +49,87 @@
+   return SubString(cx, path, schemeLength);
+ }
+ 
++// Kandelo: route bare import specifiers (not "./", "../", "/", or
++// "javascript:") through the node-compat resolver installed by bootstrap.js.
++// __kandeloResolveBare(specifier, referrerPath) returns a synthetic module
++// *path* (a token) for a Node builtin or node_modules package, and registers
++// the generated ES-module source under that token in __kandeloBareSources for
++// fetchSource() to serve. It returns null when the specifier cannot be resolved
++// there, in which case the loader falls back to its default file-path behavior
++// (which surfaces the honest "can't open" error).
++static bool KandeloResolveBareSpecifier(JSContext* cx,
++                                        Handle<JSLinearString*> specifier,
++                                        Handle<JSLinearString*> referrerPath,
++                                        JS::MutableHandleString out) {
++  out.set(nullptr);
++
++  RootedObject global(cx, JS::CurrentGlobalOrNull(cx));
++  if (!global) {
++    return true;
++  }
++
++  RootedValue fnVal(cx);
++  if (!JS_GetProperty(cx, global, "__kandeloResolveBare", &fnVal)) {
++    return false;
++  }
++  if (!fnVal.isObject() || !JS::IsCallable(&fnVal.toObject())) {
++    return true;
++  }
++
++  JS::RootedValueArray<2> args(cx);
++  args[0].setString(specifier);
++  if (referrerPath) {
++    args[1].setString(referrerPath);
++  } else {
++    args[1].setNull();
++  }
++
++  RootedValue rval(cx);
++  RootedValue callee(cx, fnVal);
++  if (!JS_CallFunctionValue(cx, global, callee, args, &rval)) {
++    return false;
++  }
++
++  if (rval.isString()) {
++    out.set(rval.toString());
++  }
++  return true;
++}
++
++// Kandelo: fetch synthetic bare-specifier module source registered in
++// globalThis.__kandeloBareSources[path], if any.
++static JSString* KandeloBareSource(JSContext* cx,
++                                   Handle<JSLinearString*> path) {
++  RootedObject global(cx, JS::CurrentGlobalOrNull(cx));
++  if (!global) {
++    return nullptr;
++  }
++
++  RootedValue sourcesVal(cx);
++  if (!JS_GetProperty(cx, global, "__kandeloBareSources", &sourcesVal)) {
++    return nullptr;
++  }
++  if (!sourcesVal.isObject()) {
++    return nullptr;
++  }
++
++  RootedObject sources(cx, &sourcesVal.toObject());
++  RootedValue keyVal(cx, StringValue(path));
++  RootedId keyId(cx);
++  if (!JS_ValueToId(cx, keyVal, &keyId)) {
++    return nullptr;
++  }
++
++  RootedValue srcVal(cx);
++  if (!JS_GetPropertyById(cx, sources, keyId, &srcVal)) {
++    return nullptr;
++  }
++  if (srcVal.isString()) {
++    return srcVal.toString();
++  }
++  return nullptr;
++}
++
+ bool ModuleLoader::init(JSContext* cx, HandleString loadPath) {
+   loadPathStr = AtomizeString(cx, loadPath);
+   if (!loadPathStr || !PinAtom(cx, loadPathStr)) {
+@@ -375,6 +459,27 @@
+ #endif
+       ;
+ 
++  // Kandelo: a specifier that is neither absolute, a javascript: URL, nor
++  // relative is a Node "bare" specifier (a builtin or a node_modules package).
++  // Resolve it through node-compat rather than as a file under the load path.
++  if (!isRelative) {
++    Rooted<JSLinearString*> refPath(cx);
++    if (!referencingInfo.isUndefined()) {
++      if (!getScriptPath(cx, referencingInfo, &refPath)) {
++        return nullptr;
++      }
++    }
++    RootedString bareResolved(cx);
++    if (!KandeloResolveBareSpecifier(cx, name, refPath, &bareResolved)) {
++      return nullptr;
++    }
++    if (bareResolved) {
++      return JS_EnsureLinearString(cx, bareResolved);
++    }
++    // Fall through: unresolved bare specifier keeps the default behavior so the
++    // failure stays visible instead of being silently swallowed.
++  }
++
+   RootedString path(cx, loadPathStr);
+ 
+   if (isRelative) {
+@@ -696,6 +801,12 @@
+     return ExtractJavaScriptURLSource(cx, path);
+   }
+ 
++  // Kandelo: synthetic bare-specifier modules carry their generated source in
++  // globalThis.__kandeloBareSources instead of a file on disk.
++  if (JSString* synthetic = KandeloBareSource(cx, path)) {
++    return synthetic;
++  }
++
+   RootedString resolvedPath(cx, ResolvePath(cx, path, RootRelative));
+   if (!resolvedPath) {
+     return nullptr;
