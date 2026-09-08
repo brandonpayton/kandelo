@@ -3535,6 +3535,13 @@ export async function centralizedWorkerMain(
       // arena. Reset once per fork (below) so a fork consumes committed headroom
       // instead of growing the guest. Null on the JS/flag-off path.
       let forkFixedFrameArena: ForkFixedFrameArena | null = null;
+      // PROBE SCAFFOLDING (Phase 0 growable-arena probe — NOT production). When
+      // set, drive the module's GROWABLE channel exports (frame/journal/
+      // module-state all channel-mmap via SYS_mmap → kernel find_gap) instead of
+      // the bounded Fix X fixed arena, to empirically settle whether tracked-
+      // growth deep forks place coherently and grow past the 2 MiB cap.
+      const probeGrowableChannelArena =
+        process.env.KANDELO_FORK_PROBE_GROWABLE_ARENA === "1";
       // Phase 6 D7a.1a: per-activation frame trampolines for a dlopen fork. Each
       // dlopen'd side activation's five frozen frame/resume imports are flipped
       // to its own trampoline (wasm->wasm), folding in the activation id so its
@@ -3813,6 +3820,7 @@ export async function centralizedWorkerMain(
             },
             pid,
             label: `pid=${pid}: fork-module`,
+            probeGrowableChannelArena,
           });
           // Seed the linked-frame format + full resume catalog once, now, before
           // any fork drives the module. Both are host-known custom sections.
@@ -3912,7 +3920,7 @@ export async function centralizedWorkerMain(
       // fork-frame arena exists (JS/flag-off fork) this is the growing
       // `newModuleStateArena`, byte-identical to before.
       const newForkModuleStateArena = (): ForkModuleStateArena =>
-        forkFixedFrameArena
+        forkFixedFrameArena && !probeGrowableChannelArena
           ? new ForkModuleStateArena(
               memory,
               ptrWidth,
@@ -6817,6 +6825,8 @@ export async function centralizedThreadWorkerMain(
           },
           pid,
           label: `pid=${pid} tid=${tid}: fork-module`,
+          probeGrowableChannelArena:
+            process.env.KANDELO_FORK_PROBE_GROWABLE_ARENA === "1",
         });
         threadForkModuleBackend.setup();
         threadProcessContinuation.enableModuleBacking(threadForkModuleBackend);

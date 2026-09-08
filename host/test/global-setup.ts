@@ -40,6 +40,13 @@ const C_TEST_FIXTURES = [
     out: join(fixturesDir, "fork-memory-clone.wasm"),
     forkInstrument: true,
   },
+  {
+    // PROBE SCAFFOLDING (Phase 0 growable-arena probe). Grows its heap via a big
+    // malloc (tracked SYS_mmap) and forks from a deep linked continuation.
+    src: join(fixturesDir, "malloc-deep-fork.c"),
+    out: join(fixturesDir, "malloc-deep-fork.wasm"),
+    forkInstrument: true,
+  },
 ];
 
 /** Program fixtures resolved through the normal local-binaries contract. */

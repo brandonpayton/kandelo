@@ -202,6 +202,17 @@ export interface ForkModuleBackendOptions {
    */
   readonly pid: number;
   readonly label: string;
+  /**
+   * PROBE SCAFFOLDING (Phase 0 growable-arena probe — NOT production behavior).
+   * When true, the parent unwind/serialize drive the module's GROWABLE channel
+   * exports (`fm_begin_unwind` / `fm_add_activation_unwind` /
+   * `fm_serialize_journal_alloc`, which channel-mmap frame/journal chunks via
+   * `SYS_mmap` → kernel `find_gap`) instead of the bounded Fix X fixed-arena
+   * exports. This exists ONLY to empirically settle whether real-program
+   * (tracked-`SYS_mmap`-growth) deep forks place coherently and grow past the
+   * 2 MiB Fix X cap. Gated by `KANDELO_FORK_PROBE_GROWABLE_ARENA=1`. Do NOT ship.
+   */
+  readonly probeGrowableChannelArena?: boolean;
 }
 
 /**
@@ -224,6 +235,8 @@ export class ForkModuleContinuationBackend {
   private readonly releaseRegion: (addr: number, size: number) => void;
   private readonly pid: number;
   private readonly label: string;
+  /** PROBE SCAFFOLDING (Phase 0 growable-arena probe). See options field. */
+  private readonly probeGrowableChannelArena: boolean;
 
   /** Whether the parent module unwind is active (Option B: no host arena). */
   private unwindActive = false;
@@ -242,6 +255,7 @@ export class ForkModuleContinuationBackend {
     this.releaseRegion = options.releaseRegion;
     this.pid = options.pid;
     this.label = options.label;
+    this.probeGrowableChannelArena = options.probeGrowableChannelArena === true;
     if (
       !Number.isSafeInteger(this.channelBase)
       || this.channelBase <= 0
@@ -673,17 +687,30 @@ export class ForkModuleContinuationBackend {
     if (this.unwindActive) {
       throw new Error(`${this.label}: fork-module unwind already active`);
     }
-    const slab = this.frameArena.allocate(frameSlabBytes);
-    const moduleBuffer = this.toNum(
-      this.exports.fm_begin_unwind_fixed_arena(
-        0,
-        this.wptr(slab),
-        this.wptr(frameSlabBytes),
-      ),
-    );
-    this.requireOk("fm_begin_unwind_fixed_arena");
-    if (!Number.isSafeInteger(moduleBuffer) || moduleBuffer <= 0) {
-      throw new Error(`${this.label}: fm_begin_unwind_fixed_arena returned invalid anchor`);
+    let moduleBuffer: number;
+    if (this.probeGrowableChannelArena) {
+      // PROBE: growable channel path — the module channel-mmaps its frame
+      // chunks via SYS_mmap (kernel find_gap), no pre-reserved arena.
+      moduleBuffer = this.toNum(
+        this.exports.fm_begin_unwind(0, this.wptr(this.channelBase)),
+      );
+      this.requireOk("fm_begin_unwind");
+      if (!Number.isSafeInteger(moduleBuffer) || moduleBuffer <= 0) {
+        throw new Error(`${this.label}: fm_begin_unwind returned invalid anchor`);
+      }
+    } else {
+      const slab = this.frameArena.allocate(frameSlabBytes);
+      moduleBuffer = this.toNum(
+        this.exports.fm_begin_unwind_fixed_arena(
+          0,
+          this.wptr(slab),
+          this.wptr(frameSlabBytes),
+        ),
+      );
+      this.requireOk("fm_begin_unwind_fixed_arena");
+      if (!Number.isSafeInteger(moduleBuffer) || moduleBuffer <= 0) {
+        throw new Error(`${this.label}: fm_begin_unwind_fixed_arena returned invalid anchor`);
+      }
     }
     this.unwindActive = true;
     this.moduleBuffer = moduleBuffer;
@@ -705,14 +732,24 @@ export class ForkModuleContinuationBackend {
     // arena (the fixed-arena unwind left the module's `channel_base = 0`, so the
     // channel serializer is unusable), so the journal image does not grow guest
     // memory. An image larger than the slab is a truthful module `ENOMEM`.
-    const journalSlab = this.frameArena.allocate(FORK_MODULE_JOURNAL_SLAB_BYTES);
-    const ptr = this.toNum(
-      this.exports.fm_serialize_journal_fixed_arena(
-        this.wptr(journalSlab),
-        this.wptr(FORK_MODULE_JOURNAL_SLAB_BYTES),
-      ),
-    );
-    this.requireOk("fm_serialize_journal_fixed_arena");
+    let ptr: number;
+    if (this.probeGrowableChannelArena) {
+      // PROBE: growable channel path — the module channel-mmaps the KFRE image
+      // chunk via SYS_mmap (kernel find_gap).
+      ptr = this.toNum(
+        this.exports.fm_serialize_journal_alloc(this.wptr(this.channelBase)),
+      );
+      this.requireOk("fm_serialize_journal_alloc");
+    } else {
+      const journalSlab = this.frameArena.allocate(FORK_MODULE_JOURNAL_SLAB_BYTES);
+      ptr = this.toNum(
+        this.exports.fm_serialize_journal_fixed_arena(
+          this.wptr(journalSlab),
+          this.wptr(FORK_MODULE_JOURNAL_SLAB_BYTES),
+        ),
+      );
+      this.requireOk("fm_serialize_journal_fixed_arena");
+    }
     const len = this.toNum(this.exports.fm_journal_image_len());
     if (!Number.isSafeInteger(ptr) || ptr <= 0) {
       throw new Error(
@@ -917,19 +954,33 @@ export class ForkModuleContinuationBackend {
     // and every other activation's, since the shared cursor only advances. No
     // channel mmap, so a multi-activation (dlopen) fork does not grow guest
     // memory either.
-    const slab = this.frameArena.allocate(FORK_MODULE_FRAME_SLAB_BYTES);
-    const moduleBuffer = this.toNum(
-      this.exports.fm_add_activation_unwind_fixed_arena(
-        this.wptr(activationId),
-        this.wptr(slab),
-        this.wptr(FORK_MODULE_FRAME_SLAB_BYTES),
-        this.wptr(fixedPrefix),
-      ),
-    );
-    this.requireOk("fm_add_activation_unwind_fixed_arena");
+    let moduleBuffer: number;
+    if (this.probeGrowableChannelArena) {
+      // PROBE: growable channel path — this activation channel-mmaps its own
+      // frame chunks via SYS_mmap (kernel find_gap).
+      moduleBuffer = this.toNum(
+        this.exports.fm_add_activation_unwind(
+          this.wptr(activationId),
+          this.wptr(this.channelBase),
+          this.wptr(fixedPrefix),
+        ),
+      );
+      this.requireOk("fm_add_activation_unwind");
+    } else {
+      const slab = this.frameArena.allocate(FORK_MODULE_FRAME_SLAB_BYTES);
+      moduleBuffer = this.toNum(
+        this.exports.fm_add_activation_unwind_fixed_arena(
+          this.wptr(activationId),
+          this.wptr(slab),
+          this.wptr(FORK_MODULE_FRAME_SLAB_BYTES),
+          this.wptr(fixedPrefix),
+        ),
+      );
+      this.requireOk("fm_add_activation_unwind_fixed_arena");
+    }
     if (!Number.isSafeInteger(moduleBuffer) || moduleBuffer <= 0) {
       throw new Error(
-        `${this.label}: fm_add_activation_unwind_fixed_arena returned invalid anchor for `
+        `${this.label}: add-activation-unwind returned invalid anchor for `
           + `activation ${activationId}`,
       );
     }
