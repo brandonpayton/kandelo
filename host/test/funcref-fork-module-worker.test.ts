@@ -93,7 +93,7 @@ describe("funcref fork through the co-resident module (Phase 6 D6.5)", () => {
     ).toBe(0);
     expect(result.stderr).toBe("");
     // (b) PROOF OF USE: the module reconstructed the carried funcref.
-    const references = moduleReferencesReconstructed(result.hostDiagnostics);
+    const references = moduleReferencesReconstructed(result.forkModuleDiagnostics);
     expect(
       references,
       "expected a fork-module funcref proof-of-use diagnostic; the module did " +
