@@ -435,6 +435,30 @@ continuation with its own child-private prefix. The guest instrumentation ABI is
 unchanged either way; the module only changes which host provider drives the
 frames and references.
 
+The co-resident fork-module reserves a bounded in-guest fork-frame arena at
+process init, as part of its host-placed region (between the backend staging
+slab and the shadow stack). A qualifying fork's three otherwise-growing
+allocations — each activation's linked frame chunk, the serialized journal
+image, and the host-side module-state arena chunks — are sub-allocated from
+this one pre-reserved region through the module's `fm_*_fixed_arena` exports
+rather than by channel-mapping fresh, memory-growing regions per fork. Because
+the arena is reserved before a fork samples the parent's memory size, a copied
+child inherits it and observes the parent's exact `memory.size`: the fork does
+not grow the guest's primary linear memory and does not clobber the guest's
+live pages. This is the deliberate fix for the co-resident module consuming the
+committed low headroom that on-demand fork frames would otherwise reuse; placing
+the fork frames outside the guest's single linear memory is not possible on
+WebAssembly (the side module addresses only memory 0, and a copied child
+inherits state only through the clone of memory 0). The arena is a fixed size
+(2 MiB per fork-capable worker) sized to cover a single activation several times
+over and a realistic multi-activation dlopen fork with clear margin; a fork that
+exhausts it fails truthfully with `ENOMEM` and is never silently grown into the
+guest. This is a bounded platform boundary, analogous to the historical
+Asyncify-era fork-save buffer, and is intentional rather than an unbounded
+on-demand model. A COW child is replay-only and allocates nothing from the
+arena, so nested fork depth does not multiply its use; only one in-flight fork
+consumes it at a time, and its cursor resets at each fork's start.
+
 Dynamic-linker reconstruction has a matching fail-closed mode. It accepts
 only shared Memory, passive data segments, and a complete loader transaction.
 For ordinary wasm-ld modules it suppresses only a start function exported as

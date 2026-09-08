@@ -636,7 +636,7 @@ export class ForkModuleContinuationBackend {
     );
     this.requireOk("fm_begin_unwind_fixed_arena");
     if (!Number.isSafeInteger(moduleBuffer) || moduleBuffer <= 0) {
-      throw new Error(`${this.label}: fm_begin_unwind returned invalid anchor`);
+      throw new Error(`${this.label}: fm_begin_unwind_fixed_arena returned invalid anchor`);
     }
     this.unwindActive = true;
     this.moduleBuffer = moduleBuffer;
