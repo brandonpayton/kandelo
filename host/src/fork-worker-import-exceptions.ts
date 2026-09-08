@@ -647,6 +647,32 @@ function buildFatalTrap(): () => never {
 
 const fatalTrap = buildFatalTrap();
 
+/**
+ * Whether to log the ORIGIN of a fatal fork trap on the error channel before it
+ * is re-raised (see `replaceThrown`). Opt-in because the same boundary carries
+ * the expected per-fork child-exit teardown trap. Reads
+ * `WASM_POSIX_FORK_TRAP_DIAG=1` (Node) or `globalThis.__wpkForkTrapDiag` truthy
+ * (browser); host-agnostic and safe when neither `process` nor the global
+ * exists.
+ */
+function forkTrapDiagnosticsEnabled(): boolean {
+  try {
+    const env = (globalThis as { process?: { env?: Record<string, string | undefined> } })
+      .process?.env;
+    if (env && env.WASM_POSIX_FORK_TRAP_DIAG === "1") return true;
+  } catch {
+    // no `process` in this host
+  }
+  try {
+    if ((globalThis as { __wpkForkTrapDiag?: unknown }).__wpkForkTrapDiag) {
+      return true;
+    }
+  } catch {
+    // no accessible global flag
+  }
+  return false;
+}
+
 export interface ForkWorkerLocalImportExceptionNormalizerOptions {
   readonly onFatal?: (
     error: unknown,
@@ -750,13 +776,44 @@ export class ForkWorkerLocalImportExceptionNormalizer {
   }
 
   private replaceThrown(
-    _sourceImportOrdinal: number,
+    sourceImportOrdinal: number,
     thrown: unknown,
   ): never {
     if (thrown instanceof WebAssembly.RuntimeError) {
       // A nested Wasm call can surface a trap as a RuntimeError in this JS
       // frame. Re-entering Wasm by throwing that JS object would turn it into
       // a catchable JSTag exception, so preserve trap semantics explicitly.
+      //
+      // `fatalTrap()` below intentionally DISCARDS this RuntimeError's message
+      // and stack to keep the trap uncatchable across the import boundary. That
+      // masking is why a genuine co-resident fork-module trap (capture, decode,
+      // or replay) previously surfaced only as a bare `unreachable` attributed
+      // to the `__wpk_fork_unwind_transport_*` helper, hiding its true origin.
+      // Surface the ORIGIN before re-raising: always via the diagnostic hook
+      // when wired, and on the error channel when trap diagnostics are enabled.
+      //
+      // The error-channel log is OPT-IN because this same branch also carries
+      // the EXPECTED child-exit teardown trap (`kernel_exit` -> `unreachable`),
+      // which crosses this boundary on every successful fork; logging it
+      // unconditionally would bury real faults in per-fork noise. Enable with
+      // `WASM_POSIX_FORK_TRAP_DIAG=1` (Node) or `globalThis.__wpkForkTrapDiag`
+      // (browser) when investigating a masked fork trap.
+      try {
+        this.options.onFatal?.(thrown, sourceImportOrdinal);
+      } catch {
+        // Diagnostics must never replace or suppress the fatal trap.
+      }
+      if (forkTrapDiagnosticsEnabled()) {
+        try {
+          // eslint-disable-next-line no-console
+          console.error(
+            `[fork] fatal trap crossing worker-local import ` +
+              `ordinal=${sourceImportOrdinal}: ${thrown.message}\n${thrown.stack ?? ""}`,
+          );
+        } catch {
+          // Never let logging change the trap path.
+        }
+      }
       return fatalTrap();
     }
     // WHY: eager normalization would change ordinary CatchAllRef/rethrow
