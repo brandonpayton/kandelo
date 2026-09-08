@@ -4513,40 +4513,18 @@ pub(crate) fn instantiate_fork_module(
         gc_codec_scratch_base,
     };
 
-    // N1-F6: seed activation 0's GC-layout catalog EXACTLY ONCE per guest OS
-    // thread (== once per `instantiate_fork_module` call for a genuinely
-    // FRESH launch) — `fm_set_activation_gc_codec`'s own contract rejects a
-    // RE-seeded activation (`crates/fork-module/src/lib.rs`'s `set_
-    // activation_gc_codec_impl`: "Reject a re-seeded activation (each is
-    // seeded once per worker)"), so this cannot be done per-replay-call
-    // (`fm_build_gc_plan`/`fm_begin_reference_replay` DO need to run per
-    // replay — see `drive_reference_replay`'s doc comment — but the layout
-    // CATALOG itself is a property of the guest module, not of any one
-    // fork, and is read back by every later `fm_build_gc_plan` call on this
-    // same instance). Gated on `seed_empty_module_state_arena` for exactly
-    // the same reason [`write_empty_module_state_arena`] above is: a fork
-    // CHILD's `instantiate_fork_module` call runs against a byte-for-byte
-    // `clone_guest_memory` of the PARENT's memory (`handle_fork`), which
-    // ALREADY carries the fork-module's OWN static globals — including
-    // `ACT_GC_CODEC_ACT_COUNT`/`ACT_GC_CODEC_INDEX` — from the PARENT's own
-    // (successful) seed call; re-seeding here would hit that SAME
-    // re-seed-rejection guard and fail `EINVAL` (confirmed empirically: this
-    // task's first attempt called this unconditionally and every
-    // GC-carrying fork failed exactly this way on the child's own launch).
-    // Skipped entirely for a guest with no GC codec at all
-    // (`gc_codec_descriptor.is_none()` — every funcref/externref/i31-only
-    // fixture): there is no catalog to seed, and calling with a fabricated
-    // one would be dishonest, not merely incomplete.
-    if seed_empty_module_state_arena {
-        if let Some(descriptor) = gc_codec_descriptor {
-            fm.fm_set_activation_gc_codec.call(
-                &mut *store,
-                (0, gc_codec_scratch_base, descriptor.len() as u32),
-            )?;
-            let errno = fm.fm_last_errno.call(&mut *store, ())?;
-            anyhow::ensure!(errno == 0, "fm_set_activation_gc_codec failed: errno {errno}");
-        }
-    }
+    // N1-F6: the guest's GC-layout catalog descriptor bytes are staged into
+    // `gc_codec_scratch_base` above (unconditionally, for every launch that has a
+    // descriptor). The `fm_set_activation_gc_codec` SEED itself is NOT issued here:
+    // it must run AFTER this worker's `fm_set_format` call, which resets the
+    // per-worker "seeded once" catalogs (including `ACT_GC_CODEC_ACT_COUNT`) to
+    // clear a COW child's inherited-but-clobbered state. Seeding here — before
+    // `fm_set_format` — would be immediately wiped by that reset (the bug that
+    // left `fm_build_gc_plan` with an EMPTY codec map on both the parent's own
+    // post-fork rewind and every replayed child). The seed is issued once per
+    // worker in `run_fork_capable_entry`'s post-`fm_set_format` block, matching
+    // the Node/browser contract (`fork-module-backend.ts` `setup()` runs
+    // `fm_set_format` first; `worker-main.ts` then calls `setActivationGcCodec`).
 
     Ok(fm)
 }
@@ -5007,6 +4985,39 @@ fn spawn_guest_thread(
                                 }
                                 Err(e) => {
                                     eprintln!("fm_last_errno after fm_set_resume_catalog failed: {e:#}");
+                                    return;
+                                }
+                            }
+                        }
+                        // N1-F6: seed activation 0's GC-layout catalog now that
+                        // `fm_set_format` (above) has reset the per-worker "seeded
+                        // once" catalogs. MUST run after `fm_set_format`, on EVERY
+                        // worker that carries a GC codec (fresh launch AND replayed
+                        // child) — the descriptor bytes were staged into
+                        // `gc_codec_scratch_base` by `instantiate_fork_module`.
+                        // Mirrors `worker-main.ts`'s `setActivationGcCodec`, which
+                        // likewise runs after the backend `setup()`/`fm_set_format`.
+                        // Without it the child's replay (and the parent's own
+                        // post-fork rewind) hits `fm_build_gc_plan` with an empty
+                        // codec map and fails `EINVAL`.
+                        if let Some(descriptor) = fmt.gc_codec_descriptor.as_deref() {
+                            if let Err(e) = fm.fm_set_activation_gc_codec.call(
+                                &mut store,
+                                (0, fm.gc_codec_scratch_base, descriptor.len() as u32),
+                            ) {
+                                eprintln!("fm_set_activation_gc_codec failed: {e:#}");
+                                return;
+                            }
+                            match fm.fm_last_errno.call(&mut store, ()) {
+                                Ok(0) => {}
+                                Ok(errno) => {
+                                    eprintln!("fm_set_activation_gc_codec failed: errno {errno}");
+                                    return;
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "fm_last_errno after fm_set_activation_gc_codec failed: {e:#}"
+                                    );
                                     return;
                                 }
                             }
@@ -8070,6 +8081,19 @@ fn run_worker_thread(
                 )?;
                 let errno = fm.fm_last_errno.call(&mut store, ())?;
                 anyhow::ensure!(errno == 0, "fm_set_resume_catalog failed: errno {errno}");
+            }
+            // N1-F6: seed activation 0's GC-layout catalog AFTER `fm_set_format`
+            // reset the per-worker catalogs, on every worker carrying a GC codec
+            // (see the parallel block in `spawn_guest_thread` for the full
+            // rationale — this is the same post-`fm_set_format` seed on the other
+            // fork-capable launch path).
+            if let Some(descriptor) = fmt.gc_codec_descriptor.as_deref() {
+                fm.fm_set_activation_gc_codec.call(
+                    &mut store,
+                    (0, fm.gc_codec_scratch_base, descriptor.len() as u32),
+                )?;
+                let errno = fm.fm_last_errno.call(&mut store, ())?;
+                anyhow::ensure!(errno == 0, "fm_set_activation_gc_codec failed: errno {errno}");
             }
         }
         fork_module = Some(fm);
