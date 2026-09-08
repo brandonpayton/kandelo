@@ -577,6 +577,34 @@ export class ForkModuleContinuationBackend {
   }
 
   /**
+   * Seal a PARTIAL mid-unwind capture for a truthful abort (a frame reservation
+   * failed mid-unwind, so `__wpk_fork_frame_reserve` returned 0). Seals every
+   * activation's frame writer + the process journal via `fm_finish_unwind` — the
+   * SAME seal `finishUnwindAndSerialize` performs — but does NOT serialize a
+   * child-inheritable journal image (no child is launched) and NOT the guest's
+   * `wpk_fork_unwind_end` (the guest is still mid-unwind; driving unwind-end
+   * there corrupts the guest's unwind state machine). A failed reserve leaves no
+   * pending frame (`LinkedFrameWriter::reserve_frame` sets `pending` only after a
+   * successful chunk allocation), so the committed chain is complete and
+   * seal-able. After this the coordinator drives the ordinary module
+   * abort-replay (`beginAbort`), which attaches drivers over the in-memory
+   * journal to replay the already-committed frames.
+   */
+  sealForAbort(): void {
+    this.exports.fm_finish_unwind();
+    this.requireOk("fm_finish_unwind");
+  }
+
+  /**
+   * The module's last errno (0 = ok). Read it IMMEDIATELY after a failed frame
+   * op (e.g. a `__wpk_fork_frame_reserve` that returned 0) and before any other
+   * module call overwrites `fm_last_errno`.
+   */
+  lastErrno(): number {
+    return Number(this.exports.fm_last_errno() as number | bigint);
+  }
+
+  /**
    * Child: seed replay from the copied guest memory (Option B). `root` is the
    * inherited continuation anchor (the parent's module buffer at the same guest
    * offset); `imagePtr`/`imageLen` come from the inherited `JournalImage` KFMS

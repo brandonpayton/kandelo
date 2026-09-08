@@ -341,6 +341,7 @@ type KernelImports = Record<string, WebAssembly.ExportValue> & {
 
 const STARTUP_E2BIG = 7;
 const STARTUP_EAGAIN = 11;
+const STARTUP_ENOMEM = 12;
 const STARTUP_EFAULT = 14;
 const STARTUP_EINVAL = 22;
 const STARTUP_ERANGE = 34;
@@ -4656,8 +4657,33 @@ export async function centralizedWorkerMain(
         // signatures are unchanged; no guest re-instrumentation.
         ...(useForkModule && forkModuleInstance
           ? {
-              __wpk_fork_frame_reserve:
-                forkModuleInstance.exports.__wpk_fork_frame_reserve,
+              // MODULE-MODE PARTIAL-CAPTURE ABORT: the module reserve returns 0
+              // (no throw, no JS callback) when a mid-unwind frame allocation
+              // fails. The guest's reserve==0 contract then branches into its
+              // abort restart loop EXPECTING the host to have already moved to
+              // abort replay (fork-instrument `__wpk_fork_select_unwind_frame`).
+              // Wrap the raw module export so that, exactly like the JS
+              // `onReservationAbort` above, a 0 result synchronously drives the
+              // module-mode partial-capture abort — reading the module errno
+              // FIRST (before any further module call overwrites it) so the
+              // guest's re-entry into `kernel_fork` finds the coordinator in
+              // `abort-replay` and `fork()` returns `-errno` with the parent
+              // intact. A successful reserve is byte-identical to the raw export.
+              __wpk_fork_frame_reserve: (size: number | bigint) => {
+                const payload = (
+                  forkModuleInstance.exports
+                    .__wpk_fork_frame_reserve as (s: number | bigint) => number | bigint
+                )(size);
+                if (payload === 0 || payload === 0n) {
+                  const moduleErrno = forkModuleBackend
+                    ? forkModuleBackend.lastErrno()
+                    : STARTUP_ENOMEM;
+                  processContinuation.beginModuleCaptureAbort(
+                    moduleErrno > 0 ? moduleErrno : STARTUP_ENOMEM,
+                  );
+                }
+                return payload;
+              },
               __wpk_fork_frame_commit:
                 forkModuleInstance.exports.__wpk_fork_frame_commit,
               __wpk_fork_frame_peek:
@@ -7032,8 +7058,27 @@ export async function centralizedThreadWorkerMain(
             // unchanged; no re-instrumentation. Flag-off skips this entirely.
             ...(threadForkModuleInstance
               ? {
-                  __wpk_fork_frame_reserve:
-                    threadForkModuleInstance.exports.__wpk_fork_frame_reserve,
+                  // MODULE-MODE PARTIAL-CAPTURE ABORT (mirrors the main worker
+                  // path): a 0 result from the module reserve synchronously drives
+                  // the module-mode partial-capture abort so the guest's reserve==0
+                  // contract finds the thread coordinator already in `abort-replay`.
+                  __wpk_fork_frame_reserve: (size: number | bigint) => {
+                    const payload = (
+                      threadForkModuleInstance!.exports
+                        .__wpk_fork_frame_reserve as (
+                        s: number | bigint,
+                      ) => number | bigint
+                    )(size);
+                    if (payload === 0 || payload === 0n) {
+                      const moduleErrno = threadForkModuleBackend
+                        ? threadForkModuleBackend.lastErrno()
+                        : STARTUP_ENOMEM;
+                      threadCoordinator.beginModuleCaptureAbort(
+                        moduleErrno > 0 ? moduleErrno : STARTUP_ENOMEM,
+                      );
+                    }
+                    return payload;
+                  },
                   __wpk_fork_frame_commit:
                     threadForkModuleInstance.exports.__wpk_fork_frame_commit,
                   __wpk_fork_frame_peek:

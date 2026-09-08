@@ -783,6 +783,54 @@ export class ForkProcessContinuationCoordinator {
     }
   }
 
+  /**
+   * Module-mode partial-capture abort — the co-resident-module sibling of
+   * `beginCaptureAbort`.
+   *
+   * The Phase 6 D5 import flip binds the guest's `__wpk_fork_frame_reserve`
+   * straight to the module export, so a mid-unwind frame-allocation failure
+   * returns 0 to the guest with no JS notification (unlike the JS path, whose
+   * `continuationImports` reserve closure calls `onReservationAbort`). The
+   * guest's reserve==0 contract (fork-instrument `__wpk_fork_select_unwind_frame`
+   * → the abort restart loop) EXPECTS the host to have ALREADY moved to abort
+   * replay synchronously inside that reserve call. This makes that true for the
+   * module path: seal the partial capture into `sealed-parent` (the module owns
+   * the journal), then run the SAME proven module abort-replay `beginAbortReplay`
+   * uses for a failed child launch — driving each activation's
+   * `wpk_fork_abort_begin` to `ABORT_UNWINDING`. When the guest's abort replay
+   * later re-enters `kernel_fork`, the coordinator is in `abort-replay`, the fork
+   * returns `-errno`, the parent is fully intact, and no child was launched.
+   *
+   * Unlike `sealModuleCapture` this does NOT drive the guest `wpk_fork_unwind_end`
+   * (the guest is mid-unwind) and does NOT serialize a journal image (no child).
+   */
+  beginModuleCaptureAbort(errno: number): void {
+    this.requirePhase("capture", "begin module partial-capture abort replay");
+    if (!this.moduleBackend) {
+      throw new Error(
+        `${this.label}: module partial-capture abort requires a module backend`,
+      );
+    }
+    if (!Number.isInteger(errno) || errno <= 0) {
+      throw new RangeError(`${this.label}: invalid fork abort errno ${errno}`);
+    }
+    try {
+      // Seal the partial capture into "sealed-parent" WITHOUT the guest
+      // unwind-end drive or journal serialization. A failed reserve left no
+      // pending frame, so the committed chain is complete and seal-able.
+      this.moduleBackend.sealForAbort();
+      this.registry.sealCapture();
+      this.publishProcessLaunchRoot(this.getActivation(0).root);
+      this.phase = "sealed-parent";
+    } catch (error) {
+      this.abort();
+      throw error;
+    }
+    // Reuse the proven module abort-replay path (drives `beginModuleAbortReplay`
+    // → `backend.beginAbort()` + `wpk_fork_abort_begin` on each activation).
+    this.beginAbortReplay(errno);
+  }
+
   finishReplay(): void {
     if (this.phase !== "parent-replay" && this.phase !== "child-replay") {
       throw new Error(
