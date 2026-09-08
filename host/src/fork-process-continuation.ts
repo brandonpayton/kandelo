@@ -912,10 +912,21 @@ export class ForkProcessContinuationCoordinator {
       // capture with its own host frame arena + prefix (`addActivationUnwind`).
       // Every activation's root is written into ITS module-state prefix and its
       // guest instance is put into UNWINDING, exactly mirroring the JS path.
+      // A single-activation fork (the common case, incl. any deep recursive
+      // fork) hands activation 0 the whole arena minus the journal + module-state
+      // reserves, so a deep linked continuation grows up to the bounded arena
+      // instead of tripping the fixed multi-activation frame sub-cap. A
+      // multi-activation (dlopen) fork keeps the per-activation slab so N
+      // activations share the arena.
+      const singleActivation = this.orderedActivations().length === 1;
       for (const activation of this.orderedActivations()) {
         const root =
           activation.activationId === 0
-            ? backend.beginUnwind()
+            ? backend.beginUnwind(
+                singleActivation
+                  ? backend.singleActivationFrameBudget()
+                  : undefined,
+              )
             : backend.addActivationUnwind(
                 activation.activationId,
                 activation.continuation.format.fixedPrefixSize,

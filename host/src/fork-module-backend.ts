@@ -26,13 +26,31 @@ const ENOMEM = 12;
 
 /**
  * Per-activation frame-chunk slab handed to `fm_begin_unwind_fixed_arena` /
- * `fm_add_activation_unwind_fixed_arena`. The module bump-allocates its linked
- * frame chunks WITHIN this slab on demand. 2 pages (128 KiB) roughly doubles the
- * historical Asyncify-era `FORK_SAVE_BUFFER_SIZE` (60 KiB) and holds far more
- * than the worst observed fork stack (lxpanel's ~21.5 KiB GLib double-fork). A
- * frame stack that overflows the slab is a truthful module `ENOMEM`.
+ * `fm_add_activation_unwind_fixed_arena` for a MULTI-activation (dlopen) fork.
+ * The module bump-allocates its linked frame chunks WITHIN this slab on demand.
+ * 2 pages (128 KiB) roughly doubles the historical Asyncify-era
+ * `FORK_SAVE_BUFFER_SIZE` (60 KiB) and holds far more than the worst observed
+ * multi-activation fork stack (lxpanel's ~21.5 KiB GLib double-fork). A frame
+ * stack that overflows the slab is a truthful module `ENOMEM`.
+ *
+ * A SINGLE-activation fork (the common case, and any deep recursive fork) does
+ * NOT use this bound: activation 0 is the only frame consumer, so the backend
+ * hands it the whole arena minus the journal + module-state reserves
+ * (`singleActivationFrameBudget`). This lets a deep linked continuation grow up
+ * to the bounded arena — restoring the pre-Fix-X growable behavior WITHIN the
+ * bound — instead of tripping a fixed 128 KiB sub-cap that no deep fork could
+ * clear. See `singleActivationFrameBudget`.
  */
 export const FORK_MODULE_FRAME_SLAB_BYTES = 2 * WASM_PAGE_SIZE;
+
+/**
+ * Bytes the single-activation frame budget holds back from the arena for the
+ * host-side module-state arena (root chunk + KFMS records). Generous: a
+ * single-activation fork's module state is a handful of small records, but the
+ * reserve must never be undercut or the post-frame module-state / journal
+ * allocation would spuriously ENOMEM inside a fork the arena can hold.
+ */
+export const FORK_MODULE_MODULE_STATE_RESERVE_BYTES = 8 * WASM_PAGE_SIZE;
 
 /**
  * The journal-image slab handed to `fm_serialize_journal_fixed_arena`. The KFRE
@@ -90,6 +108,11 @@ export class ForkFixedFrameArena {
   /** Reset the cursor to the region base — called once per fork by the owner. */
   reset(): void {
     this.cursor = this.base;
+  }
+
+  /** Total byte capacity of the reserved arena (== `FORK_MODULE_FRAME_ARENA_BYTES`). */
+  capacity(): number {
+    return this.bytes;
   }
 
   /**
@@ -614,24 +637,48 @@ export class ForkModuleContinuationBackend {
   }
 
   /**
+   * The frame-region byte budget for the ONLY activation of a single-activation
+   * fork: the whole arena minus the journal-image slab and the module-state
+   * reserve. Activation 0 is the sole frame consumer, so it may bump-allocate
+   * its linked frame chunks up to this budget — a deep linked continuation grows
+   * within the bounded arena (the pre-Fix-X growable behavior, re-expressed as a
+   * bound) rather than tripping the fixed 128 KiB multi-activation sub-cap. Past
+   * the budget the module's `ChunkAllocator` fails with a truthful `ENOMEM`.
+   */
+  singleActivationFrameBudget(): number {
+    const budget =
+      this.frameArena.capacity()
+      - FORK_MODULE_JOURNAL_SLAB_BYTES
+      - FORK_MODULE_MODULE_STATE_RESERVE_BYTES;
+    // Never hand out less than the multi-activation slab, and stay page-aligned
+    // (the module-state arena validates page-aligned chunk bases).
+    const floored = Math.max(budget, FORK_MODULE_FRAME_SLAB_BYTES);
+    return floored - (floored % WASM_PAGE_SIZE);
+  }
+
+  /**
    * Parent: begin the module unwind over a slab of the pre-reserved fork-frame
    * arena (Fix X). The module bump-allocates its linked frame chunks WITHIN this
-   * slab, so the unwind never grows guest memory. Returns the module-buffer
-   * anchor (the continuation root) the coordinator writes into the module-state
-   * prefix and passes to `wpk_fork_unwind_begin`. The caller (`worker-main`)
-   * resets the arena cursor once, before this fork's first allocation.
+   * slab, so the unwind never grows guest memory. `frameSlabBytes` is the slab
+   * size — `FORK_MODULE_FRAME_SLAB_BYTES` for one activation of a multi-activation
+   * fork, or `singleActivationFrameBudget()` for the sole activation of a
+   * single-activation fork (so a deep continuation can grow up to the arena
+   * bound). Returns the module-buffer anchor (the continuation root) the
+   * coordinator writes into the module-state prefix and passes to
+   * `wpk_fork_unwind_begin`. The caller (`worker-main`) resets the arena cursor
+   * once, before this fork's first allocation.
    */
-  beginUnwind(): number {
+  beginUnwind(frameSlabBytes: number = FORK_MODULE_FRAME_SLAB_BYTES): number {
     this.requireSetup("begin unwind");
     if (this.unwindActive) {
       throw new Error(`${this.label}: fork-module unwind already active`);
     }
-    const slab = this.frameArena.allocate(FORK_MODULE_FRAME_SLAB_BYTES);
+    const slab = this.frameArena.allocate(frameSlabBytes);
     const moduleBuffer = this.toNum(
       this.exports.fm_begin_unwind_fixed_arena(
         0,
         this.wptr(slab),
-        this.wptr(FORK_MODULE_FRAME_SLAB_BYTES),
+        this.wptr(frameSlabBytes),
       ),
     );
     this.requireOk("fm_begin_unwind_fixed_arena");
