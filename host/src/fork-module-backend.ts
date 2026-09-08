@@ -12,7 +12,10 @@
 // forks never construct this and are byte-identical to today.
 
 import { WASM_PAGE_SIZE } from "./constants";
-import type { LinkedFrameFormatDescriptor } from "./fork-continuation";
+import {
+  ContinuationAllocationError,
+  type LinkedFrameFormatDescriptor,
+} from "./fork-continuation";
 import type { ForkModuleExports } from "./fork-module-instance";
 
 /**
@@ -553,7 +556,24 @@ export class ForkModuleContinuationBackend {
     const ptr = this.toNum(
       this.exports.fm_serialize_journal_alloc(this.wptr(this.channelBase)),
     );
-    this.requireOk("fm_serialize_journal_alloc");
+    // SEAL-TIME TRUTHFUL FAILURE (Phase 4 / Phase 2 carry): `fm_finish_unwind`
+    // has ALREADY sealed every activation's frame writer + the process journal,
+    // and the guest is back at NORMAL — but the module could not channel-mmap
+    // the child-inheritable journal-image chunk. A plain `requireOk` throw here
+    // would escape `sealCapture` at the worker completion handler and TRAP the
+    // whole worker once the JS continuation fallback is gone. Surface a TYPED
+    // allocation error instead so the coordinator routes this fork through the
+    // same abort-replay path a mid-unwind reserve failure uses (parent
+    // preserved, `fork()` returns `-errno`, no child launched). There is no
+    // module failure site left that traps.
+    const serializeErrno = this.lastErrno();
+    if (serializeErrno !== 0) {
+      throw new ContinuationAllocationError(
+        serializeErrno,
+        0,
+        `${this.label}: fm_serialize_journal_alloc failed with errno=${serializeErrno}`,
+      );
+    }
     const len = this.toNum(this.exports.fm_journal_image_len());
     if (!Number.isSafeInteger(ptr) || ptr <= 0) {
       throw new Error(

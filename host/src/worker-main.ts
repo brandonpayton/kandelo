@@ -5301,7 +5301,33 @@ export async function centralizedWorkerMain(
             );
           }
           if (phase === "capture") {
-            processContinuation.sealCapture();
+            try {
+              processContinuation.sealCapture();
+            } catch (sealError) {
+              // SEAL-TIME TRUTHFUL FAILURE (Phase 2 carry / Phase 4): the unwind
+              // completed but the module could not channel-mmap the
+              // child-inheritable journal image. The coordinator sealed to
+              // `sealed-parent` WITHOUT launching a child; replay the parent's
+              // already-committed frames and return `-errno` (parent intact, no
+              // child). This is the seal-time sibling of the mid-unwind
+              // `beginModuleCaptureAbort` reserve==0 path, so NO module failure
+              // site traps once the JS continuation fallback is gone.
+              if (sealError instanceof ContinuationAllocationError) {
+                const errno =
+                  sealError.errno > 0 ? sealError.errno : STARTUP_ENOMEM;
+                forkResult = -errno;
+                processContinuation.beginAbortReplay(errno);
+                if (forkModuleBackend && !initData.isForkChild) {
+                  port.postMessage({
+                    type: "fork_module_frames",
+                    pid,
+                    frames: Number(forkModuleBackend.framesCommitted()),
+                  } satisfies WorkerToHostMessage);
+                }
+                continue;
+              }
+              throw sealError;
+            }
             // GATED REFERENCE KIND: a capture-side record-stub in
             // `buildForkActivationStateImports` marked this fork as carrying a
             // reference kind the platform cannot faithfully reconstruct in a
@@ -7318,7 +7344,23 @@ export async function centralizedThreadWorkerMain(
           );
         }
         if (phase === "capture") {
-          threadProcessContinuation.sealCapture();
+          try {
+            threadProcessContinuation.sealCapture();
+          } catch (sealError) {
+            // SEAL-TIME TRUTHFUL FAILURE (fork-from-thread mirror of the main
+            // run loop): the unwind completed but the module could not
+            // channel-mmap the child-inheritable journal image. The coordinator
+            // sealed to `sealed-parent` without launching a child; replay the
+            // parent's committed frames and return `-errno` (parent intact).
+            if (sealError instanceof ContinuationAllocationError) {
+              const errno =
+                sealError.errno > 0 ? sealError.errno : STARTUP_ENOMEM;
+              forkResult = -errno;
+              threadProcessContinuation.beginAbortReplay(errno);
+              continue;
+            }
+            throw sealError;
+          }
           // GATED REFERENCE KIND (fork-from-thread mirror of the main run
           // loop): abort cleanly with EOPNOTSUPP when a capture-side record-stub
           // marked an unsupported reference kind, instead of launching a child.

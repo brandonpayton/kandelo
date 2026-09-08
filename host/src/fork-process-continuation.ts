@@ -8,6 +8,7 @@ import {
   ForkActivationRegistry,
 } from "./fork-activation-registry";
 import {
+  ContinuationAllocationError,
   invokeForkContinuationBegin,
   LinkedForkContinuation,
 } from "./fork-continuation";
@@ -1007,7 +1008,27 @@ export class ForkProcessContinuationCoordinator {
       // owns the journal, so `this.events` is idle and there is no double-journal.
       // The image no longer sits at a host-computed arena offset, so record its
       // (ptr, len) in a `JournalImage` KFMS record for the child to find.
-      const journalImage = backend.finishUnwindAndSerialize();
+      let journalImage;
+      try {
+        journalImage = backend.finishUnwindAndSerialize();
+      } catch (error) {
+        if (error instanceof ContinuationAllocationError) {
+          // SEAL-TIME TRUTHFUL FAILURE (Phase 2 carry / Phase 4): `fm_finish_unwind`
+          // already sealed every activation's frame writer + the process journal
+          // and the guest is back at NORMAL, but the module could not channel-mmap
+          // the child-inheritable journal-image chunk. Complete the seal to
+          // `sealed-parent` WITHOUT an image or manifest — no child will inherit
+          // them — so the completion handler can route this fork through the SAME
+          // truthful abort-replay path a mid-unwind reserve failure uses (parent
+          // preserved, `fork()` returns `-errno`, no child launched). This mirrors
+          // `beginModuleCaptureAbort`'s seal exactly. Do NOT tear the capture down;
+          // rethrow so the caller drives `beginAbortReplay`.
+          this.registry.sealCapture();
+          this.publishProcessLaunchRoot(this.getActivation(0).root);
+          this.phase = "sealed-parent";
+        }
+        throw error;
+      }
       this.registry.currentArena().appendJournalImage({
         ptr: BigInt(journalImage.ptr),
         len: BigInt(journalImage.len),
@@ -1036,7 +1057,11 @@ export class ForkProcessContinuationCoordinator {
       this.publishProcessLaunchRoot(this.getActivation(0).root);
       this.phase = "sealed-parent";
     } catch (error) {
-      this.abort();
+      // The seal-time OOM route (above) intentionally completes the seal to
+      // `sealed-parent` before rethrowing so the caller can drive truthful
+      // abort-replay; do NOT tear that capture down. Every other seal failure
+      // leaves the phase pre-seal and must abort.
+      if (this.phase !== "sealed-parent") this.abort();
       throw error;
     }
   }

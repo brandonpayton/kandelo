@@ -18,7 +18,10 @@ import {
 } from "../src/fork-module-instance";
 import { ForkModuleContinuationBackend } from "../src/fork-module-backend";
 import { ForkModuleTrampolines } from "../src/fork-module-trampoline";
-import type { LinkedFrameFormatDescriptor } from "../src/fork-continuation";
+import {
+  ContinuationAllocationError,
+  type LinkedFrameFormatDescriptor,
+} from "../src/fork-continuation";
 import {
   ABI_SYSCALLS,
   CHANNEL_STATUS_IDLE,
@@ -68,11 +71,17 @@ function bumpAllocator(start: number): { reserve: (n: number) => number } {
 function startChannelResponder(
   memory: WebAssembly.Memory,
   channelBase: number,
+  // Word offset of a control flag in `memory`. When the responder reads a
+  // nonzero value there, it fails the NEXT SYS_MMAP with ENOMEM (12) instead of
+  // servicing it — letting a test simulate a seal-time journal-image allocation
+  // failure after every frame chunk has already been mapped successfully.
+  mmapFailFlagWordOffset?: number,
 ): Worker {
   const code = `
     const { workerData } = require("node:worker_threads");
     const { memory, channelBase, PAGE, FRAME_BASE, STATUS, SYSCALL, ARGS,
-      ARG_SIZE, RETURN, ERRNO, PENDING, IDLE, MMAP, MUNMAP } = workerData;
+      ARG_SIZE, RETURN, ERRNO, PENDING, IDLE, MMAP, MUNMAP, FAIL_FLAG_IDX }
+        = workerData;
     const statusIdx = (channelBase + STATUS) / 4;
     const i32 = new Int32Array(memory.buffer);
     const dv = new DataView(memory.buffer);
@@ -84,9 +93,13 @@ function startChannelResponder(
       let ret = 0n;
       let err = 0;
       if (nr === MMAP) {
-        const size = Number(dv.getBigInt64(channelBase + ARGS + ARG_SIZE, true));
-        ret = BigInt(next);
-        next += Math.ceil(size / PAGE) * PAGE;
+        if (FAIL_FLAG_IDX >= 0 && Atomics.load(i32, FAIL_FLAG_IDX) !== 0) {
+          err = 12; // ENOMEM — simulate kernel find_gap/admission exhaustion
+        } else {
+          const size = Number(dv.getBigInt64(channelBase + ARGS + ARG_SIZE, true));
+          ret = BigInt(next);
+          next += Math.ceil(size / PAGE) * PAGE;
+        }
       } else if (nr === MUNMAP) {
         ret = 0n;
       } else {
@@ -115,6 +128,8 @@ function startChannelResponder(
       IDLE: CHANNEL_STATUS_IDLE,
       MMAP: ABI_SYSCALLS.Mmap,
       MUNMAP: ABI_SYSCALLS.Munmap,
+      FAIL_FLAG_IDX:
+        mmapFailFlagWordOffset === undefined ? -1 : mmapFailFlagWordOffset / 4,
     },
   });
 }
@@ -261,6 +276,81 @@ describe("ForkModuleContinuationBackend abort-replay (beginAbort/finishAbort)", 
 
     driveAbortReplay(trampolines, memory, errno);
 
+    expect(() => backend.finishAbort()).not.toThrow();
+  });
+
+  // SEAL-TIME TRUTHFUL-FAILURE GAP (Phase 2 carry / Phase 4): a fork whose
+  // unwind completes but then OOMs at the `fm_serialize_journal_alloc` seal step
+  // must surface a TYPED `ContinuationAllocationError` (not the generic
+  // `requireOk` throw that would escape `sealCapture` and trap the worker), and
+  // must leave the already-sealed frames + journal intact so the parent can
+  // still abort-replay. This is the seal-time sibling of the mid-unwind
+  // reserve==0 abort; with the JS continuation fallback gone, NO module failure
+  // site may trap.
+  it("seal-time journal-image OOM throws ContinuationAllocationError and preserves the parent", async () => {
+    const FAIL_FLAG = 1 * MiB; // a spare low word, below CHANNEL_BASE (2 MiB)
+    const memory = new WebAssembly.Memory({
+      initial: Math.ceil(MEMORY_BYTES / PAGE),
+      maximum: 16384,
+      shared: true,
+    });
+    responder = startChannelResponder(memory, CHANNEL_BASE, FAIL_FLAG);
+    const failFlag = new Int32Array(memory.buffer);
+
+    const alloc = bumpAllocator(4 * MiB);
+    const fm = instantiateForkModule({
+      module: loadForkModule32(),
+      memory,
+      ptrWidth: 4,
+      reserve: alloc.reserve,
+      label: "backend-seal-oom",
+    });
+    const px = fm.exports as ForkModuleExports;
+    const errno = (): number => Number((px.fm_last_errno as () => number)());
+
+    const backend = new ForkModuleContinuationBackend({
+      exports: px,
+      memory,
+      ptrWidth: 4,
+      format: format(128),
+      catalogOrdinals: CATALOG0,
+      channelBase: CHANNEL_BASE,
+      reserveRegion: alloc.reserve,
+      releaseRegion: () => {},
+      pid: 1,
+      label: "backend-seal-oom",
+    });
+    backend.setup();
+    backend.setActivationResumeCatalog(1, CATALOG1);
+
+    const root0 = backend.beginUnwind();
+    expect(root0).toBeGreaterThan(0);
+    const root1 = backend.addActivationUnwind(1, PREFIX1);
+    expect(root1).toBeGreaterThan(0);
+
+    const trampolines = new ForkModuleTrampolines(px);
+    driveUnwind(trampolines, memory, errno);
+
+    // Arm the responder to fail the NEXT mmap (the journal-image chunk) with
+    // ENOMEM. Every frame chunk above was already mapped successfully.
+    Atomics.store(failFlag, FAIL_FLAG / 4, 1);
+
+    let caught: unknown;
+    try {
+      backend.finishUnwindAndSerialize();
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ContinuationAllocationError);
+    expect((caught as ContinuationAllocationError).errno).toBe(12); // ENOMEM
+
+    // The frames + journal were sealed by `fm_finish_unwind` before the image
+    // allocation failed, so the parent's committed continuation is intact and
+    // can be replayed through the abort path (parent preserved, no child).
+    Atomics.store(failFlag, FAIL_FLAG / 4, 0);
+    expect(Number(backend.framesCommitted())).toBe(COMMITS.length);
+    expect(() => backend.beginAbort()).not.toThrow();
+    driveAbortReplay(trampolines, memory, errno);
     expect(() => backend.finishAbort()).not.toThrow();
   });
 });
