@@ -1,0 +1,14 @@
+[build]
+# std for wasm32-unknown-kandelo is built from the private sysroot's
+# rust-src (see scripts/build-rust-sysroot.sh); RUSTC is the wrapper that
+# injects --sysroot.
+rustflags = []
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[env]
+# libc-kandelo uses musl v1.2.3 time64 (time_t = i64), so stat is 112
+# bytes. Rust's real bootstrap sets this; a raw build-std must too, or
+# libc's stat-size assertion fails before std compiles.
+RUST_LIBC_UNSTABLE_MUSL_V1_2_3 = "1"

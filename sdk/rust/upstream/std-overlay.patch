@@ -1,0 +1,180 @@
+--- a/library/unwind/src/libunwind.rs
++++ b/library/unwind/src/libunwind.rs
+@@ -75,7 +75,7 @@
+ #[cfg(all(target_arch = "wasm32", target_os = "emscripten"))]
+ pub const unwinder_private_data_size: usize = 20;
+ 
+-#[cfg(all(target_arch = "wasm32", target_os = "linux"))]
++#[cfg(all(target_arch = "wasm32", any(target_os = "linux", target_os = "kandelo")))]
+ pub const unwinder_private_data_size: usize = 2;
+ 
+ #[cfg(target_arch = "hexagon")]
+--- a/library/std/src/os/mod.rs
++++ b/library/std/src/os/mod.rs
+@@ -92,7 +92,10 @@
+         all(target_vendor = "fortanix", target_env = "sgx")
+     )
+ )))]
+-#[cfg(any(target_os = "linux", doc))]
++// kandelo: Kandelo's libc fork mirrors linux-musl (same `stat`, raw type
++// aliases, and MetadataExt surface), so it reuses `os::linux`'s fs/raw
++// extensions rather than duplicating them. See `os::unix`'s `platform` module.
++#[cfg(any(target_os = "linux", target_os = "kandelo", doc))]
+ pub mod linux;
+ 
+ // wasi
+--- a/library/std/src/sys/paths/unix.rs
++++ b/library/std/src/sys/paths/unix.rs
+@@ -257,7 +257,10 @@
+     target_os = "hurd",
+     target_os = "android",
+     target_os = "nuttx",
+-    target_os = "emscripten"
++    target_os = "emscripten",
++    // kandelo: Kandelo exposes the Linux-style `/proc/self/exe` symlink; if
++    // `/proc` is not mounted this returns a clean NotFound error, matching Linux.
++    target_os = "kandelo",
+ ))]
+ pub fn current_exe() -> io::Result<PathBuf> {
+     match crate::fs::read_link("/proc/self/exe") {
+--- a/library/std/src/sys/random/mod.rs
++++ b/library/std/src/sys/random/mod.rs
+@@ -44,7 +44,10 @@
+         mod hermit;
+         pub use hermit::fill_bytes;
+     }
+-    any(target_os = "horizon", target_os = "cygwin") => {
++    // kandelo: Kandelo implements the Linux `getrandom(2)` syscall, so it uses
++    // the plain `getrandom` source. `hashmap_random_keys` comes from the generic
++    // fallback below (kandelo is not in that fn's exclusion list).
++    any(target_os = "horizon", target_os = "cygwin", target_os = "kandelo") => {
+         // FIXME(horizon): add arc4random_buf to shim-3ds
+         mod getrandom;
+         pub use getrandom::fill_bytes;
+--- a/library/std/src/sys/args/unix.rs
++++ b/library/std/src/sys/args/unix.rs
+@@ -84,6 +84,10 @@
+     target_os = "hurd",
+     target_os = "rtems",
+     target_os = "nuttx",
++    // kandelo: argc/argv are handed to `init` at startup and stashed for
++    // `args()`, the same as other Unix targets. Kandelo is not gnu, so the
++    // `.init_array` variant below stays gated to linux-gnu.
++    target_os = "kandelo",
+ ))]
+ mod imp {
+     use crate::ffi::c_char;
+--- a/library/std/src/sys/fs/unix.rs
++++ b/library/std/src/sys/fs/unix.rs
+@@ -1153,6 +1153,8 @@
+         target_os = "vxworks",
+         target_os = "wasi",
+         target_vendor = "apple",
++        // kandelo: dirents carry `d_ino` (linux-musl `dirent64` layout).
++        target_os = "kandelo",
+     ))]
+     pub fn ino(&self) -> u64 {
+         self.entry.d_ino as u64
+--- a/library/std/src/sys/thread/mod.rs
++++ b/library/std/src/sys/thread/mod.rs
+@@ -59,6 +59,9 @@
+             target_os = "hurd",
+             target_os = "aix",
+             target_os = "wasi",
++            // kandelo: Kandelo's libc fork does not expose `pthread_setname_np`
++            // (thread naming is unsupported), so use the no-op `set_name`.
++            target_os = "kandelo",
+         )))]
+         pub use unix::set_name;
+         #[cfg(any(
+@@ -85,6 +88,8 @@
+             target_os = "hurd",
+             target_os = "aix",
+             target_os = "wasi",
++            // kandelo: no `pthread_setname_np`; thread naming is a no-op.
++            target_os = "kandelo",
+         ))]
+         pub use unsupported::set_name;
+     }
+--- a/library/std/src/os/unix/mod.rs
++++ b/library/std/src/os/unix/mod.rs
+@@ -67,6 +67,11 @@
+     pub use crate::os::l4re::*;
+     #[cfg(target_os = "linux")]
+     pub use crate::os::linux::*;
++    // kandelo: reuse Linux's fs (MetadataExt over the raw `stat`) and raw type
++    // aliases; Kandelo's libc fork mirrors linux-musl exactly. `os::linux`'s
++    // `net`/`process` are cfg'd out for kandelo (see `os::linux`).
++    #[cfg(target_os = "kandelo")]
++    pub use crate::os::linux::*;
+     #[cfg(target_os = "netbsd")]
+     pub use crate::os::netbsd::*;
+     #[cfg(target_os = "nto")]
+--- a/library/std/src/os/linux/mod.rs
++++ b/library/std/src/os/linux/mod.rs
+@@ -4,6 +4,12 @@
+ #![doc(cfg(target_os = "linux"))]
+ 
+ pub mod fs;
++// kandelo: reuses only `fs` and `raw` from this module. `net` and `process`
++// pull in Linux-only sys internals (`os::net::linux_ext`, pidfd via
++// `sys::pal::unix::linux`) that Kandelo does not provide, so they stay gated
++// to real Linux (and doc builds).
++#[cfg(any(target_os = "linux", doc))]
+ pub mod net;
++#[cfg(any(target_os = "linux", doc))]
+ pub mod process;
+ pub mod raw;
+--- a/library/std/src/sys/pal/unix/futex.rs
++++ b/library/std/src/sys/pal/unix/futex.rs
+@@ -6,6 +6,9 @@
+     target_os = "openbsd",
+     target_os = "dragonfly",
+     target_os = "fuchsia",
++    // kandelo: Kandelo implements the Linux futex syscall (SYS_futex with
++    // FUTEX_WAIT_BITSET/FUTEX_WAKE), so it uses the Linux futex path below.
++    target_os = "kandelo",
+ ))]
+ 
+ use crate::sync::atomic::Atomic;
+@@ -26,7 +29,12 @@
+ /// Returns directly if the futex doesn't hold the expected value.
+ ///
+ /// Returns false on timeout, and true in all other cases.
+-#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
++#[cfg(any(
++    target_os = "linux",
++    target_os = "android",
++    target_os = "freebsd",
++    target_os = "kandelo",
++))]
+ pub fn futex_wait(futex: &Atomic<u32>, expected: u32, timeout: Option<Duration>) -> bool {
+     use super::time::Timespec;
+     use crate::ptr::null;
+@@ -67,7 +75,7 @@
+                         umtx_timeout_ptr as *mut _,
+                     )
+                 }
+-                any(target_os = "linux", target_os = "android") => {
++                any(target_os = "linux", target_os = "android", target_os = "kandelo") => {
+                     // Use FUTEX_WAIT_BITSET rather than FUTEX_WAIT to be able to give an
+                     // absolute time rather than a relative time.
+                     libc::syscall(
+@@ -100,7 +108,7 @@
+ /// or false if no thread was waiting on this futex.
+ ///
+ /// On some platforms, this always returns false.
+-#[cfg(any(target_os = "linux", target_os = "android"))]
++#[cfg(any(target_os = "linux", target_os = "android", target_os = "kandelo"))]
+ pub fn futex_wake(futex: &Atomic<u32>) -> bool {
+     let ptr = futex as *const Atomic<u32>;
+     let op = libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG;
+@@ -108,7 +116,7 @@
+ }
+ 
+ /// Wakes up all threads that are waiting on `futex_wait` on this futex.
+-#[cfg(any(target_os = "linux", target_os = "android"))]
++#[cfg(any(target_os = "linux", target_os = "android", target_os = "kandelo"))]
+ pub fn futex_wake_all(futex: &Atomic<u32>) {
+     let ptr = futex as *const Atomic<u32>;
+     let op = libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG;

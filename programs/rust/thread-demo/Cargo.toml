@@ -1,0 +1,16 @@
+[package]
+name = "kandelo-thread-demo"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "kandelo-thread-demo"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[workspace]
