@@ -291,6 +291,14 @@ interface ProcessInfo extends ProcessGenerationOwnership {
   forkReplayContext?: ForkReplayContext;
   /** Parent-owned control slot borrowed only until exact exec/exit teardown. */
   vforkWorkspace?: VforkWorkspaceOwnership;
+  /**
+   * The co-resident fork-module region this process worker placed in its shared
+   * linear memory (reported by the worker at init). A COPIED fork child reuses
+   * this exact base so it does not double-map the module region it already
+   * inherits via its memory clone. Inherited into a child's generation so a
+   * grandchild fork propagates the same base.
+   */
+  forkModuleRegion?: { base: number; bytes: number };
 }
 const processes = new Map<number, ProcessInfo>();
 const vforkLifetimes = new VforkLifetimeCoordinator<ProcessInfo>();
@@ -441,6 +449,15 @@ function installProcessWorkerListeners(
           `drive_steps_executed=${message.driveSteps} ` +
           `static_roots_published=${message.staticRoots}`,
       });
+    } else if (
+      message.type === "fork_module_region" &&
+      message.pid === pid
+    ) {
+      // Record where this worker placed its co-resident fork-module region so a
+      // COPIED fork child reuses the same base instead of double-mapping the
+      // region it already inherits (see `forkModuleInheritedBase` plumbing in
+      // `handleOrdinaryFork`).
+      process.forkModuleRegion = { base: message.base, bytes: message.bytes };
     }
   });
   installCrashSafetyNet(worker, pid);
@@ -2413,6 +2430,14 @@ async function handleOrdinaryFork(
       isForkChild: true,
       forkMode: mode,
       forkBufAddr,
+      // A COPIED fork child inherits the parent's co-resident fork-module region
+      // via its memory clone; hand it the parent's exact base so it reuses that
+      // region instead of double-mapping a fresh one (which would inflate the
+      // child's observable `memory.size`). Absent only if the parent worker has
+      // not yet reported its region (it reports at init, before it can fork), in
+      // which case the child falls back to reserving its own.
+      forkModuleInheritedBase: parentInfo.forkModuleRegion?.base,
+      forkModuleInheritedBytes: parentInfo.forkModuleRegion?.bytes,
       forkReplayGate: forkReplay.gate,
       forkChildThreadFnPtr: forkReplayContext?.fnPtr,
       forkChildThreadArgPtr: forkReplayContext?.argPtr,
@@ -2443,6 +2468,10 @@ async function handleOrdinaryFork(
       threadAllocator: threadAllocatorForLayout(childLayout, ptrWidth, childPid),
       forkReplayContext,
       externrefGeneration: externrefGrant.generation,
+      // The child reuses the parent's fork-module region; seed its generation so
+      // a grandchild fork propagates the same base even before the child worker
+      // re-reports it at init.
+      forkModuleRegion: parentInfo.forkModuleRegion,
     };
     processes.set(childPid, childGeneration);
 

@@ -95,6 +95,23 @@ export interface CentralizedWorkerInitMessage {
   /** Exact admitted scratch capacity. */
   forkScratchBytes?: number;
   /**
+   * First byte of the co-resident fork-module region a COPIED fork child
+   * INHERITS from its parent (COW). The parent reserved this region in the
+   * shared linear memory at process init (via a first-fit `mmap`), and the
+   * child's full memory clone already contains it — the region is also present
+   * in the child's inherited kernel mapping table. When set, the child MUST
+   * reuse this exact base for its own fork-module instance instead of reserving
+   * a fresh region; a fresh reservation would double-map the module (parent's
+   * inherited copy + a new one), inflating the child's observable
+   * `memory.size` (e.g. a 240-page child growing to ~328) and breaking the
+   * fork memory-clone invariant. Only meaningful for `forkMemoryOwnership ===
+   * "copied"`; a borrowed (vfork) child reserves its own on-demand region and
+   * munmaps it after replay, so it never inherits a durable base.
+   */
+  forkModuleInheritedBase?: number;
+  /** Exact byte length of the inherited fork-module region (paired with the base). */
+  forkModuleInheritedBytes?: number;
+  /**
    * Two-phase launch gate for a fork child. The child announces that all
    * reconstruction and activation frames reached the inherited fork import,
    * then waits here until the kernel host commits the launch.
@@ -198,7 +215,26 @@ export type WorkerToHostMessage =
   | ForkModuleFramesMessage
   | ForkModuleChildFramesMessage
   | ForkModuleReferencesMessage
+  | ForkModuleRegionMessage
   | ForkHostImportWakeMessage;
+
+/**
+ * The co-resident fork-module region a process worker placed in its shared
+ * linear memory at init. A worker reports its exact base + byte length so the
+ * kernel host can hand a COPIED fork child the SAME base to reuse (the child
+ * inherits the region via its memory clone; re-reserving would double-map it
+ * and inflate `memory.size`). Reported once per process/exec generation, before
+ * the guest can fork. Borrowed (vfork) children do not report — they use an
+ * on-demand region they munmap after replay.
+ */
+export interface ForkModuleRegionMessage {
+  type: "fork_module_region";
+  pid: number;
+  /** First byte of the reserved region (== the module's `__memory_base`). */
+  base: number;
+  /** Total reserved bytes (static/BSS footprint plus the shadow stack). */
+  bytes: number;
+}
 
 /**
  * Phase 6 D5: proof-of-use for the co-resident fork-module. A process worker

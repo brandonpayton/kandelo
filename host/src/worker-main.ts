@@ -3618,15 +3618,68 @@ export async function centralizedWorkerMain(
         forkModuleHostCapabilities = createForkModuleHostCapabilities({
           tokens: externrefTokens,
         });
+        // A COPIED fork child INHERITS the parent's co-resident fork-module
+        // region through its full memory clone (the region is present both in
+        // the inherited bytes and in the inherited kernel mapping table). It
+        // MUST reuse that exact base instead of reserving a fresh one: a fresh
+        // `mmap` would allocate a SECOND module region on top of the inherited
+        // one (the inherited region's base is already mapped, so first-fit skips
+        // it and grows the memory), double-counting ~88 pages and inflating the
+        // child's observable `memory.size` — which breaks the fork memory-clone
+        // invariant (a forked child must observe the parent's EXACT size). The
+        // kernel host passes the parent's base via `forkModuleInheritedBase`
+        // (see `handleOrdinaryFork`). A borrowed (vfork) child is excluded: it
+        // does not clone memory and reserves its own on-demand region that it
+        // munmaps after replay, so it never inherits a durable base.
+        const inheritForkModuleRegion =
+          initData.isForkChild === true &&
+          !borrowedForkChild &&
+          initData.forkModuleInheritedBase !== undefined;
+        const inheritedForkModuleBase = initData.forkModuleInheritedBase;
         forkModuleInstance = instantiateForkModule({
           module: forkModuleModule,
           memory,
           ptrWidth,
-          reserve: (size) =>
-            continuationMmap(memory, channelOffset, size, `pid=${pid}: fork-module`),
+          reserve: (size) => {
+            if (inheritForkModuleRegion) {
+              // Reuse the inherited region rather than mmapping a fresh one. The
+              // size is deterministic (same module) so a mismatch against the
+              // parent's reserved byte length is a fork-plumbing bug, not a
+              // resource condition — fail loud instead of silently re-reserving.
+              if (
+                initData.forkModuleInheritedBytes !== undefined &&
+                initData.forkModuleInheritedBytes !== size
+              ) {
+                throw new Error(
+                  `pid=${pid}: inherited fork-module region size ` +
+                    `${initData.forkModuleInheritedBytes} does not match this ` +
+                    `worker's computed size ${size}`,
+                );
+              }
+              return inheritedForkModuleBase!;
+            }
+            return continuationMmap(
+              memory,
+              channelOffset,
+              size,
+              `pid=${pid}: fork-module`,
+            );
+          },
           label: `pid=${pid}: fork-module`,
           resolveExternref: forkModuleHostCapabilities.imports.resolve_externref,
         });
+        // Publish this worker's co-resident fork-module region so the kernel
+        // host can hand a COPIED fork child the SAME base to reuse (above). A
+        // borrowed (vfork) child's region is temporary (munmapped after replay),
+        // so it is never reported as an inheritable base.
+        if (!borrowedForkChild) {
+          port.postMessage({
+            type: "fork_module_region",
+            pid,
+            base: forkModuleInstance.memoryBase,
+            bytes: forkModuleInstance.regionBytes,
+          } satisfies WorkerToHostMessage);
+        }
         // STORE #2: wrap the fork-module's OWN exported transit table so the
         // registry binds the guest's `__wpk_fork_ref_gc_transit` import (and this
         // host's `host_transit_publish`/`host_transit_read` seam) to the exact
@@ -3692,6 +3745,18 @@ export async function centralizedWorkerMain(
         // dlopen-vfork ("mode-1") via `addActivationBorrowedChildReplay`. The
         // coordinator's `attachBorrowedModuleChild` handles both.
         if (useForkModule) {
+          // Stage the backend's small pre-fork guest buffers into the dedicated
+          // slab reserved inside the fork-module region rather than mmapping a
+          // fresh, memory-growing region per staging. The slab is part of the
+          // single reused region, so a COPIED fork child (which reuses the whole
+          // region via `forkModuleInheritedBase`) stages into the SAME slab and
+          // its `memory.size` stays equal to the parent's — a growing channel
+          // mmap here would land at the child's inherited (higher) mmap cursor
+          // and inflate the clone. A staging request larger than the slab (a
+          // large GC codec) falls back to the growing channel mmap; that path
+          // never asserts an exact memory size, so its growth is invisible.
+          const forkModuleStagingBase = forkModuleInstance.stagingBase;
+          const forkModuleStagingBytes = forkModuleInstance.stagingBytes;
           forkModuleBackend = new ForkModuleContinuationBackend({
             exports: forkModuleInstance.exports,
             memory,
@@ -3701,23 +3766,27 @@ export async function centralizedWorkerMain(
             // Option B: the module mmaps its own frame chunks through the guest
             // syscall channel; the host reserves no per-fork frame arena. These
             // reserve/release hooks remain ONLY for the small pre-fork catalog
-            // scratch (setup()/setActivationResumeCatalog).
+            // scratch (setup()/setActivationResumeCatalog) and GC-codec staging.
             channelBase: channelOffset,
             reserveRegion: (size) =>
-              continuationMmap(
-                memory,
-                channelOffset,
-                size,
-                `pid=${pid}: fork-module catalog scratch`,
-              ),
-            releaseRegion: (addr, size) =>
+              size <= forkModuleStagingBytes
+                ? forkModuleStagingBase
+                : continuationMmap(
+                    memory,
+                    channelOffset,
+                    size,
+                    `pid=${pid}: fork-module catalog scratch`,
+                  ),
+            releaseRegion: (addr, size) => {
+              if (addr === forkModuleStagingBase) return;
               continuationMunmap(
                 memory,
                 channelOffset,
                 addr,
                 size,
                 `pid=${pid}: fork-module catalog scratch`,
-              ),
+              );
+            },
             pid,
             label: `pid=${pid}: fork-module`,
           });
@@ -6636,6 +6705,13 @@ export async function centralizedThreadWorkerMain(
         threadActivationRegistry!.adoptGcTransit(
           threadForkModuleInstance.gcTransitTable,
         );
+        // Stage into the dedicated slab inside this thread's fork-module region
+        // rather than a growing channel mmap (see the process-worker path for
+        // the full rationale): keeps the staging from permanently growing the
+        // shared process memory a fork-from-thread child would clone.
+        const threadForkModuleStagingBase = threadForkModuleInstance.stagingBase;
+        const threadForkModuleStagingBytes =
+          threadForkModuleInstance.stagingBytes;
         threadForkModuleBackend = new ForkModuleContinuationBackend({
           exports: threadForkModuleInstance.exports,
           memory,
@@ -6647,20 +6723,24 @@ export async function centralizedThreadWorkerMain(
           // reserve/release hooks remain ONLY for the pre-fork catalog scratch.
           channelBase: channelOffset,
           reserveRegion: (size) =>
-            continuationMmap(
-              memory,
-              channelOffset,
-              size,
-              `pid=${pid} tid=${tid}: fork-module catalog scratch`,
-            ),
-          releaseRegion: (addr, size) =>
+            size <= threadForkModuleStagingBytes
+              ? threadForkModuleStagingBase
+              : continuationMmap(
+                  memory,
+                  channelOffset,
+                  size,
+                  `pid=${pid} tid=${tid}: fork-module catalog scratch`,
+                ),
+          releaseRegion: (addr, size) => {
+            if (addr === threadForkModuleStagingBase) return;
             continuationMunmap(
               memory,
               channelOffset,
               addr,
               size,
               `pid=${pid} tid=${tid}: fork-module catalog scratch`,
-            ),
+            );
+          },
           pid,
           label: `pid=${pid} tid=${tid}: fork-module`,
         });

@@ -359,8 +359,17 @@ export interface ForkModuleInstance {
   exports: ForkModuleExports;
   /** First byte of the host-reserved region (== `__memory_base`). */
   memoryBase: number;
-  /** Total reserved bytes: static/BSS footprint plus the shadow stack. */
+  /** Total reserved bytes: static/BSS footprint, staging slab, and shadow stack. */
   regionBytes: number;
+  /**
+   * First byte of the backend staging slab reserved inside this region (see
+   * `FORK_MODULE_STAGING_BYTES`). The backend stages its small pre-fork guest
+   * buffers here instead of `mmap`ping a fresh, memory-growing region, keeping a
+   * COPIED fork child's `memory.size` equal to the parent's.
+   */
+  stagingBase: number;
+  /** Byte length of the staging slab (== `FORK_MODULE_STAGING_BYTES`). */
+  stagingBytes: number;
   /** The module's own (empty) indirect function table. */
   table: WebAssembly.Table;
   /**
@@ -401,6 +410,29 @@ export interface ForkModuleInstance {
  * codec while staying far below the ~4 MiB static footprint.
  */
 const FORK_MODULE_SHADOW_STACK_BYTES = 1 << 20;
+
+/**
+ * A dedicated, persistent staging slab reserved INSIDE the fork-module region
+ * for the backend's small pre-fork guest buffers (the resume-catalog ordinals
+ * `setup()`/`setActivationResumeCatalog` copy in, and per-activation GC-codec
+ * bytes). Before this slab existed the backend `mmap`'d each staging buffer
+ * from the guest syscall channel and released it after the module copied it
+ * into its own arena. That transient `mmap` GROWS the process memory and never
+ * shrinks (the kernel does not reclaim on munmap), and — critically — a COPIED
+ * fork child re-runs this staging at its INHERITED (higher) mmap cursor, so the
+ * child's staging landed at the top of the cloned memory and grew it by a page
+ * that the parent had staged lower. That broke the fork memory-clone invariant
+ * (child `memory.size` must equal the parent's). Staging into a slab that is
+ * part of the single reused fork-module region makes it symmetric: the parent
+ * and child reuse the SAME slab (a COPIED child reuses the whole region via
+ * `forkModuleInheritedBase`), so no staging `mmap` grows either one. One page
+ * holds the full resume catalog (`FORK_MODULE_RESUME_CATALOG_CAP` = 16384
+ * ordinals * 4 bytes = 65536). A staging request larger than the slab (a large
+ * GC codec) falls back to the growing channel `mmap` — that path never asserts
+ * an exact memory size, so its growth is invisible; see `worker-main`'s backend
+ * `reserveRegion`.
+ */
+const FORK_MODULE_STAGING_BYTES = 1 << 16;
 
 const WASM_DYLINK_MEM_INFO = 1;
 
@@ -471,7 +503,13 @@ export function instantiateForkModule(
   const memInfo = readForkModuleMemInfo(module, label);
 
   const staticBytes = alignUp(memInfo.memorySize, memInfo.memoryAlignBytes);
-  const regionBytes = staticBytes + FORK_MODULE_SHADOW_STACK_BYTES;
+  // Layout of the reserved region (low -> high):
+  //   [memoryBase, +staticBytes)                     static data + BSS
+  //   [+staticBytes, +stagingBytes)                  backend staging slab
+  //   [.., +FORK_MODULE_SHADOW_STACK_BYTES)          shadow stack (grows down)
+  const stagingBytes = FORK_MODULE_STAGING_BYTES;
+  const regionBytes =
+    staticBytes + stagingBytes + FORK_MODULE_SHADOW_STACK_BYTES;
 
   const memoryBase = reserve(regionBytes);
   if (!Number.isSafeInteger(memoryBase) || memoryBase < 0) {
@@ -581,6 +619,11 @@ export function instantiateForkModule(
     );
   }
 
+  // The staging slab sits directly above the module's static/BSS footprint and
+  // below the shadow stack. Its base inherits `staticBytes`' alignment (>= 8),
+  // which satisfies the 4-byte alignment `fm_set_resume_catalog` needs.
+  const stagingBase = memoryBase + staticBytes;
+
   const exports = instance.exports as ForkModuleExports;
   const missing = FORK_MODULE_REQUIRED_EXPORTS.filter((name) =>
     FORK_MODULE_TABLE_EXPORTS.has(name)
@@ -602,6 +645,8 @@ export function instantiateForkModule(
     exports,
     memoryBase,
     regionBytes,
+    stagingBase,
+    stagingBytes,
     table,
     functionCatalog,
     driveTable,
