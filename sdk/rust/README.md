@@ -35,6 +35,20 @@ std) built via a linked private toolchain — see
 `docs/plans/2026-09-07-rust-std-target-implementation.md` (Milestone 1)
 and `scripts/build-rust-sysroot.sh` once it lands.
 
+## Quick start: `wasm32posix-cargo`
+
+From a Rust package directory, inside `scripts/dev-shell.sh`:
+
+```
+wasm32posix-cargo run --release -- [prog args]   # build + (instrument) + run
+wasm32posix-cargo build --release                # just build
+```
+
+The wrapper assembles the private sysroot on first use, injects the
+target spec + `-Z build-std` flags + `RUSTC` wrapper + the musl-time64
+env var, and fork-instruments any output that uses fork (e.g.
+`std::process`). The manual flow below is what it automates.
+
 ## Building a full-`std` program (bin crate)
 
 `std` programs use a normal `fn main` and are linked directly by the SDK

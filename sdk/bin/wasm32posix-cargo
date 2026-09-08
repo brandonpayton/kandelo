@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# wasm32posix-cargo — Build Rust programs for wasm32-unknown-kandelo with
+# one command. Wraps `cargo` with the target spec, the `-Z build-std`
+# flags, the private-sysroot `rustc` wrapper, and the musl-time64 env var,
+# then fork-instruments any output that uses fork (std::process, etc.).
+#
+# Usage (inside scripts/dev-shell.sh), from a Rust package directory:
+#   wasm32posix-cargo build [--release] [cargo args...]
+#   wasm32posix-cargo run   [--release] [-- prog args...]   # build + run
+#
+# The first invocation assembles the private sysroot on demand via
+# scripts/build-rust-sysroot.sh (idempotent).
+
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+SPEC="$REPO_ROOT/sdk/rust/wasm32-unknown-kandelo-std.json"
+TRIPLE="wasm32-unknown-kandelo-std"
+OUT_DIR="${KANDELO_RUST_DIR:-$HOME/.kandelo/rust}"
+RUSTC_WRAP="$OUT_DIR/rustc-kandelo"
+FORK_INSTRUMENT="$REPO_ROOT/scripts/run-wasm-fork-instrument.sh"
+RUNNER="$REPO_ROOT/examples/run-wasm.ts"
+
+command -v cargo >/dev/null || { echo "cargo not on PATH; run inside scripts/dev-shell.sh" >&2; exit 1; }
+
+if [ ! -x "$RUSTC_WRAP" ] || [ ! -d "$OUT_DIR/sysroot/lib/rustlib/src/rust/library" ]; then
+  echo "==> Assembling Rust sysroot (first run)…" >&2
+  bash "$REPO_ROOT/scripts/build-rust-sysroot.sh" >&2
+fi
+
+SUBCMD="${1:-}"
+[ -n "$SUBCMD" ] || { echo "usage: wasm32posix-cargo <build|run> [args...]" >&2; exit 2; }
+shift || true
+
+# Separate cargo args from post-`--` program args (for `run`).
+CARGO_ARGS=()
+PROG_ARGS=()
+seen_dashdash=0
+PROFILE_DIR="debug"
+for a in "$@"; do
+  if [ "$seen_dashdash" = 1 ]; then PROG_ARGS+=("$a"); continue; fi
+  case "$a" in
+    --) seen_dashdash=1 ;;
+    --release|-r) PROFILE_DIR="release"; CARGO_ARGS+=("$a") ;;
+    *) CARGO_ARGS+=("$a") ;;
+  esac
+done
+
+export RUSTC="$RUSTC_WRAP"
+export RUST_LIBC_UNSTABLE_MUSL_V1_2_3=1
+
+BUILD_FLAGS=(
+  -Z unstable-options
+  -Z json-target-spec
+  -Z build-std=std,panic_abort
+  --target "$SPEC"
+)
+
+# Fork-instrument every fork-using output wasm (the kernel refuses an
+# uninstrumented artifact at guest-initiated exec). Non-fork programs are
+# left as-is. Returns the list of top-level output wasms via stdout.
+instrument_outputs() {
+  local dir="target/$TRIPLE/$PROFILE_DIR"
+  [ -d "$dir" ] || return 0
+  local w
+  for w in "$dir"/*.wasm; do
+    [ -e "$w" ] || continue
+    if grep -qa "kernel_fork" "$w"; then
+      echo "==> fork-instrumenting $(basename "$w")" >&2
+      bash "$FORK_INSTRUMENT" "$w" -o "$w.inst" >&2
+      mv "$w.inst" "$w"
+    fi
+    echo "$w"
+  done
+}
+
+case "$SUBCMD" in
+  build)
+    cargo build "${BUILD_FLAGS[@]}" "${CARGO_ARGS[@]}"
+    instrument_outputs >/dev/null
+    ;;
+  run)
+    cargo build "${BUILD_FLAGS[@]}" "${CARGO_ARGS[@]}"
+    mapfile -t WASMS < <(instrument_outputs)
+    if [ "${#WASMS[@]}" -eq 0 ]; then
+      echo "no output .wasm found in target/$TRIPLE/$PROFILE_DIR" >&2; exit 1
+    elif [ "${#WASMS[@]}" -gt 1 ]; then
+      echo "multiple outputs; run one explicitly:" >&2
+      printf '  npx tsx %s %s\n' "$RUNNER" "${WASMS[@]}" >&2; exit 1
+    fi
+    exec npx tsx "$RUNNER" "${WASMS[0]}" "${PROG_ARGS[@]}"
+    ;;
+  *)
+    cargo "$SUBCMD" "${BUILD_FLAGS[@]}" "${CARGO_ARGS[@]}"
+    ;;
+esac
