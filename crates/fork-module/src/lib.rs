@@ -4737,21 +4737,33 @@ mod wasm {
     /// counters are monotonic non-negative, so `-1` is an unambiguous sentinel).
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_stats(field: u32) -> i64 {
-        let value = match field {
-            0 => FRAMES_COMMITTED.load(Ordering::Relaxed),
-            1 => FRAMES_REPLAYED.load(Ordering::Relaxed),
-            2 => REFERENCES_RECONSTRUCTED.load(Ordering::Relaxed),
-            3 => EXTERNREFS_RESOLVED.load(Ordering::Relaxed),
-            4 => EXNREFS_RECONSTRUCTED.load(Ordering::Relaxed),
-            5 => GC_NODES_RECONSTRUCTED.load(Ordering::Relaxed),
-            6 => STATIC_ROOTS_PUBLISHED.load(Ordering::Relaxed),
-            7 => DRIVE_STEPS_EXECUTED.load(Ordering::Relaxed),
-            8 => REFERENCE_FEED_READS.load(Ordering::Relaxed),
-            9 => REFERENCE_GRAPHS_DECODED.load(Ordering::Relaxed),
-            10 => EXTERNREF_HANDLES_SCANNED.load(Ordering::Relaxed),
-            _ => return -1,
-        };
-        value as i64
+        // Index a table of references rather than `match`-ing over the eleven
+        // atomic loads directly: a `match field { 0 => A.load(), 1 => B.load(),
+        // ... }` compiles to a `br_table` selecting among eleven distinct
+        // memory-base-relative atomic loads, which miscompiled after fork-module
+        // injection (arms read a stale/zero value even though the counter had
+        // advanced -- confirmed by an in-scope diagnostic reader seeing the real
+        // value while the same-static `match` arm returned 0). Building one
+        // reference table and doing a single bounds-checked `.get` + load is a
+        // single computed-address load with no `br_table`, which codegens
+        // correctly.
+        let stats: [&AtomicU64; 11] = [
+            &FRAMES_COMMITTED,
+            &FRAMES_REPLAYED,
+            &REFERENCES_RECONSTRUCTED,
+            &EXTERNREFS_RESOLVED,
+            &EXNREFS_RECONSTRUCTED,
+            &GC_NODES_RECONSTRUCTED,
+            &STATIC_ROOTS_PUBLISHED,
+            &DRIVE_STEPS_EXECUTED,
+            &REFERENCE_FEED_READS,
+            &REFERENCE_GRAPHS_DECODED,
+            &EXTERNREF_HANDLES_SCANNED,
+        ];
+        match stats.get(field as usize) {
+            Some(counter) => counter.load(Ordering::Relaxed) as i64,
+            None => -1,
+        }
     }
 
     /// The sticky errno of the most recent export call (0 == success).
