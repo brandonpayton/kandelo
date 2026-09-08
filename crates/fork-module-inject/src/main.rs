@@ -122,6 +122,14 @@ const DRIVE_OP_EXTERNREF_TRANSIT: i32 = 4;
 /// must NOT bump that counter (it gates the "reference-free fork stays silent"
 /// diagnostic). The shim still `call_indirect`s them; it just skips the bump.
 const DRIVE_OP_RESTORE: i32 = 5;
+/// op == run one activation's guest `wpk_fork_rewind_begin(root)` — the first
+/// POINTER-argument drive op. Every op `>= DRIVE_OP_REWIND_BEGIN` drives a guest
+/// export whose single parameter is the continuation `root` pointer (`i32` on
+/// wasm32, `i64` on wasm64), NOT the `(i32)` activation id / recipe the RESTORE /
+/// ALLOC family passes, so the shim reconstructs the pointer from the step's
+/// `recipe` (high 32) / `arg` (low 32) fields and `call_indirect`s it through a
+/// `(ptr) -> ()` type. MUST match `fork_codec::drive_plan::DRIVE_OP_REWIND_BEGIN`.
+const DRIVE_OP_REWIND_BEGIN: i32 = 7;
 
 /// The Rust helper the injected shim calls to map a recipe id to a catalog
 /// ordinal (or the null sentinel). Exported by `crates/fork-module/src/lib.rs`.
@@ -462,8 +470,13 @@ fn inject_drive_execute(module: &mut Module) -> Result<()> {
     );
 
     // The guest `_gc_allocate`/`_gc_fill` signature the shim `call_indirect`s:
-    // `(i32) -> ()` (see `WPK_FORK_REFERENCE_EXPORT_GC_ALLOCATE` in abi.ts).
+    // `(i32) -> ()` (see `WPK_FORK_REFERENCE_EXPORT_GC_ALLOCATE` in abi.ts). Also
+    // the RESTORE / FINISH_RESTORE guest exports (`(i32 activation) -> ()`).
     let indirect_ty = module.types.add(&[ValType::I32], &[]);
+    // The guest `wpk_fork_rewind_begin`/`wpk_fork_abort_begin` signature the shim
+    // `call_indirect`s for a REWIND_BEGIN / ABORT_BEGIN step: `(ptr) -> ()`
+    // (`i32` on wasm32 — identical to `indirect_ty` there — `i64` on wasm64).
+    let ptr_indirect_ty = module.types.add(&[ptr_ty], &[]);
 
     let mut builder =
         FunctionBuilder::new(&mut module.types, &[ptr_ty, ValType::I32], &[]);
@@ -648,9 +661,65 @@ fn inject_drive_execute(module: &mut Module) -> Result<()> {
                                         |_| {},
                                     );
                             },
-                            // Real guest drive: call_indirect guest[slot](arg), then
-                            // (if ALLOC) assert the guest published a live GC object
-                            // into STORE #2 at slot `recipe + 1`.
+                            // Real guest drive. Two shapes, split on the op:
+                            //   op >= DRIVE_OP_REWIND_BEGIN (REWIND_BEGIN/ABORT_BEGIN):
+                            //     the guest export takes the continuation ROOT pointer,
+                            //     `call_indirect (ptr)->()`; the root is reconstructed
+                            //     from recipe (high 32) / arg (low 32).
+                            //   otherwise (ALLOC/FILL/EXN/RESTORE/FINISH_RESTORE):
+                            //     `call_indirect (i32)->()` with `arg`, then (if ALLOC)
+                            //     the store-#2 published-object assert.
+                            |drive| {
+                        drive
+                            .local_get(op)
+                            .i32_const(DRIVE_OP_REWIND_BEGIN)
+                            .binop(BinaryOp::I32GeU);
+                        drive.if_else(
+                            None,
+                            // Pointer-argument drive: call_indirect guest[slot](root).
+                            |ptr_drive| {
+                                if is64 {
+                                    // root = (extend_u(recipe) << 32) | extend_u(arg)
+                                    ptr_drive
+                                        .local_get(step)
+                                        .load(
+                                            memory,
+                                            LoadKind::I32 { atomic: false },
+                                            MemArg { align: 4, offset: DRIVE_STEP_OFF_RECIPE },
+                                        )
+                                        .unop(UnaryOp::I64ExtendUI32)
+                                        .i64_const(32)
+                                        .binop(BinaryOp::I64Shl)
+                                        .local_get(step)
+                                        .load(
+                                            memory,
+                                            LoadKind::I32 { atomic: false },
+                                            MemArg { align: 4, offset: DRIVE_STEP_OFF_ARG },
+                                        )
+                                        .unop(UnaryOp::I64ExtendUI32)
+                                        .binop(BinaryOp::I64Or);
+                                } else {
+                                    // root = arg (whole i32 pointer; recipe is 0)
+                                    ptr_drive.local_get(step).load(
+                                        memory,
+                                        LoadKind::I32 { atomic: false },
+                                        MemArg { align: 4, offset: DRIVE_STEP_OFF_ARG },
+                                    );
+                                }
+                                // slot (i32 table index) then call_indirect (ptr)->().
+                                ptr_drive
+                                    .local_get(step)
+                                    .load(
+                                        memory,
+                                        LoadKind::I32 { atomic: false },
+                                        MemArg { align: 4, offset: DRIVE_STEP_OFF_SLOT },
+                                    )
+                                    .instr(CallIndirect {
+                                        ty: ptr_indirect_ty,
+                                        table: drive_table,
+                                    });
+                            },
+                            // (i32)-argument drive: the existing family.
                             |drive| {
                         // call_indirect guest[slot](arg): push arg, then slot.
                         drive
@@ -695,6 +764,8 @@ fn inject_drive_execute(module: &mut Module) -> Result<()> {
                                     );
                             },
                             |_| {},
+                        );
+                            },
                         );
                             },
                         );
