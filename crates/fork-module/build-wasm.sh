@@ -109,17 +109,17 @@ if [[ "${1:-}" == "--verify-fresh" ]]; then
       status=1
       continue
     fi
-    echo "fork-module: $artifact matches current source ($current_sha)"
+    echo "fork-module: $artifact matches current source ($current_sha)" >&2
   done
   exit "$status"
 fi
 
-echo "== building fork-module (PIC side module, wasm32) =="
+echo "== building fork-module (PIC side module, wasm32) ==" >&2
 RUSTFLAGS="${PIC_RUSTFLAGS[*]}" \
   cargo build --release -p fork-module --target wasm32-unknown-unknown -Z build-std=core,alloc
 
 WASM32="target/wasm32-unknown-unknown/release/fork_module.wasm"
-echo "wasm32 artifact: $WASM32"
+echo "wasm32 artifact: $WASM32" >&2
 
 # Build the host-only post-build injector (Phase 6 D6.1). Rust cannot emit the
 # `__wpk_fork_ref_decode_funcref` export (a function that RETURNS a funcref by
@@ -127,7 +127,7 @@ echo "wasm32 artifact: $WASM32"
 # function — wired to the module's Rust `fm_funcref_ordinal` helper and a new
 # `env.__wpk_fork_function_catalog` funcref-table import — into the compiled
 # module before staging. See crates/fork-module-inject.
-echo "== building fork-module injector (host) =="
+echo "== building fork-module injector (host) ==" >&2
 # The repo `.cargo/config.toml` defaults `build.target` to wasm32; the injector
 # is a HOST tool (it needs std + walrus), so build it for the host triple
 # ($HOST_TRIPLE was already resolved above, for the freshness stamp).
@@ -169,7 +169,7 @@ stage_fork_module() {
   cp "$src" "$REPO_ROOT/local-binaries/$name"
   cp "$src" "$REPO_ROOT/host/wasm/$name"
   printf '%s\n' "$FRESH_CLOSURE_SHA" > "$(build_key_path "$width")"
-  echo "staged $name -> local-binaries/$name, host/wasm/$name (build-key $FRESH_CLOSURE_SHA)"
+  echo "staged $name -> local-binaries/$name, host/wasm/$name (build-key $FRESH_CLOSURE_SHA)" >&2
 }
 FRESH_CLOSURE_SHA="$(closure_sha)"
 stage_fork_module "$WASM32" 32
@@ -177,22 +177,22 @@ stage_fork_module "$WASM32" 32
 # The wasm64 (`pointer_width = 8` guest) variant. wasm64-unknown-unknown is a
 # tier-3 target built entirely from source via build-std. Best-effort: a wasm64
 # guest is not yet exercised by the harness, so a failure here is non-fatal.
-echo "== building fork-module (PIC side module, wasm64, best-effort) =="
+echo "== building fork-module (PIC side module, wasm64, best-effort) ==" >&2
 if RUSTFLAGS="${PIC_RUSTFLAGS[*]}" \
     cargo build --release -p fork-module --target wasm64-unknown-unknown -Z build-std=core,alloc; then
   WASM64="target/wasm64-unknown-unknown/release/fork_module.wasm"
-  echo "wasm64 artifact: $WASM64"
+  echo "wasm64 artifact: $WASM64" >&2
   inject_funcref_decode "$WASM64"
   stage_fork_module "$WASM64" 64
 else
-  echo "wasm64 build unavailable on this toolchain (wasm32 is sufficient for this slice)"
+  echo "wasm64 build unavailable on this toolchain (wasm32 is sufficient for this slice)" >&2
 fi
 
 if [[ "${1:-}" == "--run" ]]; then
-  echo "== running co-residency harness (wasm32) =="
+  echo "== running co-residency harness (wasm32) ==" >&2
   node crates/fork-module/tests/harness.mjs "$WASM32"
-  echo "== running multi-activation frame-routing harness (wasm32) =="
+  echo "== running multi-activation frame-routing harness (wasm32) ==" >&2
   node crates/fork-module/tests/harness-multi-activation.mjs "$WASM32"
-  echo "== running reference-capture session harness (wasm32) =="
+  echo "== running reference-capture session harness (wasm32) ==" >&2
   node crates/fork-module/tests/harness-capture.mjs "$WASM32"
 fi
