@@ -878,6 +878,187 @@ pub(crate) fn verify_fresh_report(repo: &Path) -> Result<(), String> {
     // sources -- so run that check too, gated to keep the local no-op path
     // fast.
     snapshot_drift_check(repo, false)?;
+    // L5: the kernel is not the only artifact projected into the SourceOnlyV1
+    // root and served to the browser by the pinned-projection resolver. The
+    // co-resident fork-module (`fork_module{32,64}.wasm`) is built out-of-band
+    // and projected too, and a fork-module source change can leave the
+    // published projection stale while `kernel.wasm` stays fresh. Gate it here
+    // so `verify-fresh` fails loud instead of green-lighting a boot the
+    // resolver will 500.
+    verify_fresh_coresident_fork_module(repo)?;
+    Ok(())
+}
+
+/// L5 freshness gate for the PROJECTED co-resident fork-module.
+///
+/// `crates/fork-module/build-wasm.sh` builds `fork_module{32,64}.wasm`
+/// out-of-band (no `packages/registry/<name>/build.toml`), and the local-build
+/// engine projects them into the SourceOnlyV1 root as first-class owned members
+/// alongside `kernel.wasm` (see `coresident_fork_module_projection` /
+/// `coresident_fork_module_nodes`). The browser's pinned-projection resolver
+/// (`binary-resolver.ts` / `source-only-vite-assets.ts`) serves each fork-module
+/// member and validates the fetched bytes against the size + sha the projection
+/// manifest declares for it.
+///
+/// The kernel `verify-fresh` backstop above only proves `kernel.wasm` is fresh.
+/// Left ungated, a fork-module rebuild that changes the wasm size leaves the
+/// manifest declaring the OLD size while the staged bytes are new, and the boot
+/// 500s ("member size is X, expected Y") with `verify-fresh` reporting green.
+/// This closes that seam by failing loud on either staleness dimension:
+///
+///  1. **Stale vs source.** Each projected fork-module node records the
+///     fork-module cargo-closure digest it was built for as its
+///     `cacheKeySha256` (the same `workspace_crates_closure_sha` digest the
+///     build-key stamp carries). Recompute it from the CURRENT source tree; any
+///     drift means the projected module was built from older sources.
+///  2. **Stale mirror (the direct browser-500 condition).** The bytes staged at
+///     the projection root must match the size + sha the manifest declares,
+///     because that is exactly what the resolver validates the fetched member
+///     against.
+///
+/// Mirrors the kernel check's "not projected yet -> Ok" semantics: a missing
+/// manifest, or one that carries no fork-module node, is not a staleness error.
+fn verify_fresh_coresident_fork_module(repo: &Path) -> Result<(), String> {
+    let output_root = repo.join("local-binaries").join("source-only-v1");
+    let manifest_path = output_root
+        .join(".kandelo")
+        .join("source-only-program-projection-v1.json");
+    let bytes = match fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("read {}: {error}", manifest_path.display())),
+    };
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse {}: {error}", manifest_path.display()))?;
+
+    // Freshness signal 1 (stale vs source): recompute the current fork-module
+    // closure digest once and compare every projected node against it. Computed
+    // here (needs `cargo metadata` on `repo`) and handed to the pure validator
+    // so the validator itself is unit-testable without a Cargo workspace.
+    let current_closure = crate::util::hex(&crate::cargo_closure::workspace_crates_closure_sha(
+        repo,
+        &["fork-module".to_string(), "fork-module-inject".to_string()],
+    )?);
+
+    check_projected_fork_module_freshness(&manifest, &current_closure, &output_root, &manifest_path)
+}
+
+/// Pure validator for [`verify_fresh_coresident_fork_module`]: given the parsed
+/// projection `manifest`, the `current_closure` digest recomputed from source,
+/// and the `output_root` the fork-module members are staged under, fail loud on
+/// either staleness dimension (see the caller's doc). Split out with no I/O
+/// beyond reading the already-staged member files so it can be unit-tested with
+/// a synthetic manifest and a known closure, without a Cargo workspace.
+fn check_projected_fork_module_freshness(
+    manifest: &serde_json::Value,
+    current_closure: &str,
+    output_root: &Path,
+    manifest_path: &Path,
+) -> Result<(), String> {
+    let nodes = manifest
+        .get("nodes")
+        .and_then(|nodes| nodes.as_array())
+        .ok_or_else(|| format!("{}: manifest has no nodes array", manifest_path.display()))?;
+
+    let fork_nodes: Vec<&serde_json::Value> = nodes
+        .iter()
+        .filter(|node| {
+            node.get("node")
+                .and_then(|id| id.get("name"))
+                .and_then(|name| name.as_str())
+                == Some(CORESIDENT_FORK_MODULE_NODE_NAME)
+        })
+        .collect();
+    if fork_nodes.is_empty() {
+        // No fork-module projected (projection predates fork-module projection,
+        // or does not include it): nothing to verify here.
+        return Ok(());
+    }
+
+    for node in fork_nodes {
+        let arch = node
+            .get("node")
+            .and_then(|id| id.get("targetArch"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("<unknown-arch>");
+        let recorded_key = node
+            .get("cacheKeySha256")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "{}: projected fork-module node ({arch}) has no cacheKeySha256",
+                    manifest_path.display()
+                )
+            })?;
+        if recorded_key != current_closure {
+            return Err(format!(
+                "{} is stale: the projected co-resident fork-module ({arch}) was built for \
+                 closure key {recorded_key}, but the current source tree (crates/fork-module, \
+                 crates/fork-module-inject, crates/fork-codec, crates/shared) resolves to \
+                 {current_closure}. Rebuild + re-project with `./run.sh setup` (or a \
+                 `cargo xtask local-build` that finalizes the SourceOnly projection).",
+                manifest_path.display()
+            ));
+        }
+
+        // Freshness signal 2 (stale mirror -> the browser-500 condition): the
+        // staged bytes must match the size + sha the manifest declares.
+        let members = node
+            .get("members")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| {
+                format!(
+                    "{}: projected fork-module node ({arch}) has no members array",
+                    manifest_path.display()
+                )
+            })?;
+        for member in members {
+            let mirror_path = member
+                .get("mirrorPath")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    format!(
+                        "{}: projected fork-module member has no mirrorPath",
+                        manifest_path.display()
+                    )
+                })?;
+            let recorded_size = member
+                .get("size")
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| {
+                    format!(
+                        "{}: projected fork-module member {mirror_path} has no size",
+                        manifest_path.display()
+                    )
+                })?;
+            let recorded_sha = member
+                .get("sha256")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    format!(
+                        "{}: projected fork-module member {mirror_path} has no sha256",
+                        manifest_path.display()
+                    )
+                })?;
+            let staged = output_root.join(mirror_path);
+            let staged_bytes = fs::read(&staged)
+                .map_err(|error| format!("read projected {}: {error}", staged.display()))?;
+            let actual_size = staged_bytes.len() as u64;
+            let actual_sha = sha256_bytes(&staged_bytes);
+            if actual_size != recorded_size || actual_sha.as_str() != recorded_sha {
+                return Err(format!(
+                    "{} is stale: the projection manifest declares co-resident fork-module \
+                     member {mirror_path} as size {recorded_size} sha {recorded_sha}, but the \
+                     staged file is size {actual_size} sha {actual_sha}. The browser's \
+                     pinned-projection resolver validates each fetched member against the \
+                     manifest, so this mismatch would 500 the boot. Re-project with \
+                     `./run.sh setup` (or a `cargo xtask local-build` that finalizes the \
+                     SourceOnly projection).",
+                    manifest_path.display()
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -6288,6 +6469,146 @@ materialization = "lazy"
             err.contains("kernel.wasm has no __abi_version export"),
             "must name the missing export: {err}"
         );
+    }
+
+    // -- L5: projected co-resident fork-module freshness gate --
+    //
+    // Exercise the pure validator `check_projected_fork_module_freshness`
+    // directly with a synthetic projection manifest + staged member bytes and a
+    // known closure digest, so no Cargo workspace / `cargo metadata` run is
+    // needed. The outer `verify_fresh_coresident_fork_module` only adds the
+    // closure recompute + manifest read, both covered end-to-end against the
+    // real repo in the empirical validation step.
+
+    /// Build a one-node projection manifest for a fork-module width, declaring
+    /// the given member `size`/`sha256` and node `cache_key`.
+    fn fork_module_manifest(
+        arch: &str,
+        mirror_path: &str,
+        cache_key: &str,
+        size: u64,
+        sha256: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "nodes": [
+                {
+                    "node": { "kind": "package", "name": CORESIDENT_FORK_MODULE_NODE_NAME, "targetArch": arch },
+                    "manifestSha256": "00",
+                    "cacheKeySha256": cache_key,
+                    "cacheReceiptSha256": "00",
+                    "members": [
+                        { "sourceArtifact": mirror_path, "mirrorPath": mirror_path, "mode": 420, "size": size, "sha256": sha256 }
+                    ]
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn l5_passes_for_a_fresh_projected_fork_module() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output_root = temp.path().join("local-binaries/source-only-v1");
+        fs::create_dir_all(&output_root).unwrap();
+        let bytes = b"fork-module-bytes-fresh";
+        fs::write(output_root.join("fork_module32.wasm"), bytes).unwrap();
+        let sha = sha256_bytes(bytes);
+        let closure = "deadbeef";
+        let manifest =
+            fork_module_manifest("wasm32", "fork_module32.wasm", closure, bytes.len() as u64, &sha);
+        check_projected_fork_module_freshness(
+            &manifest,
+            closure,
+            &output_root,
+            &output_root.join(".kandelo/source-only-program-projection-v1.json"),
+        )
+        .expect("a fresh projected fork-module must verify clean");
+    }
+
+    #[test]
+    fn l5_fails_when_projected_fork_module_is_stale_vs_source() {
+        // The manifest was built for an OLD closure key; the current source
+        // resolves to a different one -> stale-vs-source.
+        let temp = tempfile::TempDir::new().unwrap();
+        let output_root = temp.path().join("local-binaries/source-only-v1");
+        fs::create_dir_all(&output_root).unwrap();
+        let bytes = b"fork-module-bytes";
+        fs::write(output_root.join("fork_module32.wasm"), bytes).unwrap();
+        let sha = sha256_bytes(bytes);
+        let manifest = fork_module_manifest(
+            "wasm32",
+            "fork_module32.wasm",
+            "oldclosurekey",
+            bytes.len() as u64,
+            &sha,
+        );
+        let err = check_projected_fork_module_freshness(
+            &manifest,
+            "newclosurekey",
+            &output_root,
+            &output_root.join(".kandelo/source-only-program-projection-v1.json"),
+        )
+        .unwrap_err();
+        assert!(err.contains("oldclosurekey"), "must name the recorded key: {err}");
+        assert!(err.contains("newclosurekey"), "must name the current key: {err}");
+        assert!(err.contains("was built for closure key"), "{err}");
+    }
+
+    #[test]
+    fn l5_fails_when_manifest_size_sha_disagree_with_staged_file() {
+        // The exact live browser-500 seam: the closure key still matches (not
+        // stale vs source) but the staged bytes differ from what the manifest
+        // declares, so the pinned-projection resolver would reject the member.
+        let temp = tempfile::TempDir::new().unwrap();
+        let output_root = temp.path().join("local-binaries/source-only-v1");
+        fs::create_dir_all(&output_root).unwrap();
+        let staged = b"the-actually-staged-newer-bytes";
+        fs::write(output_root.join("fork_module32.wasm"), staged).unwrap();
+        let closure = "matchingkey";
+        // Manifest declares a DIFFERENT (older/smaller) member than what is staged.
+        let manifest = fork_module_manifest(
+            "wasm32",
+            "fork_module32.wasm",
+            closure,
+            999,
+            &sha256_bytes(b"older-manifest-bytes"),
+        );
+        let err = check_projected_fork_module_freshness(
+            &manifest,
+            closure,
+            &output_root,
+            &output_root.join(".kandelo/source-only-program-projection-v1.json"),
+        )
+        .unwrap_err();
+        assert!(err.contains("would 500 the boot"), "must explain the browser impact: {err}");
+        assert!(
+            err.contains(&format!("{}", staged.len())),
+            "must report the actual staged size: {err}"
+        );
+    }
+
+    #[test]
+    fn l5_ok_when_no_fork_module_node_is_projected() {
+        // A manifest with nodes but no fork-module node: nothing to verify.
+        let manifest = serde_json::json!({ "nodes": [
+            { "node": { "kind": "package", "name": "kernel", "targetArch": "wasm32" },
+              "cacheKeySha256": "x", "members": [] }
+        ]});
+        check_projected_fork_module_freshness(
+            &manifest,
+            "anyclosure",
+            Path::new("/nonexistent"),
+            Path::new("/nonexistent/manifest.json"),
+        )
+        .expect("no fork-module node -> nothing to verify");
+    }
+
+    #[test]
+    fn l5_ok_when_no_projection_manifest_exists() {
+        // `verify_fresh_coresident_fork_module` treats an absent manifest as
+        // "not projected yet", mirroring the kernel check's NotFound -> Ok.
+        let temp = tempfile::TempDir::new().unwrap();
+        verify_fresh_coresident_fork_module(temp.path())
+            .expect("absent projection manifest must not fail freshness");
     }
 
     // -- snapshot_drift_check / abi_sources_changed_since_snapshot (B3) --
