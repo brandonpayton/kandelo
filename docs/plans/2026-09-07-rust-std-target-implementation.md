@@ -312,7 +312,29 @@ constants (`O_*`, signals, errno, `ipc_perm`) remain WALI values** — they
 compile but are runtime-wrong for Kandelo, whose ABI is pinned in
 `crates/shared/src/lib.rs` and `libc/musl-overlay/bits/`.
 
-### Milestone 2.5 — Reconcile the wasm32 libc leaf to Kandelo's ABI
+### Milestone 2.5 — Reconcile the wasm32 libc leaf to Kandelo's ABI — DONE
+
+**Done** (`c7b5fcc62`): reconciled the wasm32 leaf from WALI (x86_64) to
+Kandelo's `wasm32posix` musl ABI. 279 `SYS_*` numbers rewritten to the
+overlay's `bits/syscall.h.in` / `crates/shared` numbering (`read` 0→3,
+`write` 1→4, `futex` 202→200, `getrandom` 318→120, …); `O_LARGEFILE` and
+`F_GETLK/SETLK/SETLKW` fixed for 32-bit `long`; seven struct-size guards
+added (`siginfo_t`=128, `stack_t`=12, `statfs`=88, `sysinfo`=312,
+`msghdr`=28, `iovec`=8, `cmsghdr`=12) alongside the existing `stat`=112.
+Audited-and-unchanged (already match the overlay): signal numbers,
+`SA_*`, errno, `MAP_*`, `SOCK_*`/`AF_*`, ioctl/termios. All four fixtures
+re-verified passing.
+
+**Documented caveat (honest boundary):** 81 `SYS_*` names have no Kandelo
+`__NR_*` counterpart (Linux syscalls Kandelo doesn't implement); their
+inherited x86_64 values were kept (no authoritative source to reconcile
+to). 41 of those collide with a real Kandelo syscall number (e.g.
+`SYS_creat`=85 == Kandelo `truncate`=85). Nothing in std or the fixtures
+references them, but a future `syscall(SYS_creat, …)` would misdispatch.
+Resolving cleanly needs a kernel/overlay number assignment or removing
+the constants — an API-surface change, deferred.
+
+### Milestone 2.5 (original scope note)
 
 **This gates M4 runtime correctness.** A `std` program may compile and
 link but pass wrong flag/errno/struct values to Kandelo's musl until this
