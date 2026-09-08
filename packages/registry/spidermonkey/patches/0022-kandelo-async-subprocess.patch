@@ -1,0 +1,631 @@
+--- a/js/src/shell/js.cpp
++++ b/js/src/shell/js.cpp
+@@ -62,6 +62,7 @@
+ #    include <arpa/inet.h>
+ #    include <netdb.h>
+ #    include <netinet/in.h>
++#    include <spawn.h>
+ #    include <sys/mman.h>
+ #    include <sys/socket.h>
+ #    include <sys/wait.h>
+@@ -777,6 +778,7 @@
+   TlsConnect,
+   TlsRead,
+   TlsWrite,
++  Child,
+ };
+ 
+ struct KandeloSocketWatch {
+@@ -791,6 +793,7 @@
+   SSL_CTX* tlsCtx = nullptr;
+   int tlsHandle = -1;
+   bool closeFdOnCleanup = false;
++  pid_t childPid = -1;
+   KandeloSocketWatch* next = nullptr;
+ 
+   KandeloSocketWatch(JSContext* cx, int fd, KandeloSocketWatchKind kind,
+@@ -850,15 +853,118 @@
+   if (!array) return false;
+   RootedValue resolved(cx, ObjectValue(*array));
+   return JS::ResolvePromise(cx, promise, resolved);
++}
++
++// Canonical POSIX signal name (e.g. "SIGTERM") for a signal number, used to
++// report how a child died. Falls back to a numeric "SIG<n>" form.
++static const char* KandeloSignalName(int sig) {
++  switch (sig) {
++    case SIGHUP: return "SIGHUP";
++    case SIGINT: return "SIGINT";
++    case SIGQUIT: return "SIGQUIT";
++    case SIGILL: return "SIGILL";
++    case SIGTRAP: return "SIGTRAP";
++    case SIGABRT: return "SIGABRT";
++    case SIGBUS: return "SIGBUS";
++    case SIGFPE: return "SIGFPE";
++    case SIGKILL: return "SIGKILL";
++    case SIGUSR1: return "SIGUSR1";
++    case SIGSEGV: return "SIGSEGV";
++    case SIGUSR2: return "SIGUSR2";
++    case SIGPIPE: return "SIGPIPE";
++    case SIGALRM: return "SIGALRM";
++    case SIGTERM: return "SIGTERM";
++    case SIGCHLD: return "SIGCHLD";
++    case SIGCONT: return "SIGCONT";
++    case SIGSTOP: return "SIGSTOP";
++    case SIGTSTP: return "SIGTSTP";
++    case SIGTTIN: return "SIGTTIN";
++    case SIGTTOU: return "SIGTTOU";
++#ifdef SIGWINCH
++    case SIGWINCH: return "SIGWINCH";
++#endif
++    default: return "SIG";
++  }
++}
++
++// Resolve a __kandeloWaitPid promise with a Node-shaped
++// {code:number|null, signal:string|null} status object.
++static bool KandeloResolveChild(JSContext* cx, HandleObject promise,
++                                bool haveCode, int code,
++                                const char* signalName) {
++  RootedObject result(cx, JS_NewPlainObject(cx));
++  if (!result) return false;
++  RootedValue codeVal(cx, JS::NullValue());
++  if (haveCode) {
++    codeVal.setInt32(code);
++  }
++  RootedValue signalVal(cx, JS::NullValue());
++  if (signalName) {
++    RootedString s(cx, JS_NewStringCopyZ(cx, signalName));
++    if (!s) return false;
++    signalVal.setString(s);
++  }
++  if (!JS_DefineProperty(cx, result, "code", codeVal, JSPROP_ENUMERATE)) {
++    return false;
++  }
++  if (!JS_DefineProperty(cx, result, "signal", signalVal, JSPROP_ENUMERATE)) {
++    return false;
++  }
++  RootedValue resolved(cx, ObjectValue(*result));
++  return JS::ResolvePromise(cx, promise, resolved);
++}
++
++// Resolve a __kandeloWaitPid promise from a raw waitpid() status word.
++static bool KandeloResolveChildFromStatus(JSContext* cx, HandleObject promise,
++                                          int status) {
++  if (WIFEXITED(status)) {
++    return KandeloResolveChild(cx, promise, true, WEXITSTATUS(status), nullptr);
++  }
++  if (WIFSIGNALED(status)) {
++    return KandeloResolveChild(cx, promise, false, 0,
++                               KandeloSignalName(WTERMSIG(status)));
++  }
++  // Stopped/continued or otherwise not terminated: report no code yet.
++  return KandeloResolveChild(cx, promise, true, 0, nullptr);
+ }
+ 
+ static int KandeloSocketDispatch(JSContext* cx) {
++  int processed = 0;
++
++  // Reap child watches first. Children have no fd to poll, so they are driven
++  // by a non-blocking waitpid() every dispatch pass, independent of poll().
++  {
++    KandeloSocketWatch* watch = gKandeloSocketWatches;
++    while (watch) {
++      KandeloSocketWatch* next = watch->next;
++      if (watch->kind == KandeloSocketWatchKind::Child) {
++        int status = 0;
++        pid_t r = waitpid(watch->childPid, &status, WNOHANG);
++        bool done = false;
++        if (r == watch->childPid) {
++          KandeloResolveChildFromStatus(cx, watch->promise, status);
++          done = true;
++        } else if (r == -1 && errno == ECHILD) {
++          // Already reaped elsewhere: report a benign success exit.
++          KandeloResolveChild(cx, watch->promise, true, 0, nullptr);
++          done = true;
++        }
++        if (done) {
++          KandeloSocketWatchUnlink(watch);
++          js_delete(watch);
++          processed++;
++        }
++      }
++      watch = next;
++    }
++  }
++
+   int count = 0;
+   for (KandeloSocketWatch* watch = gKandeloSocketWatches; watch;
+        watch = watch->next) {
+     count++;
+   }
+-  if (count == 0) return 0;
++  if (count == 0) return processed;
+ 
+   std::vector<pollfd> pollfds;
+   pollfds.reserve(size_t(count));
+@@ -871,9 +977,8 @@
+   }
+ 
+   int rc = poll(pollfds.data(), nfds_t(pollfds.size()), 0);
+-  if (rc <= 0) return 0;
++  if (rc <= 0) return processed;
+ 
+-  int processed = 0;
+   KandeloSocketWatch* watch = gKandeloSocketWatches;
+   size_t index = 0;
+   while (watch && index < pollfds.size()) {
+@@ -1075,6 +1180,370 @@
+   return true;
+ }
+ 
++// ---------------------------------------------------------------------------
++// Native async subprocess + fd seam (Phase K). Generalizes the socket watch
++// list / job-queue poll loop above to arbitrary fds (pipes) and child reaping,
++// using only existing POSIX syscalls (posix_spawn/pipe/waitpid/kill/read/write/
++// chdir via file-actions). ABI-neutral: no new syscall number or marshalling.
++// ---------------------------------------------------------------------------
++
++// Best-effort errno -> Node-style code string (e.g. ENOENT) for the error we
++// raise on posix_spawn/kill failure. Returns nullptr when there is no mapping.
++static const char* KandeloErrnoCode(int err) {
++  switch (err) {
++    case EPERM: return "EPERM";
++    case ENOENT: return "ENOENT";
++    case ESRCH: return "ESRCH";
++    case EINTR: return "EINTR";
++    case EIO: return "EIO";
++    case E2BIG: return "E2BIG";
++    case ENOEXEC: return "ENOEXEC";
++    case EBADF: return "EBADF";
++    case EAGAIN: return "EAGAIN";
++    case ENOMEM: return "ENOMEM";
++    case EACCES: return "EACCES";
++    case EFAULT: return "EFAULT";
++    case ENOTDIR: return "ENOTDIR";
++    case EISDIR: return "EISDIR";
++    case EINVAL: return "EINVAL";
++    case EMFILE: return "EMFILE";
++    case ENFILE: return "ENFILE";
++    case ELOOP: return "ELOOP";
++    case ENAMETOOLONG: return "ENAMETOOLONG";
++    case ETXTBSY: return "ETXTBSY";
++    default: return nullptr;
++  }
++}
++
++// Attach .errno (number) and .code (string) to the pending exception, matching
++// how Node surfaces a failed spawn/kill so callers can branch on err.code.
++static void KandeloDecoratePendingError(JSContext* cx, int err) {
++  RootedValue exc(cx);
++  if (!JS_GetPendingException(cx, &exc) || !exc.isObject()) {
++    return;
++  }
++  RootedObject excObj(cx, &exc.toObject());
++  RootedValue errnoVal(cx, Int32Value(err));
++  JS_SetProperty(cx, excObj, "errno", errnoVal);
++  const char* code = KandeloErrnoCode(err);
++  if (code) {
++    RootedString codeStr(cx, JS_NewStringCopyZ(cx, code));
++    if (codeStr) {
++      RootedValue codeVal(cx, StringValue(codeStr));
++      JS_SetProperty(cx, excObj, "code", codeVal);
++    }
++  }
++  JS_SetPendingException(cx, exc);
++}
++
++// __kandeloPipe() -> [readFd, writeFd], both ends O_NONBLOCK.
++static bool KandeloNativePipe(JSContext* cx, unsigned argc, Value* vp) {
++  CallArgs args = CallArgsFromVp(argc, vp);
++  int fds[2];
++  if (pipe(fds) != 0) {
++    int err = errno;
++    JS_ReportErrorUTF8(cx, "pipe: %s", strerror(err));
++    KandeloDecoratePendingError(cx, err);
++    return false;
++  }
++  KandeloSetNonblocking(fds[0]);
++  KandeloSetNonblocking(fds[1]);
++  RootedObject arr(cx, JS::NewArrayObject(cx, 2));
++  if (!arr) {
++    close(fds[0]);
++    close(fds[1]);
++    return false;
++  }
++  RootedValue readVal(cx, Int32Value(fds[0]));
++  RootedValue writeVal(cx, Int32Value(fds[1]));
++  if (!JS_SetElement(cx, arr, 0, readVal) ||
++      !JS_SetElement(cx, arr, 1, writeVal)) {
++    return false;
++  }
++  args.rval().setObject(*arr);
++  return true;
++}
++
++// __kandeloFdRead/Write/Close: the socket read/write/close internals already
++// operate on an arbitrary fd via read()/write()/close() + the watch list, so
++// pipe fds reuse them directly. Read resolves an empty ArrayBuffer on EOF
++// (read()==0) rather than treating it as an error.
++static bool KandeloNativeFdRead(JSContext* cx, unsigned argc, Value* vp) {
++  return KandeloNativeSocketRead(cx, argc, vp);
++}
++
++static bool KandeloNativeFdWrite(JSContext* cx, unsigned argc, Value* vp) {
++  return KandeloNativeSocketWrite(cx, argc, vp);
++}
++
++static bool KandeloNativeFdClose(JSContext* cx, unsigned argc, Value* vp) {
++  return KandeloNativeSocketClose(cx, argc, vp);
++}
++
++// Marshal a JS array of strings into a NULL-terminated char* const[]. The
++// backing UniqueChars are kept alive in `storage`.
++static bool KandeloStringArray(JSContext* cx, HandleValue value,
++                               std::vector<UniqueChars>* storage,
++                               std::vector<char*>* out) {
++  storage->clear();
++  out->clear();
++  if (value.isNullOrUndefined()) {
++    out->push_back(nullptr);
++    return true;
++  }
++  if (!value.isObject()) {
++    JS_ReportErrorASCII(cx, "expected an array of strings");
++    return false;
++  }
++  RootedObject arr(cx, &value.toObject());
++  bool isArray = false;
++  if (!JS::IsArrayObject(cx, arr, &isArray) || !isArray) {
++    JS_ReportErrorASCII(cx, "expected an array of strings");
++    return false;
++  }
++  uint32_t length = 0;
++  if (!JS::GetArrayLength(cx, arr, &length)) {
++    return false;
++  }
++  for (uint32_t i = 0; i < length; i++) {
++    RootedValue element(cx);
++    if (!JS_GetElement(cx, arr, i, &element)) {
++      return false;
++    }
++    UniqueChars str;
++    if (!KandeloGetString(cx, element, &str)) {
++      return false;
++    }
++    out->push_back(str.get());
++    storage->push_back(std::move(str));
++  }
++  out->push_back(nullptr);
++  return true;
++}
++
++// __kandeloSpawn(file, argv, env, actions, attrs) -> pid. Throws with
++// .errno/.code on posix_spawn failure (never a silent hang).
++static bool KandeloNativeSpawn(JSContext* cx, unsigned argc, Value* vp) {
++  CallArgs args = CallArgsFromVp(argc, vp);
++  if (args.length() < 2) {
++    JS_ReportErrorASCII(cx, "spawn requires a file and argv");
++    return false;
++  }
++  UniqueChars file;
++  if (!KandeloGetString(cx, args[0], &file)) {
++    return false;
++  }
++
++  std::vector<UniqueChars> argvStorage;
++  std::vector<char*> argvVec;
++  if (!KandeloStringArray(cx, args[1], &argvStorage, &argvVec)) {
++    return false;
++  }
++
++  std::vector<UniqueChars> envStorage;
++  std::vector<char*> envVec;
++  RootedValue envArg(cx, args.length() >= 3 ? args[2] : JS::UndefinedValue());
++  if (!KandeloStringArray(cx, envArg, &envStorage, &envVec)) {
++    return false;
++  }
++
++  posix_spawn_file_actions_t fa;
++  if (posix_spawn_file_actions_init(&fa) != 0) {
++    JS_ReportErrorASCII(cx, "spawn: cannot init file actions");
++    return false;
++  }
++  posix_spawnattr_t at;
++  if (posix_spawnattr_init(&at) != 0) {
++    posix_spawn_file_actions_destroy(&fa);
++    JS_ReportErrorASCII(cx, "spawn: cannot init attributes");
++    return false;
++  }
++
++  bool ok = true;
++  const char* actionErr = nullptr;
++
++  if (args.length() >= 4 && !args[3].isNullOrUndefined()) {
++    if (!args[3].isObject()) {
++      ok = false;
++      actionErr = "spawn actions must be an array";
++    } else {
++      RootedObject actions(cx, &args[3].toObject());
++      bool isArray = false;
++      uint32_t length = 0;
++      if (!JS::IsArrayObject(cx, actions, &isArray) || !isArray ||
++          !JS::GetArrayLength(cx, actions, &length)) {
++        ok = false;
++        actionErr = "spawn actions must be an array";
++      }
++      for (uint32_t i = 0; ok && i < length; i++) {
++        RootedValue elemVal(cx);
++        if (!JS_GetElement(cx, actions, i, &elemVal) || !elemVal.isObject()) {
++          ok = false;
++          actionErr = "spawn action must be an object";
++          break;
++        }
++        RootedObject elem(cx, &elemVal.toObject());
++        RootedValue opVal(cx);
++        UniqueChars op;
++        if (!JS_GetProperty(cx, elem, "op", &opVal) ||
++            !KandeloGetString(cx, opVal, &op)) {
++          ok = false;
++          actionErr = "spawn action needs an op";
++          break;
++        }
++        auto getInt = [&](const char* name, int32_t* out) -> bool {
++          RootedValue v(cx);
++          return JS_GetProperty(cx, elem, name, &v) && JS::ToInt32(cx, v, out);
++        };
++        int rc = 0;
++        if (strcmp(op.get(), "dup2") == 0) {
++          int32_t from = 0, to = 0;
++          if (!getInt("from", &from) || !getInt("to", &to)) {
++            ok = false;
++            actionErr = "dup2 needs from/to";
++            break;
++          }
++          rc = posix_spawn_file_actions_adddup2(&fa, from, to);
++        } else if (strcmp(op.get(), "close") == 0) {
++          int32_t fd = 0;
++          if (!getInt("fd", &fd)) {
++            ok = false;
++            actionErr = "close needs fd";
++            break;
++          }
++          rc = posix_spawn_file_actions_addclose(&fa, fd);
++        } else if (strcmp(op.get(), "open") == 0) {
++          int32_t fd = 0, flags = 0, mode = 0;
++          RootedValue pathVal(cx);
++          UniqueChars path;
++          if (!getInt("fd", &fd) || !getInt("flags", &flags) ||
++              !getInt("mode", &mode) ||
++              !JS_GetProperty(cx, elem, "path", &pathVal) ||
++              !KandeloGetString(cx, pathVal, &path)) {
++            ok = false;
++            actionErr = "open needs fd/path/flags/mode";
++            break;
++          }
++          rc = posix_spawn_file_actions_addopen(&fa, fd, path.get(), flags,
++                                                mode_t(mode));
++        } else if (strcmp(op.get(), "chdir") == 0) {
++          RootedValue pathVal(cx);
++          UniqueChars path;
++          if (!JS_GetProperty(cx, elem, "path", &pathVal) ||
++              !KandeloGetString(cx, pathVal, &path)) {
++            ok = false;
++            actionErr = "chdir needs path";
++            break;
++          }
++          rc = posix_spawn_file_actions_addchdir_np(&fa, path.get());
++        } else {
++          ok = false;
++          actionErr = "unknown spawn action op";
++          break;
++        }
++        if (rc != 0) {
++          posix_spawn_file_actions_destroy(&fa);
++          posix_spawnattr_destroy(&at);
++          JS_ReportErrorUTF8(cx, "spawn action %s: %s", op.get(), strerror(rc));
++          KandeloDecoratePendingError(cx, rc);
++          return false;
++        }
++      }
++    }
++  }
++
++  if (ok && args.length() >= 5 && args[4].isObject()) {
++    RootedObject attrs(cx, &args[4].toObject());
++    RootedValue flagsVal(cx);
++    int32_t flags = 0;
++    if (JS_GetProperty(cx, attrs, "flags", &flagsVal) &&
++        !flagsVal.isUndefined() && JS::ToInt32(cx, flagsVal, &flags) &&
++        flags != 0) {
++      posix_spawnattr_setflags(&at, short(flags));
++      if (flags & POSIX_SPAWN_SETPGROUP) {
++        RootedValue pgVal(cx);
++        int32_t pgroup = 0;
++        if (JS_GetProperty(cx, attrs, "pgroup", &pgVal) &&
++            JS::ToInt32(cx, pgVal, &pgroup)) {
++          posix_spawnattr_setpgroup(&at, pgroup);
++        }
++      }
++    }
++  }
++
++  if (!ok) {
++    posix_spawn_file_actions_destroy(&fa);
++    posix_spawnattr_destroy(&at);
++    JS_ReportErrorUTF8(cx, "%s", actionErr ? actionErr : "spawn: bad arguments");
++    return false;
++  }
++
++  pid_t pid = -1;
++  int rc = posix_spawn(&pid, file.get(), &fa, &at, argvVec.data(),
++                       envVec.data());
++  posix_spawn_file_actions_destroy(&fa);
++  posix_spawnattr_destroy(&at);
++  if (rc != 0) {
++    JS_ReportErrorUTF8(cx, "spawn %s: %s", file.get(), strerror(rc));
++    KandeloDecoratePendingError(cx, rc);
++    return false;
++  }
++  args.rval().setInt32(int32_t(pid));
++  return true;
++}
++
++// __kandeloWaitPid(pid) -> Promise<{code, signal}>. Reaps via non-blocking
++// waitpid, registering a Child watch when the child is still running.
++static bool KandeloNativeWaitPid(JSContext* cx, unsigned argc, Value* vp) {
++  CallArgs args = CallArgsFromVp(argc, vp);
++  int32_t pid;
++  if (args.length() < 1 || !JS::ToInt32(cx, args[0], &pid)) {
++    return false;
++  }
++  RootedObject promise(cx, JS::NewPromiseObject(cx, nullptr));
++  if (!promise) {
++    return false;
++  }
++  args.rval().setObject(*promise);
++
++  int status = 0;
++  pid_t r = waitpid(pid_t(pid), &status, WNOHANG);
++  if (r == pid_t(pid)) {
++    return KandeloResolveChildFromStatus(cx, promise, status);
++  }
++  if (r == -1 && errno == ECHILD) {
++    return KandeloResolveChild(cx, promise, true, 0, nullptr);
++  }
++
++  auto* watch = js_new<KandeloSocketWatch>(cx, -1, KandeloSocketWatchKind::Child,
++                                           promise);
++  if (!watch) {
++    JS_ReportOutOfMemory(cx);
++    return false;
++  }
++  watch->childPid = pid_t(pid);
++  KandeloSocketWatchLink(watch);
++  return true;
++}
++
++// __kandeloKill(pid, sig) -> 0 on success; throws with .errno/.code on failure.
++static bool KandeloNativeKill(JSContext* cx, unsigned argc, Value* vp) {
++  CallArgs args = CallArgsFromVp(argc, vp);
++  int32_t pid, sig;
++  if (args.length() < 2 || !JS::ToInt32(cx, args[0], &pid) ||
++      !JS::ToInt32(cx, args[1], &sig)) {
++    return false;
++  }
++  if (kill(pid_t(pid), sig) != 0) {
++    int err = errno;
++    JS_ReportErrorUTF8(cx, "kill %d: %s", int(pid), strerror(err));
++    KandeloDecoratePendingError(cx, err);
++    return false;
++  }
++  args.rval().setInt32(0);
++  return true;
++}
++
+ struct KandeloTlsHandle {
+   bool active = false;
+   int fd = -1;
+@@ -2034,6 +2503,13 @@
+       JS_FN("tlsRead", KandeloNativeTlsRead, 2, 0),
+       JS_FN("tlsWrite", KandeloNativeTlsWrite, 2, 0),
+       JS_FN("tlsClose", KandeloNativeTlsClose, 1, 0),
++      JS_FN("__kandeloPipe", KandeloNativePipe, 0, 0),
++      JS_FN("__kandeloSpawn", KandeloNativeSpawn, 5, 0),
++      JS_FN("__kandeloFdRead", KandeloNativeFdRead, 2, 0),
++      JS_FN("__kandeloFdWrite", KandeloNativeFdWrite, 2, 0),
++      JS_FN("__kandeloFdClose", KandeloNativeFdClose, 1, 0),
++      JS_FN("__kandeloWaitPid", KandeloNativeWaitPid, 1, 0),
++      JS_FN("__kandeloKill", KandeloNativeKill, 2, 0),
+       JS_FS_END,
+   };
+   if (!JS_DefineFunctions(cx, native, funcs)) {
+@@ -3203,6 +3679,52 @@
+ 
+   RootedObject job(cx, &args[0].toObject());
+   return js::EnqueueJob(cx, job);
++}
++
++// Drive the JS-level real-delay timer wheel that adapter.js installs as
++// globalThis.__kandeloRunDueTimers / __kandeloNextTimerDelay. Without this the
++// wheel had no caller, so any setTimeout(fn, ms>0) never fired. Returns the
++// number of timers that fired this pass; *nextDelayMs is the ms until the next
++// pending timer (-1 when none pending).
++static int KandeloRunDueTimers(JSContext* cx, int64_t* nextDelayMs) {
++  *nextDelayMs = -1;
++  RootedObject global(cx, JS::CurrentGlobalOrNull(cx));
++  if (!global) {
++    return 0;
++  }
++  int fired = 0;
++
++  RootedValue runFn(cx);
++  if (JS_GetProperty(cx, global, "__kandeloRunDueTimers", &runFn) &&
++      runFn.isObject() && JS::IsCallable(&runFn.toObject())) {
++    RootedValue rval(cx);
++    if (JS_CallFunctionValue(cx, global, runFn, JS::HandleValueArray::empty(),
++                             &rval)) {
++      if (rval.isNumber()) {
++        fired = int(rval.toNumber());
++      }
++    } else {
++      JS_ClearPendingException(cx);
++    }
++  }
++
++  RootedValue delayFn(cx);
++  if (JS_GetProperty(cx, global, "__kandeloNextTimerDelay", &delayFn) &&
++      delayFn.isObject() && JS::IsCallable(&delayFn.toObject())) {
++    RootedValue rval(cx);
++    if (JS_CallFunctionValue(cx, global, delayFn, JS::HandleValueArray::empty(),
++                             &rval)) {
++      if (rval.isNumber()) {
++        double d = rval.toNumber();
++        if (d >= 0) {
++          *nextDelayMs = int64_t(d);
++        }
++      }
++    } else {
++      JS_ClearPendingException(cx);
++    }
++  }
++  return fired;
+ }
+ 
+ static void RunShellJobs(JSContext* cx) {
+@@ -3221,11 +3743,32 @@
+     // Run tasks (only finalization registry clean tasks are possible).
+     bool ranTasks = MaybeRunFinalizationRegistryCleanupTasks(cx);
+     int ranNative = KandeloSocketDispatch(cx);
+-    if (!ranTasks && ranNative == 0 && !KandeloSocketHasWatches()) {
++
++    // Fire real-delay timers and learn when the next one is due. A pending
++    // timer keeps the loop alive just like a pending native watch.
++    int64_t nextTimerDelay = -1;
++    int ranTimers = KandeloRunDueTimers(cx, &nextTimerDelay);
++    bool timersPending = nextTimerDelay >= 0;
++    if (sc->quitting) {
++      return;
++    }
++
++    if (!ranTasks && ranNative == 0 && ranTimers == 0 &&
++        !KandeloSocketHasWatches() && !timersPending) {
+       break;
+     }
+-    if (!ranTasks && ranNative == 0) {
+-      usleep(1000);
++    if (!ranTasks && ranNative == 0 && ranTimers == 0) {
++      useconds_t sleepUs = 1000;
++      if (timersPending) {
++        int64_t wantUs = nextTimerDelay * 1000;
++        if (wantUs < 0) {
++          wantUs = 0;
++        }
++        if (wantUs < int64_t(sleepUs)) {
++          sleepUs = useconds_t(wantUs);
++        }
++      }
++      usleep(sleepUs);
+     }
+   }
+ }
