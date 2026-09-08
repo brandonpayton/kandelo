@@ -537,14 +537,6 @@ const ownershipSeeds: OwnershipSeed[] = [
     why: "The WASI shim operates on its guest process memory.",
   },
   {
-    declaration:
-      "host/src/fork-continuation.ts::LinkedForkContinuation.$param:memory",
-    target: "value",
-    owner: "process-memory",
-    form: "memory",
-    why: "Fork continuation frames live in process memory.",
-  },
-  {
     declaration: "host/src/dylink.ts::LoadSharedLibraryOptions.memory",
     target: "value",
     owner: "process-memory",

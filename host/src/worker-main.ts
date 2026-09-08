@@ -81,8 +81,6 @@ import {
 } from "./process-memory";
 import {
   ContinuationAllocationError,
-  invokeForkContinuationBegin,
-  LinkedForkContinuation,
   readLinkedFrameFormat,
   writeForkContinuationAnchor,
 } from "./fork-continuation";
@@ -150,6 +148,7 @@ import {
   type ForkGcCodecProvider,
 } from "./fork-gc-codec";
 import {
+  type ForkActivationContinuation,
   ForkProcessContinuationCoordinator,
   type ForkBorrowedReplayWorkspaceRequirements,
 } from "./fork-process-continuation";
@@ -822,26 +821,12 @@ function createProcessDylinkActivationOwner(
       let childImportedStatePlanner: ForkImportedGlobalPlanner | null = null;
       let importedStateRegistered = false;
       let importsWrapped = false;
-      const continuation = new LinkedForkContinuation(
-        options.memory,
-        readLinkedFrameFormat(request.module),
-        (size) =>
-          continuationMmap(
-            options.memory,
-            options.channelOffset,
-            size,
-            `${options.label}: ${request.name} continuation`,
-          ),
-        (addr, size) =>
-          continuationMunmap(
-            options.memory,
-            options.channelOffset,
-            addr,
-            size,
-            `${options.label}: ${request.name} continuation`,
-          ),
-        `${options.label}: ${request.name}`,
-      );
+      // The co-resident Rust module owns all linked frames/journal/resume
+      // storage (Phase 4 point of no return). The host only carries this
+      // activation's linked-frame FORMAT descriptor into the coordinator.
+      const continuation: ForkActivationContinuation = {
+        format: readLinkedFrameFormat(request.module),
+      };
       if (continuation.format.ptrWidth !== options.ptrWidth) {
         throw new Error(
           `${request.name}: linked continuation pointer width ` +
@@ -890,9 +875,7 @@ function createProcessDylinkActivationOwner(
           options.forkUnwindTag,
           `${request.name}: fork activation`,
         ) as unknown as WebAssembly.ImportValue,
-        ...options.coordinator.continuationImports(activationId, (errno) =>
-          options.coordinator.beginCaptureAbort(errno),
-        ),
+        ...options.coordinator.continuationImports(activationId),
         // Phase 6 D7a.1a FRAME FLIP: for a module-backed dlopen fork, this side
         // activation's five frozen frame/resume imports route through its own
         // trampoline (folding in the activation id) to the shared module. Placed
@@ -3848,14 +3831,11 @@ export async function centralizedWorkerMain(
             }
           : {};
       const mainTemplateId = await computeForkModuleTemplateId(programBytes);
-      const forkContinuation = new LinkedForkContinuation(
-        memory,
-        linkedFrameFormat,
-        (size) => continuationMmap(memory, channelOffset, size, `pid=${pid}`),
-        (addr, size) =>
-          continuationMunmap(memory, channelOffset, addr, size, `pid=${pid}`),
-        `pid=${pid}`,
-      );
+      // The co-resident Rust module owns all frame/journal/resume storage
+      // (Phase 4 point of no return); the coordinator only needs the format.
+      const forkContinuation: ForkActivationContinuation = {
+        format: linkedFrameFormat,
+      };
       let processInstance: WebAssembly.Instance | null = null;
 
       const newModuleStateArena = (): ForkModuleStateArena =>
@@ -4649,15 +4629,12 @@ export async function centralizedWorkerMain(
         }
       }
       const forkEnvImports: Record<string, WebAssembly.ImportValue> = {
-        ...processContinuation.continuationImports(0, (errno) => {
-          processContinuation.beginCaptureAbort(errno);
-        }),
-        // Phase 6 D5 IMPORT FLIP: for a QUALIFYING fork, the guest calls the
-        // co-resident module's frame/resume exports directly (wasm->wasm over
-        // shared memory), replacing exactly the five per-frame JS closures from
-        // `continuationImports`. Everything else — crucially the JS
-        // `__wpk_fork_resume_table` funcref table the module's `resume_peek`
-        // indexes — is kept from `continuationImports`. Guest ABI names and
+        ...processContinuation.continuationImports(0),
+        // Phase 6 D5 IMPORT FLIP: the guest calls the co-resident module's
+        // frame/resume exports directly (wasm->wasm over shared memory); the
+        // module is the ONLY frame/journal implementation. `continuationImports`
+        // contributes only the host-owned `__wpk_fork_resume_table` funcref
+        // table the module's `resume_peek` indexes. Guest ABI names and
         // signatures are unchanged; no guest re-instrumentation.
         ...(useForkModule && forkModuleInstance
           ? {
@@ -6570,28 +6547,12 @@ export async function centralizedThreadWorkerMain(
     );
     let forkBufAddr = 0;
     const forkAnchorAddr = channelOffset - FORK_BUF_SIZE;
-    const threadForkContinuation = hasForkInstrumentation
-      ? new LinkedForkContinuation(
-          memory,
-          readLinkedFrameFormat(module),
-          (size) =>
-            continuationMmap(
-              memory,
-              channelOffset,
-              size,
-              `pid=${pid} tid=${tid}`,
-            ),
-          (addr, size) =>
-            continuationMunmap(
-              memory,
-              channelOffset,
-              addr,
-              size,
-              `pid=${pid} tid=${tid}`,
-            ),
-          `pid=${pid} tid=${tid}`,
-        )
-      : null;
+    // The co-resident Rust module owns all frame/journal/resume storage
+    // (Phase 4 point of no return); the coordinator only needs the format.
+    const threadForkContinuation: ForkActivationContinuation | null =
+      hasForkInstrumentation
+        ? { format: readLinkedFrameFormat(module) }
+        : null;
     const threadTemplateId = hasForkInstrumentation
       ? await computeForkModuleTemplateId(initData.programBytes)
       : null;
@@ -7082,9 +7043,7 @@ export async function centralizedThreadWorkerMain(
     const threadForkEnvImports =
       threadCoordinator && threadActivationRegistry && threadExceptionBroker
         ? {
-            ...threadCoordinator.continuationImports(0, (errno) => {
-              threadCoordinator.beginCaptureAbort(errno);
-            }),
+            ...threadCoordinator.continuationImports(0),
             // Phase 6 D7b IMPORT FLIP (mirrors the main worker path): when the
             // fork-module is wired into this pthread parent, the thread's guest
             // calls the module's frame/resume exports directly (wasm->wasm over
