@@ -1,20 +1,17 @@
-// PROBE FIXTURE (Phase 0 growable-arena probe — NOT a production contract test).
+// Deep-fork fixture for the module-owned growing frame allocator (dynamic
+// channel `SYS_mmap` frame allocation, the production capture path).
 //
-// Purpose: settle whether the fix-y frame/guest-page collision is a FIXTURE
-// artifact of `fork-memory-clone.c`'s raw `__builtin_wasm_memory_grow` (which
-// the kernel MemoryManager never learns about, so `find_gap` places fork frames
-// into the guest's grown-but-untracked live pages), or a REAL headroom/placement
-// constraint. This program grows its heap the REAL way a ported C program does:
-// a large `malloc` routes through mallocng to `mmap(0, ...)` -> `SYS_mmap` ->
-// kernel `find_gap`, i.e. a KERNEL-TRACKED mapping. It then forks from a DEEP
-// linked continuation so the fork-time frame capture is large (used to exceed
-// the bounded 2 MiB Fix X arena when the growable channel path is enabled).
+// This program grows its heap the REAL way a ported C program does: a large
+// `malloc` routes through mallocng to `mmap(0, ...)` -> `SYS_mmap` -> kernel
+// `find_gap`, i.e. a KERNEL-TRACKED mapping. It then forks from a DEEP linked
+// continuation so the fork-time frame capture is large (deep enough to exceed
+// the old bounded 2 MiB Fix X arena, which the uncapped growing allocator no
+// longer imposes).
 //
-// Unlike fork-memory-clone.c, this fixture does NOT assert strict zero page
-// growth — a real program never does; it only requires that fork not CLOBBER
-// live data and that the child replay correctly. Growth to hold fork frames is
-// acceptable for a real program; the strict "original+3" assertion was the
-// fixture-specific artifact.
+// It asserts NO strict page count — a real program's memory legitimately grows
+// to hold fork-continuation frames; it only requires that fork not CLOBBER live
+// data (the tracked malloc region survives, since `find_gap` places frames
+// above it) and that the child replay correctly.
 
 #include <errno.h>
 #include <stdint.h>

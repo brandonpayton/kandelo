@@ -54,18 +54,20 @@ export const FORK_MODULE_REQUIRED_EXPORTS = [
   // module (a funcref minted in one activation but held by another's frame
   // resolves against its own activation's catalog slice).
   "fm_set_activation_catalog_base",
+  // Option B (dynamic mmap frame allocation — the production capture path): the
+  // module channel-mmaps each activation's linked frame chunks on demand via
+  // `SYS_mmap` -> the kernel `find_gap` allocator (kernel-tracked placement, no
+  // fork-depth cap, no carved-out guest region).
   "fm_begin_unwind",
-  // Fix X (bounded in-guest fork-frame arena): the in-realm siblings of
-  // `fm_begin_unwind` / `fm_add_activation_unwind` that bump-allocate each frame
-  // chunk from a caller-owned, pre-reserved FIXED region `[base, base + len)`
-  // instead of channel-mmapping (which grows guest memory). The production fork
-  // path now drives THESE with slabs of the reserved fork-frame arena, so a fork
-  // consumes committed headroom rather than growing the guest. They honor the
-  // same `CAPTURE_ARMED` bump-heap discipline as the channel path (the Rust
-  // impl was corrected for this), so a reference capture survives across unwind.
+  // The bounded fixed-arena siblings of the channel unwind/serialize exports are
+  // NO LONGER driven by the host (Fix X was retired in favor of Option B's
+  // growing channel allocator). They remain in the module's export surface —
+  // and therefore in this required-presence list — so removing the host wiring
+  // does not change the module ABI; they are simply unused.
   "fm_begin_unwind_fixed_arena",
   // Phase 6 D7a.1a: add ANOTHER activation (a dlopen fork's side module) to the
-  // capture begun by `fm_begin_unwind`, with its own host frame arena + prefix.
+  // capture begun by `fm_begin_unwind`, with its own channel-mmap'd frame chunks
+  // + prefix.
   "fm_add_activation_unwind",
   "fm_add_activation_unwind_fixed_arena",
   "fm_finish_unwind",
@@ -73,11 +75,8 @@ export const FORK_MODULE_REQUIRED_EXPORTS = [
   // the module channel-mmaps itself, returning its guest offset; the host reads
   // `fm_journal_image_len` and records both in a `JournalImage` KFMS record.
   "fm_serialize_journal_alloc",
-  // Fix X: the in-realm sibling of `fm_serialize_journal_alloc` that writes the
-  // KFRE journal image into a caller-owned FIXED region `[base, base + len)`
-  // instead of a channel-mmap'd chunk. The production fixed-arena fork drives
-  // this (its `fm_begin_unwind_fixed_arena` left `channel_base = 0`, so the
-  // channel serializer is unusable) with a journal slab of the fork-frame arena.
+  // Retained-but-unused fixed-arena sibling (see the note above the fixed-arena
+  // unwind exports); kept in the export surface to avoid a module ABI change.
   "fm_serialize_journal_fixed_arena",
   "fm_journal_image_len",
   // Release every channel-mapped frame/image chunk on the host abort path.
@@ -387,17 +386,6 @@ export interface ForkModuleInstance {
   stagingBase: number;
   /** Byte length of the staging slab (== `FORK_MODULE_STAGING_BYTES`). */
   stagingBytes: number;
-  /**
-   * First byte of the bounded, pre-reserved fork-frame arena (Fix X, page
-   * aligned). The fork continuation backend sub-allocates the frame chunk,
-   * journal image, and the host-side module-state arena page from THIS region
-   * (via a cursor) instead of growing guest memory per fork. Reserved at init so
-   * a COPIED fork child inherits it and observes the parent's exact
-   * `memory.size`.
-   */
-  frameArenaBase: number;
-  /** Byte length of the fork-frame arena (== `FORK_MODULE_FRAME_ARENA_BYTES`). */
-  frameArenaBytes: number;
   /** The module's own (empty) indirect function table. */
   table: WebAssembly.Table;
   /**
@@ -461,36 +449,6 @@ const FORK_MODULE_SHADOW_STACK_BYTES = 1 << 20;
  * `reserveRegion`.
  */
 const FORK_MODULE_STAGING_BYTES = 1 << 16;
-
-/**
- * A bounded, pre-reserved in-guest fork-frame arena (Fix X). Reserved AT INIT
- * — as part of the fork-module region, before the fork-memory-clone fixtures
- * sample `original_pages` at `main()` start — so a fork consumes it WITHOUT
- * growing the guest's primary linear memory and without clobbering the guest's
- * live pages.
- *
- * WHY this exists (the platform boundary): the co-resident fork-module's
- * ~89-page region physically occupies the committed low headroom that main's
- * on-demand fork frames reuse, so at fork time there are too few committed-free
- * pages below the guest's grown boundary for the three growing allocations
- * (frame chunk, journal image, host-side module-state arena page). Placing the
- * fork-module elsewhere is wasm-inherently impossible (a `find_gap` allocator is
- * already lowest-address-first and the module cannot leave memory 0), so the
- * headroom is RESERVED here instead. See
- * `.superpowers/sdd/2026-09-05-n1-f5-externref-capture/task-fix-x-report.md`.
- *
- * SIZING: one fork activation costs ~3-4 pages (frame chunk + journal + the
- * module-state root/records); nested-fork depth does NOT multiply arena use (a
- * COW child is replay-only and allocates nothing, so only ONE in-flight fork
- * uses the arena at a time). 2 MiB (32 x 64 KiB) is the upper end of the
- * measured 1-2 MiB recommendation: it covers a single activation ~4x over and a
- * multi-activation (dlopen) fork of ~10 activations, with clear margin. Past
- * capacity the sub-allocator fails TRUTHFULLY with `ENOMEM` — it never grows the
- * guest, which is the intended bounded boundary (the historical Asyncify-era
- * `FORK_SAVE_BUFFER_SIZE` had the same bounded balance). This is the single
- * easy-to-change knob.
- */
-export const FORK_MODULE_FRAME_ARENA_BYTES = 32 * WASM_PAGE_SIZE;
 
 const WASM_DYLINK_MEM_INFO = 1;
 
@@ -562,22 +520,19 @@ export function instantiateForkModule(
 
   const staticBytes = alignUp(memInfo.memorySize, memInfo.memoryAlignBytes);
   // Layout of the reserved region (low -> high):
-  //   [memoryBase, +staticBytes)                     static data + BSS
-  //   [+staticBytes, +stagingBytes)                  backend staging slab
-  //   [<page-aligned>, +FORK_MODULE_FRAME_ARENA_BYTES) fork-frame arena (Fix X)
-  //   [.., +FORK_MODULE_SHADOW_STACK_BYTES)          shadow stack (grows down)
+  //   [memoryBase, +staticBytes)             static data + BSS
+  //   [+staticBytes, +stagingBytes)          backend staging slab
+  //   [.., +FORK_MODULE_SHADOW_STACK_BYTES)  shadow stack (grows down)
   //
-  // The fork-frame arena sits between the staging slab and the shadow stack.
-  // It is page-aligned (the fork module-state arena validates page-aligned chunk
-  // addresses), so the region carries up to one extra page of alignment padding
-  // between the staging slab and the arena base.
+  // Option B (dynamic mmap frame allocation): the module channel-mmaps its
+  // per-fork frame chunks + journal image on demand via `SYS_mmap` → the kernel
+  // `find_gap` allocator (kernel-tracked placement above the guest's live
+  // pages), so NO fork-frame arena is carved out of this region and a deep fork
+  // is not capped.
   const stagingBytes = FORK_MODULE_STAGING_BYTES;
-  const frameArenaBytes = FORK_MODULE_FRAME_ARENA_BYTES;
   const regionBytes =
     staticBytes +
     stagingBytes +
-    WASM_PAGE_SIZE + // worst-case page-alignment padding before the arena
-    frameArenaBytes +
     FORK_MODULE_SHADOW_STACK_BYTES;
 
   const memoryBase = reserve(regionBytes);
@@ -599,22 +554,7 @@ export function instantiateForkModule(
     );
   }
 
-  // The bounded fork-frame arena (Fix X) sits above the staging slab, on a page
-  // boundary (the fork module-state arena validates page-aligned chunk
-  // addresses). The full `WASM_PAGE_SIZE` of padding folded into `regionBytes`
-  // above absorbs this alignment, so the arena + shadow stack always fit.
-  const frameArenaBase = alignUp(
-    memoryBase + staticBytes + stagingBytes,
-    WASM_PAGE_SIZE,
-  );
-  if (frameArenaBase + frameArenaBytes > memoryBase + regionBytes - FORK_MODULE_SHADOW_STACK_BYTES) {
-    throw new Error(
-      `${label}: fork-frame arena [0x${frameArenaBase.toString(16)}, +${frameArenaBytes}) ` +
-        `overruns the shadow stack reservation`,
-    );
-  }
-
-  // Shadow stack lives above the fork-frame arena and grows down from the top.
+  // Shadow stack lives above the staging slab and grows down from the top.
   const stackTop = alignDown(memoryBase + regionBytes, 16);
   const pointerType = ptrWidth === 8 ? "i64" : "i32";
 
@@ -731,8 +671,6 @@ export function instantiateForkModule(
     regionBytes,
     stagingBase,
     stagingBytes,
-    frameArenaBase,
-    frameArenaBytes,
     table,
     functionCatalog,
     driveTable,

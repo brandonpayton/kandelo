@@ -909,24 +909,17 @@ export class ForkProcessContinuationCoordinator {
       this.phase = "capture";
       // Phase 6 D7a.1a: a dlopen fork has N activations. Activation 0 opens the
       // module capture (`beginUnwind`); each side activation is added to the SAME
-      // capture with its own host frame arena + prefix (`addActivationUnwind`).
-      // Every activation's root is written into ITS module-state prefix and its
-      // guest instance is put into UNWINDING, exactly mirroring the JS path.
-      // A single-activation fork (the common case, incl. any deep recursive
-      // fork) hands activation 0 the whole arena minus the journal + module-state
-      // reserves, so a deep linked continuation grows up to the bounded arena
-      // instead of tripping the fixed multi-activation frame sub-cap. A
-      // multi-activation (dlopen) fork keeps the per-activation slab so N
-      // activations share the arena.
-      const singleActivation = this.orderedActivations().length === 1;
+      // capture with its own prefix (`addActivationUnwind`). Every activation's
+      // root is written into ITS module-state prefix and its guest instance is
+      // put into UNWINDING, exactly mirroring the JS path. Each activation's
+      // linked frame chunks are channel-mmap'd on demand by the module (Option
+      // B: dynamic, kernel-tracked `find_gap` placement), so a deep continuation
+      // grows without a fork-depth cap and a genuine exhaustion is a truthful
+      // `-ENOMEM`.
       for (const activation of this.orderedActivations()) {
         const root =
           activation.activationId === 0
-            ? backend.beginUnwind(
-                singleActivation
-                  ? backend.singleActivationFrameBudget()
-                  : undefined,
-              )
+            ? backend.beginUnwind()
             : backend.addActivationUnwind(
                 activation.activationId,
                 activation.continuation.format.fixedPrefixSize,

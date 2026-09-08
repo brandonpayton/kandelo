@@ -103,7 +103,6 @@ import { ForkReferenceCaptureModule } from "./fork-reference-capture-module";
 import { ForkModuleTrampolines } from "./fork-module-trampoline";
 import {
   FORK_MODULE_RESUME_CATALOG_CAP,
-  ForkFixedFrameArena,
   ForkModuleContinuationBackend,
 } from "./fork-module-backend";
 import { ForkTableSnapshot } from "./fork-table-snapshot";
@@ -3530,18 +3529,6 @@ export async function centralizedWorkerMain(
       // its module-backed branches. Null (non-qualifying / flag-off) => the
       // byte-identical JavaScript continuation.
       let forkModuleBackend: ForkModuleContinuationBackend | null = null;
-      // Fix X: the bounded, pre-reserved in-guest fork-frame arena shared by the
-      // fork-module backend (frame + journal slabs) and the per-fork module-state
-      // arena. Reset once per fork (below) so a fork consumes committed headroom
-      // instead of growing the guest. Null on the JS/flag-off path.
-      let forkFixedFrameArena: ForkFixedFrameArena | null = null;
-      // PROBE SCAFFOLDING (Phase 0 growable-arena probe — NOT production). When
-      // set, drive the module's GROWABLE channel exports (frame/journal/
-      // module-state all channel-mmap via SYS_mmap → kernel find_gap) instead of
-      // the bounded Fix X fixed arena, to empirically settle whether tracked-
-      // growth deep forks place coherently and grow past the 2 MiB cap.
-      const probeGrowableChannelArena =
-        process.env.KANDELO_FORK_PROBE_GROWABLE_ARENA === "1";
       // Phase 6 D7a.1a: per-activation frame trampolines for a dlopen fork. Each
       // dlopen'd side activation's five frozen frame/resume imports are flipped
       // to its own trampoline (wasm->wasm), folding in the activation id so its
@@ -3777,28 +3764,18 @@ export async function centralizedWorkerMain(
           // never asserts an exact memory size, so its growth is invisible.
           const forkModuleStagingBase = forkModuleInstance.stagingBase;
           const forkModuleStagingBytes = forkModuleInstance.stagingBytes;
-          // Fix X: sub-allocate the frame/journal slabs and the module-state
-          // arena from the pre-reserved fork-frame arena (reserved at init inside
-          // the fork-module region, so a COPIED child inherits it and observes
-          // the parent's exact memory.size) instead of channel-mmapping growing
-          // regions per fork.
-          forkFixedFrameArena = new ForkFixedFrameArena(
-            forkModuleInstance.frameArenaBase,
-            forkModuleInstance.frameArenaBytes,
-            `pid=${pid}: fork-frame arena`,
-          );
           forkModuleBackend = new ForkModuleContinuationBackend({
             exports: forkModuleInstance.exports,
             memory,
             ptrWidth,
             format: linkedFrameFormat,
             catalogOrdinals,
-            // Fix X: frame chunks + journal image come from `frameArena` (bounded,
-            // pre-reserved), not the channel. `channelBase` and these hooks remain
-            // ONLY for the small pre-fork catalog scratch
-            // (setup()/setActivationResumeCatalog) and GC-codec staging.
+            // Option B: the module channel-mmaps its per-fork frame chunks + the
+            // journal image on demand via `SYS_mmap` → the kernel `find_gap`
+            // allocator (dynamic, kernel-tracked placement — no fork-depth cap
+            // and no carved-out guest region). `channelBase` also backs the
+            // small pre-fork catalog scratch and GC-codec staging.
             channelBase: channelOffset,
-            frameArena: forkFixedFrameArena,
             reserveRegion: (size) =>
               size <= forkModuleStagingBytes
                 ? forkModuleStagingBase
@@ -3820,7 +3797,6 @@ export async function centralizedWorkerMain(
             },
             pid,
             label: `pid=${pid}: fork-module`,
-            probeGrowableChannelArena,
           });
           // Seed the linked-frame format + full resume catalog once, now, before
           // any fork drives the module. Both are host-known custom sections.
@@ -3910,35 +3886,6 @@ export async function centralizedWorkerMain(
           },
           `pid=${pid}`,
         );
-
-      // Fix X: the PER-FORK module-state arena. When the fork-frame arena is
-      // reserved (module-backed fork), its chunks come from that bounded region
-      // (deallocate is a no-op — the region is reclaimed by the per-fork cursor
-      // reset, not munmap) so the module-state page stops growing guest memory at
-      // fork. A COW child never allocates here (it `attach`es the inherited
-      // arena), and a borrowed child cannot allocate module state at all. When no
-      // fork-frame arena exists (JS/flag-off fork) this is the growing
-      // `newModuleStateArena`, byte-identical to before.
-      const newForkModuleStateArena = (): ForkModuleStateArena =>
-        forkFixedFrameArena && !probeGrowableChannelArena
-          ? new ForkModuleStateArena(
-              memory,
-              ptrWidth,
-              (size) => {
-                if (borrowedForkChild) {
-                  throw new Error(
-                    `pid=${pid}: borrowed child cannot allocate module state`,
-                  );
-                }
-                return forkFixedFrameArena!.allocate(size);
-              },
-              () => {
-                // Fixed-arena slab: reclaimed by the per-fork cursor reset, not
-                // by munmap. Intentionally a no-op.
-              },
-              `pid=${pid}`,
-            )
-          : newModuleStateArena();
 
       processHostImportRuntime = new ForkHostImportWorkerRuntime(
         initData.forkHostImports,
@@ -4188,12 +4135,10 @@ export async function centralizedWorkerMain(
           inheritedLaunchRoot,
           ptrWidth,
         );
-        // Fix X: use the fork-frame-arena factory so a COW child's `attach`ed
-        // module-state chunks (which now live in the inherited fork-frame arena,
-        // part of the module region) are released as a no-op instead of munmap'd
-        // — the child must never unmap a slice of its own module region. The child
-        // never allocates here (it attaches), so the cursor is untouched.
-        childArena = newForkModuleStateArena();
+        // A COW child never allocates module state here (it `attach`es the
+        // inherited arena the parent channel-mmap'd), so this arena's allocator
+        // is unused on the child; it only provides the release/attach surface.
+        childArena = newModuleStateArena();
         const arenaRoot = ptrWidth === 8
           ? BigInt(moduleStateRoot)
           : moduleStateRoot;
@@ -4320,12 +4265,7 @@ export async function centralizedWorkerMain(
         // frame commits. If this fails, fork returns errno with no partially
         // published activation graph.
         acquireCurrentProcessForkArchiveReader();
-        // Fix X: reset the bounded fork-frame arena cursor at the TRUE start of
-        // this fork, before the module-state root chunk, the frame slabs, and the
-        // journal slab bump-allocate from it. A COW child does not run this branch
-        // (it replays), so it never resets and never clobbers inherited slabs.
-        forkFixedFrameArena?.reset();
-        const arena = newForkModuleStateArena();
+        const arena = newModuleStateArena();
         try {
           arena.begin();
           processContinuation.beginCapture(arena);
@@ -6716,9 +6656,6 @@ export async function centralizedThreadWorkerMain(
     // deleted JS path.
     let threadForkModuleInstance: ForkModuleInstance | null = null;
     let threadForkModuleBackend: ForkModuleContinuationBackend | null = null;
-    // Fix X: the pthread parent's bounded fork-frame arena (parity with the
-    // process worker). Reset once per fork-from-thread capture below.
-    let threadForkFixedFrameArena: ForkFixedFrameArena | null = null;
     if (
       hasForkInstrumentation &&
       threadProcessContinuation &&
@@ -6786,24 +6723,17 @@ export async function centralizedThreadWorkerMain(
         const threadForkModuleStagingBase = threadForkModuleInstance.stagingBase;
         const threadForkModuleStagingBytes =
           threadForkModuleInstance.stagingBytes;
-        // Fix X: the pthread parent's frame/journal slabs come from its own
-        // pre-reserved fork-frame arena, not the channel (parity with the process
-        // worker path).
-        threadForkFixedFrameArena = new ForkFixedFrameArena(
-          threadForkModuleInstance.frameArenaBase,
-          threadForkModuleInstance.frameArenaBytes,
-          `pid=${pid} tid=${tid}: fork-frame arena`,
-        );
         threadForkModuleBackend = new ForkModuleContinuationBackend({
           exports: threadForkModuleInstance.exports,
           memory,
           ptrWidth,
           format: linkedFrameFormat,
           catalogOrdinals,
-          // Fix X: frame chunks + journal image come from `frameArena`, not the
-          // channel. `channelBase` + these hooks remain ONLY for catalog scratch.
+          // Option B: the module channel-mmaps its per-fork frame chunks + the
+          // journal image on demand via `SYS_mmap` → the kernel `find_gap`
+          // allocator (dynamic, kernel-tracked). `channelBase` also backs the
+          // small pre-fork catalog scratch.
           channelBase: channelOffset,
-          frameArena: threadForkFixedFrameArena,
           reserveRegion: (size) =>
             size <= threadForkModuleStagingBytes
               ? threadForkModuleStagingBase
@@ -6825,8 +6755,6 @@ export async function centralizedThreadWorkerMain(
           },
           pid,
           label: `pid=${pid} tid=${tid}: fork-module`,
-          probeGrowableChannelArena:
-            process.env.KANDELO_FORK_PROBE_GROWABLE_ARENA === "1",
         });
         threadForkModuleBackend.setup();
         threadProcessContinuation.enableModuleBacking(threadForkModuleBackend);
@@ -6989,23 +6917,7 @@ export async function centralizedThreadWorkerMain(
           throw error;
         }
 
-        // Fix X: reset the pthread parent's bounded fork-frame arena at the true
-        // start of this fork, then draw the module-state root/records from it (a
-        // no-op deallocate; reclaimed by the next reset) so a fork-from-thread
-        // does not grow the shared process memory a child would clone. Falls back
-        // to the growing arena when no fork-frame arena exists.
-        threadForkFixedFrameArena?.reset();
-        const arena = threadForkFixedFrameArena
-          ? new ForkModuleStateArena(
-              memory,
-              ptrWidth,
-              (size) => threadForkFixedFrameArena!.allocate(size),
-              () => {
-                // Fixed-arena slab: reclaimed by the per-fork cursor reset.
-              },
-              `pid=${pid} tid=${tid}`,
-            )
-          : newThreadModuleStateArena();
+        const arena = newThreadModuleStateArena();
         try {
           arena.begin();
           threadProcessContinuation.beginCapture(arena);

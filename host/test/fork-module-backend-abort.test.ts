@@ -16,10 +16,7 @@ import {
   type ForkModuleExports,
   instantiateForkModule,
 } from "../src/fork-module-instance";
-import {
-  ForkFixedFrameArena,
-  ForkModuleContinuationBackend,
-} from "../src/fork-module-backend";
+import { ForkModuleContinuationBackend } from "../src/fork-module-backend";
 import { ForkModuleTrampolines } from "../src/fork-module-trampoline";
 import type { LinkedFrameFormatDescriptor } from "../src/fork-continuation";
 import {
@@ -219,13 +216,8 @@ describe("ForkModuleContinuationBackend abort-replay (beginAbort/finishAbort)", 
     const px = fm.exports as ForkModuleExports;
     const errno = (): number => Number((px.fm_last_errno as () => number)());
 
-    // Fix X: frame chunks + journal image come from the pre-reserved fork-frame
-    // arena, not the channel.
-    const frameArena = new ForkFixedFrameArena(
-      fm.frameArenaBase,
-      fm.frameArenaBytes,
-      "backend-abort frame arena",
-    );
+    // Option B: the module channel-mmaps its frame chunks + journal image
+    // through the channel (serviced by the worker responder).
     const backend = new ForkModuleContinuationBackend({
       exports: px,
       memory,
@@ -233,7 +225,6 @@ describe("ForkModuleContinuationBackend abort-replay (beginAbort/finishAbort)", 
       format: format(128),
       catalogOrdinals: CATALOG0,
       channelBase: CHANNEL_BASE,
-      frameArena,
       reserveRegion: alloc.reserve,
       releaseRegion: () => {},
       pid: 1,
@@ -252,10 +243,9 @@ describe("ForkModuleContinuationBackend abort-replay (beginAbort/finishAbort)", 
     driveUnwind(trampolines, memory, errno);
 
     const image = backend.finishUnwindAndSerialize();
-    // Fix X: the image lives in the pre-reserved fork-frame arena, not a
-    // channel-mmap'd high chunk.
-    expect(image.ptr).toBeGreaterThanOrEqual(fm.frameArenaBase);
-    expect(image.ptr).toBeLessThan(fm.frameArenaBase + fm.frameArenaBytes);
+    // Option B: the image lives in a channel-mmap'd chunk the module allocated
+    // itself.
+    expect(image.ptr).toBeGreaterThan(0);
     expect(image.len).toBeGreaterThan(0);
     expect(Number(backend.framesCommitted())).toBe(COMMITS.length);
 

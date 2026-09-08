@@ -41,8 +41,10 @@ const C_TEST_FIXTURES = [
     forkInstrument: true,
   },
   {
-    // PROBE SCAFFOLDING (Phase 0 growable-arena probe). Grows its heap via a big
-    // malloc (tracked SYS_mmap) and forks from a deep linked continuation.
+    // Deep-fork fixture for the module-owned growing frame allocator: grows its
+    // heap via a big malloc (tracked SYS_mmap) and forks from a deep linked
+    // continuation, so fork-time continuation frames grow uncapped past the old
+    // 2 MiB Fix X arena and still place coherently above the live heap.
     src: join(fixturesDir, "malloc-deep-fork.c"),
     out: join(fixturesDir, "malloc-deep-fork.wasm"),
     forkInstrument: true,
