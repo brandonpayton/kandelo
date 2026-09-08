@@ -16,7 +16,10 @@ import {
   type ForkModuleExports,
   instantiateForkModule,
 } from "../src/fork-module-instance";
-import { ForkModuleContinuationBackend } from "../src/fork-module-backend";
+import {
+  ForkModuleContinuationBackend,
+  FORK_MODULE_RESUME_CATALOG_CAP,
+} from "../src/fork-module-backend";
 import { ForkModuleTrampolines } from "../src/fork-module-trampoline";
 import {
   ContinuationAllocationError,
@@ -352,5 +355,33 @@ describe("ForkModuleContinuationBackend abort-replay (beginAbort/finishAbort)", 
     expect(() => backend.beginAbort()).not.toThrow();
     driveAbortReplay(trampolines, memory, errno);
     expect(() => backend.finishAbort()).not.toThrow();
+  });
+});
+
+// MODULE-OR-FATAL (Phase 4 point of no return): the co-resident module backs
+// EVERY fork; there is no JS continuation fallback. A fork the module cannot
+// back (here: a resume catalog larger than the module's static BSS cap) must
+// FAIL LOUD at construction, never silently drop to a deleted JS route.
+describe("ForkModuleContinuationBackend module-or-fatal capacity boundary", () => {
+  it("a resume catalog past the module cap is a loud fatal, not a silent JS route", () => {
+    const memory = new WebAssembly.Memory({ initial: 1, maximum: 1 });
+    const overCap = new Array<number>(FORK_MODULE_RESUME_CATALOG_CAP + 1).fill(0);
+    expect(
+      () =>
+        new ForkModuleContinuationBackend({
+          // The cap check runs in the constructor before any export is touched,
+          // so an empty exports stand-in is sufficient to prove the boundary.
+          exports: {} as unknown as ForkModuleExports,
+          memory,
+          ptrWidth: 4,
+          format: format(128),
+          catalogOrdinals: overCap,
+          channelBase: CHANNEL_BASE,
+          reserveRegion: () => 0,
+          releaseRegion: () => {},
+          pid: 1,
+          label: "module-or-fatal",
+        }),
+    ).toThrow(/exceeds the module cap/);
   });
 });
