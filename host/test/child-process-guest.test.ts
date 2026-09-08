@@ -32,6 +32,16 @@
  * Kandelo gap — `'close'` is documented to fire only once the process has
  * exited *and* its stdio streams have ended, which is exactly what
  * `_spawn`'s `_maybeClose` gate implements.
+ *
+ * `exec()`/`execFile()` had the exact same 'exit'-vs-'close' race baked into
+ * their callback (they read the accumulated `stdout`/`stderr` when the
+ * child exits, before the pipe reads necessarily finish) plus a second bug:
+ * `code ? error : null` treats a `null` exit code — which is what a
+ * signal-killed child reports — as success. `mainexecbig.cjs`/
+ * `mainexecfail.cjs` guard the first fix (full, non-truncated stdout) and
+ * the exit-code error path; the signal-kill path is exercised indirectly by
+ * the `kill(SIGKILL)` `spawn()` test above proving `_spawn` reports signals
+ * correctly on `'close'`, which `exec`'s shared `_runWithCallback` consumes.
  */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -74,6 +84,26 @@ const FIXTURES: Record<string, string> = {
   "maincwd.cjs":
     '(()=>{const cp=require("child_process");const c=cp.spawn("/bin/sh",["-c","pwd"],{cwd:"/tmp"});' +
     'let o="";c.stdout.on("data",d=>o+=d);c.on("close",()=>console.log("CWD",o.trim()));})();',
+  // exec() must deliver FULL (non-truncated) stdout to its callback. Before
+  // this fix exec/execFile invoked their callback on 'exit', which races the
+  // async stdout/stderr drain the same way the raw 'exit'-vs-'close' fixtures
+  // above do — a callback firing before the pipe-read promises settle would
+  // see a truncated (or empty) `stdout` string. 5000 bytes (500x "0123456789")
+  // is big enough that a truncation would be visible either as a short
+  // length or a wrong tail slice.
+  "mainexecbig.cjs":
+    '(()=>{const cp=require("child_process");' +
+    'cp.exec("i=0; while [ $i -lt 500 ]; do printf 0123456789; i=$((i+1)); done",' +
+    '(err,stdout,stderr)=>{console.log("EXECBIG",err?String(err):"OK",stdout.length,stdout.slice(0,10),stdout.slice(-10));});})();',
+  // exec() of a command that exits non-zero must yield an Error with `.code`
+  // set to the real exit code (not report success). `code` alone (not
+  // `code || signal`) is asserted here; the null-code/non-null-signal case
+  // (killed by a signal) is covered by _runWithCallback's `code !== 0 ||
+  // signal !== null` check, exercised indirectly by the kill() test above
+  // proving `_spawn` reports signals correctly on 'close'.
+  "mainexecfail.cjs":
+    '(()=>{const cp=require("child_process");' +
+    'cp.exec("exit 7",(err,stdout,stderr)=>{console.log("EXECFAIL",err&&err.code,err&&err.signal,typeof stdout,typeof stderr);});})();',
 };
 
 function stageFixtures(): string {
@@ -178,5 +208,19 @@ describe("spidermonkey-node child_process (real async spawn)", () => {
     // eslint-disable-next-line no-console
     console.log("CWD STDOUT:", JSON.stringify(r.stdout.trim()), "STDERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
     expect(r.stdout).toContain("CWD /tmp");
+  }, 90_000);
+
+  it.runIf(ready)("exec: callback gets the FULL stdout, not truncated by an 'exit'/'close' race", async () => {
+    const r = await runOne("/app/mainexecbig.cjs");
+    // eslint-disable-next-line no-console
+    console.log("EXECBIG STDOUT:", JSON.stringify(r.stdout.trim()), "STDERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
+    expect(r.stdout).toContain("EXECBIG OK 5000 0123456789 0123456789");
+  }, 90_000);
+
+  it.runIf(ready)("exec: non-zero exit yields an Error with .code, not a false success", async () => {
+    const r = await runOne("/app/mainexecfail.cjs");
+    // eslint-disable-next-line no-console
+    console.log("EXECFAIL STDOUT:", JSON.stringify(r.stdout.trim()), "STDERR:", r.stderr.trim().split("\n").slice(-6).join(" | "));
+    expect(r.stdout).toContain("EXECFAIL 7 null string string");
   }, 90_000);
 });

@@ -2840,6 +2840,7 @@ const child_process = (() => {
 
         const child = new events.EventEmitter();
         child.stdin = null; child.stdout = null; child.stderr = null; child.pid = 0;
+        child.killed = false;
 
         let pid;
         try { pid = _nn.__kandeloSpawn(file, argv, env, actions, {}); }
@@ -2898,31 +2899,56 @@ const child_process = (() => {
 
         child.kill = function (sig) {
             const signum = typeof sig === 'number' ? sig : (nodeOs.constants.signals[sig || 'SIGTERM'] | 0);
-            try { _nn.__kandeloKill(pid, signum || 15); return true; } catch (_) { return false; }
+            try { _nn.__kandeloKill(pid, signum || 15); child.killed = true; return true; } catch (_) { return false; }
         };
         return child;
     }
 
-    function exec(command, options, cb) {
-        if (typeof options === 'function') { cb = options; options = {}; }
-        const child = _spawn(command, [], { ...(options || {}), shell: true });
+    // Shared by exec/execFile: accumulate stdout/stderr and invoke `cb` once
+    // the child is fully done. Callers MUST wait for 'close', not 'exit':
+    // 'exit' fires as soon as the child is reaped, independently of whether
+    // the async pipe-read promises filling `out`/`err` have settled yet, so
+    // reading accumulated output from an 'exit' handler risks delivering
+    // TRUNCATED stdout/stderr to the callback (a real race, confirmed
+    // directly — see child-process-guest.test.ts's header comment).
+    // 'close' only fires after the process has been reaped AND every stdio
+    // stream has reached EOF/error (`_spawn`'s `_maybeClose` gate), which is
+    // exactly when the accumulated strings are guaranteed complete.
+    //
+    // A non-zero exit code OR a non-null termination signal is a failure —
+    // `code` is `null` when the child was killed by a signal, so a naive
+    // `code ? err : null` check would misreport a signal-killed child as
+    // success. Mirrors Node's own exec() error shape: `.code`/`.signal` are
+    // the reaped values, `.killed` reflects whether this ChildProcess's own
+    // `.kill()` was called.
+    function _runWithCallback(child, label, cb) {
         let out = '', err = '';
         if (child.stdout) child.stdout.on('data', d => out += d);
         if (child.stderr) child.stderr.on('data', d => err += d);
         child.on('error', e => cb && cb(e, out, err));
-        child.on('exit', (code) => cb && cb(code ? Object.assign(new Error('Command failed: ' + command), { code }) : null, out, err));
+        child.on('close', (code, signal) => {
+            if (!cb) return;
+            if (code !== 0 || signal !== null) {
+                const e = Object.assign(new Error('Command failed: ' + label), {
+                    code: code, signal: signal, killed: !!child.killed,
+                });
+                cb(e, out, err);
+            } else {
+                cb(null, out, err);
+            }
+        });
         return child;
+    }
+    function exec(command, options, cb) {
+        if (typeof options === 'function') { cb = options; options = {}; }
+        const child = _spawn(command, [], { ...(options || {}), shell: true });
+        return _runWithCallback(child, command, cb);
     }
     function execFile(file, args, options, cb) {
         if (typeof args === 'function') { cb = args; args = []; options = {}; }
         else if (typeof options === 'function') { cb = options; options = {}; }
         const child = _spawn(file, args || [], options || {});
-        let out = '', err = '';
-        if (child.stdout) child.stdout.on('data', d => out += d);
-        if (child.stderr) child.stderr.on('data', d => err += d);
-        child.on('error', e => cb && cb(e, out, err));
-        child.on('exit', (code) => cb && cb(code ? Object.assign(new Error('Command failed: ' + file), { code }) : null, out, err));
-        return child;
+        return _runWithCallback(child, file, cb);
     }
 
     return { execSync, execFileSync, spawnSync, exec, execFile, spawn: _spawn };
