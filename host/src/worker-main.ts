@@ -3729,7 +3729,14 @@ export async function centralizedWorkerMain(
         const isForkFromThreadChild =
           initData.isForkChild === true &&
           initData.forkChildThreadFnPtr != null;
-        const hasResumeThreadExport = WebAssembly.Module.exports(module).some(
+        // Use the exact-bytes reflection registered above (line ~3310) rather
+        // than WebAssembly.Module.exports(module) directly: WebKit throws
+        // "unable to produce export descriptors for the given module" when the
+        // engine cannot describe an ABI 44 fork artifact's export types as
+        // descriptors, which blocked all fork on WebKit. wasmModuleExports()
+        // returns the ordered descriptors Kandelo already parsed and validated
+        // from the program bytes, matching every other reflection site here.
+        const hasResumeThreadExport = wasmModuleExports(module).some(
           (entry) => entry.name === "wpk_fork_resume_thread",
         );
         // Phase 6 D7a.1a: POSITIVE multi-activation admission — a dlopen fork
