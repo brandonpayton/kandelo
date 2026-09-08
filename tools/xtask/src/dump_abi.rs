@@ -8436,7 +8436,15 @@ mod tests {
         );
 
         let imports = fork["required_imports"].as_array().unwrap();
-        assert_eq!(imports.len(), 47);
+        assert_eq!(imports.len(), 48);
+        // The 48th required import is the externref provenance broker
+        // (`WPK_FORK_REFERENCE_IMPORT_PROVENANCE_EXTERNREF`); pin its identity so
+        // the count above is not a blind bump. It is verified by the ABI snapshot
+        // (`abi/snapshot.json`) and the `WPK_FORK_REQUIRED_IMPORTS.len()`
+        // self-test in `crates/shared`.
+        assert!(imports.iter().any(|entry| {
+            entry["name"] == json!("__wpk_fork_ref_provenance_externref")
+        }));
         assert_eq!(
             imports[0],
             json!({
