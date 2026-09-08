@@ -59,9 +59,22 @@ BUILD_FLAGS=(
 # Fork-instrument every fork-using output wasm (the kernel refuses an
 # uninstrumented artifact at guest-initiated exec). Non-fork programs are
 # left as-is. Returns the list of top-level output wasms via stdout.
+# Locate a prebuilt host xtask binary for the abi.contract stamp (built by
+# ./run.sh setup). We do not build it here to avoid a surprise long compile.
+host_xtask() {
+  local host
+  host="$(rustc -vV 2>/dev/null | awk '/^host:/{print $2}')"
+  [ -n "$host" ] || return 1
+  local bin="$REPO_ROOT/target/$host/release/xtask"
+  [ -x "$bin" ] && { echo "$bin"; return 0; }
+  return 1
+}
+
 instrument_outputs() {
   local dir="target/$TRIPLE/$PROFILE_DIR"
   [ -d "$dir" ] || return 0
+  local xtask
+  xtask="$(host_xtask || true)"
   local w
   for w in "$dir"/*.wasm; do
     [ -e "$w" ] || continue
@@ -69,6 +82,15 @@ instrument_outputs() {
       echo "==> fork-instrumenting $(basename "$w")" >&2
       bash "$FORK_INSTRUMENT" "$w" -o "$w.inst" >&2
       mv "$w.inst" "$w"
+    fi
+    # Stamp the abi.contract section so the host accepts the program at exec
+    # without the "legacy binary" warning. Non-fatal: a re-run without a
+    # rebuild finds it already stamped.
+    if [ -n "$xtask" ]; then
+      "$xtask" stamp-abi-contract "$w" >/dev/null 2>&1 \
+        || echo "   (abi.contract stamp skipped for $(basename "$w"))" >&2
+    else
+      echo "   (abi.contract stamp skipped: host xtask not built; run ./run.sh setup)" >&2
     fi
     echo "$w"
   done
