@@ -126,13 +126,15 @@ export interface ForkModuleBackendOptions {
  */
 /**
  * Drive-table slot offsets within an activation's slice (must match
- * `fork_codec::drive_plan` DRIVE_SLOT_REWIND_BEGIN / DRIVE_SLOT_ABORT_BEGIN and
- * the DRIVE_SLOTS_PER_ACTIVATION stride the module's `fm_drive_table_base`
- * reserves). ALLOC/FILL/EXN/RESTORE/FINISH_RESTORE occupy slots 0..=4; the
- * per-activation REPLAY/ABORT begin drive occupies 5/6.
+ * `fork_codec::drive_plan` DRIVE_SLOT_REWIND_BEGIN / DRIVE_SLOT_ABORT_BEGIN /
+ * DRIVE_SLOT_UNWIND_END and the DRIVE_SLOTS_PER_ACTIVATION stride the module's
+ * `fm_drive_table_base` reserves). ALLOC/FILL/EXN/RESTORE/FINISH_RESTORE occupy
+ * slots 0..=4; the per-activation REPLAY/ABORT begin drive occupies 5/6; the
+ * capture-SEAL `wpk_fork_unwind_end` drive occupies 7.
  */
 const DRIVE_SLOT_REWIND_BEGIN = 5;
 const DRIVE_SLOT_ABORT_BEGIN = 6;
+const DRIVE_SLOT_UNWIND_END = 7;
 
 export class ForkModuleContinuationBackend {
   private readonly exports: ForkModuleExports;
@@ -702,6 +704,29 @@ export class ForkModuleContinuationBackend {
   }
 
   /**
+   * Bind ONE activation's guest `wpk_fork_unwind_end` into the module's imported
+   * drive table at `fm_drive_table_base(activation) + DRIVE_SLOT_UNWIND_END`, so
+   * the coarse `sealCaptureAndSerialize` drive can `call_indirect` it (the
+   * argument-free `() -> ()` capture-seal flip). Like `bindActivationBeginDrive`
+   * the ref-typed `Table.set`/`Table.grow` is a host floor (Rust cannot hold a
+   * funcref). Idempotent. Call once per open activation before
+   * `sealCaptureAndSerialize`.
+   */
+  bindActivationSealDrive(activationId: number, unwindEnd: Function): void {
+    this.requireSetup("bind activation seal drive");
+    const slotBase = this.toNum(
+      (this.exports.fm_drive_table_base as (activation: number) => number | bigint)(
+        activationId,
+      ),
+    );
+    const needed = slotBase + DRIVE_SLOT_UNWIND_END + 1;
+    if (this.driveTable.length < needed) {
+      this.driveTable.grow(needed - this.driveTable.length);
+    }
+    this.driveTable.set(slotBase + DRIVE_SLOT_UNWIND_END, unwindEnd);
+  }
+
+  /**
    * Parent REPLAY-begin, coarsened (control-flow inversion). ONE module call
    * sequences the whole phase internally: begin the parent rewind (attach every
    * activation's driver + register its resume slots), build the per-activation
@@ -730,6 +755,60 @@ export class ForkModuleContinuationBackend {
     this.requireSetup("parent abort");
     this.exports.fm_parent_abort();
     this.requireOk("fm_parent_abort");
+  }
+
+  /**
+   * Capture SEAL, coarsened (control-flow inversion). ONE module call sequences
+   * the whole seal internally: drive each open activation's guest
+   * `wpk_fork_unwind_end()` through the injected `fm_drive_execute` shim (moving
+   * each activation from `UNWINDING` back to `NORMAL`), then seal every frame
+   * writer + the process journal and serialize the child-inheritable KFRE image
+   * into a freshly channel-mmap'd chunk. Returns that chunk's guest offset and
+   * byte length. Replaces the host's former per-activation `wpk_fork_unwind_end`
+   * loop + `fm_finish_unwind` + `fm_serialize_journal_alloc`. Each participating
+   * activation's `bindActivationSealDrive` must have run first (the ref-typed
+   * table bind is a host floor).
+   *
+   * ONLY for a COMPLETE capture. A partial/aborted capture must NOT call this
+   * (driving `wpk_fork_unwind_end` mid-unwind corrupts the guest state machine);
+   * that path stays on `sealForAbort`.
+   *
+   * SEAL-TIME TRUTHFUL FAILURE (Phase 4 / Phase 2 carry): the module has ALREADY
+   * driven every activation's `wpk_fork_unwind_end` and sealed the writers +
+   * journal (guest back at `NORMAL`) but could not channel-mmap the
+   * child-inheritable journal-image chunk. `fm_parent_seal_capture` returns 0 with
+   * `fm_last_errno` set rather than trapping, so — exactly as the fine-grained
+   * `finishUnwindAndSerialize` did — surface a TYPED `ContinuationAllocationError`
+   * that the coordinator routes through the same abort-replay path a mid-unwind
+   * reserve failure uses (parent preserved, `fork()` returns `-errno`, no child
+   * launched). A guest reconstruction/seal failure traps inside the shim exactly
+   * as it did under the host loop.
+   */
+  sealCaptureAndSerialize(): ForkModuleJournalImage {
+    this.requireSetup("seal capture and serialize");
+    const ptr = this.toNum(
+      this.exports.fm_parent_seal_capture(this.wptr(this.channelBase)),
+    );
+    const sealErrno = this.lastErrno();
+    if (sealErrno !== 0) {
+      throw new ContinuationAllocationError(
+        sealErrno,
+        0,
+        `${this.label}: fm_parent_seal_capture failed with errno=${sealErrno}`,
+      );
+    }
+    const len = this.toNum(this.exports.fm_journal_image_len());
+    if (!Number.isSafeInteger(ptr) || ptr <= 0) {
+      throw new Error(
+        `${this.label}: fm_parent_seal_capture returned invalid image ptr ${ptr}`,
+      );
+    }
+    if (!Number.isSafeInteger(len) || len <= 0) {
+      throw new Error(
+        `${this.label}: fm_journal_image_len returned invalid length ${len}`,
+      );
+    }
+    return { ptr, len };
   }
 
   /**

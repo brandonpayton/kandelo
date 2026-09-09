@@ -92,6 +92,16 @@ export const FORK_MODULE_REQUIRED_EXPORTS = [
   // the native (`host-native`) runner.
   "fm_parent_replay",
   "fm_parent_abort",
+  // Control-flow inversion: the coarse capture-SEAL entry. Drives each open
+  // activation's guest `wpk_fork_unwind_end` through the injected
+  // `fm_drive_execute` shim, then seals the writers + journal
+  // (`fm_finish_unwind`) and serializes the child-inheritable image
+  // (`fm_serialize_journal_alloc`) in ONE module call, replacing the host's
+  // per-activation `wpk_fork_unwind_end` loop + `fm_finish_unwind` +
+  // `fm_serialize_journal_alloc`. `fm_finish_unwind` / `fm_serialize_journal_alloc`
+  // remain exported for `sealForAbort` (partial-capture abort) and the
+  // fine-grained module unit tests.
+  "fm_parent_seal_capture",
   // F1: parent abort-replay begin/finish. Mirror `fm_begin_replay`/
   // `fm_finish_replay` exactly (same frame/journal mechanics), tagging the
   // drive as an abort so `fm_finish_abort` can assert a matching

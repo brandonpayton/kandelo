@@ -648,9 +648,21 @@ export class ForkProcessContinuationCoordinator {
   private sealModuleCapture(): void {
     const backend = this.moduleBackend!;
     try {
+      // Control-flow inversion: bind each activation's guest `wpk_fork_unwind_end`
+      // into the drive table, then seal the WHOLE capture in ONE module call
+      // (`sealCaptureAndSerialize`). It drives each activation's
+      // `wpk_fork_unwind_end()` (UNWINDING -> NORMAL) through the injected shim in
+      // ascending id order, then seals the writers + journal and serializes the
+      // child-inheritable image — replacing the former host per-activation
+      // `wpk_fork_unwind_end` loop + `fm_finish_unwind` + `fm_serialize_journal_alloc`.
+      // The per-activation NORMAL assertion moves to a single post-drive sweep
+      // below, exactly as `beginModuleParentReplay` sweeps state after its coarse
+      // drive.
       for (const activation of this.orderedActivations()) {
-        requireExportFunction(activation, "wpk_fork_unwind_end")();
-        this.requireActivationState(activation, WPK_FORK_NORMAL, "end unwind");
+        backend.bindActivationSealDrive(
+          activation.activationId,
+          requireExportFunction(activation, "wpk_fork_unwind_end"),
+        );
       }
       // The module serializes its own journal (every activation's events, tagged)
       // into a chunk it channel-mmaps itself (Option B), inherited verbatim by
@@ -660,7 +672,7 @@ export class ForkProcessContinuationCoordinator {
       // (ptr, len) in a `JournalImage` KFMS record for the child to find.
       let journalImage;
       try {
-        journalImage = backend.finishUnwindAndSerialize();
+        journalImage = backend.sealCaptureAndSerialize();
       } catch (error) {
         if (error instanceof ContinuationAllocationError) {
           // SEAL-TIME TRUTHFUL FAILURE (Phase 2 carry / Phase 4): `fm_finish_unwind`
@@ -678,6 +690,12 @@ export class ForkProcessContinuationCoordinator {
           this.phase = "sealed-parent";
         }
         throw error;
+      }
+      // Post-drive sweep: the coarse seal left every activation back at NORMAL;
+      // assert it exactly as the host per-activation unwind-end loop did (moved
+      // after the coarse drive, mirroring `beginModuleParentReplay`).
+      for (const activation of this.orderedActivations()) {
+        this.requireActivationState(activation, WPK_FORK_NORMAL, "end unwind");
       }
       this.registry.currentArena().appendJournalImage({
         ptr: BigInt(journalImage.ptr),
