@@ -92,6 +92,16 @@ export const FORK_MODULE_REQUIRED_EXPORTS = [
   // the native (`host-native`) runner.
   "fm_parent_replay",
   "fm_parent_abort",
+  // Control-flow inversion: the coarse CHILD reconstruct rewind-begin entry (the
+  // child-worker mirror of `fm_parent_replay`). Builds the per-activation
+  // REWIND-begin drive plan from each activation's stored `child_rewind_root`
+  // (COW inherited anchor or borrowed child-private prefix) and drives each
+  // guest `wpk_fork_rewind_begin` through the injected `fm_drive_execute` shim in
+  // ONE module call, replacing the host's per-activation rewind loop in
+  // `attachModuleChild` / `attachBorrowedModuleChild`. The child's replay state
+  // is seeded by `fm_begin_child_replay` / `fm_add_activation_child_replay` (or
+  // the borrowed variants) first, so this has NO begin step.
+  "fm_child_reconstruct",
   // Control-flow inversion: the coarse capture-SEAL entry. Drives each open
   // activation's guest `wpk_fork_unwind_end` through the injected
   // `fm_drive_execute` shim, then seals the writers + journal

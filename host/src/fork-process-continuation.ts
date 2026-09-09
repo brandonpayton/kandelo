@@ -944,13 +944,27 @@ export class ForkProcessContinuationCoordinator {
         );
       }
 
+      // Control-flow inversion (the child-worker mirror of
+      // `beginModuleParentReplay`): bind each activation's guest
+      // `wpk_fork_rewind_begin` into the drive table, then drive the WHOLE child
+      // rewind-begin phase in ONE module call (`childReconstruct`). The module
+      // builds the per-activation plan from each activation's stored
+      // `child_rewind_root` — which is exactly `activation.replayRoot` here (the
+      // inherited COW anchor, seeded above by `beginChildReplay` /
+      // `addActivationChildReplay`) — and `call_indirect`s each guest
+      // `wpk_fork_rewind_begin(root)` in ascending id order, replacing the former
+      // host per-activation loop. The abort-begin bind is unused on the child
+      // path but harmless (the child plan never drives it). The post-drive
+      // REWINDING assertion sweep is unchanged.
       for (const activation of activations) {
-        invokeForkContinuationBegin(
+        backend.bindActivationBeginDrive(
+          activation.activationId,
           requireExportFunction(activation, "wpk_fork_rewind_begin"),
-          activation.replayRoot,
-          activation.continuation.format.ptrWidth,
-          `${this.label}: activation ${activation.activationId} child replay (module)`,
+          requireExportFunction(activation, "wpk_fork_abort_begin"),
         );
+      }
+      backend.childReconstruct();
+      for (const activation of activations) {
         this.requireActivationState(activation, WPK_FORK_REWINDING, "begin replay");
       }
     } catch (error) {
@@ -1132,14 +1146,25 @@ export class ForkProcessContinuationCoordinator {
           activation.replayRoot,
         );
       }
-      // Begin each activation's rewind at its child-private prefix.
+      // Control-flow inversion (mirror of `attachModuleChild`, borrowed): bind
+      // each activation's guest `wpk_fork_rewind_begin` into the drive table,
+      // then drive the WHOLE borrowed child rewind-begin phase in ONE module call
+      // (`childReconstruct`). The module builds the per-activation plan from each
+      // activation's stored `child_rewind_root` — which for a borrowed child is
+      // its child-PRIVATE prefix (== `activation.replayRoot` here, seeded above by
+      // `beginBorrowedChildReplay` / `addActivationBorrowedChildReplay`), so the
+      // guest's active-frame-pointer write lands in private scratch and never the
+      // parked parent's prefix. Replaces the former host per-activation rewind
+      // loop; the post-drive REWINDING assertion sweep is unchanged.
       for (const activation of activations) {
-        invokeForkContinuationBegin(
+        backend.bindActivationBeginDrive(
+          activation.activationId,
           requireExportFunction(activation, "wpk_fork_rewind_begin"),
-          activation.replayRoot,
-          activation.continuation.format.ptrWidth,
-          `${this.label}: activation ${activation.activationId} borrowed child replay (module)`,
+          requireExportFunction(activation, "wpk_fork_abort_begin"),
         );
+      }
+      backend.childReconstruct();
+      for (const activation of activations) {
         this.requireActivationState(activation, WPK_FORK_REWINDING, "begin replay");
       }
     } catch (error) {

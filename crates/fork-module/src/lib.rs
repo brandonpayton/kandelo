@@ -845,6 +845,57 @@ mod wasm {
         Ok(())
     }
 
+    /// Build a CHILD REWIND-begin drive plan: one `DRIVE_OP_REWIND_BEGIN` step per
+    /// activation carrying that activation's `child_rewind_root` — the exact root
+    /// the host's former per-activation `wpk_fork_rewind_begin(replayRoot)` loop
+    /// used (`module_buffer` for a COW child, the child-private prefix for a
+    /// borrowed/vfork child). Ascending id order (a `BTreeMap` iterates sorted
+    /// keys), matching that loop. Reuses `DRIVE_OP_REWIND_BEGIN` — the same op and
+    /// drive-table slot parent replay uses — so no new codec op or injector branch
+    /// is needed; only the root differs (child rewind root vs the parent's
+    /// `module_buffer`). Serialized through the shared plan scratch; the count is
+    /// read back via `GC_PLAN_COUNT`.
+    fn build_child_rewind_plan_impl() -> Result<usize, Errno> {
+        let st = state().as_ref().ok_or(Errno::EINVAL)?;
+        let roots: alloc::vec::Vec<(u32, u64)> = st
+            .activations
+            .iter()
+            .map(|(id, act)| (*id, act.child_rewind_root))
+            .collect();
+        let mut steps = alloc::vec::Vec::new();
+        drive_plan::append_rewind_begin_steps(&mut steps, &roots);
+        serialize_and_store_plan(&steps)
+    }
+
+    /// Sequence a whole CHILD reconstruct rewind-begin phase in the module
+    /// (control-flow inversion): build the per-activation REWIND-begin drive plan
+    /// from each activation's stored `child_rewind_root`, then drive it through the
+    /// injector-wired shim, which `call_indirect`s each activation's guest
+    /// `wpk_fork_rewind_begin(root)` in ascending id order.
+    ///
+    /// Unlike `parent_replay_impl` there is NO begin step here: the child's replay
+    /// state was already seeded by `fm_begin_child_replay` /
+    /// `fm_add_activation_child_replay` (or the borrowed variants) BEFORE this
+    /// call — the coarse entry folds ONLY the host's former per-activation
+    /// `wpk_fork_rewind_begin` loop in `attachModuleChild` /
+    /// `attachBorrowedModuleChild`. A zero-activation state is a truthful `EINVAL`
+    /// (a child always has at least the primary activation); a guest reconstruction
+    /// failure traps inside the shim exactly as it did under the host loop.
+    fn child_reconstruct_impl() -> Result<(), Errno> {
+        {
+            let st = state().as_ref().ok_or(Errno::EINVAL)?;
+            if st.activations.is_empty() {
+                return Err(Errno::EINVAL);
+            }
+        }
+        let plan = build_child_rewind_plan_impl()?;
+        let count = GC_PLAN_COUNT.load(Ordering::Relaxed);
+        if count > 0 {
+            drive_plan_via_injector(plan, count);
+        }
+        Ok(())
+    }
+
     /// Build a capture-SEAL drive plan: one `DRIVE_OP_UNWIND_END` step per open
     /// activation (ascending id order — a `BTreeMap` iterates sorted keys), so the
     /// injected shim `call_indirect`s each activation's guest
@@ -1693,6 +1744,17 @@ mod wasm {
         driver: Option<RewindDriver>,
         committed_ordinals: Vec<u32>,
         module_buffer: u64,
+        /// The continuation root the guest's `wpk_fork_rewind_begin` is driven
+        /// with when THIS instance is a replay CHILD (the coarse
+        /// `fm_child_reconstruct` drive plan carries it per activation). For a COW
+        /// child it equals `module_buffer` (the inherited anchor the guest rewinds
+        /// in place); for a vfork BORROWED child it is the child-PRIVATE replay
+        /// prefix (`private_prefix`) the module copied the parent's fixed prefix
+        /// into, so the guest's active-frame-pointer write lands in private scratch
+        /// and never touches the parked parent's prefix. Unused on the parent
+        /// (unwind) path, where `fm_parent_replay` drives from `module_buffer`
+        /// directly; left 0 there.
+        child_rewind_root: u64,
         /// A child (forked) instance seeds its journal from copied guest memory
         /// and only ever replays; it never unwinds, so it has no live frame
         /// arena to reserve into. Guard the reserve/commit exports against it so
@@ -1803,6 +1865,9 @@ mod wasm {
                 driver: None,
                 committed_ordinals: Vec::new(),
                 module_buffer,
+                // Parent (unwind) path: `fm_parent_replay` drives from
+                // `module_buffer`, never this field.
+                child_rewind_root: 0,
                 replay_only: false,
             },
         );
@@ -2365,6 +2430,11 @@ mod wasm {
                 driver: Some(driver),
                 committed_ordinals,
                 module_buffer,
+                // COW child default: the guest rewinds the inherited continuation
+                // in place, so the rewind root IS `module_buffer`. The vfork
+                // BORROWED primary path overrides this to its child-private prefix
+                // in `begin_borrowed_child_replay_impl` after the prefix copy.
+                child_rewind_root: module_buffer,
                 replay_only: true,
             },
         );
@@ -2429,6 +2499,17 @@ mod wasm {
             .format
             .fixed_prefix_size as u64;
         copy_borrowed_child_prefix(&module, activation_id, module_buffer, private_prefix, fixed_prefix)?;
+
+        // The borrowed child's guest rewind begins at the child-PRIVATE prefix
+        // (not `module_buffer`, the read-only parent anchor), so the coarse
+        // `fm_child_reconstruct` drive plan must carry `private_prefix` for this
+        // activation. This overrides the COW default `build_child_replay_module`
+        // seeded (== `module_buffer`).
+        module
+            .activations
+            .get_mut(&activation_id)
+            .ok_or(Errno::EINVAL)?
+            .child_rewind_root = private_prefix;
 
         *state() = Some(module);
         PRIMARY_ACTIVATION.store(activation_id, Ordering::Relaxed);
@@ -2530,6 +2611,10 @@ mod wasm {
                 driver: Some(driver),
                 committed_ordinals,
                 module_buffer,
+                // Borrowed side activation: the guest rewinds at its own
+                // child-private prefix (see the primary borrowed path), so the
+                // coarse child-reconstruct plan drives from `private_prefix`.
+                child_rewind_root: private_prefix,
                 replay_only: true,
             },
         );
@@ -2603,6 +2688,9 @@ mod wasm {
                 driver: Some(driver),
                 committed_ordinals,
                 module_buffer,
+                // COW side activation: the guest rewinds the inherited
+                // continuation in place, so the rewind root IS `module_buffer`.
+                child_rewind_root: module_buffer,
                 replay_only: true,
             },
         );
@@ -4210,6 +4298,37 @@ mod wasm {
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_parent_abort() {
         match parent_replay_impl(true) {
+            Ok(()) => set_ok(),
+            Err(errno) => set_err(errno),
+        }
+    }
+
+    /// Sequence a whole CHILD reconstruct rewind-begin phase in the module
+    /// (control-flow inversion, the child-worker mirror of [`fm_parent_replay`]):
+    /// build the per-activation REWIND-begin drive plan from each activation's
+    /// stored `child_rewind_root`, then DRIVE it through the injector-wired
+    /// `fm_drive_execute` shim, which `call_indirect`s each activation's guest
+    /// `wpk_fork_rewind_begin(root)` in ascending id order.
+    ///
+    /// This replaces the host's former per-activation `wpk_fork_rewind_begin`
+    /// loop in `attachModuleChild` / `attachBorrowedModuleChild` with ONE module
+    /// call. The child's replay state (journal, resume-slot table, per-activation
+    /// frame drivers, and the `child_rewind_root` each step carries) was ALREADY
+    /// seeded by `fm_begin_child_replay` / `fm_add_activation_child_replay` (COW)
+    /// or `fm_begin_borrowed_child_replay` / `fm_add_activation_borrowed_child_replay`
+    /// (vfork borrowed) before this entry — so, unlike `fm_parent_replay`, there is
+    /// NO begin step; this folds only the guest rewind DRIVE. The host must have
+    /// bound each activation's `wpk_fork_rewind_begin` into `__wpk_fork_drive_table`
+    /// at `fm_drive_table_base(activation) + DRIVE_SLOT_REWIND_BEGIN` before calling
+    /// this (the ref-typed table bind is a host floor). Behaviourally identical to
+    /// the old host loop: same guest export, same roots (COW: `module_buffer`;
+    /// borrowed: child-private prefix), same ascending order. A guest reconstruction
+    /// failure traps inside the shim exactly as it did under the host loop; a
+    /// zero-activation state or plan-build failure is a truthful errno
+    /// (`fm_last_errno`).
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_child_reconstruct() {
+        match child_reconstruct_impl() {
             Ok(()) => set_ok(),
             Err(errno) => set_err(errno),
         }

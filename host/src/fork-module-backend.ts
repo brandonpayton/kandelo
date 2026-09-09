@@ -758,6 +758,29 @@ export class ForkModuleContinuationBackend {
   }
 
   /**
+   * CHILD reconstruct rewind-begin, coarsened (control-flow inversion, the
+   * child-worker mirror of `parentReplay`). ONE module call builds the
+   * per-activation REWIND-begin drive plan from each activation's stored
+   * `child_rewind_root` (the COW inherited anchor, or the borrowed child-private
+   * prefix) and drives each activation's guest `wpk_fork_rewind_begin(root)`
+   * through the injected `fm_drive_execute` shim in ascending id order. Replaces
+   * the host's former per-activation `wpk_fork_rewind_begin` loop in
+   * `attachModuleChild` / `attachBorrowedModuleChild`.
+   *
+   * Unlike `parentReplay` there is NO begin step: the child's replay state was
+   * already seeded by `beginChildReplay` / `addActivationChildReplay` (or the
+   * borrowed variants) before this call, so this folds ONLY the guest rewind
+   * drive. Each participating activation's `bindActivationBeginDrive` must have
+   * run first (the ref-typed table bind is a host floor). A guest reconstruction
+   * failure traps inside the shim exactly as it did under the host loop.
+   */
+  childReconstruct(): void {
+    this.requireSetup("child reconstruct");
+    this.exports.fm_child_reconstruct();
+    this.requireOk("fm_child_reconstruct");
+  }
+
+  /**
    * Capture SEAL, coarsened (control-flow inversion). ONE module call sequences
    * the whole seal internally: drive each open activation's guest
    * `wpk_fork_unwind_end()` through the injected `fm_drive_execute` shim (moving
