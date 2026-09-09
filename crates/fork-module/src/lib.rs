@@ -845,6 +845,57 @@ mod wasm {
         Ok(())
     }
 
+    /// Build a capture-SEAL drive plan: one `DRIVE_OP_UNWIND_END` step per open
+    /// activation (ascending id order — a `BTreeMap` iterates sorted keys), so the
+    /// injected shim `call_indirect`s each activation's guest
+    /// `wpk_fork_unwind_end()` in the same order the host's former per-activation
+    /// seal loop used. The step is argument-free (`() -> ()`), so it carries no
+    /// root. Serialized through the shared plan scratch; the step count is read
+    /// back via `GC_PLAN_COUNT` exactly as the rewind plan.
+    fn build_seal_plan_impl() -> Result<usize, Errno> {
+        let st = state().as_ref().ok_or(Errno::EINVAL)?;
+        let activations: alloc::vec::Vec<u32> = st.activations.keys().copied().collect();
+        let mut steps = alloc::vec::Vec::new();
+        drive_plan::append_unwind_end_steps(&mut steps, &activations);
+        serialize_and_store_plan(&steps)
+    }
+
+    /// Sequence a whole capture SEAL in the module (control-flow inversion): drive
+    /// each open activation's guest `wpk_fork_unwind_end()` (moving it from
+    /// `UNWINDING` back to `NORMAL`) through the injector-wired shim, then seal
+    /// every activation's frame writer + the process journal (`finish_unwind_impl`)
+    /// and serialize the child-inheritable KFRE journal image into a freshly
+    /// channel-mmap'd chunk (`serialize_journal_alloc_impl`). Returns the image
+    /// chunk's guest offset (the byte length is read back via
+    /// `fm_journal_image_len`).
+    ///
+    /// This folds the host's former three-part seal — a per-activation
+    /// `wpk_fork_unwind_end()` loop, then `fm_finish_unwind`, then
+    /// `fm_serialize_journal_alloc` — into ONE module call. Order is identical to
+    /// that host sequence: drive FIRST (every activation to `NORMAL`), THEN seal +
+    /// serialize the now-complete journal.
+    ///
+    /// ONLY for a COMPLETE capture — every frame committed. A partial/aborted
+    /// capture (a mid-unwind `frame_reserve` failure) must NOT reach here: driving
+    /// `wpk_fork_unwind_end` while the guest is mid-unwind corrupts the guest
+    /// unwind state machine (the prior trap). That path stays on the host's
+    /// `fm_finish_unwind`-only `sealForAbort` + abort-replay.
+    ///
+    /// Truthful failure: a guest reconstruction/seal failure traps inside the shim
+    /// exactly as it did under the host loop; a `finish_unwind` or serialize error
+    /// (e.g. the child-inheritable image chunk could not be channel-mmap'd) is a
+    /// truthful errno (`fm_last_errno`) with a 0 return, so the host can reroute a
+    /// seal-time OOM to abort-replay rather than trap.
+    fn seal_capture_impl(channel_base: u64) -> Result<u64, Errno> {
+        let plan = build_seal_plan_impl()?;
+        let count = GC_PLAN_COUNT.load(Ordering::Relaxed);
+        if count > 0 {
+            drive_plan_via_injector(plan, count);
+        }
+        finish_unwind_impl()?;
+        serialize_journal_alloc_impl(channel_base)
+    }
+
     // The step count of the plan `fm_build_gc_plan` last serialized (the `count`
     // argument for `fm_drive_execute`).
     static GC_PLAN_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -4161,6 +4212,46 @@ mod wasm {
         match parent_replay_impl(true) {
             Ok(()) => set_ok(),
             Err(errno) => set_err(errno),
+        }
+    }
+
+    /// Sequence a whole capture SEAL in the module (control-flow inversion): drive
+    /// each open activation's guest `wpk_fork_unwind_end()` through the injector-
+    /// wired `fm_drive_execute` shim (one `DRIVE_OP_UNWIND_END` step per
+    /// activation, ascending id order — the argument-free `() -> ()` capture-seal
+    /// flip), then seal every frame writer + the process journal
+    /// (`finish_unwind_impl`) and serialize the child-inheritable KFRE image into a
+    /// freshly channel-mmap'd chunk (`serialize_journal_alloc_impl`). Returns that
+    /// chunk's guest offset (0 on failure; check `fm_last_errno`), and
+    /// `fm_journal_image_len` returns its byte length — identical to the return
+    /// contract of the fine-grained `fm_serialize_journal_alloc`.
+    ///
+    /// This replaces the host's former three-part seal — a per-activation
+    /// `wpk_fork_unwind_end()` loop, then `fm_finish_unwind`, then
+    /// `fm_serialize_journal_alloc` — with ONE module call. The host must have
+    /// bound each activation's `wpk_fork_unwind_end` into `__wpk_fork_drive_table`
+    /// at `fm_drive_table_base(activation) + DRIVE_SLOT_UNWIND_END` before calling
+    /// this (the ref-typed table bind is a host floor). Behaviourally identical to
+    /// the old host sequence: same guest export, same order, seal FIRST then
+    /// serialize.
+    ///
+    /// ONLY for a COMPLETE capture (every frame committed). A partial/aborted
+    /// capture must NOT call this — driving `wpk_fork_unwind_end` mid-unwind
+    /// corrupts the guest state machine (the prior trap); that path stays on
+    /// `fm_finish_unwind` (`sealForAbort`) + abort-replay. A seal-time serialize
+    /// OOM returns 0 with `fm_last_errno` set so the host reroutes to abort-replay
+    /// rather than trapping.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_parent_seal_capture(channel_base: usize) -> usize {
+        match seal_capture_impl(channel_base as u64) {
+            Ok(ptr) => {
+                set_ok();
+                ptr as usize
+            }
+            Err(errno) => {
+                set_err(errno);
+                0
+            }
         }
     }
 
