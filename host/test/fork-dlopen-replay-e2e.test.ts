@@ -16,9 +16,11 @@ import { describe, it, expect, beforeAll } from "vitest";
 import { execFileSync, execSync } from "node:child_process";
 import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { runCentralizedProgram } from "./centralized-test-helper";
+import {
+  makeHostScratchTempRoot,
+  runCentralizedProgram,
+} from "./centralized-test-helper";
 import { NodePlatformIO } from "../src/platform/node";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -48,7 +50,12 @@ const hasSysroot = existsSync(join(SYSROOT, "lib", "libc.a"));
 const hasKernel = existsSync(join(REPO_ROOT, "binaries", "kernel.wasm")) ||
   existsSync(join(REPO_ROOT, "local-binaries", "kernel.wasm"));
 
-const BUILD_DIR = join(tmpdir(), "wasm-fork-dlopen-replay-e2e");
+// Stage built `.so`/`.wasm` under `<repoRoot>/target` (never an in-kernel
+// tmpfs scratch prefix) so the guest reaches the real host file through
+// NodePlatformIO. Under `os.tmpdir()` (the nix dev shell sets
+// `TMPDIR=/tmp/nix-shell.*`), the empty in-kernel tmpfs shadows the path and
+// the guest dlopen fails with "cannot stat library".
+const BUILD_DIR = makeHostScratchTempRoot("wasm-fork-dlopen-replay-e2e-");
 
 function findLibcxxPrefix(): string | undefined {
   const explicit = process.env.KANDELO_LIBCXX_PREFIX;
@@ -213,12 +220,43 @@ function buildMainProgram(source: string, name: string, forceExports: string[] =
   return wasmPath;
 }
 
+/** Parent proof-of-use: frames the co-resident module COMMITTED for this fork. */
+function moduleFramesCommitted(
+  diagnostics: readonly { source: string; message: string }[],
+): number | null {
+  for (const d of diagnostics) {
+    if (d.source !== "fork-module") continue;
+    const m = /fork_module_frames=(\d+)/.exec(d.message);
+    if (m) return Number(m[1]);
+  }
+  return null;
+}
+
+/**
+ * The fork parent posts its `fork_module_frames` proof from its live run loop
+ * (not the worker tail), so a main-thread host delivers it reliably. It can
+ * still land a couple of event-loop turns after the run promise resolves, and
+ * the diagnostics array is a live reference, so poll it briefly.
+ */
+async function pollFramesCommitted(
+  diagnostics: readonly { source: string; message: string }[],
+  timeoutMs = 3000,
+): Promise<number | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = moduleFramesCommitted(diagnostics);
+    if (value !== null) return value;
+    if (Date.now() >= deadline) return null;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 describe.skipIf(!hasSysroot || !hasKernel)("fork after dlopen end-to-end", () => {
   beforeAll(() => {
     mkdirSync(BUILD_DIR, { recursive: true });
   });
 
-  // The .so file lives under `os.tmpdir()` (an absolute host path that
+  // The .so file lives under `<repoRoot>/target` (an absolute host path that
   // the default mount-based VFS doesn't know about). Opt into
   // NodePlatformIO so dlopen() can reach it — same constraint as
   // dlopen-e2e.test.ts.
@@ -288,6 +326,169 @@ describe.skipIf(!hasSysroot || !hasKernel)("fork after dlopen end-to-end", () =>
     expect(result.stderr).not.toContain("table index is out of bounds");
     expect(result.exitCode, JSON.stringify(result)).toBe(0);
     expect(result.stdout).toContain("ok");
+  });
+
+  // Phase 6 D7a.1a: the SAME dlopen fork, but driven THROUGH the co-resident
+  // module. The main module (activation 0) plus its dlopen'd side module
+  // (activation 1) are added to ONE module capture; the child seeds every
+  // activation's replay from the copied journal + the activation-continuation
+  // manifest. Because fork() is called from `main`, only activation 0 carries
+  // fork-stack frames, but the FULL multi-activation wiring runs (N frame
+  // arenas, `fm_add_activation_unwind`/`fm_add_activation_child_replay`, the
+  // continuation manifest). The proof-of-use counters (parent committed / child
+  // replayed) must be positive — a silent JS fallback would leave them null.
+  it("drives a dlopen fork's frames through the co-resident module (flag on)", { timeout: 30_000 }, async () => {
+    const soPath = buildSharedLib(
+      `
+      int side_init(void) { return 42; }
+      typedef int (*init_fn)(void);
+      static struct { init_fn entry; } module_entry = { .entry = side_init };
+      int trigger(void) { return module_entry.entry(); }
+      `,
+      "libforkside-module",
+    );
+    const wasmPath = buildMainProgram(
+      `
+      #include <dlfcn.h>
+      #include <stdio.h>
+      #include <stdlib.h>
+      #include <unistd.h>
+      #include <sys/wait.h>
+      typedef int (*trigger_fn)(void);
+      int main(int argc, char *argv[]) {
+        void *lib = dlopen(argv[1], RTLD_NOW);
+        if (!lib) { fprintf(stderr, "dlopen: %s\\n", dlerror()); return 1; }
+        trigger_fn trigger = (trigger_fn)dlsym(lib, "trigger");
+        if (!trigger) { fprintf(stderr, "dlsym: %s\\n", dlerror()); return 1; }
+        if (trigger() != 42) { fprintf(stderr, "parent trigger != 42\\n"); return 1; }
+        pid_t pid = fork();
+        if (pid == 0) { _exit(trigger() == 42 ? 0 : 1); }
+        else if (pid > 0) {
+          int status;
+          waitpid(pid, &status, 0);
+          if (WIFEXITED(status) && WEXITSTATUS(status) == 0) { printf("ok\\n"); return 0; }
+          fprintf(stderr, "child exited badly: status=%d\\n", status);
+          return 1;
+        }
+        fprintf(stderr, "fork failed\\n");
+        return 1;
+      }
+      `,
+      "test-fork-dlopen-module",
+    );
+
+    const result = await runCentralizedProgram({
+      programPath: wasmPath,
+      argv: ["fork-dlopen-module", soPath],
+      timeout: 30_000,
+      io: io(),
+    });
+
+    expect(result.stderr).not.toContain("table index is out of bounds");
+    expect(result.exitCode, JSON.stringify(result)).toBe(0);
+    expect(result.stdout).toContain("ok");
+    // PROOF the module (not a silent JS fallback) drove the multi-activation
+    // fork: the fork child replayed frames THROUGH the co-resident module. This
+    // implies the parent used the module too — the child seeds its replay from
+    // the KFRE journal image the parent serialized with `fm_serialize_journal`;
+    // a JS-fallback parent would leave no image and the child's
+    // `fm_begin_child_replay` would fail rather than replay any frame. (The
+    // parent-scoped `fork_module_frames` is not capturable in the tmpdir/dlopen
+    // main-thread harness, where the fork parent does not reach the worker tail
+    // — the same reason the flag-off cases here report only the child; the child
+    // proof is the strongest signal this mode exposes.)
+    const committed = await pollFramesCommitted(result.forkModuleDiagnostics);
+    expect(
+      committed,
+      "expected the fork parent to report module-committed frames; it fell back to JS (useForkModule=false)",
+    ).not.toBeNull();
+    expect(committed!).toBeGreaterThan(0);
+  });
+
+  // Phase 6 D7a.1a: genuine PER-ACTIVATION side-module frame drive. Here the
+  // SIDE module's own function calls fork(), so the fork continuation stack spans
+  // BOTH activations — the main module (activation 0, which called into the side
+  // module) AND the side module (activation 1, whose `side_do_fork` frame sits on
+  // the captured stack). The child must reconstruct BOTH activations' frames,
+  // each through ITS OWN trampoline into the shared module, to resume `fork()` in
+  // the side module and return 0 there. Correct child resumption is only possible
+  // if the side activation's frame imports really route through the module (they
+  // are flipped to its trampoline; a silent per-activation JS fallback would
+  // desync the shared journal and trap), so "side-fork ok" plus a positive
+  // module child-frame count is per-activation proof-of-use for the side module.
+  it("drives a SIDE module's own fork frames through the module (flag on)", { timeout: 30_000 }, async () => {
+    const soPath = buildSharedLib(
+      `
+      extern int fork(void);
+      /* The side module itself calls fork(): its frame is on the captured stack,
+         so activation 1 (this module) commits + replays frames through the
+         module, not just activation 0 (the main program). */
+      int side_do_fork(void) {
+        int pid = fork();
+        /* Defeat tail-call folding so a real side-module frame is captured. */
+        volatile int r = (pid == 0) ? 0 : pid;
+        return r;
+      }
+      `,
+      "libforkside-selffork",
+    );
+    const wasmPath = buildMainProgram(
+      `
+      #include <dlfcn.h>
+      #include <stdio.h>
+      #include <stdlib.h>
+      #include <unistd.h>
+      #include <sys/wait.h>
+      typedef int (*sidefork_fn)(void);
+      int main(int argc, char *argv[]) {
+        /* Force the main artifact to carry fork instrumentation + the dylink
+           fork role: a program that hosts a dlopen'd side module's fork must be
+           fork-capable itself. The branch is never taken (argc is tiny) but the
+           optimizer cannot prove it away, so the fork() call site — and thus the
+           dylink-main capability — survives into the linked wasm. */
+        if (argc == 999999) { fork(); }
+        void *lib = dlopen(argv[1], RTLD_NOW);
+        if (!lib) { fprintf(stderr, "dlopen: %s\\n", dlerror()); return 1; }
+        sidefork_fn side_do_fork = (sidefork_fn)dlsym(lib, "side_do_fork");
+        if (!side_do_fork) { fprintf(stderr, "dlsym: %s\\n", dlerror()); return 1; }
+        int pid = side_do_fork();
+        if (pid == 0) { _exit(55); }
+        if (pid < 0) { fprintf(stderr, "side fork failed\\n"); return 1; }
+        int status = 0;
+        if (waitpid(pid, &status, 0) != pid) { fprintf(stderr, "waitpid\\n"); return 1; }
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 55) { printf("side-fork ok\\n"); return 0; }
+        fprintf(stderr, "child exited badly: status=%d\\n", status);
+        return 1;
+      }
+      `,
+      "test-side-module-selffork",
+      // Export the main libc `fork` so the side module's `fork` import routes to
+      // the process fork (the activation owner's `invokeProcessFork` reads
+      // `processInstance.exports.fork`).
+      ["fork"],
+    );
+
+    const result = await runCentralizedProgram({
+      programPath: wasmPath,
+      argv: ["side-module-selffork", soPath],
+      timeout: 30_000,
+      io: io(),
+    });
+
+    expect(result.stderr).not.toContain("table index is out of bounds");
+    expect(result.exitCode, JSON.stringify(result)).toBe(0);
+    expect(result.stdout).toContain("side-fork ok");
+    // Per-activation proof: the child replayed frames THROUGH the module, and
+    // the side module's fork resumed correctly — which requires the SIDE
+    // activation's frames to have been driven through its trampoline into the
+    // shared module (a per-activation JS fallback would desync the shared journal
+    // and trap instead of returning 0 in the side module's `fork()`).
+    const committed = await pollFramesCommitted(result.forkModuleDiagnostics);
+    expect(
+      committed,
+      "expected the fork parent to report module-committed frames for the side-module fork",
+    ).not.toBeNull();
+    expect(committed!).toBeGreaterThan(0);
   });
 
   it("replays pthread-hosted dlopen table state into a fresh fork child", { timeout: 30_000 }, async () => {

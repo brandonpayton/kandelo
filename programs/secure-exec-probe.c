@@ -30,8 +30,67 @@ static void observe_secure_startup(void)
         secure_getenv("KANDELO_UNTRUSTED") != NULL;
 }
 
+/*
+ * Fixture bytes for the sensitive-lookup probes below, embedded here (rather
+ * than staged into /tmp by the test harness's own VirtualPlatformIO mount)
+ * because the in-kernel tmpfs is the unconditional authority over `/tmp`
+ * (VFS: make in-kernel tmpfs scratch mounts unconditional; delete
+ * WASM_POSIX_TMPFS kill-switch). A host-side `/tmp` mount is never consulted
+ * for a guest open under a kernel-owned scratch prefix, so the only way to
+ * make these files visible to this program is to write them itself, through
+ * the same guest syscalls a real setuid target would use.
+ */
+static const unsigned char kSecureLocaleMo[] = {
+    0xde, 0x12, 0x04, 0x95, 0, 0, 0, 0,
+    1, 0, 0, 0, 28, 0, 0, 0, 36, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    3, 0, 0, 0, 44, 0, 0, 0,
+    3, 0, 0, 0, 48, 0, 0, 0,
+    0x53, 0x75, 0x6e, 0, 0x4c, 0x6f, 0x6b, 0,
+};
+static const unsigned char kSecureEmptyCatalog[] = {
+    0xff, 0x88, 0xff, 0x89,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+};
+static const unsigned char kSecureTestZone[] = {
+    0x54, 0x5a, 0x69, 0x66, 0x31,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0,
+    0, 0, 0, 1, 0, 0, 0, 4,
+    0, 0, 0x0e, 0x10, 0, 0,
+    0x54, 0x53, 0x54, 0,
+};
+
+static int write_scratch_fixture(const char *path, const unsigned char *data,
+                                 size_t len)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    ssize_t written = write(fd, data, len);
+    int closed = close(fd);
+    return (written == (ssize_t)len && closed == 0) ? 0 : -1;
+}
+
+/* Populate the /tmp fixtures every run: the in-kernel tmpfs starts empty for
+ * every fresh kernel instance, and a set-ID exec's own writes are exactly the
+ * untrusted-in-/tmp content the secure-exec checks below must ignore. */
+static int seed_scratch_fixtures(void)
+{
+    if (write_scratch_fixture("/tmp/zz_TEST", kSecureLocaleMo,
+                              sizeof kSecureLocaleMo)) return 30;
+    if (write_scratch_fixture("/tmp/secure.cat", kSecureEmptyCatalog,
+                              sizeof kSecureEmptyCatalog)) return 30;
+    if (write_scratch_fixture("/tmp/secure-zone", kSecureTestZone,
+                              sizeof kSecureTestZone)) return 30;
+    return 0;
+}
+
 static int check_sensitive_lookups(int secure)
 {
+    int seed_rc = seed_scratch_fixtures();
+    if (seed_rc) return seed_rc;
     if (setenv("LC_TIME", "zz_TEST", 1)) return 31;
     if (setenv("MUSL_LOCPATH", "/tmp", 1)) return 32;
     if (!setlocale(LC_TIME, "")) return 33;

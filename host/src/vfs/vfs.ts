@@ -199,8 +199,27 @@ export class VirtualPlatformIO implements PlatformIO {
   // --- File handle operations ---
 
   async preparePath(path: string): Promise<boolean> {
-    const { backend, relativePath } = this.resolve(path);
-    return backend.preparePath?.(relativePath) ?? false;
+    // Best-effort host-backend pre-materialization. A path with no mount has no
+    // host lazy content to prepare — most importantly `/` once the in-kernel
+    // rootfs overlay owns it and the host `/` mount has been dropped (Phase 5
+    // 3b-wiring.5). Return false instead of propagating `resolve`'s "no mount"
+    // throw: the overlay materializes its own lazy members through the kernel
+    // exec-target EAGAIN retry, and the subsequent open/read stays the sole
+    // authority for a genuinely-missing path. `resolve`'s only throw is the
+    // no-mount error; rethrow anything else.
+    let resolved;
+    try {
+      resolved = this.resolve(path);
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message.startsWith("ENOENT: no mount for path")
+      ) {
+        return false;
+      }
+      throw error;
+    }
+    return resolved.backend.preparePath?.(resolved.relativePath) ?? false;
   }
 
   open(path: string, flags: number, mode: number): number {

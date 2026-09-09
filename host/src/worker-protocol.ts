@@ -38,6 +38,15 @@ export interface CentralizedWorkerInitMessage {
   programBytes: ArrayBuffer;
   /** Pre-compiled WebAssembly module (avoids recompilation in web workers) */
   programModule?: WebAssembly.Module;
+  /**
+   * Phase 6 D5: the pre-compiled `fork-module` matching this process's pointer
+   * width. The kernel host resolves and compiles it once and ships it here so
+   * the worker instantiates without recompiling. The co-resident module is the
+   * UNCONDITIONAL fork reconstructor + capturer, so it is always shipped to a
+   * fork-instrumented worker; a fork-instrumented worker that receives no module
+   * fails loud.
+   */
+  forkModuleModule?: WebAssembly.Module;
   /** Shared Memory for this process (also shared with CentralizedKernelWorker) */
   memory: WebAssembly.Memory;
   /** Channel offset within the shared Memory for this thread's syscall channel */
@@ -85,6 +94,23 @@ export interface CentralizedWorkerInitMessage {
   forkScratchAddr?: number;
   /** Exact admitted scratch capacity. */
   forkScratchBytes?: number;
+  /**
+   * First byte of the co-resident fork-module region a COPIED fork child
+   * INHERITS from its parent (COW). The parent reserved this region in the
+   * shared linear memory at process init (via a first-fit `mmap`), and the
+   * child's full memory clone already contains it — the region is also present
+   * in the child's inherited kernel mapping table. When set, the child MUST
+   * reuse this exact base for its own fork-module instance instead of reserving
+   * a fresh region; a fresh reservation would double-map the module (parent's
+   * inherited copy + a new one), inflating the child's observable
+   * `memory.size` (e.g. a 240-page child growing to ~328) and breaking the
+   * fork memory-clone invariant. Only meaningful for `forkMemoryOwnership ===
+   * "copied"`; a borrowed (vfork) child reserves its own on-demand region and
+   * munmaps it after replay, so it never inherits a durable base.
+   */
+  forkModuleInheritedBase?: number;
+  /** Exact byte length of the inherited fork-module region (paired with the base). */
+  forkModuleInheritedBytes?: number;
   /**
    * Two-phase launch gate for a fork child. The child announces that all
    * reconstruction and activation frames reached the inherited fork import,
@@ -143,6 +169,14 @@ export interface CentralizedThreadInitMessage {
   externrefGenerationId?: number;
   /** Distinct pthread mailbox; side modules in this pthread reuse it. */
   forkHostImports?: ForkHostImportWorkerInit;
+  /**
+   * Phase 6 D7b: the pre-compiled `fork-module` matching this process's pointer
+   * width, forwarded exactly as for the process worker. A fork issued FROM this
+   * pthread must unwind/serialize/parent-replay through the module — the parent
+   * side of a fork-from-thread — so the pthread worker always receives the same
+   * co-resident module the process worker gets.
+   */
+  forkModuleModule?: WebAssembly.Module;
   fnPtr: number;
   argPtr: number;
   stackPtr: number;
@@ -178,7 +212,104 @@ export type WorkerToHostMessage =
   | ExecCompleteMessage
   | AlarmSetMessage
   | VmInterruptTimerMessage
+  | ForkModuleFramesMessage
+  | ForkModuleChildFramesMessage
+  | ForkModuleReferencesMessage
+  | ForkModuleRegionMessage
   | ForkHostImportWakeMessage;
+
+/**
+ * The co-resident fork-module region a process worker placed in its shared
+ * linear memory at init. A worker reports its exact base + byte length so the
+ * kernel host can hand a COPIED fork child the SAME base to reuse (the child
+ * inherits the region via its memory clone; re-reserving would double-map it
+ * and inflate `memory.size`). Reported once per process/exec generation, before
+ * the guest can fork. Borrowed (vfork) children do not report — they use an
+ * on-demand region they munmap after replay.
+ */
+export interface ForkModuleRegionMessage {
+  type: "fork_module_region";
+  pid: number;
+  /** First byte of the reserved region (== the module's `__memory_base`). */
+  base: number;
+  /** Total reserved bytes (static/BSS footprint plus the shadow stack). */
+  bytes: number;
+}
+
+/**
+ * Phase 6 D5: proof-of-use for the co-resident fork-module. A process worker
+ * that drove a qualifying fork through the module reports how many frames the
+ * module committed, so the host (and tests) can confirm the continuation ran
+ * through the module and did not silently fall back to the JS closures.
+ */
+export interface ForkModuleFramesMessage {
+  type: "fork_module_frames";
+  pid: number;
+  frames: number;
+}
+
+/**
+ * Phase 6 D7b: replay-side proof-of-use for the co-resident fork-module. A
+ * replay-only fork CHILD never commits a frame, so `fork_module_frames` (which
+ * the parent commits) cannot prove the CHILD ran its rewind through the module.
+ * A fork-from-thread child carries no references either, so
+ * `fork_module_references` also stays silent. This distinct message lets a fork
+ * CHILD report how many frames the module replayed (consuming rewind advances),
+ * so the host (and tests) can confirm both SIDES of a fork-from-thread — the
+ * pthread parent (via `fork_module_frames`) and the child (via this) — ran
+ * through the module and did not silently fall back to the JS closures. A
+ * distinct type (not a second `fork_module_frames`) so a consumer waiting on the
+ * parent's committed-frame count is never confused by the child's replay count.
+ */
+export interface ForkModuleChildFramesMessage {
+  type: "fork_module_child_frames";
+  pid: number;
+  frames: number;
+}
+
+/**
+ * Phase 6 D6.5: PER-KIND proof-of-use for the co-resident fork-module's
+ * REFERENCE reconstruction. A fresh fork CHILD worker whose carried references
+ * were reconstructed through the module (the flipped `__wpk_fork_ref_decode_*`
+ * exports and `fm_begin_reference_replay`) reports one count per reference kind,
+ * so the host (and tests) can confirm the reference decode ran through the
+ * module rather than silently falling back to the JS reference path. A single
+ * message carries every kind because a graph can mix them (an exnref whose
+ * payload is an externref advances both counters). Reference reconstruction
+ * happens in the child, so — unlike `fork_module_frames`, which the parent
+ * commits — this is posted by the child worker.
+ *
+ * Emitted ONLY when at least one kind's count is positive (the D7b lesson: a
+ * `=0` diagnostic broke the `d_01` poll), so a reference-free fork stays silent.
+ */
+export interface ForkModuleReferencesMessage {
+  type: "fork_module_references";
+  pid: number;
+  /** Funcref/null count (`fm_stats` ReferencesReconstructed field). */
+  references: number;
+  /** Externref count (`fm_stats` ExternrefsResolved field). */
+  externrefs: number;
+  /** Exnref-node count (`fm_stats` ExnrefsReconstructed field). */
+  exnrefs: number;
+  /** Typed-GC node count — struct/array/i31 (`fm_stats` GcNodesReconstructed). */
+  gcNodes: number;
+  /**
+   * Typed-GC DRIVE step count (`fm_stats` DriveStepsExecuted field, Phase 6
+   * item 3c). Distinct from `gcNodes`: this advances only when the module
+   * actually drove the typed allocate/fill/exn order (`fm_build_gc_plan` +
+   * `fm_drive_execute`), so a nonzero value proves the module — not the JS
+   * `materializeAllTyped` fallback — reconstructed the typed graph.
+   */
+  driveSteps: number;
+  /**
+   * Static-root publish count (`fm_stats` StaticRootsPublished field, the
+   * binder). Advances only when the module's DRIVE_OP_STATIC_ROOT step
+   * republished an immutable static root into the anyref transit, so a nonzero
+   * value proves the module — not the JS `publishTransit` fallback — reconstructed
+   * the static-root identity.
+   */
+  staticRoots: number;
+}
 
 export interface WorkerReadyMessage {
   type: "ready";

@@ -21,7 +21,7 @@
     (i32.const 65536))
 
   (func (export "__abi_version") (result i32)
-    i32.const 43)
+    i32.const 44)
 
   (func $sentinel (type $sentinel_type) (result i32)
     i32.const 77)

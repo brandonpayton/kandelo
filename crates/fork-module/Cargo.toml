@@ -1,0 +1,17 @@
+[package]
+name = "fork-module"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The co-resident process-worker fork module. Built for wasm32 (and, later, a
+# wasm64 variant) as a cdylib that imports the guest's linear memory and exports
+# the guest-facing `__wpk_fork_frame_*` continuation functions. It is PURELY
+# ADDITIVE scaffolding: nothing here is wired into the live host/worker yet.
+[lib]
+name = "fork_module"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+fork-codec = { path = "../fork-codec" }
+wasm-posix-shared = { path = "../shared" }

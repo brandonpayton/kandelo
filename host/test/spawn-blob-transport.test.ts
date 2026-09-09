@@ -32,6 +32,7 @@ import {
 } from "../src/generated/abi";
 import { allocateKernelScratchRegion } from "../src/kernel-scratch";
 import { createKernelScratchTestInstance } from "./support/kernel-scratch-instance";
+import { mockKernelSpawnBlobDecode } from "./support/spawn-blob-decode-mock";
 
 const E2BIG = 7;
 const EBUSY = 16;
@@ -361,7 +362,10 @@ describe("SYS_SPAWN blob transport", () => {
 
     expect(onResolveSpawn).toHaveBeenCalledOnce();
     expect(completeChannel).not.toHaveBeenCalled();
-    expect(beginSpawnScratch).toHaveBeenCalledOnce();
+    // The kernel now owns the blob decode, so a large blob reserves the shared
+    // spawn scratch once during the preflight argv/envp decode (begin+cancel)
+    // and again for the transport that follows resolution.
+    expect(beginSpawnScratch).toHaveBeenCalledTimes(2);
     expect(beginSpawnScratch).toHaveBeenCalledWith(blob.byteLength);
     expect(kernelReservedSpawn).toHaveBeenCalledOnce();
     expect(onSpawn).toHaveBeenCalledWith(
@@ -400,7 +404,10 @@ describe("SYS_SPAWN blob transport", () => {
       resolvedProgram(),
       envp,
     );
-    expect(beginSpawnScratch).toHaveBeenCalledTimes(2);
+    // The direct after-resolve call performs transport only (no preflight
+    // decode), so this is the third reservation overall: preflight decode (1),
+    // drained transport (2), and this transport (3).
+    expect(beginSpawnScratch).toHaveBeenCalledTimes(3);
     expect(kernelReservedSpawn).toHaveBeenCalledTimes(2);
   });
 
@@ -1360,9 +1367,18 @@ describe("SYS_SPAWN blob transport", () => {
     const channel = createChannel(7, memory);
     const completeChannel = vi.fn();
     const onResolveSpawn = vi.fn();
+    // The oversized blob decodes through the tokenized reservation; the kernel
+    // mock rejects it with E2BIG while measuring the first duplicated offset,
+    // before the repeated tail is ever copied out.
+    const { kernelMemory, scratchExports } = largeSpawnDecodeScratch(
+      blob.byteLength,
+      4,
+    );
     const worker = createWorker({
       callbacks: { onResolveSpawn, onSpawn: vi.fn() },
       completeChannel,
+      kernelMemory,
+      kernelExports: scratchExports,
     });
     const args = [
       pathPtr,
@@ -1387,6 +1403,42 @@ describe("SYS_SPAWN blob transport", () => {
   });
 });
 
+/**
+ * Build a kernel memory plus tokenized spawn-scratch exports large enough for
+ * the kernel to decode a blob of `blobLen` bytes in place. The reserved region
+ * must hold both the blob copy and the (slightly larger) argv/envp read-back
+ * framing, so it is sized with headroom. Small blobs decode in the shared
+ * channel scratch and never touch these exports; supplying them is harmless.
+ */
+function largeSpawnDecodeScratch(
+  blobLen: number,
+  pointerWidth: 4 | 8,
+): {
+  kernelMemory: WebAssembly.Memory;
+  scratchExports: Record<string, unknown>;
+} {
+  const largeScratchOffset = 2 * CH_TOTAL_SIZE;
+  // Framing adds a 4-byte length prefix per entry; 64 KiB of slack covers it.
+  const reservationCapacity = blobLen + 0x1_0000;
+  const kernelPages = Math.ceil(
+    (largeScratchOffset + reservationCapacity) / 65_536,
+  );
+  const kernelMemory = new WebAssembly.Memory({
+    initial: kernelPages,
+    maximum: kernelPages,
+  });
+  const asPtr = (value: number): number | bigint =>
+    pointerWidth === 8 ? BigInt(value) : value;
+  let token = 0n;
+  const scratchExports: Record<string, unknown> = {
+    kernel_spawn_scratch_begin: vi.fn(() => ++token),
+    kernel_spawn_scratch_pointer: vi.fn(() => asPtr(largeScratchOffset)),
+    kernel_spawn_scratch_capacity: vi.fn(() => asPtr(reservationCapacity)),
+    kernel_spawn_scratch_cancel: vi.fn(() => 0),
+  };
+  return { kernelMemory, scratchExports };
+}
+
 function createSpawnPreflightHarness(
   blob: Uint8Array,
   pointerWidth: 4 | 8,
@@ -1407,12 +1459,22 @@ function createSpawnPreflightHarness(
   const channel = createChannel(7, memory);
   const completeChannel = vi.fn();
   // Leave accepted preflight pending so these boundary tests exercise only
-  // host parsing and never need a kernel scratch fixture or child launch.
+  // host parsing and never launch a child.
   const onResolveSpawn = vi.fn(() => new Promise<never>(() => {}));
+  // The kernel now owns the blob decode. Boundary blobs that exceed the shared
+  // channel scratch (aggregate ARG_MAX, duplicate offsets) route the decode
+  // through the tokenized reservation, so give the harness a reservation large
+  // enough for the blob plus the read-back framing.
+  const { kernelMemory, scratchExports } = largeSpawnDecodeScratch(
+    blob.byteLength,
+    pointerWidth,
+  );
   const worker = createWorker({
     callbacks: { onResolveSpawn, onSpawn: vi.fn() },
     pointerWidth,
     completeChannel,
+    kernelMemory,
+    kernelExports: scratchExports,
   });
   const args = [
     pathPtr,
@@ -1503,6 +1565,8 @@ function createWorker(
       return count;
     }),
     kernel_exec_target_size: vi.fn(() => BigInt(defaultTargetBytes.byteLength)),
+    kernel_exec_target_shebang: vi.fn(() => 0),
+    kernel_spawn_blob_decode: mockKernelSpawnBlobDecode(kernelMemory),
     kernel_get_parent_pid: vi.fn(() => -1),
     kernel_get_process_exit_signal: vi.fn(() => -1),
     kernel_mark_process_signaled: vi.fn(() => 0),

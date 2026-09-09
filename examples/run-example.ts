@@ -507,6 +507,9 @@ async function main() {
         host = new NodeKernelHost({
             maxWorkers: 4,
             rootfsImage: runnerFilesystem.rootfsImage,
+            ...(runnerFilesystem.rootfsMountSpec === undefined
+                ? {}
+                : { rootfsMountSpec: runnerFilesystem.rootfsMountSpec }),
             sessionSeedTrees: runnerFilesystem.sessionSeedTrees,
             // WHY: isolated mode must give explicitly resolved guest tools
             // precedence over same-named lazy rootfs stubs. `execPrograms` is

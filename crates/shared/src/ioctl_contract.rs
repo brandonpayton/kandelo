@@ -43,6 +43,20 @@ pub const KDGKBTYPE: u32 = 0x4b33;
 pub const KDGKBMODE: u32 = 0x4b44;
 pub const KDSKBMODE: u32 = 0x4b45;
 
+// Network-interface ioctls (fixed-size `struct ifreq` requests only).
+// `SIOCGIFCONF` is deliberately absent: its `struct ifconf.ifc_buf` is a
+// second, dynamically-sized process-memory pointer nested inside the first,
+// which this table's one-static-size-per-request model cannot express. The
+// host still decodes that outer pointer (the same reason `sendmsg`/`recvmsg`
+// decompose `msghdr` host-side elsewhere), but the content it writes comes
+// from `runtime_core::netif` via the dedicated `kernel_network_ifconf_*`
+// kernel exports, not from host-side interface/MAC/address logic.
+pub const SIOCGIFNAME: u32 = 0x8910;
+pub const SIOCGIFCONF: u32 = 0x8912;
+pub const SIOCGIFADDR: u32 = 0x8915;
+pub const SIOCGIFHWADDR: u32 = 0x8927;
+pub const SIOCGIFINDEX: u32 = 0x8933;
+
 /// How the request's third argument is represented by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoctlArgKind {
@@ -136,13 +150,21 @@ macro_rules! pointer {
             wasm64_size: Some($size),
         }
     };
+    ($request:expr, $direction:ident, $wasm32_size:expr, $wasm64_size:expr) => {
+        IoctlRequestContract {
+            request: $request,
+            arg_kind: IoctlArgKind::Pointer,
+            direction: IoctlDirection::$direction,
+            wasm32_size: Some($wasm32_size),
+            wasm64_size: Some($wasm64_size),
+        }
+    };
 }
 
 /// Ioctls that may reach the Rust kernel dispatcher.
 ///
-/// Keep entries sorted by unsigned request number. Network-interface ioctls
-/// are deliberately absent: the host intercepts those before kernel scratch
-/// because their outer structures contain process-memory pointers.
+/// Keep entries sorted by unsigned request number. `SIOCGIFCONF` is
+/// deliberately absent — see the comment above the `SIOCGIF*` constants.
 pub const IOCTL_REQUEST_CONTRACTS: &[IoctlRequestContract] = &[
     // Kandelo GLES requests use small private request numbers.
     pointer!(crate::gl::GLIO_INIT, In, 4),
@@ -192,6 +214,12 @@ pub const IOCTL_REQUEST_CONTRACTS: &[IoctlRequestContract] = &[
     no_arg!(crate::dri::DRM_IOCTL_SET_MASTER),
     no_arg!(crate::dri::DRM_IOCTL_DROP_MASTER),
     pointer!(SIOCATMARK, Out, 4),
+    // ifreqSize differs by pointer width: `struct ifmap`'s `unsigned long`
+    // members double from 4 to 8 bytes under wasm64.
+    pointer!(SIOCGIFNAME, InOut, 32, 40),
+    pointer!(SIOCGIFADDR, InOut, 32, 40),
+    pointer!(SIOCGIFHWADDR, InOut, 32, 40),
+    pointer!(SIOCGIFINDEX, InOut, 32, 40),
     pointer!(crate::oss::SNDCTL_DSP_SETBLKSIZE, In, 4),
     pointer!(crate::oss::SNDCTL_DSP_SETTRIGGER, In, 4),
     pointer!(TIOCSPTLCK, In, 4),

@@ -41,6 +41,12 @@ import { MemoryFileSystem } from "./vfs/memory-fs";
 import { createClosedLazyAssetFetcherFromOwnedAssets } from "./vfs/closed-lazy-assets";
 import { createBrowserLazyFetcher } from "./vfs/browser-lazy-fetcher";
 import { resolveLazyUrl } from "./vfs/lazy-url";
+import {
+  emitRootfsManifest,
+  createRootfsBlobProvider,
+} from "./vfs/rootfs-manifest";
+import { buildRootfsLazyWiring } from "./vfs/rootfs-lazy-archives";
+import { exportRootfsImageFromOverlay } from "./vfs/rootfs-overlay-export";
 import { DeviceFileSystem } from "./vfs/device-fs";
 import { BrowserTimeProvider } from "./vfs/time";
 import { restoreBrowserKernelInitMounts } from "./browser-kernel-vfs-init";
@@ -138,9 +144,30 @@ const O_WRONLY_CREAT_TRUNC =
   OPEN_FLAGS.O_WRONLY | OPEN_FLAGS.O_CREAT | OPEN_FLAGS.O_TRUNC;
 // State
 let kernelWorker: CentralizedKernelWorker;
+// Phase 6 D5 / Path B flip: the co-resident wasm32 fork-module, compiled ONCE
+// at kernel init from the bytes the main thread ships in the init message
+// (handleInit, below). The module is the UNCONDITIONAL fork reconstructor;
+// browser workers cannot read `process.env`, so there is no kill switch here.
+let forkModuleModule32Browser: WebAssembly.Module | null = null;
+function forkModuleInitFields(
+  ptrWidth: 4 | 8,
+): { forkModuleModule?: WebAssembly.Module } {
+  // Only the wasm32 module ships in the browser; wasm32 is the guest width. A
+  // wasm64 guest gets no module and a fork-instrumented wasm64 worker fails loud
+  // (browser guests are wasm32).
+  if (ptrWidth !== 4 || !forkModuleModule32Browser) {
+    return {};
+  }
+  return { forkModuleModule: forkModuleModule32Browser };
+}
 let workerAdapter: BrowserWorkerAdapter;
 let memfs: MemoryFileSystem;
 let io: VirtualPlatformIO;
+/** Canonical mount points of the sibling filesystems still mounted under `/`
+ *  after the host `/` mount is dropped (e.g. `/dev/shm`, session-seed trees,
+ *  extra host mounts). Handed to the in-kernel rootfs overlay so it does not
+ *  greedily claim these sibling paths. Mirrors the Node worker entry. */
+let rootfsForeignPrefixes: string[] = [];
 let maxPages: number = DEFAULT_MAX_PAGES;
 let defaultThreadSlots: number = DEFAULT_PROCESS_THREAD_SLOTS;
 let processMemoryAllocator: ProcessMemoryAllocator;
@@ -218,6 +245,14 @@ interface ProcessInfo extends ProcessGenerationOwnership {
   forkReplayContext?: ForkReplayContext;
   /** Parent-owned control slot borrowed only until exact exec/exit teardown. */
   vforkWorkspace?: VforkWorkspaceOwnership;
+  /**
+   * The co-resident fork-module region this process worker placed in its shared
+   * linear memory (reported by the worker at init). A COPIED fork child reuses
+   * this exact base so it does not double-map the region it already inherits via
+   * its memory clone. Inherited into a child's generation so a grandchild fork
+   * propagates the same base.
+   */
+  forkModuleRegion?: { base: number; bytes: number };
 }
 const processes = new Map<number, ProcessInfo>();
 const vforkLifetimes = new VforkLifetimeCoordinator<ProcessInfo>();
@@ -667,6 +702,16 @@ function reportHostDiagnostic(
   post({ type: "host_diagnostic", ...diagnostic });
 }
 
+// Forward co-resident fork-module proof-of-use on its OWN channel. This is an
+// informational success signal, not a host PROBLEM, so it must not ride the
+// `host_diagnostic` stream a caller inspects for failures (a clean fork would
+// otherwise pollute `onHostDiagnostic` on every process). Only a consumer that
+// opts in via `onForkModuleProof` receives it. Mirrors node-kernel-worker-entry
+// so both hosts report identically.
+function postForkModuleProof(diagnostic: HostDiagnostic): void {
+  post({ type: "fork_module_proof", ...diagnostic });
+}
+
 function terminatePoisonedKernelWorker(error: Error): void {
   if (kernelFatalReported) return;
   kernelFatalReported = true;
@@ -738,7 +783,14 @@ function formatError(err: unknown): string {
 function isMissingPathError(err: unknown): boolean {
   if (!err || typeof err !== "object") return false;
   const code = (err as { code?: unknown }).code;
-  return code === -2 || code === "ENOENT";
+  if (code === -2 || code === "ENOENT") return true;
+  // With the overlay owning `/`, the host `/` mount is dropped, so a `/`-owned
+  // path the overlay disowns hits `VirtualPlatformIO` with no covering mount
+  // ("ENOENT: no mount for path: ..."). That is a missing-path condition, not a
+  // hard failure — treat it as ENOENT so exec resolution falls through cleanly.
+  const message = (err as { message?: unknown }).message;
+  return typeof message === "string" &&
+    message.startsWith("ENOENT: no mount for path");
 }
 
 function respond(requestId: number, result: unknown) {
@@ -1059,13 +1111,21 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
     memfs.rewriteLazyFileUrls((url) => resolveLazyUrl(msg.lazyUrlBase!, url));
     memfs.rewriteLazyArchiveUrls((url) => resolveLazyUrl(msg.lazyUrlBase!, url));
   }
+  // Captured for the rootfs overlay's archive provider below (Phase 5
+  // 3b-wiring.3): the SAME fetcher object installed on memfs, so the
+  // in-kernel LazyMember path fetches raw archives over the identical
+  // transport (closed-asset bundle or CORS proxy) as System A's first-touch
+  // materialization.
+  let rootfsLazyFetcher: Parameters<MemoryFileSystem["setLazyFetcher"]>[0] | undefined;
   if (msg.closedLazyAssets !== undefined) {
-    memfs.setLazyFetcher(createClosedLazyAssetFetcherFromOwnedAssets(msg.closedLazyAssets));
+    rootfsLazyFetcher = createClosedLazyAssetFetcherFromOwnedAssets(msg.closedLazyAssets);
+    memfs.setLazyFetcher(rootfsLazyFetcher);
   } else if (corsProxyLazyFetcher !== undefined) {
     // WHY: guest networking and lazy VFS downloads are separate fetch paths.
     // Lazy VFS must read and verify release-asset bytes, which requires CORS.
     // CORP alone cannot make an opaque response body readable to JavaScript.
-    memfs.setLazyFetcher(corsProxyLazyFetcher);
+    rootfsLazyFetcher = corsProxyLazyFetcher;
+    memfs.setLazyFetcher(rootfsLazyFetcher);
   }
   const mounts: MountConfig[] = [
     { mountPoint: "/dev/shm", backend: shmfs, nosuid: true },
@@ -1075,7 +1135,24 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
   memfs.subscribeLazyDownloads((event) => {
     post({ type: "lazy_download", event });
   });
-  io = new VirtualPlatformIO(mounts, new BrowserTimeProvider());
+  // Phase 5 cutover: the in-kernel rootfs overlay is the unconditional sole
+  // `/` authority, so the host `/` mount is always dropped from the
+  // guest-facing VirtualPlatformIO. Guest syscalls route non-tmpfs `/` paths
+  // through the overlay (`rootfs::claims_path`), and host-initiated exec-byte
+  // reads go through the overlay (`readExecFromOverlay`), so nothing depends
+  // on `/` being mounted here. Leaving it mounted would double-fetch lazy
+  // archives (this host mount plus the overlay's own lazy wiring both
+  // fetching). `memfs` was already captured from `rootMount` above, so the
+  // backing MemoryFileSystem stays alive as the `blob_read` byte store and
+  // lazy-group source even though it is no longer mounted.
+  const guestMounts = mounts.filter((m) => m.mountPoint !== "/");
+  // The mounts that survive dropping `/` are exactly the sibling filesystems the
+  // overlay must not claim. Hand their prefixes to the overlay so `/dev/shm`,
+  // session-seed trees, and extra host mounts keep resolving through their own
+  // backend rather than being shadowed by the sole `/` authority. (tmpfs scratch
+  // mounts are excluded by the kernel independently.) Mirrors the Node entry.
+  rootfsForeignPrefixes = guestMounts.map((m) => m.mountPoint);
+  io = new VirtualPlatformIO(guestMounts, new BrowserTimeProvider());
 
   // Create TLS-MITM network backend. Programs do real TLS handshakes via
   // their compiled-in OpenSSL; the backend terminates TLS locally, makes
@@ -1268,7 +1345,52 @@ async function handleInit(msg: Extract<MainToKernelMessage, { type: "init" }>) {
     post({ type: "listen_tcp", pid, fd, port });
   });
 
+  // Phase 5 cutover: the in-kernel rootfs overlay is the unconditional sole
+  // `/` authority. Hand the `/` image tree to the overlay and install the byte
+  // provider before init applies them. The `/` MemoryFileSystem is reachable
+  // only here in the entry.
+  if (memfs) {
+    // Phase 5 Increment 3b-wiring.3: also bridge System A's lazy-archive
+    // export (`memfs.exportLazyArchiveEntries()`) into the overlay's
+    // `KIND_LAZY_FILE` linkage + `host_fetch_archive` provider.
+    // `buildRootfsLazyWiring` needs a `(url) => Promise<Uint8Array>` fetcher,
+    // but the fetcher installed via `setLazyFetcher` above (`LazyFetch`)
+    // returns a `Response` — adapt it here rather than change
+    // `setLazyFetcher`'s contract. If neither branch above installed a
+    // fetcher, fail loudly instead of guessing a transport: with zero lazy
+    // groups `lazyInput` is empty and the provider is never called; with
+    // lazy groups but no transport, a lazy read genuinely cannot succeed and
+    // the provider should report that truthfully (EIO) rather than hang.
+    const installedLazyFetcher = rootfsLazyFetcher;
+    const lazyArchiveFetcher: (url: string) => Promise<Uint8Array> =
+      installedLazyFetcher
+        ? async (url) =>
+          new Uint8Array(await (await installedLazyFetcher(url)).arrayBuffer())
+        : async () => {
+          throw new Error("no lazy transport configured");
+        };
+    const { lazyInput, archiveProvider } = buildRootfsLazyWiring(
+      memfs.exportLazyArchiveEntries(),
+      lazyArchiveFetcher,
+    );
+    const { buffer, blobPaths } = emitRootfsManifest(memfs, (p) => p, lazyInput);
+    kernelWorker.configureRootfsOverlay(
+      buffer,
+      createRootfsBlobProvider(memfs, blobPaths),
+      archiveProvider,
+      rootfsForeignPrefixes,
+      rootMount?.nosuid === true,
+    );
+  }
+
   await kernelWorker.init(msg.kernelWasmBytes);
+
+  // Phase 6 D5: compile the fork-module once here, at the kernel host, so each
+  // process worker instantiates from a pre-compiled module. The module is the
+  // unconditional fork reconstructor, so the main thread always ships the bytes.
+  if (msg.forkModuleBytes) {
+    forkModuleModule32Browser = await WebAssembly.compile(msg.forkModuleBytes);
+  }
 
   // /dev/fb0 forwarding: the registry lives in this worker, but the canvas
   // lives on the main thread. WHY: today's zero-copy fbdev contract therefore
@@ -1511,6 +1633,7 @@ async function handleSpawn(msg: Extract<MainToKernelMessage, { type: "spawn" }>)
       ptrWidth,
       kernelAbiVersion: kernelWorker.getKernelAbiVersion(),
       kernelAbiContractDigest: kernelWorker.getKernelAbiContractDigest() ?? undefined,
+      ...forkModuleInitFields(ptrWidth),
     };
 
     workerCreationAttempted = true;
@@ -1740,6 +1863,50 @@ function installProcessWorkerListeners(
       handleVmInterruptTimer(m, pid, process);
     } else if (m.type === "fork_host_import") {
       dispatchForkHostImport(worker, m);
+    } else if (m.type === "fork_module_frames" && m.pid === pid) {
+      // Forward the co-resident fork-module's proof-of-use (Phase 6 D5): a
+      // nonzero frame count confirms the qualifying fork ran its continuation
+      // through the module. Proof-of-use is informational success telemetry, not
+      // a host problem, so it rides the dedicated `fork_module_proof` channel and
+      // never pollutes `onHostDiagnostic`. Mirrors node-kernel-worker-entry.
+      postForkModuleProof({
+        pid,
+        source: "fork-module",
+        message: `fork_module_frames=${m.frames}`,
+      });
+    } else if (m.type === "fork_module_child_frames" && m.pid === pid) {
+      // Forward the co-resident fork-module's REPLAY-side proof-of-use (Phase 6
+      // D7b): a nonzero count confirms a fork CHILD (e.g. a fork-from-thread
+      // child) drove its rewind through the module — the child never commits, so
+      // `fork_module_frames` cannot show this. Mirrors node-kernel-worker-entry.
+      postForkModuleProof({
+        pid,
+        source: "fork-module",
+        message: `fork_module_child_frames=${m.frames}`,
+      });
+    } else if (m.type === "fork_module_references" && m.pid === pid) {
+      // Forward the co-resident fork-module's PER-KIND REFERENCE proof-of-use
+      // (Phase 6 D6.5): a nonzero count for a kind confirms the child's carried
+      // references of that kind were reconstructed through the module. All kinds
+      // ride one string so a reader can extract any of funcref/externref/exnref/
+      // typed-GC. Mirrors node-kernel-worker-entry.
+      postForkModuleProof({
+        pid,
+        source: "fork-module",
+        message:
+          `fork_module_references=${m.references} ` +
+          `externrefs_resolved=${m.externrefs} ` +
+          `exnrefs_reconstructed=${m.exnrefs} ` +
+          `gc_nodes_reconstructed=${m.gcNodes} ` +
+          `drive_steps_executed=${m.driveSteps} ` +
+          `static_roots_published=${m.staticRoots}`,
+      });
+    } else if (m.type === "fork_module_region" && m.pid === pid) {
+      // Record where this worker placed its co-resident fork-module region so a
+      // COPIED fork child reuses the same base instead of double-mapping the
+      // region it already inherits via its memory clone. Mirrors
+      // node-kernel-worker-entry.
+      process.forkModuleRegion = { base: m.base, bytes: m.bytes };
     }
   });
 }
@@ -1982,12 +2149,20 @@ async function handleVfork(
       workspaceAddress,
       PAGES_PER_THREAD * PAGE_SIZE,
     );
-    kernelWorker.registerProcess(childPid, parentMemory, [childChannelOffset], {
-      ptrWidth,
-      maxAddr: childLayout.maxAddr,
-      mmapBase: childLayout.mmapBase,
-      borrowedAddressSpace: true,
-    });
+    // Retry on reentrant contention (see the Node worker entry): under a fork
+    // burst with the in-kernel tmpfs serving scratch, sibling syscall-channel
+    // ingress fills the deferred FIFO and the drain is starved by pending fork
+    // transaction-starts, so a single synchronous registration loses the
+    // microtask race. Yielding to a later host turn lets the bounded burst
+    // drain so the registration lands instead of rolling back the launch.
+    await retryKernelEntryResult(() =>
+      kernelWorker.registerProcess(childPid, parentMemory, [childChannelOffset], {
+        ptrWidth,
+        maxAddr: childLayout.maxAddr,
+        mmapBase: childLayout.mmapBase,
+        borrowedAddressSpace: true,
+      }),
+    );
     registered = true;
     kernelWorker.inheritProcessSharedMappings(parentPid, childPid);
 
@@ -2056,6 +2231,12 @@ async function handleVfork(
       ptrWidth,
       kernelAbiVersion: kernelWorker.getKernelAbiVersion(),
       kernelAbiContractDigest: kernelWorker.getKernelAbiContractDigest() ?? undefined,
+      // Phase 6 item 4 (browser peer of node-kernel-worker-entry): the borrowed
+      // (vfork) child drives its continuation replay through the co-resident
+      // fork-module, so it needs the flag + compiled module like a COW child.
+      // Without this it would silently fall back to the JS engine and fail
+      // against the module-backed parent's Option-B journal image.
+      ...forkModuleInitFields(ptrWidth),
     };
 
     childWorker = new DeferredWorkerHandle(() => {
@@ -2363,11 +2544,19 @@ async function handleOrdinaryFork(
       CH_TOTAL_SIZE,
     ).fill(0);
 
-    kernelWorker.registerProcess(childPid, childMemory, [childChannelOffset], {
-      ptrWidth,
-      maxAddr: childLayout.maxAddr,
-      mmapBase: childLayout.mmapBase,
-    });
+    // Retry on reentrant contention (see the Node worker entry): a php-fpm-style
+    // fork burst with the in-kernel tmpfs serving scratch fills the deferred
+    // FIFO while the drain is starved by pending fork transaction-starts, so a
+    // single synchronous registration loses the microtask race. Yielding — as
+    // the sibling `shouldLaunchPendingChild` call above already does — lets the
+    // bounded burst drain so the registration lands.
+    await retryKernelEntryResult(() =>
+      kernelWorker.registerProcess(childPid, childMemory, [childChannelOffset], {
+        ptrWidth,
+        maxAddr: childLayout.maxAddr,
+        mmapBase: childLayout.mmapBase,
+      }),
+    );
     registered = true;
     kernelWorker.inheritProcessSharedMappings(parentPid, childPid);
 
@@ -2423,12 +2612,21 @@ async function handleOrdinaryFork(
       isForkChild: true,
       forkMode: mode,
       forkBufAddr,
+      // A COPIED fork child inherits the parent's co-resident fork-module region
+      // via its memory clone; hand it the parent's exact base so it reuses that
+      // region instead of double-mapping a fresh one (which would inflate the
+      // child's observable `memory.size`). Absent only if the parent worker has
+      // not yet reported its region (it reports at init, before it can fork), in
+      // which case the child falls back to reserving its own.
+      forkModuleInheritedBase: parentInfo.forkModuleRegion?.base,
+      forkModuleInheritedBytes: parentInfo.forkModuleRegion?.bytes,
       forkReplayGate: forkReplay.gate,
       forkChildThreadFnPtr: forkReplayContext?.fnPtr,
       forkChildThreadArgPtr: forkReplayContext?.argPtr,
       ptrWidth,
       kernelAbiVersion: kernelWorker.getKernelAbiVersion(),
       kernelAbiContractDigest: kernelWorker.getKernelAbiContractDigest() ?? undefined,
+      ...forkModuleInitFields(ptrWidth),
     };
 
     childWorker = new DeferredWorkerHandle(
@@ -2456,6 +2654,10 @@ async function handleOrdinaryFork(
       threadAllocator: threadAllocatorForLayout(childLayout, ptrWidth, childPid),
       forkReplayContext,
       externrefGeneration: externrefGrant.generation,
+      // The child reuses the parent's fork-module region; seed its generation so
+      // a grandchild fork propagates the same base even before the child worker
+      // re-reports it at init.
+      forkModuleRegion: parentInfo.forkModuleRegion,
     };
     processes.set(childPid, childGeneration);
 
@@ -2799,6 +3001,7 @@ async function handleExec(
         ptrWidth,
         kernelAbiVersion: kernelWorker.getKernelAbiVersion(),
         kernelAbiContractDigest: kernelWorker.getKernelAbiContractDigest() ?? undefined,
+        ...forkModuleInitFields(ptrWidth),
       };
 
       replacementWorker = new DeferredWorkerHandle(() => {
@@ -3182,6 +3385,7 @@ async function handlePosixSpawn(
       ptrWidth,
       kernelAbiVersion: kernelWorker.getKernelAbiVersion(),
       kernelAbiContractDigest: kernelWorker.getKernelAbiContractDigest() ?? undefined,
+      ...forkModuleInitFields(ptrWidth),
     };
 
     newWorker = new DeferredWorkerHandle(
@@ -3390,6 +3594,10 @@ async function handleClone(
     secureExec: processInfo.secureExec,
     externrefGenerationId: processInfo.externrefGeneration.id,
     forkHostImports: forkHostImports.init,
+    // Phase 6 D7b: ship the same co-resident fork-module decision the process
+    // worker receives, so a fork issued FROM this pthread unwinds through the
+    // module (the parent side of a fork-from-thread). Mirrors the Node host.
+    ...forkModuleInitFields(processInfo.ptrWidth),
     fnPtr,
     argPtr,
     stackPtr,
@@ -3511,6 +3719,17 @@ async function handleClone(
       handleVmInterruptTimer(m, pid, processInfo);
     } else if (m.type === "fork_host_import") {
       dispatchForkHostImport(threadWorker, m);
+    } else if (m.type === "fork_module_frames" && m.pid === pid) {
+      // Phase 6 D7b: forward the pthread PARENT worker's fork-module proof-of-use
+      // (the parent side of a fork-from-thread). The process-worker handler above
+      // forwards the same message for the main worker; the pthread worker has its
+      // own handler, so mirror it here or the parent-frame proof is dropped.
+      // Mirrors node-kernel-worker-entry so both hosts report identically.
+      postForkModuleProof({
+        pid,
+        source: "fork-module",
+        message: `fork_module_frames=${m.frames}`,
+      });
     }
   });
   threadWorker.on("error", (err: Error) => {
@@ -3719,32 +3938,28 @@ async function finishProcessExit(
 async function handleReadVfsFile(
   msg: Extract<MainToKernelMessage, { type: "read_vfs_file" }>,
 ) {
-  if (!io) { respond(msg.requestId, null); return; }
-  let releaseMutation: (() => void) | undefined;
+  // The kernel overlay owns `/` unconditionally; read authoritative bytes
+  // (incl. guest copy-on-writes) from it. The host `/` mount no longer exists.
   try {
-    // A read can materialize a lazy file/tree and is therefore serialized
-    // with snapshots even though an already-materialized read is non-mutating.
-    releaseMutation = rootfsSnapshotGate.beginMutation(
-      "read or materialize a rootfs file",
-    );
-    const { data, stat } = await readPreparedPlatformFile(io, msg.path);
-    if ((stat.mode & FILE_MODES.S_IFMT) !== FILE_MODES.S_IFREG) {
-      respond(msg.requestId, null);
-      return;
+    const data = kernelWorker.rootfsReadFile(msg.path);
+    if (msg.includeMode) {
+      const mode = kernelWorker.rootfsStatMode(msg.path);
+      respond(msg.requestId, {
+        data,
+        mode: mode & FILE_MODES.S_MODE_BITS,
+      });
+    } else {
+      respond(msg.requestId, data);
     }
-    // Copy into a plain (non-shared) ArrayBuffer so it structured-clones back.
-    const result = data.slice();
-    respond(
-      msg.requestId,
-      msg.includeMode
-        ? { data: result, mode: stat.mode & FILE_MODES.S_MODE_BITS }
-        : result,
-    );
   } catch (error) {
-    if (isMissingPathError(error)) respond(msg.requestId, null);
-    else respondError(msg.requestId, formatError(error));
-  } finally {
-    releaseMutation?.();
+    const errno = (error as { errno?: number }).errno;
+    // ENOENT (2), ENOTDIR (20), EISDIR (21): missing or not a readable regular
+    // file -> null, matching the host-served path's contract.
+    if (errno === 2 || errno === 20 || errno === 21) {
+      respond(msg.requestId, null);
+    } else {
+      respondError(msg.requestId, formatError(error));
+    }
   }
 }
 
@@ -3752,39 +3967,21 @@ async function handleReadVfsFile(
 // VFS SAB off the persistent browser main thread while allowing harnesses to
 // stage transient files between process spawns.
 function handleWriteVfsFile(msg: Extract<MainToKernelMessage, { type: "write_vfs_file" }>) {
-  if (!io) { respondError(msg.requestId, "VFS is not initialized"); return; }
+  // The kernel overlay owns `/` unconditionally; write into it so the file is
+  // visible to live guests. The host `/` mount no longer exists. A kernel
+  // booted without a `/` image has no overlay to write into — reject clearly
+  // rather than surfacing a lower-level "rootfs write failed".
+  if (!memfs) { respondError(msg.requestId, "VFS is not initialized"); return; }
   let releaseMutation: (() => void) | undefined;
-  let fd: number | null = null;
   try {
     releaseMutation = rootfsSnapshotGate.beginMutation("write a rootfs file");
-    fd = io.open(
+    kernelWorker.rootfsWriteFile(
       msg.path,
-      O_WRONLY_CREAT_TRUNC,
+      msg.data,
       msg.mode & FILE_MODES.S_MODE_BITS,
     );
-    let offset = 0;
-    while (offset < msg.data.byteLength) {
-      const written = io.write(
-        fd,
-        msg.data.subarray(offset),
-        null,
-        msg.data.byteLength - offset,
-      );
-      if (written <= 0) {
-        throw new Error(`Short write while staging ${msg.path}`);
-      }
-      offset += written;
-    }
-    io.close(fd);
-    fd = null;
-    // open(O_CREAT) preserves an existing file's mode. Apply the caller's
-    // requested mode explicitly so replacement and creation behave alike.
-    io.chmod(msg.path, msg.mode & FILE_MODES.S_MODE_BITS);
     respond(msg.requestId, true);
   } catch (err) {
-    if (fd !== null) {
-      try { io.close(fd); } catch { /* preserve the original failure */ }
-    }
     respondError(msg.requestId, formatError(err));
   } finally {
     releaseMutation?.();
@@ -3833,7 +4030,16 @@ async function handleExportRootfsImage(
           "rootfs export requires a quiescent kernel with no live or tearing-down processes",
         );
       }
-      return memfs.saveImage();
+      // The kernel overlay owns `/`; `memfs` is only the frozen base image.
+      // Rebuild a faithful image by reconciling that base with the overlay's
+      // authoritative tree (copy-on-writes, runtime creates/deletes, metadata)
+      // rather than serializing the stale base directly.
+      const { image: overlayImage } = await exportRootfsImageFromOverlay({
+        baseImage: await memfs!.saveImage(),
+        overlayTree: kernelWorker.rootfsExportTree(),
+        readCowBytes: (path) => kernelWorker.rootfsReadFile(path),
+      });
+      return overlayImage;
     });
     respondTransferredBytes(msg.requestId, image);
   } catch (error) {
@@ -4334,17 +4540,120 @@ function readFileFromFs(path: string): ArrayBuffer | null {
   }
 }
 
-async function readExecFileFromFs(path: string): Promise<ArrayBuffer | null> {
-  try {
-    const { data } = await readPreparedPlatformFile(io, path);
-    return data.buffer.slice(
-      data.byteOffset,
-      data.byteOffset + data.byteLength,
-    ) as ArrayBuffer;
-  } catch (error) {
-    if (isMissingPathError(error)) return null;
-    throw error;
+// EAGAIN retry shape for host-initiated exec-byte reads through the in-kernel
+// rootfs overlay (`kernelWorker.rootfsReadFile`, kernel-worker.ts:5151).
+// Mirrors the node entry's `readExecFromOverlay` (see
+// host/src/node-kernel-worker-entry.ts) and host/src/exec-target.ts's
+// `readPreparedExecTarget` EAGAIN retry: a lazy-archive member not yet
+// fetched (rootfs-lazy-archives.ts) surfaces as EAGAIN from the kernel; the
+// fetch runs on this same worker's event loop, so a `setTimeout`-backed (not
+// microtask) delay is required between retries so it can complete.
+const EXEC_OVERLAY_EAGAIN_ERRNO = 11;
+const EXEC_OVERLAY_ENOENT_ERRNO = 2;
+const EXEC_OVERLAY_ENOTDIR_ERRNO = 20;
+const EXEC_OVERLAY_EISDIR_ERRNO = 21;
+const EXEC_OVERLAY_ETIMEDOUT_ERRNO = 110;
+const EXEC_OVERLAY_RETRY_DELAY_MS = 10;
+// Defensive backstop only — normal operation always resolves via bytes or a
+// terminal errno well before this. It exists so a hypothetical stuck fetch
+// fails with a truthful timeout instead of hanging exec forever.
+const EXEC_OVERLAY_RETRY_MAX_WAIT_MS = 30_000;
+
+function execOverlayRetryDelay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+class ExecOverlayReadTimeoutError extends Error {
+  readonly errno = EXEC_OVERLAY_ETIMEDOUT_ERRNO;
+  constructor(path: string, waitedMs: number) {
+    super(
+      `rootfs overlay exec read of ${path} timed out after ${waitedMs}ms ` +
+        "waiting for a lazy archive fetch to complete",
+    );
+    this.name = "ExecOverlayReadTimeoutError";
   }
+}
+
+// Read a file's bytes for host-initiated exec THROUGH the in-kernel rootfs
+// overlay. The overlay is the unconditional sole `/` authority, so it is the
+// sole source of exec bytes for `/`-tree paths (the host `/` mount no longer
+// exists). ENOENT/ENOTDIR/EISDIR mean "not a readable regular
+// file here" -> null, so callers fall through to the same resolution the
+// pre-overlay path used. Any other errno is a truthful failure.
+async function readExecFromOverlay(path: string): Promise<ArrayBuffer | null> {
+  const start = Date.now();
+  for (;;) {
+    try {
+      // `rootfsReadFile` is an immediate, result-bearing kernel entry. The
+      // guest-initiated spawn resolver (`onResolveSpawn` ->
+      // `resolveExecutableForLaunch` -> `resolveExec` -> here) runs from inside
+      // the SYS_SPAWN protocol transaction-start (kernel-worker.ts
+      // `#handleSpawn` -> `deferProtocolTransactionStart`), whose synchronous
+      // prefix reaches this read while `#runningProtocolTransactionStart` is
+      // still set. The entry gate then rejects the read with
+      // `KernelReentrantEntryError` BEFORE touching any kernel state
+      // (kernel-entry-gate.ts `runImmediateVoidIngress`), so retrying it on a
+      // later host turn is safe and idempotent — the sanctioned handling for
+      // spawn/exec/fork/clone continuations (see kernel-entry-retry.ts). Once
+      // the transaction-start operation returns and the gate is idle, the read
+      // completes. Host-initiated exec (`handleSpawn`/`spawnFromVfs`) reaches
+      // this with an idle gate, so it resolves on the first attempt.
+      const data = await retryKernelEntryResult(
+        () => kernelWorker.rootfsReadFile(path),
+      );
+      return data.buffer.slice(
+        data.byteOffset,
+        data.byteOffset + data.byteLength,
+      ) as ArrayBuffer;
+    } catch (error) {
+      const errno = (error as { errno?: number }).errno;
+      if (
+        errno === EXEC_OVERLAY_ENOENT_ERRNO ||
+        errno === EXEC_OVERLAY_ENOTDIR_ERRNO ||
+        errno === EXEC_OVERLAY_EISDIR_ERRNO
+      ) {
+        return null;
+      }
+      if (errno !== EXEC_OVERLAY_EAGAIN_ERRNO) throw error;
+      const waited = Date.now() - start;
+      if (waited >= EXEC_OVERLAY_RETRY_MAX_WAIT_MS) {
+        throw new ExecOverlayReadTimeoutError(path, waited);
+      }
+      await execOverlayRetryDelay(EXEC_OVERLAY_RETRY_DELAY_MS);
+    }
+  }
+}
+
+async function readExecFileFromFs(path: string): Promise<ArrayBuffer | null> {
+  // The overlay owns `/` unconditionally, so it is the authority for `/`-tree
+  // exec bytes — read through it directly (the host `/` mount no longer
+  // exists), with async EAGAIN retry so a lazy archive fetch can complete.
+  // Mirrors the Node entry's `readExecFromVfs`.
+  const fromOverlay = await readExecFromOverlay(path);
+  if (fromOverlay) return fromOverlay;
+  // The overlay is the sole `/` authority, but sibling foreign mounts that
+  // remain in the guest mount table (e.g. session-seed trees, extra host
+  // mounts) still serve their own exec bytes. The overlay correctly disowns
+  // those paths (see `rootfs::owns_path` foreign-mount registry), so a null
+  // overlay read must fall through to the guest mount table rather than
+  // fail — otherwise `spawnFromVfs` of a program that only lives under a
+  // foreign mount would ENOENT. `/` is unmounted, so only genuine sibling
+  // mounts resolve here.
+  if (io) {
+    try {
+      // The base-image / foreign mount resolves symlinks and materializes lazy
+      // programs.
+      const { data } = await readPreparedPlatformFile(io, path);
+      return data.buffer.slice(
+        data.byteOffset,
+        data.byteOffset + data.byteLength,
+      ) as ArrayBuffer;
+    } catch (error) {
+      if (!isMissingPathError(error)) throw error;
+      // Missing from the mount table; nothing else to fall through to.
+    }
+  }
+  return null;
 }
 
 // ── Message dispatch ──

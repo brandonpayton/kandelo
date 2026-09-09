@@ -194,6 +194,7 @@ fn custom_entry_import_name() {
     let bytes = wat::parse_str(wat).expect("wat parse");
     let opts = Options {
         entry_import: "host.do_async".into(),
+        ..Options::default()
     };
     let analysis = analyze(&bytes, &opts).expect("analyze");
     assert_eq!(analysis.fork_path.len(), 2);

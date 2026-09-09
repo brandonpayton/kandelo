@@ -381,6 +381,33 @@ function makeScratchHarness(
       _offset: bigint,
       _retryToken: bigint,
     ) => Number(length),
+    // Workstream H4: mirror `crates/runtime-core/src/netif.rs`'s fixed
+    // two-interface table ("lo", "eth0") closely enough for the
+    // SIOCGIFCONF boundary tests below, which assert on the returned
+    // `ifc_len` and the first bytes of the written buffer.
+    kernel_network_ifreq_size: (pointerWidth: number) =>
+      pointerWidth === 8 ? 40 : 32,
+    kernel_network_ifconf_size: (pointerWidth: number) =>
+      2 * (pointerWidth === 8 ? 40 : 32),
+    kernel_network_ifconf_write: (
+      pointerWidth: number,
+      outPtr: number | bigint,
+      outLen: number,
+    ) => {
+      const entrySize = pointerWidth === 8 ? 40 : 32;
+      const names = ["lo", "eth0"];
+      const count = Math.min(Math.floor(outLen / entrySize), names.length);
+      const base = Number(outPtr);
+      for (let i = 0; i < count; i++) {
+        const entryOffset = base + i * entrySize;
+        kernelBytes.fill(0, entryOffset, entryOffset + entrySize);
+        kernelBytes.set(
+          new TextEncoder().encode(names[i]),
+          entryOffset,
+        );
+      }
+      return count * entrySize;
+    },
   };
   worker =
     createCentralizedKernelWorkerTestDouble() as CentralizedKernelWorker &
@@ -7760,6 +7787,13 @@ describe("kernel scratch transfer capacity regressions", () => {
   );
 
   it.each([4, 8] as const)(
+    // SIOCGIFNAME/SIOCGIFHWADDR/SIOCGIFADDR/SIOCGIFINDEX are plain
+    // fixed-size `struct ifreq` requests and, since Workstream H4, are no
+    // longer host-intercepted at all: they flow through the same generic
+    // ioctl-contract marshal path as every other pointer-valued ioctl (see
+    // "rejects a null pointer for a pointer-valued ioctl" below), so a null
+    // pointer is rejected by `completeChannel` before `kernel_handle_channel`
+    // is ever reached, not by a bespoke `completeChannelRaw` call.
     "rejects null wasm%s outer ifreq objects for every network handler",
     (pointerWidth) => {
       const ifreqSize = pointerWidth === 8 ? 40 : 32;
@@ -7771,10 +7805,19 @@ describe("kernel scratch transfer capacity regressions", () => {
 
         invokeNetworkIoctlHandler(harness, entry.handler, 0);
 
+        expect(harness.handleChannel, `ioctl 0x${entry.request.toString(16)}`)
+          .not.toHaveBeenCalled();
         expect(
-          harness.completeChannelRaw,
+          harness.completeChannel,
           `ioctl 0x${entry.request.toString(16)}`,
-        ).toHaveBeenCalledWith(harness.channel, -EFAULT, EFAULT);
+        ).toHaveBeenCalledWith(
+          harness.channel,
+          ABI_SYSCALLS.Ioctl,
+          [7, entry.request, 0, 0, 0, 0],
+          undefined,
+          -1,
+          EFAULT,
+        );
         expect(harness.processBytes.slice(0, ifreqSize + 16)).toEqual(before);
         expectScratchTailUntouched(harness);
       }
@@ -7843,12 +7886,24 @@ describe("kernel scratch transfer capacity regressions", () => {
           exactPointer,
         );
 
+        exact.handleChannel.mockImplementation((offset: number | bigint) => {
+          const channelView = new DataView(
+            exact.kernelBytes.buffer,
+            Number(offset),
+          );
+          channelView.setBigInt64(CH_RETURN, 0n, true);
+          channelView.setUint32(CH_ERRNO, 0, true);
+          return 0;
+        });
+
         invokeNetworkIoctlHandler(exact, entry.handler, exactPointer);
 
+        expect(exact.handleChannel, `ioctl 0x${entry.request.toString(16)}`)
+          .toHaveBeenCalledOnce();
         expect(
-          exact.completeChannelRaw,
+          exact.completeChannel.mock.calls[0]?.slice(4, 6),
           `ioctl 0x${entry.request.toString(16)}`,
-        ).toHaveBeenCalledWith(exact.channel, 0, 0);
+        ).toEqual([0, 0]);
         expect(
           exact.processBytes.slice(exactPointer - 16, exactPointer),
         ).toEqual(exactPrefix);
@@ -7862,10 +7917,19 @@ describe("kernel scratch transfer capacity regressions", () => {
 
         invokeNetworkIoctlHandler(short, entry.handler, shortPointer);
 
+        expect(short.handleChannel, `ioctl 0x${entry.request.toString(16)}`)
+          .not.toHaveBeenCalled();
         expect(
-          short.completeChannelRaw,
+          short.completeChannel,
           `ioctl 0x${entry.request.toString(16)}`,
-        ).toHaveBeenCalledWith(short.channel, -EFAULT, EFAULT);
+        ).toHaveBeenCalledWith(
+          short.channel,
+          ABI_SYSCALLS.Ioctl,
+          [7, entry.request, shortPointer, 0, 0, 0],
+          undefined,
+          -1,
+          EFAULT,
+        );
         expect(short.processBytes.slice(shortPointer - 16)).toEqual(
           shortBefore,
         );

@@ -529,6 +529,61 @@ fn decode_measured_strings(ranges: &[(usize, usize)], strings: &[u8]) -> Vec<Vec
         .collect()
 }
 
+/// Exact byte length [`serialize_argv_envp`] needs for `parsed`.
+///
+/// `parse_blob`'s ARG_MAX budget keeps real callers far below `usize`, but the
+/// framing size must never wrap, so an oversized aggregate maps to
+/// `Errno::EOVERFLOW` instead of a truncated frame.
+fn framed_argv_envp_len(parsed: &ParsedBlob) -> Result<usize, Errno> {
+    let mut total = 2usize * core::mem::size_of::<u32>();
+    for entry in parsed.argv.iter().chain(parsed.envp.iter()) {
+        if entry.len() > u32::MAX as usize {
+            return Err(Errno::EOVERFLOW);
+        }
+        total = total
+            .checked_add(core::mem::size_of::<u32>())
+            .and_then(|running| running.checked_add(entry.len()))
+            .ok_or(Errno::EOVERFLOW)?;
+    }
+    Ok(total)
+}
+
+/// Serialize a parsed blob's argv and envp into the host-private read-back
+/// framing consumed by the `kernel_spawn_blob_decode` kernel export.
+///
+/// Layout: `[argc: u32 LE][envc: u32 LE]`, then every argv entry followed by
+/// every envp entry, each encoded as `[len: u32 LE][raw bytes]`. The raw bytes
+/// are exactly the NUL-delimited argument/environment bytes `parse_blob`
+/// measured; the host `TextDecode`s them, reproducing the deleted TypeScript
+/// `decodeSpawnBlobStrings` byte-for-byte. Duplicate wire offsets are emitted
+/// as duplicate bytes, matching that decoder.
+///
+/// Returns the number of bytes written, or `Errno::EOVERFLOW` when `out` cannot
+/// hold the complete framing. WHY a loud boundary rather than a partial write:
+/// a truncated frame would decode as a different argv/envp — a silent program
+/// substitution — so a short buffer must be retryable, never partial.
+pub fn serialize_argv_envp(parsed: &ParsedBlob, out: &mut [u8]) -> Result<usize, Errno> {
+    let framed_len = framed_argv_envp_len(parsed)?;
+    if framed_len > out.len() {
+        return Err(Errno::EOVERFLOW);
+    }
+    let argc = parsed.argv.len() as u32;
+    let envc = parsed.envp.len() as u32;
+    let mut cursor = 0usize;
+    out[cursor..cursor + 4].copy_from_slice(&argc.to_le_bytes());
+    cursor += 4;
+    out[cursor..cursor + 4].copy_from_slice(&envc.to_le_bytes());
+    cursor += 4;
+    for entry in parsed.argv.iter().chain(parsed.envp.iter()) {
+        let len = entry.len() as u32;
+        out[cursor..cursor + 4].copy_from_slice(&len.to_le_bytes());
+        cursor += 4;
+        out[cursor..cursor + entry.len()].copy_from_slice(entry);
+        cursor += entry.len();
+    }
+    Ok(cursor)
+}
+
 #[cfg(test)]
 mod parser_tests {
     use super::*;
@@ -840,6 +895,85 @@ mod parser_tests {
         }
         assert_eq!(parsed.attrs.flags, attr_flags::SETPGROUP);
         assert_eq!(parsed.attrs.pgrp, 7);
+    }
+
+    /// Parse the host-private read-back framing back into argv/envp so tests
+    /// assert on decoded strings rather than raw offsets.
+    fn decode_framing(framed: &[u8]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let argc = u32::from_le_bytes(framed[0..4].try_into().unwrap()) as usize;
+        let envc = u32::from_le_bytes(framed[4..8].try_into().unwrap()) as usize;
+        let mut cursor = 8;
+        let take = |count: usize, cursor: &mut usize| {
+            let mut out = Vec::with_capacity(count);
+            for _ in 0..count {
+                let len =
+                    u32::from_le_bytes(framed[*cursor..*cursor + 4].try_into().unwrap()) as usize;
+                *cursor += 4;
+                out.push(framed[*cursor..*cursor + len].to_vec());
+                *cursor += len;
+            }
+            out
+        };
+        let argv = take(argc, &mut cursor);
+        let envp = take(envc, &mut cursor);
+        assert_eq!(cursor, framed.len(), "framing must be fully consumed");
+        (argv, envp)
+    }
+
+    #[test]
+    fn serialize_argv_envp_frames_header_then_length_prefixed_entries() {
+        let parsed = parse_blob(&build_basic_blob()).expect("parse");
+        let mut out = alloc::vec![0u8; 256];
+        let written = serialize_argv_envp(&parsed, &mut out).expect("serialize");
+        assert_eq!(&out[0..4], &1u32.to_le_bytes()); // argc
+        assert_eq!(&out[4..8], &1u32.to_le_bytes()); // envc
+        assert_eq!(&out[8..12], &7u32.to_le_bytes()); // argv[0].len
+        assert_eq!(&out[12..19], b"/bin/ls");
+        assert_eq!(&out[19..23], &13u32.to_le_bytes()); // envp[0].len
+        assert_eq!(&out[23..36], b"PATH=/usr/bin");
+        assert_eq!(written, 36);
+        let (argv, envp) = decode_framing(&out[..written]);
+        assert_eq!(argv, alloc::vec![b"/bin/ls".to_vec()]);
+        assert_eq!(envp, alloc::vec![b"PATH=/usr/bin".to_vec()]);
+    }
+
+    #[test]
+    fn serialize_argv_envp_reports_overflow_instead_of_a_partial_frame() {
+        let parsed = parse_blob(&build_basic_blob()).expect("parse");
+        let mut header_only = alloc::vec![0u8; 8];
+        assert_eq!(
+            serialize_argv_envp(&parsed, &mut header_only),
+            Err(Errno::EOVERFLOW),
+        );
+    }
+
+    #[test]
+    fn serialize_argv_envp_duplicates_shared_offsets_beyond_the_blob_length() {
+        // Two argv entries reference the same string offset. `parse_blob`
+        // yields the duplicated argv, and the framing must emit the bytes twice
+        // even though the source blob stored them once — a framed length that
+        // exceeds the compact blob length.
+        let mut blob: Vec<u8> = Vec::new();
+        blob.extend_from_slice(&2u32.to_le_bytes()); // argc
+        blob.extend_from_slice(&0u32.to_le_bytes()); // envc
+        blob.extend_from_slice(&0u32.to_le_bytes()); // n_actions
+        blob.extend_from_slice(&0u32.to_le_bytes()); // attr_flags
+        blob.extend_from_slice(&0i32.to_le_bytes()); // pgrp
+        blob.extend_from_slice(&0u32.to_le_bytes()); // _pad
+        blob.extend_from_slice(&0u64.to_le_bytes()); // sigdef
+        blob.extend_from_slice(&0u64.to_le_bytes()); // sigmask
+        blob.extend_from_slice(&0u32.to_le_bytes()); // argv[0] @ 0
+        blob.extend_from_slice(&0u32.to_le_bytes()); // argv[1] @ 0
+        blob.extend_from_slice(b"AB\0");
+
+        let parsed = parse_blob(&blob).expect("parse duplicated offsets");
+        assert_eq!(parsed.argv, alloc::vec![b"AB".to_vec(), b"AB".to_vec()]);
+        let mut out = alloc::vec![0u8; 64];
+        let written = serialize_argv_envp(&parsed, &mut out).expect("serialize");
+        assert_eq!(written, 8 + (4 + 2) + (4 + 2));
+        let (argv, envp) = decode_framing(&out[..written]);
+        assert_eq!(argv, alloc::vec![b"AB".to_vec(), b"AB".to_vec()]);
+        assert!(envp.is_empty());
     }
 
     #[test]

@@ -9,10 +9,8 @@ import {
 } from "./fork-module-state";
 import {
   FORK_REFERENCE_TRANSACTION_OWNER_ID,
-} from "./fork-reference-transaction";
-import {
   scanSegmentedForkReferenceExternrefHandles,
-} from "./fork-reference-segments";
+} from "./fork-reference-wire";
 import {
   unwrapForkWorkerExceptionCapability,
 } from "./fork-worker-exception-capability";

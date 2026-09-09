@@ -1,0 +1,73 @@
+[package]
+name = "host-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native reference host: loads the real kernel.wasm in Wasmtime and runs the channel handshake"
+publish = false
+
+# HOST-ONLY crate. Wasmtime (and its Cranelift backend) does not build for
+# `wasm32-unknown-unknown`, so this crate — like `tools/xtask` — must always
+# be built and tested for the host target, never the workspace-default wasm
+# target from `.cargo/config.toml`:
+#
+#     cargo build -p host-native --target aarch64-apple-darwin
+#     cargo test  -p host-native --target aarch64-apple-darwin
+#
+# It is a workspace member so the closed-by-default
+# `cargo test --workspace --exclude xtask --target <host>` suite picks it up
+# automatically. The wasm kernel build (`cargo build --release -p kandelo
+# -Z build-std=core,alloc`) targets `-p kandelo` specifically and never
+# compiles this crate, so Wasmtime is only resolved (into Cargo.lock), never
+# built, on the wasm path.
+
+[lib]
+name = "host_native"
+path = "src/lib.rs"
+
+[dependencies]
+# Wasmtime 35 originally matched the feasibility spike in
+# docs/plans/2026-08-25-rust-first-runtime-design.md. It supports every
+# feature the kernel needs (threads/shared-memory + atomic wait/notify,
+# bulk-memory, mutable-globals, imported/exported memory) with no WASI or
+# Component Model. Loading the same `kernel.wasm` on a non-JS engine is the
+# freeze-gate acid test that the platform boundary is not JavaScript-shaped.
+#
+# Upgraded 35 -> 48 (N1-I4/I5 native-fork unblock): Wasmtime 35 cannot load a
+# fork-instrumented guest at all — it rejects the exception-handling
+# proposal's `exnref`/`Exn` heap type outright ("unsupported heap type Exn").
+# Wasmtime 48 supports the exceptions proposal (see
+# `kernel_engine`'s `Config::wasm_exceptions` call in `src/lib.rs`), which is
+# the whole point of this bump: native `fork()` needs the fork-instrumented
+# guest to load in the first place. See
+# `.superpowers/sdd/2026-09-05-n1-i4-native-fork-frames/wasmtime-upgrade-report.md`
+# for the full reconciliation of the 35->48 API churn.
+wasmtime = "48"
+
+# The authoritative ABI: syscall numbers, channel offsets, and the pointer-arg
+# marshalling descriptors. A `no_std` constants/types crate with no external
+# dependencies, so linking it into this `std` host binary is free and keeps the
+# native pump keyed off the same source of truth the kernel and guest glue use —
+# never hand-copied magic numbers.
+wasm-posix-shared = { path = "../shared" }
+
+# The portable, `no_std`, wasmtime-free fork core: wire decoders, the linked-
+# frame writer, the replay journal, the rewind driver, and the reference/GC
+# graph builder this crate drives directly (`fork_codec::ReferenceGraphBuilder`,
+# `gc_codec`, `drive_plan`, `reference_replay`, etc. throughout `guest.rs`). H3
+# (host-surface minimization, 2026-09-06) deleted the `ForkHostCapabilities`
+# engine-floor trait this dependency used to also carry — it was never wired
+# to any guest on any host (native trapped every `wpk_fork_host.*` import as
+# unreachable) and the completed F5/F6 reference-completeness work bypassed
+# it entirely, so `fork-codec` stays a dependency solely for the live
+# portable core above.
+fork-codec = { path = "../fork-codec" }
+
+# Ergonomic error propagation for the pump (`bail!`, `?` across the many
+# fallible kernel-export calls). Wasmtime already pulls anyhow into the tree.
+anyhow = "1"
+
+[dev-dependencies]
+# `wat` compiles the tiny WAT wait/notify probe module in-test, keeping the
+# fixture readable alongside the assertions that consume it.
+wat = "1"

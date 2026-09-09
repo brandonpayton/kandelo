@@ -672,4 +672,9 @@ export class ForkExternrefTokenRecipeProvider {
   materialize(handle: number): ForkExternrefToken {
     return this.tokens.materialize(handle);
   }
+
+  tryEncode(value: unknown): number | undefined {
+    const handle = this.tokens.encode(value);
+    return handle === null ? undefined : handle;
+  }
 }

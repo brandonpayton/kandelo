@@ -312,6 +312,111 @@ describe("NodeKernelHost rootfs export contract", () => {
     },
   );
 
+  it.skipIf(!haveKernel)(
+    "exports a faithful image from the in-kernel overlay tree",
+    async () => {
+      const kernel = new Uint8Array(readFileSync(kernelPath!));
+
+      // Base image: an untouched base file, a base file we will overwrite via
+      // copy-on-write, a base symlink, and a lazy per-file descriptor.
+      const base = MemoryFileSystem.create(new SharedArrayBuffer(8 * 1024 * 1024));
+      base.mkdir("/var", 0o755);
+      base.mkdir("/var/lib", 0o755);
+      writeFile(
+        base,
+        "/var/lib/persisted-state",
+        new TextEncoder().encode("survives reboot\n"),
+        0o640,
+      );
+      writeFile(
+        base,
+        "/var/lib/base-to-overwrite",
+        new TextEncoder().encode("original bytes\n"),
+        0o644,
+      );
+      base.symlink("persisted-state", "/var/lib/link");
+      base.registerLazyFile(
+        "/opt/lazy-tool",
+        "https://packages.example.test/lazy-tool.wasm",
+        4242,
+        0o755,
+      );
+      const baseImage = await base.saveImage();
+
+      const created = new Uint8Array([9, 8, 7, 6]);
+      let exported: Uint8Array;
+      const host = new NodeKernelHost({ rootfsImage: baseImage });
+      try {
+        await host.init(asArrayBuffer(kernel));
+
+        await host.writeFileToVfs("/var/lib/ingested", created, 0o620);
+        await host.writeFileToVfs(
+          "/var/lib/base-to-overwrite",
+          new TextEncoder().encode("copy-on-written\n"),
+          0o600,
+        );
+
+        exported = await host.exportRootfsImage();
+      } finally {
+        await host.destroy();
+      }
+
+      // The exported image round-trips through the normal loader.
+      const restored = MemoryFileSystem.fromImage(exported);
+
+      // Untouched base file: bytes and mode preserved.
+      expect(new TextDecoder().decode(
+        readFile(restored, "/var/lib/persisted-state"),
+      )).toBe("survives reboot\n");
+      expect(restored.stat("/var/lib/persisted-state").mode & 0o7777).toBe(0o640);
+
+      // Copy-on-written base file: overlay bytes and mode win.
+      expect(new TextDecoder().decode(
+        readFile(restored, "/var/lib/base-to-overwrite"),
+      )).toBe("copy-on-written\n");
+      expect(restored.stat("/var/lib/base-to-overwrite").mode & 0o7777).toBe(0o600);
+
+      // Runtime-created file: bytes and mode preserved.
+      expect(readFile(restored, "/var/lib/ingested")).toEqual(created);
+      expect(restored.stat("/var/lib/ingested").mode & 0o7777).toBe(0o620);
+
+      // Base symlink preserved (target, not the resolved file).
+      expect(restored.readlink("/var/lib/link")).toBe("persisted-state");
+
+      // Lazy per-file descriptor preserved without being force-materialized
+      // (its URL lives only in the base image, never in the overlay).
+      expect(restored.exportLazyEntries()).toEqual([
+        expect.objectContaining({
+          path: "/opt/lazy-tool",
+          url: "https://packages.example.test/lazy-tool.wasm",
+          size: 4242,
+        }),
+      ]);
+
+      // Rebooting from the exported image and re-exporting is idempotent.
+      const rebooted = new NodeKernelHost({ rootfsImage: exported });
+      try {
+        await rebooted.init(asArrayBuffer(kernel));
+        const again = await rebooted.exportRootfsImage();
+        const againFs = MemoryFileSystem.fromImage(again);
+        expect(new TextDecoder().decode(
+          readFile(againFs, "/var/lib/base-to-overwrite"),
+        )).toBe("copy-on-written\n");
+        expect(readFile(againFs, "/var/lib/ingested")).toEqual(created);
+        expect(againFs.readlink("/var/lib/link")).toBe("persisted-state");
+        expect(againFs.exportLazyEntries()).toEqual([
+          expect.objectContaining({
+            path: "/opt/lazy-tool",
+            url: "https://packages.example.test/lazy-tool.wasm",
+            size: 4242,
+          }),
+        ]);
+      } finally {
+        await rebooted.destroy();
+      }
+    },
+  );
+
   it.skipIf(!haveKernel || !haveWasiHello)(
     "spawns an executable by path from the existing worker-owned rootfs",
     async () => {

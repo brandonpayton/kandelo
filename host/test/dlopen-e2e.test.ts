@@ -8,9 +8,11 @@ import { describe, it, expect, beforeAll } from "vitest";
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { runCentralizedProgram } from "./centralized-test-helper";
+import {
+  makeHostScratchTempRoot,
+  runCentralizedProgram,
+} from "./centralized-test-helper";
 import { NodePlatformIO } from "../src/platform/node";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -31,7 +33,12 @@ function hasCompiler(compiler = "wasm32posix-cc"): boolean {
   }
 }
 
-const BUILD_DIR = join(tmpdir(), "wasm-dlopen-e2e");
+// Stage the built `.so`/`.wasm` under `<repoRoot>/target` (never an in-kernel
+// tmpfs scratch prefix) so the guest reaches the real host file through
+// NodePlatformIO. `os.tmpdir()` frequently resolves under `/tmp` (the nix dev
+// shell sets `TMPDIR=/tmp/nix-shell.*`), where the empty in-kernel tmpfs shadows
+// the path and the guest dlopen fails with "cannot stat library".
+const BUILD_DIR = makeHostScratchTempRoot("wasm-dlopen-e2e-");
 
 /** Build a shared Wasm library (.so side module) from C source. */
 function buildSharedLib(
@@ -69,12 +76,11 @@ describe.skipIf(!hasSysroot || !hasKernel || !hasCompiler())("dlopen end-to-end"
     mkdirSync(BUILD_DIR, { recursive: true });
   });
 
-  // The .so files are written under `os.tmpdir()` (e.g. `/var/folders/.../T`
-  // on macOS) and passed to the wasm program as an absolute host path. The
-  // default mount-based VFS doesn't know about that path, so dlopen() would
-  // see ENOENT. Opt the test into the raw-host-fs escape hatch via
-  // `NodePlatformIO`, since this test exercises the dlopen plumbing rather
-  // than the VFS layer.
+  // The .so files are written under `<repoRoot>/target` and passed to the wasm
+  // program as an absolute host path. The default mount-based VFS doesn't know
+  // about that path, so dlopen() would see ENOENT. Opt the test into the
+  // raw-host-fs escape hatch via `NodePlatformIO`, since this test exercises
+  // the dlopen plumbing rather than the VFS layer.
   const io = () => new NodePlatformIO();
 
   it("opens and resolves the main program symbol scope", async () => {

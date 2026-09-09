@@ -1,4 +1,4 @@
-;; ABI 43 real-worker integration fixture for activation-owned Wasm GC state.
+;; ABI 44 real-worker integration fixture for activation-owned Wasm GC state.
 ;;
 ;; One cyclic object is aliased simultaneously by a reference parameter, an
 ;; operand-stack carryover across kernel_fork, a mutable reference global, and
@@ -23,7 +23,7 @@
     (i32.const 65536))
 
   (func (export "__abi_version") (result i32)
-    i32.const 43)
+    i32.const 44)
 
   (func $wait_child (param $pid i32) (result i32)
     (local $base i32)

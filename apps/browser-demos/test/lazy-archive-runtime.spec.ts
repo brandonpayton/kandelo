@@ -6,19 +6,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { expect, test, type Page } from "@playwright/test";
-import { gzipSync, zipSync, type Zippable } from "fflate";
+import { zipSync, type Zippable } from "fflate";
 
 import { resolveBinary } from "../../../host/src/binary-resolver";
 import { ABI_VERSION } from "../../../host/src/generated/abi";
-import {
-  MemoryFileSystem,
-  type LazyTreeRegistrationEntry,
-  type LazyTreeSourceInventory,
-} from "../../../host/src/vfs/memory-fs";
-import {
-  encodeMaterializationBytes,
-  type LazyTreeMaterializationPlan,
-} from "../../../host/src/vfs/materialization-plan";
+import { MemoryFileSystem } from "../../../host/src/vfs/memory-fs";
 import {
   derivePackageDeferredZipTree,
   materializePackageDeferredZipTree,
@@ -65,7 +57,6 @@ function tryResolveKernelWasm(): string | null {
 }
 const kernel = tryResolveKernelWasm();
 const available = existsSync(environmentProgram) && kernel !== null;
-const TAR_BLOCK = 512;
 
 // The production preview itself supplies the cross-origin isolation headers.
 // Keep Playwright's byte routes authoritative for these same-origin fixtures;
@@ -83,39 +74,25 @@ function sameOriginFixtureUrl(baseURL: string, name: string): string {
   return new URL(`__kandelo_lazy_fixture__/${name}`, baseURL).href;
 }
 
+// Phase 5 cutover: the in-kernel rootfs overlay is the sole `/` authority and
+// its lazy-archive decoder is ZIP-only (tar-gzip System-A registration was
+// dropped). Every lazy group is registered through the overlay's ZIP path
+// (`registerLazyArchiveFromEntries` -> `buildRootfsLazyWiring` ->
+// `host_fetch_archive`), the only format the kernel decodes.
 async function lazyImage(groups: Array<{
   url: string;
   archive: Uint8Array;
-  tarBytes?: number;
-  inventory?: LazyTreeRegistrationEntry[];
-  source?: LazyTreeSourceInventory;
-  materialization?: LazyTreeMaterializationPlan;
 }>): Promise<Uint8Array> {
   const fs = MemoryFileSystem.create(new SharedArrayBuffer(32 * 1024 * 1024));
   fs.setImageMetadata({ version: 1, kernelAbi: ABI_VERSION });
   for (const group of groups) {
-    if (group.inventory && group.tarBytes !== undefined) {
-      fs.registerLazyTree({
-        decoder: "tar-gzip-v1",
-        mediaType: "application/vnd.oci.image.layer.v1.tar+gzip",
-        ...identity(group.archive),
-        expandedBytes: group.tarBytes,
-        sourceEntryCount: group.source?.entries.length ?? group.inventory.length,
-        transports: [group.url],
-        ...(group.source === undefined ? {} : { source: group.source }),
-        ...(group.materialization === undefined
-          ? {}
-          : { materialization: group.materialization }),
-      }, group.inventory);
-    } else {
-      fs.registerLazyArchiveFromEntries(
-        group.url,
-        parseZipCentralDirectory(group.archive),
-        "/",
-        undefined,
-        identity(group.archive),
-      );
-    }
+    fs.registerLazyArchiveFromEntries(
+      group.url,
+      parseZipCentralDirectory(group.archive),
+      "/",
+      undefined,
+      identity(group.archive),
+    );
   }
   return fs.saveImage();
 }
@@ -204,47 +181,23 @@ test("Chromium boots, reads, and execs through verified lazy archives", async ({
 }) => {
   test.setTimeout(180_000);
   if (!baseURL) throw new Error("Playwright baseURL is required");
-  const execUrl = sameOriginFixtureUrl(baseURL, "exec.tar.gz");
+  const execUrl = sameOriginFixtureUrl(baseURL, "exec.zip");
   const dataUrl = sameOriginFixtureUrl(baseURL, "data.zip");
   const imageUrl = sameOriginFixtureUrl(baseURL, "lazy.vfs");
   const execBytes = new Uint8Array(readFileSync(environmentProgram));
-  const execTar = tarBytes([
-    { path: "bin/environment-lifecycle-real", mode: 0o755, data: execBytes },
-    {
-      path: "bin/environment-lifecycle",
-      mode: 0o755,
-      target: "bin/environment-lifecycle-real",
-    },
-  ]);
-  const execArchive = gzipSync(execTar);
+  // The environment lifecycle fixture re-execs itself through argv[0]
+  // (`/bin/environment-lifecycle`), so plant the executable directly at that
+  // path in the ZIP archive. (The former tar-gzip hardlink layout is not a ZIP
+  // capability, and the overlay decodes ZIP only.)
+  const execArchive = zipSync({
+    "bin/": unixZipEntry(new Uint8Array(), 0o040755),
+    "bin/environment-lifecycle": unixZipEntry(execBytes, 0o100755),
+  } satisfies Zippable);
   const dataArchive = zipSync({
     "etc/lazy-browser-data": new TextEncoder().encode("lazy-browser-data"),
   });
   const image = await lazyImage([
-    {
-      url: execUrl,
-      archive: execArchive,
-      tarBytes: execTar.byteLength,
-      inventory: [
-        {
-          vfsPath: "/bin/environment-lifecycle-real",
-          sourcePath: "bin/environment-lifecycle-real",
-          type: "file",
-          mode: 0o755,
-          size: execBytes.byteLength,
-          inodeGroup: "environment-lifecycle",
-        },
-        {
-          vfsPath: "/bin/environment-lifecycle",
-          sourcePath: "bin/environment-lifecycle",
-          type: "hardlink",
-          mode: 0o755,
-          size: execBytes.byteLength,
-          target: "/bin/environment-lifecycle-real",
-          inodeGroup: "environment-lifecycle",
-        },
-      ],
-    },
+    { url: execUrl, archive: execArchive },
     { url: dataUrl, archive: dataArchive },
   ]);
   let execFetches = 0;
@@ -304,30 +257,11 @@ test("Chromium retries a transient lazy-tree response before surfacing EIO", asy
   baseURL,
 }) => {
   if (!baseURL) throw new Error("Playwright baseURL is required");
-  const archiveUrl = sameOriginFixtureUrl(baseURL, "transient.tar.gz");
+  const archiveUrl = sameOriginFixtureUrl(baseURL, "transient.zip");
   const imageUrl = sameOriginFixtureUrl(baseURL, "transient.vfs");
   const payload = new TextEncoder().encode("verified-after-transient-502");
-  const tar = tarBytes([
-    {
-      path: "etc/transient-data",
-      mode: 0o644,
-      data: payload,
-    },
-  ]);
-  const archive = gzipSync(tar);
-  const image = await lazyImage([{
-    url: archiveUrl,
-    archive,
-    tarBytes: tar.byteLength,
-    inventory: [{
-      vfsPath: "/etc/transient-data",
-      sourcePath: "etc/transient-data",
-      type: "file",
-      mode: 0o644,
-      size: payload.byteLength,
-      inodeGroup: "transient-data",
-    }],
-  }]);
+  const archive = zipSync({ "etc/transient-data": payload });
+  const image = await lazyImage([{ url: archiveUrl, archive }]);
   let fetches = 0;
   await routeBytes(page, imageUrl, image, "application/octet-stream");
   await page.route(archiveUrl, async (route) => {
@@ -372,107 +306,15 @@ test("Chromium retries a transient lazy-tree response before surfacing EIO", asy
   expect(fetches).toBe(2);
 });
 
-test("browser applies a generic authenticated archive transformation", async ({
-  page,
-  baseURL,
-}) => {
-  if (!baseURL) throw new Error("Playwright baseURL is required");
-  const archiveUrl = sameOriginFixtureUrl(baseURL, "transformed.tar.gz");
-  const imageUrl = sameOriginFixtureUrl(baseURL, "transformed.vfs");
-  const sourceBytes = new TextEncoder().encode("prefix=@@ROOT@@\n");
-  const outputBytes = new TextEncoder().encode("prefix=/etc\n");
-  const tar = tarBytes([{
-    path: "bundle/config",
-    mode: 0o644,
-    data: sourceBytes,
-  }]);
-  const archive = gzipSync(tar);
-  const source = {
-    schema: 1,
-    kind: "archive-source-inventory-v1",
-    entries: [{
-      sourcePath: "bundle/config",
-      type: "file",
-      mode: 0o644,
-      size: sourceBytes.byteLength,
-    }],
-  } as const satisfies LazyTreeSourceInventory;
-  const recipe = {
-    id: "browser-root-relocation-v1",
-    replacements: [{
-      matchHex: encodeMaterializationBytes(
-        new TextEncoder().encode("@@ROOT@@"),
-      ),
-      replacementHex: encodeMaterializationBytes(
-        new TextEncoder().encode("/etc"),
-      ),
-    }],
-    rejectHex: [
-      encodeMaterializationBytes(new TextEncoder().encode("@@ROOT@@")),
-    ],
-  };
-  const materialization = {
-    schema: 1,
-    kind: "archive-byte-transforms-v1",
-    assertions: [{
-      sourcePath: "bundle/config",
-      bytesHex: encodeMaterializationBytes(sourceBytes),
-    }],
-    recipes: [recipe],
-    transforms: [{
-      sourcePath: "bundle/config",
-      recipe: recipe.id,
-      input: identity(sourceBytes),
-      output: identity(outputBytes),
-    }],
-  } as const satisfies LazyTreeMaterializationPlan;
-  const image = await lazyImage([{
-    url: archiveUrl,
-    archive,
-    tarBytes: tar.byteLength,
-    source,
-    materialization,
-    inventory: [{
-      vfsPath: "/etc/transformed-data",
-      sourcePath: "bundle/config",
-      materialization: "archive",
-      type: "file",
-      mode: 0o644,
-      size: outputBytes.byteLength,
-      inodeGroup: "browser:transformed-data",
-    }],
-  }]);
-  let fetches = 0;
-  await routeBytes(page, imageUrl, image, "application/octet-stream");
-  await page.route(archiveUrl, async (route) => {
-    fetches++;
-    await route.fulfill({
-      status: 200,
-      body: Buffer.from(archive),
-      headers: {
-        "access-control-allow-origin": "*",
-        "content-length": String(archive.byteLength),
-      },
-    });
-  });
-
-  await page.goto(new URL("/pages/lazy-archive-vfs-test/", baseURL).href);
-  await expect.poll(
-    () => page.evaluate(() => window.__lazyArchiveVfsTestReady),
-    { timeout: 120_000 },
-  ).toBe(true);
-  const result = await page.evaluate(
-    (url) => window.__runLazyVfsAcceptance({
-      vfsUrl: url,
-      readPath: "/etc/transformed-data",
-      timeoutMs: 30_000,
-    }),
-    imageUrl,
-  );
-
-  expect(result.readText).toBe("prefix=/etc\n");
-  expect(fetches).toBe(1);
-});
+// NOTE: The former "browser applies a generic authenticated archive
+// transformation" case was DELETED in the Phase 5 cutover. It exercised the
+// host-side lazy byte-transform materialization (`archive-byte-transforms-v1`,
+// e.g. `@@ROOT@@` -> `/etc` on materialize) that only the removed tar-gzip
+// System-A `registerLazyTree` path applied. The in-kernel overlay that now owns
+// `/` fetches raw archive bytes and decodes ZIP members verbatim
+// (`buildRootfsLazyWiring` has no transform hook), so lazy read-time
+// materialization no longer exists as a served behavior. There is no ZIP-overlay
+// equivalent to migrate onto.
 
 test("browser workers proxy external lazy archives under cross-origin isolation", async ({
   page,
@@ -672,75 +514,4 @@ test("Chromium consumes lazy and eager package trees derived from one exact ZIP"
 
 function unixZipEntry(bytes: Uint8Array, mode: number): Zippable[string] {
   return [bytes, { os: 3, attrs: ((mode << 16) >>> 0) }];
-}
-
-interface TarSpec {
-  path: string;
-  mode: number;
-  data?: Uint8Array;
-  target?: string;
-}
-
-function tarBytes(entries: readonly TarSpec[]): Uint8Array {
-  const chunks: Uint8Array[] = [];
-  let total = TAR_BLOCK * 2;
-  for (const entry of entries) {
-    const data = entry.data ?? new Uint8Array();
-    const payload = new Uint8Array(Math.ceil(data.byteLength / TAR_BLOCK) * TAR_BLOCK);
-    payload.set(data);
-    const header = new Uint8Array(TAR_BLOCK);
-    writeTarString(header, 0, 100, entry.path);
-    writeTarOctal(header, 100, 8, entry.mode);
-    writeTarOctal(header, 108, 8, 0);
-    writeTarOctal(header, 116, 8, 0);
-    writeTarOctal(header, 124, 12, data.byteLength);
-    writeTarOctal(header, 136, 12, 0);
-    header.fill(0x20, 148, 156);
-    header[156] = (entry.target ? "1" : "0").charCodeAt(0);
-    if (entry.target) writeTarString(header, 157, 100, entry.target);
-    writeTarString(header, 257, 6, "ustar");
-    writeTarString(header, 263, 2, "00");
-    let checksum = 0;
-    for (const byte of header) checksum += byte;
-    writeTarString(
-      header,
-      148,
-      8,
-      `${checksum.toString(8).padStart(6, "0")}\0 `,
-    );
-    chunks.push(header, payload);
-    total += header.byteLength + payload.byteLength;
-  }
-  const output = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    output.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return output;
-}
-
-function writeTarString(
-  target: Uint8Array,
-  offset: number,
-  length: number,
-  value: string,
-): void {
-  const bytes = new TextEncoder().encode(value);
-  if (bytes.byteLength > length) throw new Error("test TAR field is too long");
-  target.set(bytes, offset);
-}
-
-function writeTarOctal(
-  target: Uint8Array,
-  offset: number,
-  length: number,
-  value: number,
-): void {
-  writeTarString(
-    target,
-    offset,
-    length,
-    `${value.toString(8).padStart(length - 2, "0")}\0`,
-  );
 }

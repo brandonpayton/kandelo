@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runCentralizedProgram } from "./centralized-test-helper";
+import { moduleReferenceProof } from "./fork-module-reference-proof";
 import {
   RAW_GC_REFERENCE_STATE_FRESH_WORKER_HEX,
 } from "./fixtures/gc-reference-state-fresh-worker-bytes";
@@ -41,7 +42,7 @@ describe("Wasm GC reference state in a fresh process Worker", () => {
     if (workDir) rmSync(workDir, { recursive: true, force: true });
   });
 
-  it("preserves one cyclic identity across params, carryovers, globals, and tables", async () => {
+  it("reconstructs the cyclic typed-GC identity fork through the co-resident module", async () => {
     const result = await runCentralizedProgram({
       programPath,
       argv: ["gc-reference-state-fresh-worker"],
@@ -51,8 +52,15 @@ describe("Wasm GC reference state in a fresh process Worker", () => {
 
     expect(
       result.exitCode,
-      `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      `GC fork exited unexpectedly\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
     ).toBe(0);
     expect(result.stderr).toBe("");
+    const gcNodes = moduleReferenceProof(result.forkModuleDiagnostics, "gc");
+    expect(
+      gcNodes,
+      "expected a fork-module typed-GC proof-of-use diagnostic; the module " +
+        "did not admit the cyclic GC reconstruction",
+    ).not.toBeNull();
+    expect(gcNodes!).toBeGreaterThan(0);
   });
 });

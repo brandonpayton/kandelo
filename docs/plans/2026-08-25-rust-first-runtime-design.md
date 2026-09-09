@@ -8,6 +8,13 @@ Related prior art (context and inspiration only, not authority):
 `docs/plans/2026-05-20-rust-owned-host-logic-plan.md`,
 `docs/plans/2026-05-11-shareable-computer-url-design.md`.
 
+> **Current remaining-work plan:** for what is left in this campaign, why,
+> and in what order, see
+> `docs/plans/2026-09-04-rust-first-remaining-purpose-framed.md` — the
+> authoritative, purpose-framed view of the remaining steps. This design
+> doc remains the architecture and staged plan; that document is the live
+> status, the decision "Bar," and the current sequence.
+
 ## Why
 
 Kandelo's runtime today splits POSIX and ABI responsibility across two

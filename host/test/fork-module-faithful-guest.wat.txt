@@ -1,0 +1,33 @@
+(module
+  ;; The host publishes a live GC identity into STORE #2 (the shared anyref
+  ;; transit table) at slot arg+1 when the guest's gc_allocate drives it. The
+  ;; test toolchain's wat2wasm predates GC wasm (no `ref.i31`/anyref tables),
+  ;; so the guest double routes the publish through this host import instead of
+  ;; a wasm `table.set`; the TIMING (guest-allocate-driven, mid-drive) and the
+  ;; STORE (the same table object the shim reads) match production. The guest's
+  ;; real wasm `table.set(ref.i31 ...)` publish is covered by fork-instrument's
+  ;; module_gc_codec tests.
+  (import "env" "__wpk_fork_publish" (func $publish (param i32)))
+  (global $alloc_arg (mut i32) (i32.const -1))
+  (global $fill_arg (mut i32) (i32.const -1))
+  (global $exn_arg (mut i32) (i32.const -1))
+  (global $order (mut i32) (i32.const 0))
+  (global $seq (mut i32) (i32.const 0))
+  (func (export "gc_allocate") (param $x i32)
+    (global.set $alloc_arg (local.get $x))
+    (global.set $seq (i32.add (global.get $seq) (i32.const 1)))
+    (global.set $order (i32.add (i32.mul (global.get $order) (i32.const 10)) (i32.const 1)))
+    (call $publish (local.get $x)))
+  (func (export "gc_fill") (param $x i32)
+    (global.set $fill_arg (local.get $x))
+    (global.set $seq (i32.add (global.get $seq) (i32.const 1)))
+    (global.set $order (i32.add (i32.mul (global.get $order) (i32.const 10)) (i32.const 2))))
+  (func (export "exception_materialize") (param $x i32)
+    (global.set $exn_arg (local.get $x))
+    (global.set $seq (i32.add (global.get $seq) (i32.const 1)))
+    (global.set $order (i32.add (i32.mul (global.get $order) (i32.const 10)) (i32.const 3))))
+  (func (export "alloc_arg") (result i32) (global.get $alloc_arg))
+  (func (export "fill_arg") (result i32) (global.get $fill_arg))
+  (func (export "exn_arg") (result i32) (global.get $exn_arg))
+  (func (export "order") (result i32) (global.get $order))
+  (func (export "seq") (result i32) (global.get $seq)))

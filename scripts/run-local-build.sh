@@ -45,4 +45,4 @@ exec cargo run -p xtask --target "$host_target" -- local-build run \
     --source-cache-root "$source_cache_root" \
     --output-root "$REPO_ROOT/local-binaries/source-only-v1" \
     --product all \
-    --jobs 16
+    --jobs "${WASM_POSIX_LOCAL_BUILD_JOBS:-16}"

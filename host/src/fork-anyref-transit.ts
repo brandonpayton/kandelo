@@ -67,9 +67,15 @@ export function forkAnyrefTransitProviderBytes(): Uint8Array {
  */
 export class ForkAnyrefTransitTable {
   readonly table: WebAssembly.Table;
-  private readonly clearTable: () => void;
+  private readonly clearTable: (() => void) | null;
 
-  constructor() {
+  constructor(adopted?: WebAssembly.Table) {
+    if (adopted) {
+      this.table = adopted;
+      this.clearTable = null;
+      this.clear();
+      return;
+    }
     const instance = new WebAssembly.Instance(compileProviderModule());
     const table = instance.exports[FORK_ANYREF_TRANSIT_IMPORT];
     const clearTable = instance.exports[FORK_ANYREF_TRANSIT_CLEAR_EXPORT];
@@ -82,7 +88,11 @@ export class ForkAnyrefTransitTable {
   }
 
   clear(): void {
-    this.clearTable();
+    if (this.clearTable) {
+      this.clearTable();
+      return;
+    }
+    for (let i = 0; i < this.table.length; i++) this.table.set(i, null);
   }
 
   /**

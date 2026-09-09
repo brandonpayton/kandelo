@@ -206,7 +206,17 @@ test("Chromium reconstructs CatchRef state in a fresh child worker", async ({
       "-o",
       rawPath,
     ]);
-    execFileSync(forkInstrumenterPath, [rawPath, "-o", programPath]);
+    // Stamp the current ABI at instrumentation time (test-only flag) so the
+    // committed fixture, whose __abi_version is a placeholder sentinel rather
+    // than a real epoch, tracks the running ABI instead of going stale. This
+    // only unblocks the artifact gate; the reconstruction assertions below are
+    // what prove correctness.
+    execFileSync(forkInstrumenterPath, [
+      "--stamp-abi-version",
+      rawPath,
+      "-o",
+      programPath,
+    ]);
 
     // The parent waits for the child, whose exit 91 means CatchRef payload
     // reconstruction failed after the browser worker instantiated a fresh
@@ -253,7 +263,17 @@ test("Chromium reconstructs reference-bearing catches in fresh child workers", a
       "-o",
       rawPath,
     ]);
-    execFileSync(forkInstrumenterPath, [rawPath, "-o", programPath]);
+    // Stamp the current ABI at instrumentation time (test-only flag) so the
+    // committed fixture, whose __abi_version is a placeholder sentinel rather
+    // than a real epoch, tracks the running ABI instead of going stale. This
+    // only unblocks the artifact gate; the reconstruction assertions below are
+    // what prove correctness.
+    execFileSync(forkInstrumenterPath, [
+      "--stamp-abi-version",
+      rawPath,
+      "-o",
+      programPath,
+    ]);
 
     // One fresh child calls the reconstructed non-null funcref; a second
     // verifies the nullable externref path. Either child exits nonzero if its
@@ -291,7 +311,17 @@ test("Chromium reconstructs aliased Wasm GC state in a fresh child worker", asyn
       rawPath,
       Buffer.from(RAW_GC_REFERENCE_STATE_FRESH_WORKER_HEX, "hex"),
     );
-    execFileSync(forkInstrumenterPath, [rawPath, "-o", programPath]);
+    // Stamp the current ABI at instrumentation time (test-only flag) so the
+    // committed fixture, whose __abi_version is a placeholder sentinel rather
+    // than a real epoch, tracks the running ABI instead of going stale. This
+    // only unblocks the artifact gate; the reconstruction assertions below are
+    // what prove correctness.
+    execFileSync(forkInstrumenterPath, [
+      "--stamp-abi-version",
+      rawPath,
+      "-o",
+      programPath,
+    ]);
 
     // The child verifies one cyclic identity through a live parameter,
     // operand-stack carryover, mutable reference global, and mutated typed

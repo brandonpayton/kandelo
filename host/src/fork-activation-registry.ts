@@ -24,6 +24,7 @@ import {
   WPK_FORK_REFERENCE_IMPORT_GC_PROVENANCE_END,
   WPK_FORK_REFERENCE_IMPORT_GC_PROVENANCE_REF,
   WPK_FORK_REFERENCE_IMPORT_GC_ROUTE,
+  WPK_FORK_REFERENCE_IMPORT_PROVENANCE_EXTERNREF,
   WPK_FORK_REFERENCE_IMPORT_VECTOR_APPEND,
   WPK_FORK_REFERENCE_IMPORT_VECTOR_BEGIN,
   WPK_FORK_REFERENCE_IMPORT_VECTOR_FINISH,
@@ -54,14 +55,33 @@ import {
   forkGcCodecProviderFromInstance,
   type ForkGcCodecProvider,
 } from "./fork-gc-codec";
+import { FORK_HOST_EXCEPTION_ACTIVATION_ID } from "./fork-reference-wire";
+import type {
+  ForkReferenceScratchAllocate,
+  ForkReferenceScratchDeallocate,
+} from "./fork-reference-scratch";
 import {
-  FORK_HOST_EXCEPTION_ACTIVATION_ID,
-  ForkReferenceTransaction,
-  type ForkGcDefinitionProvenance,
-  type ForkExternrefRecipeProvider,
-  type ForkReferenceScratchAllocate,
-  type ForkReferenceScratchDeallocate,
-} from "./fork-reference-transaction";
+  ForkCaptureSession,
+  type ForkReferenceCaptureSurface,
+} from "./fork-capture-session";
+import { ForkModuleReconstructionFloor } from "./fork-module-reconstruction";
+import {
+  ForkTableReconstruction,
+  type ForkTableRestoreDependencies,
+} from "./fork-table-snapshot";
+import { ForkExternrefProvenanceTable } from "./fork-externref-provenance";
+import type { ForkReferenceCaptureModule } from "./fork-reference-capture-module";
+import type {
+  ForkActivationExceptionProvider,
+  ForkExternrefRecipeProvider,
+  ForkGcDefinitionProvenance,
+} from "./fork-reference-contracts";
+// Re-home (Path-A INC-C wiring, part 2): the per-activation exception provider
+// contract moved to staying glue so the staying reconstruction floor
+// (`fork-early-reference-provider.ts`) can reference it without importing this
+// deletable engine file. Re-exported so this module's existing importers see an
+// unchanged surface.
+export type { ForkActivationExceptionProvider } from "./fork-reference-contracts";
 import type {
   DecodedSegmentedForkReferenceTransaction,
 } from "./fork-reference-segments";
@@ -110,21 +130,6 @@ export interface ForkActivationTableReplication {
     length: number | bigint,
   ): void;
   /** Release mutation writer ownership after a non-mutating failure/no-op. */
-  abort(): void;
-}
-
-export interface ForkActivationExceptionProvider {
-  /** Throw the exact exception currently rooted in an activation-local slot. */
-  throwSlot(slot: number): never;
-  /** Throw an exception reconstructed from the process recipe graph. */
-  throwRecipe(recipeId: number): never;
-  /** Route a host/JSTag ingress token into the process recipe graph. */
-  encodeIngress(token: number): number;
-  /** Decode/cache a recipe without returning an `exnref` through JavaScript. */
-  materialize?(recipeId: number): void;
-  /** Release transient roots after the outermost replay frame is restored. */
-  clear(): void;
-  /** Release the same roots when capture or replay aborts. */
   abort(): void;
 }
 
@@ -483,9 +488,25 @@ export function buildForkActivationStateImports(
     [WPK_FORK_REFERENCE_IMPORT_DECODE_FUNCREF]: (
       recipeId: number,
     ): CallableFunction | null => referenceReplay().decodeFuncref(recipeId >>> 0),
+    // GATED: dead code for every module `wasm-fork-instrument` currently
+    // builds (a plain externref-typed local/global/table entry is routed
+    // through `GC_LOOKUP`/`ExternRef::convert_any`, not this raw import —
+    // see the architecture correction in
+    // `docs/plans/2026-09-05-n1-nodebrowser-reference-parity-grounding.md`).
+    // Left gated rather than revived: touching it risks confusing a future
+    // reader about which path is live.
     [WPK_FORK_REFERENCE_IMPORT_ENCODE_EXTERNREF]: (
       value: unknown,
-    ): number => references().encodeExternref(value),
+    ): number => {
+      registry.markUnsupportedReferenceKind("externref");
+      return registry.reserveGatedLeafPlaceholder(value);
+    },
+    // N1 Node/browser parity: real restore body. A fresh child now genuinely
+    // reconstructs a plain host externref (recorded provenance, `GC_LOOKUP`'s
+    // third branch) or a runtime funcref-as-externref, so this seam is live
+    // again — the host-exception externref payload still decodes through the
+    // INTERNAL `ForkReferenceTransaction.materializeHostException`, not this
+    // guest import.
     [WPK_FORK_REFERENCE_IMPORT_DECODE_EXTERNREF]: (
       recipeId: number,
     ): unknown => referenceReplay().decodeExternref(recipeId >>> 0),
@@ -506,12 +527,23 @@ export function buildForkActivationStateImports(
       ordinal >>> 0,
       index >>> 0,
     ),
+    // N1 Node/browser parity: `gc_lookup` is the anyref-transit dedup entry
+    // EVERY anyref-lineage value routes through (a plain host externref held
+    // in a local/global/table, a static root, or a typed Wasm-GC
+    // struct/array/i31). It answers exactly one question: "is this EXACT live
+    // value already assigned a recipe id?" — dedup, then static-root, then
+    // externref-provenance (see `ForkReferenceTransaction.lookupGcSlot`,
+    // mirrors native's `gc_lookup` layering). A miss returns `0` ("unknown"),
+    // NOT a gate: the guest's own dispatch reads that as "try i31/struct/
+    // array construction next" via `GC_CLAIM`, which is where the real gate
+    // for a genuinely unsupported kind still belongs (`encodeGcFromSlot`'s
+    // internalized-hostref fallback, F6 scope).
     [WPK_FORK_REFERENCE_IMPORT_GC_LOOKUP]: (
       slot: number,
-    ): number => registry.lookupGcSlot(activationId, slot),
+    ): number => registry.lookupGcSlot(activationId, slot >>> 0),
     [WPK_FORK_REFERENCE_IMPORT_GC_CLAIM]: (
       slot: number,
-    ): number => registry.claimGcSlot(slot),
+    ): number => registry.claimGcSlot(slot >>> 0),
     [WPK_FORK_REFERENCE_IMPORT_GC_I31]: (
       value: number,
     ): number => registry.encodeI31(value),
@@ -524,17 +556,23 @@ export function buildForkActivationStateImports(
       scalarPointer: number | bigint,
       scalarByteLength: number,
       referenceVectorOrdinal: number,
-    ): void => registry.defineGc(
-      activationId,
-      recipeId >>> 0,
-      recordActivationId >>> 0,
-      typeOrdinal,
-      layoutId,
-      kind,
-      scalarPointer,
-      scalarByteLength,
-      referenceVectorOrdinal >>> 0,
-    ),
+    ): void => {
+      registry.defineGc(
+        activationId,
+        recipeId >>> 0,
+        recordActivationId >>> 0,
+        typeOrdinal,
+        layoutId,
+        kind,
+        scalarPointer,
+        scalarByteLength,
+        referenceVectorOrdinal >>> 0,
+      );
+    },
+    // N1 Node/browser parity: real restore bodies. A fresh child now
+    // genuinely reconstructs a typed Wasm-GC (struct/array/i31) reference.
+    // exnref restore keeps its own separate route/load imports
+    // (`ROUTE_EXCEPTION`/`LOAD_EXCEPTION`), untouched here.
     [WPK_FORK_REFERENCE_IMPORT_GC_ROUTE]: (
       recipeId: number,
       expectedActivation: number,
@@ -568,9 +606,12 @@ export function buildForkActivationStateImports(
       scalarDestination,
       scalarByteLength,
     ),
+    // N1 Node/browser parity: real body. See `encodeGcFromSlot`'s doc
+    // comment for the ONE remaining gated boundary this still respects
+    // (a GC-internalized hostref with no recorded provenance, F6 scope).
     [WPK_FORK_REFERENCE_IMPORT_GC_BROKER_ENCODE]: (
       slot: number,
-    ): number => registry.encodeGcFromSlot(activationId, slot),
+    ): number => registry.encodeGcFromSlot(activationId, slot >>> 0),
     [WPK_FORK_REFERENCE_IMPORT_GC_CAPTURE_LAYOUT]: (
       slot: number,
       recordActivationId: number,
@@ -584,7 +625,7 @@ export function buildForkActivationStateImports(
       }
       return registry.captureGcLayout(
         activationId,
-        slot,
+        slot >>> 0,
         baseLayoutId,
       );
     },
@@ -598,7 +639,7 @@ export function buildForkActivationStateImports(
       referenceCount: number,
     ): number => registry.beginGcProvenance(
       activationId,
-      slot,
+      slot >>> 0,
       recordActivationId,
       baseLayoutId,
       specializedLayoutId,
@@ -610,10 +651,19 @@ export function buildForkActivationStateImports(
       token: number,
       index: number,
       slot: number,
-    ): void => registry.appendGcProvenanceReference(token, index, slot),
+    ): void => {
+      registry.appendGcProvenanceReference(token, index, slot >>> 0);
+    },
     [WPK_FORK_REFERENCE_IMPORT_GC_PROVENANCE_END]: (
       token: number,
-    ): void => registry.endGcProvenance(token),
+    ): void => {
+      registry.endGcProvenance(token);
+    },
+    // N1 Node/browser parity P0: `__wpk_fork_ref_provenance_externref`'s
+    // real mint-time body. See `ForkActivationRegistry.recordExternrefProvenance`.
+    [WPK_FORK_REFERENCE_IMPORT_PROVENANCE_EXTERNREF]: (
+      value: unknown,
+    ): unknown => registry.recordExternrefProvenance(value),
   };
 }
 
@@ -644,11 +694,53 @@ export class ForkActivationRegistry {
   private readonly tablePatchFunctions = new ForkFunctionCatalog();
   private phase: RegistryPhase = "idle";
   private arena: ForkModuleStateArena | null = null;
-  private references: ForkReferenceTransaction | null = null;
+  private references: ForkReferenceCaptureSurface | null = null;
   private functions: ForkFunctionCatalog | null = null;
   private readonly staticRoots = new ForkStaticRootCatalog();
-  private readonly gcTransit = new ForkAnyrefTransitTable();
+  // The process-worker-owned Wasm-GC transit table bound to every activation's
+  // guest `__wpk_fork_ref_gc_transit` import (see `bindActivationImports` /
+  // `gcTransitTable()`). The co-resident fork-module's injected `fm_drive_execute`
+  // must read this SAME table object (STORE #2) to see what a guest's
+  // `_gc_allocate` published, so the worker can pass it in via the constructor and
+  // hand the identical table to `instantiateForkModule`. When not supplied a fresh
+  // one is minted, preserving every existing caller.
+  private gcTransit: ForkAnyrefTransitTable;
   private readonly gcProvenance = new ForkGcProvenanceRegistry();
+  /**
+   * N1 Node/browser parity: local, same-realm provenance table for a plain
+   * host externref reached through the anyref-transit `GC_LOOKUP` seam.
+   * Populated only by the `PROVENANCE_EXTERNREF` host import's body at
+   * mint time; consulted (lookup-only) by `ForkReferenceTransaction.lookupGcSlot`.
+   */
+  private readonly externrefProvenance = new ForkExternrefProvenanceTable();
+  /**
+   * First gated reference kind observed by a capture-side record-stub during
+   * the active capture, or `null` when the fork carries only supported kinds.
+   *
+   * A raw `throw` from a capture import cannot unwind an errno through the Wasm
+   * fork save walk (see `fork-continuation.ts`), so the gated import bodies in
+   * `buildForkActivationStateImports` RECORD the kind here and return a benign
+   * sentinel instead of throwing. The parent run loop reads and clears this
+   * after `sealCapture` and, when set, aborts the fork cleanly with
+   * `EOPNOTSUPP` via `beginAbortReplay` instead of launching a child. Read-and-
+   * clear (`takeUnsupportedReferenceKind`) guarantees it never leaks into the
+   * next fork; capture entry also clears it defensively.
+   */
+  private unsupportedReferenceKind: string | null = null;
+
+  /**
+   * Path B P3: when set, a FORK capture (`beginCapture`) routes reference
+   * interning through the co-resident fork-module's shared builder (the module
+   * is the SOLE capture graph). The peer-table snapshot paths
+   * (`captureTableState`/`restoreTableState`) are unaffected and stay on the JS
+   * transaction. Set by the worker once the fork-module instance exists.
+   */
+  private captureModule: ForkReferenceCaptureModule | undefined;
+
+  /** Route FORK reference capture through the co-resident module (Path B P3). */
+  setCaptureModule(captureModule: ForkReferenceCaptureModule): void {
+    this.captureModule = captureModule;
+  }
 
   constructor(
     private readonly memory: WebAssembly.Memory,
@@ -656,7 +748,10 @@ export class ForkActivationRegistry {
     private readonly label: string,
     private readonly allocateScratch?: ForkReferenceScratchAllocate,
     private readonly deallocateScratch?: ForkReferenceScratchDeallocate,
-  ) {}
+    gcTransit?: ForkAnyrefTransitTable,
+  ) {
+    this.gcTransit = gcTransit ?? new ForkAnyrefTransitTable();
+  }
 
   registerActivation(registration: ForkActivationRegistration): void {
     this.requireIdle("register a module activation");
@@ -997,7 +1092,7 @@ export class ForkActivationRegistry {
     return this.arena;
   }
 
-  currentReferences(): ForkReferenceTransaction {
+  currentReferences(): ForkReferenceCaptureSurface {
     if (!this.references) {
       throw new Error(`${this.label}: no fork reference transaction is active`);
     }
@@ -1007,6 +1102,24 @@ export class ForkActivationRegistry {
   /** Host-owned typed scratch table imported by every activation codec. */
   gcTransitTable(): WebAssembly.Table {
     return this.gcTransit.table;
+  }
+
+  /**
+   * Replace this registry's transit table with one that WRAPS an externally
+   * owned table — used on the thread-fork path, where a co-resident
+   * fork-module is instantiated AFTER this registry already exists (the
+   * module's own `enableModuleBacking` gate needs a process-continuation
+   * coordinator built from this registry first). Once adopted, the guest's
+   * `__wpk_fork_ref_gc_transit` import (bound later via
+   * `gcTransitTable()`/`buildForkActivationStateImports`) and the
+   * fork-module's own exported table are the same object, matching the
+   * process path's single-table invariant. Must be called before any
+   * activation import is built and before any fork capture; the mint-time
+   * default remains a self-owned table when this is never called (flag-off
+   * or non-qualifying fork).
+   */
+  adoptGcTransit(table: WebAssembly.Table): void {
+    this.gcTransit = new ForkAnyrefTransitTable(table);
   }
 
   /**
@@ -1057,6 +1170,74 @@ export class ForkActivationRegistry {
       moduleActivation: activationId,
       ordinal,
     });
+  }
+
+  /**
+   * `__wpk_fork_ref_provenance_externref`'s host-import body (N1 Node/browser
+   * parity, mirrors native's `provenance_externref` wire). Called by the
+   * fork-instrument-inserted wrapper immediately after a real host-import
+   * call site returns an externref value, BEFORE the value reaches the
+   * original caller — the only sound moment to record `(value -> handle)`
+   * (see `ForkExternrefProvenanceTable`'s doc comment). Pass-through:
+   * returns `value` unchanged.
+   *
+   * The "handle" is read back, never minted: `value` is expected to already
+   * be a self-describing worker-local `ForkExternrefToken` (the shape every
+   * current externref-producing host import returns, materialized from a
+   * broker handle by `ForkExternrefTokenCache.materialize`/`.encode`). A
+   * value with no such self-describing handle simply has nothing to record
+   * here — the same documented boundary native's `encode_externref` guard
+   * describes for a host import with no self-describing `u32` payload.
+   */
+  recordExternrefProvenance(value: unknown): unknown {
+    if (
+      (typeof value !== "object" || value === null)
+      && typeof value !== "function"
+    ) {
+      return value;
+    }
+    const handle = this.externrefs.tryEncode(value);
+    if (handle !== undefined) {
+      this.externrefProvenance.register(value, handle);
+    }
+    return value;
+  }
+
+  /**
+   * Reserve a gated placeholder recipe for an anyref value that the module GC
+   * codec has already published into transit slot 0 (`lookup` / `claim` /
+   * broker).
+   *
+   * The live anyref is republished at `recipe + 1` so the PARENT continuation
+   * replay — a same-worker `table.get(transit, recipe + 1)` in the module's
+   * `decode_anyref` — restores the identical live object without any typed
+   * reconstruction. A gated `lookup` returning this NONZERO recipe makes the
+   * guest treat the value as an already-seen alias, so it never recurses into
+   * the struct/array field walk: no layout descriptor, provenance, or
+   * static-root catalog work runs on the capture side.
+   */
+  reserveGatedTransitPlaceholder(): number {
+    const value = this.gcTransit.get(0);
+    const recipeId = this.currentReferences().reserveGatedPlaceholder(value);
+    this.gcTransit.ensureRecipeSlot(recipeId);
+    this.gcTransit.set(recipeId + 1, value);
+    return recipeId;
+  }
+
+  /**
+   * Reserve a gated placeholder recipe for a value the guest hands directly to
+   * a capture import (`encode_externref`) or republishes into transit itself
+   * (`i31`).
+   *
+   * The runtime externref/funcref codec restores the parent from
+   * `capturedValues` (kept here), and the i31 bridge publishes its own
+   * `i31ref` into `recipe + 1`; both only need the transit slot sized so a later
+   * guest `table.set(transit, recipe + 1)` publish store stays in bounds.
+   */
+  reserveGatedLeafPlaceholder(value: unknown): number {
+    const recipeId = this.currentReferences().reserveGatedPlaceholder(value);
+    this.gcTransit.ensureRecipeSlot(recipeId);
+    return recipeId;
   }
 
   lookupGcSlot(requestingActivation: number, slot: number): number {
@@ -1192,6 +1373,18 @@ export class ForkActivationRegistry {
     );
   }
 
+  /**
+   * Route a Wasm-GC value at `slot` to its owning activation's typed provider,
+   * or intern it as a plain host externref when no module codec claims it.
+   *
+   * KEPT GATED (N1/F6 boundary, unlike the rest of this revival): a value
+   * reaching the final fallback is an internalized `any.convert_extern`
+   * hostref with no recorded production-site provenance, which is the same
+   * "GC-internalized externref" case native scopes out to F6. Fabricating a
+   * handle here would be exactly the disavowed unsound reverse lookup, so
+   * this marks the fork unsupported and returns a survivable placeholder
+   * instead of calling the deleted `encodeExternref`.
+   */
   encodeGcFromSlot(sourceActivation: number, slot: number): number {
     const provenance = this.gcProvenance.find(this.gcTransit.get(slot));
     if (
@@ -1222,14 +1415,13 @@ export class ForkActivationRegistry {
       }
       return provider.encodeSlot(slot);
     }
-    // No module codec recognized the internal value, so it is a hostref made
-    // by `any.convert_extern`. Its worker-local token names a process-owned
-    // broker handle; retain that handle as an externref leaf in the same graph.
-    const recipeId = this.currentReferences().encodeExternref(
-      this.gcTransit.get(slot),
-    );
-    this.gcTransit.ensureRecipeSlot(recipeId);
-    return recipeId;
+    // N1/F6 boundary: no module codec recognized the internal value, so it is
+    // a GC-internalized hostref made by `any.convert_extern` with no recorded
+    // production-site provenance. This is out of scope for this revival (F5
+    // covers only a plain host externref reached with recorded provenance);
+    // gate cleanly instead of mis-capturing.
+    this.markUnsupportedReferenceKind("gc (internalized externref)");
+    return this.reserveGatedTransitPlaceholder();
   }
 
   beginGcProvenance(
@@ -1287,17 +1479,33 @@ export class ForkActivationRegistry {
     }
     // A prior trap must never make a stale object appear as a recipe hit.
     this.gcProvenance.abortPending();
+    // A partially-consumed marker from an aborted prior capture must never
+    // gate this fork; the run loop's read-and-clear is the primary owner.
+    this.unsupportedReferenceKind = null;
     this.gcTransit.clear();
     const functions = this.buildFunctionCatalog();
-    const references = new ForkReferenceTransaction(
+    // Fork capture is module-only: the co-resident fork module is the SOLE
+    // capture graph and the UNCONDITIONAL fork engine, so the capture floor runs
+    // in the staying `ForkCaptureSession` and NO JS reference-graph engine
+    // (`ForkReferenceTransaction`) exists behind it. A fork-instrumented worker
+    // always instantiates the module (`setCaptureModule`); a worker that reaches
+    // capture without it fails loud rather than silently running a deleted JS
+    // path.
+    if (!this.captureModule) {
+      throw new Error(
+        `${this.label}: fork capture requires the co-resident fork module`,
+      );
+    }
+    const references: ForkReferenceCaptureSurface = new ForkCaptureSession(
       functions,
       this.externrefs,
+      this.captureModule,
+      this.staticRoots,
+      this.externrefProvenance,
       this.memory,
       this.allocateScratch,
       this.deallocateScratch,
-      `${this.label}: references`,
-      this.staticRoots,
-      this.typedReplayOwner(),
+      `${this.label}: capture session`,
     );
     references.beginCapture();
     this.functions = functions;
@@ -1339,15 +1547,25 @@ export class ForkActivationRegistry {
     this.gcProvenance.abortPending();
     this.gcTransit.clear();
     const functions = this.buildFunctionCatalog();
-    const references = new ForkReferenceTransaction(
+    // Peer-table capture is module-only (Path-A A3): the co-resident module is
+    // the SOLE capture graph, exactly as the module-on fork `beginCapture`. There
+    // is no JS `ForkReferenceTransaction` fallback here — that engine is being
+    // deleted — so a worker without the fork module fails loudly.
+    if (!this.captureModule) {
+      throw new Error(
+        `${this.label}: peer table capture requires the co-resident fork module`,
+      );
+    }
+    const references = new ForkCaptureSession(
       functions,
       this.externrefs,
+      this.captureModule,
+      this.staticRoots,
+      this.externrefProvenance,
       this.memory,
       this.allocateScratch,
       this.deallocateScratch,
-      `${this.label}: peer table references`,
-      this.staticRoots,
-      this.typedReplayOwner(),
+      `${this.label}: peer table capture session`,
     );
     references.beginCapture();
     this.functions = functions;
@@ -1379,7 +1597,10 @@ export class ForkActivationRegistry {
   /**
    * Apply one validated table-only snapshot to this Worker's instance graph.
    */
-  restoreTableState(arena: ForkModuleStateArena): void {
+  restoreTableState(
+    arena: ForkModuleStateArena,
+    deps: ForkTableRestoreDependencies,
+  ): void {
     this.requirePhase("idle", "restore peer table state");
     if (!arena.hasActiveArena() || !arena.isSealed()) {
       throw new Error(
@@ -1410,15 +1631,25 @@ export class ForkActivationRegistry {
       );
     }
     const functions = this.buildFunctionCatalog();
-    const references = new ForkReferenceTransaction(
+    // Peer-table restore is module-only (Path-A A4). The reconstruction runs in
+    // a LIVE worker whose guest reference-decode imports are JS-bound (only a
+    // fresh qualifying fork child binds them to the module), so the guest
+    // `restoreTables` walk calls `decodeFuncref` / `decodeExternref` back into
+    // this surface — the throwing `ForkModuleReconstructionFloor` cannot serve
+    // it. `ForkTableReconstruction` sizes the transit + drives the module
+    // reconstruction (externref/GC into STORE #2) AND decodes funcrefs from the
+    // module's resident decoded-graph oracle against this worker's own function
+    // catalogs (funcref-ordinal stability). No JS `ForkReferenceTransaction`.
+    const references = new ForkTableReconstruction(
       functions,
-      this.externrefs,
+      deps.oracle,
+      (recipeId) => this.gcTransit.get(recipeId + 1),
+      this.typedReplayOwner(),
+      () => deps.decodedNodeCount,
       this.memory,
       this.allocateScratch,
       this.deallocateScratch,
-      `${this.label}: peer table references`,
-      this.staticRoots,
-      this.typedReplayOwner(),
+      `${this.label}: peer table reconstruction`,
     );
     references.attachChild(records);
     this.functions = functions;
@@ -1426,7 +1657,7 @@ export class ForkActivationRegistry {
     this.arena = arena;
     this.phase = "table-replay";
     try {
-      references.materializeAllTyped();
+      references.materializeAllTyped(deps.drive);
       for (const activation of this.activations()) {
         activation.moduleState.restoreTables(activation.activationId);
       }
@@ -1472,6 +1703,14 @@ export class ForkActivationRegistry {
   attachChild(
     arena: ForkModuleStateArena,
     decodedReferences?: DecodedSegmentedForkReferenceTransaction,
+    // Module-on child reconstruction: the co-resident fork-module is the SOLE
+    // reconstructor (decode + data feed + the whole `drive_plan` walk run in
+    // Rust), so this child path constructs the module-backed reconstruction
+    // FLOOR instead of a JS `ForkReferenceTransaction`. The getter reads the
+    // module's resident decoded-graph node count (`fm_decoded_node_count`) for
+    // the STORE #2 transit sizing. Omitted on the flag-off child path, which
+    // keeps the JS reconstruction engine.
+    moduleDecodedNodeCount?: () => number,
   ): void {
     this.requirePhase("idle", "attach child activation state");
     if (!arena.hasActiveArena() || !arena.isSealed()) {
@@ -1501,16 +1740,33 @@ export class ForkActivationRegistry {
       );
     }
     const functions = this.buildFunctionCatalog();
-    const references = new ForkReferenceTransaction(
-      functions,
-      this.externrefs,
-      this.memory,
-      this.allocateScratch,
-      this.deallocateScratch,
-      `${this.label}: references`,
-      this.staticRoots,
-      this.typedReplayOwner(),
-    );
+    // Child reconstruction is module-only: the co-resident module is the
+    // UNCONDITIONAL reconstructor (decode + RESTORE data feed + the whole
+    // topological drive order run in Rust), so this path constructs the
+    // module-backed reconstruction FLOOR and NO JS reference-graph engine
+    // (`ForkReferenceTransaction`) exists behind it. The floor only sizes the
+    // shared anyref transit (from the module's resident `fm_decoded_node_count`)
+    // and is the validate-only early-provider adoption target. A module-backed
+    // fork always supplies the node-count source; a child that reaches
+    // reconstruction without it (a fork the module could not back — e.g. a
+    // resume catalog past the module cap, or a fork-from-thread child lacking the
+    // module's alternate resume entry) fails loud rather than silently running a
+    // deleted JS path.
+    if (!moduleDecodedNodeCount) {
+      throw new Error(
+        `${this.label}: child reconstruction requires the co-resident fork ` +
+          "module",
+      );
+    }
+    const references: ForkReferenceCaptureSurface =
+      new ForkModuleReconstructionFloor(
+        this.typedReplayOwner(),
+        moduleDecodedNodeCount,
+        this.memory,
+        this.allocateScratch,
+        this.deallocateScratch,
+        `${this.label}: module reconstruction`,
+      );
     references.attachChild(decodedReferences ?? records);
     this.functions = functions;
     this.references = references;
@@ -1518,7 +1774,10 @@ export class ForkActivationRegistry {
     this.phase = "child-replay";
   }
 
-  restoreModuleState(): void {
+  restoreModuleState(
+    typedDrive?: () => void,
+    guestRestoreDriven = false,
+  ): void {
     if (this.phase !== "parent-replay" && this.phase !== "child-replay") {
       throw new Error(
         `${this.label}: cannot restore module state while registry is ${this.phase}`,
@@ -1529,13 +1788,32 @@ export class ForkActivationRegistry {
       // the fresh instance's transit table. Publish every reconstructed typed
       // identity first, while passive data/element segments are still intact
       // for array.new_data/array.new_elem constructors.
-      this.currentReferences().materializeAllTyped();
+      //
+      // P2 (Path B): `typedDrive`, when supplied by the module-backed child
+      // coordinator, makes the co-resident fork-module the SOLE typed
+      // reconstructor — it drives the whole `drive_plan` walk (static-root
+      // publish, EVERY externref transit publish, then the typed allocate/fill/
+      // exn order), so no JS reconstruction (validation, PHASE A/B, or the
+      // sub-loop) runs on the module path. When the drive plan is a module
+      // ATTACH plan (`fm_attach_child`), that same drive continues past the
+      // reconstruction steps into the two-phase guest restore/finish install
+      // below — see `guestRestoreDriven`.
+      this.currentReferences().materializeAllTyped(typedDrive);
     }
-    for (const activation of this.activations()) {
-      activation.moduleState.restore(activation.activationId);
-    }
-    for (const activation of this.activations()) {
-      activation.moduleState.finishRestore(activation.activationId);
+    // Child-install SEQUENCING. On the module-on attach path the drive plan the
+    // module built (`fm_attach_child` / `fm_attach_borrowed_child`) already drove
+    // each activation's `restore` then `finishRestore` as `DRIVE_OP_RESTORE` /
+    // `DRIVE_OP_FINISH_RESTORE` steps through the host-bound drive table, so the
+    // MODULE owns the two-phase order and this JS loop must not run again (it
+    // would double-restore). `guestRestoreDriven` is set true only by that path;
+    // the flag-off / reference-free / parent-replay paths keep the JS loop.
+    if (!guestRestoreDriven) {
+      for (const activation of this.activations()) {
+        activation.moduleState.restore(activation.activationId);
+      }
+      for (const activation of this.activations()) {
+        activation.moduleState.finishRestore(activation.activationId);
+      }
     }
   }
 
@@ -1613,6 +1891,28 @@ export class ForkActivationRegistry {
 
   phaseName(): RegistryPhase {
     return this.phase;
+  }
+
+  /**
+   * Record that the active capture encountered a gated reference kind. First
+   * observation wins so the parent run loop reports the first kind the guest's
+   * save walk actually reached. Called from the capture-side record-stubs in
+   * `buildForkActivationStateImports`; never throws (throwing here cannot carry
+   * an errno through the Wasm fork save walk).
+   */
+  markUnsupportedReferenceKind(kind: string): void {
+    this.unsupportedReferenceKind ??= kind;
+  }
+
+  /**
+   * Read and clear the gated reference kind observed during capture. Returns
+   * `null` when the fork carried only supported kinds. Read-and-clear so a
+   * gated kind can never leak into a subsequent, supported fork.
+   */
+  takeUnsupportedReferenceKind(): string | null {
+    const kind = this.unsupportedReferenceKind;
+    this.unsupportedReferenceKind = null;
+    return kind;
   }
 
   private buildFunctionCatalog(): ForkFunctionCatalog {

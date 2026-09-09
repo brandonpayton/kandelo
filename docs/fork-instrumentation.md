@@ -415,6 +415,50 @@ deallocates the module-state arena. Failure midway through attachment detaches
 every child controller so the suspended parent can replay the original
 transaction.
 
+When the co-resident fork-module is enabled (`WASM_POSIX_FORK_MODULE`), a
+single-activation borrowed child drives that same borrowed replay through the
+module instead of the JavaScript engine. It instantiates its own fork-module at
+a distinct `__memory_base` — obtained on demand by channel-mapping a fresh,
+non-overlapping region so it can never alias the parked parent's live data, and
+released again the moment the one replay finishes so nothing is durably owned in
+the parent's restored address space (the runtime never shrinks a `Shared
+WebAssembly.Memory`, so an unreleased region would persist). It reads the
+parent's serialized journal image and drives a read-only rewind over the
+parent's borrowed frame nodes, copying the parent's fixed runtime prefix into a
+child-private region so the guest's rewind writes its active-frame pointer there
+rather than the parent's. It never marks nodes consumed, releases the parent's
+mappings, or writes the process launch anchor. A multi-activation dlopen-vfork
+("mode-1") borrowed child — one that issues `vfork` from a dlopened side-module
+frame — drives every activation the same way: the main activation seeds from the
+journal image and each side activation is added against the same borrowed
+continuation with its own child-private prefix. The guest instrumentation ABI is
+unchanged either way; the module only changes which host provider drives the
+frames and references.
+
+The co-resident fork-module reserves a bounded in-guest fork-frame arena at
+process init, as part of its host-placed region (between the backend staging
+slab and the shadow stack). A qualifying fork's three otherwise-growing
+allocations — each activation's linked frame chunk, the serialized journal
+image, and the host-side module-state arena chunks — are sub-allocated from
+this one pre-reserved region through the module's `fm_*_fixed_arena` exports
+rather than by channel-mapping fresh, memory-growing regions per fork. Because
+the arena is reserved before a fork samples the parent's memory size, a copied
+child inherits it and observes the parent's exact `memory.size`: the fork does
+not grow the guest's primary linear memory and does not clobber the guest's
+live pages. This is the deliberate fix for the co-resident module consuming the
+committed low headroom that on-demand fork frames would otherwise reuse; placing
+the fork frames outside the guest's single linear memory is not possible on
+WebAssembly (the side module addresses only memory 0, and a copied child
+inherits state only through the clone of memory 0). The arena is a fixed size
+(2 MiB per fork-capable worker) sized to cover a single activation several times
+over and a realistic multi-activation dlopen fork with clear margin; a fork that
+exhausts it fails truthfully with `ENOMEM` and is never silently grown into the
+guest. This is a bounded platform boundary, analogous to the historical
+Asyncify-era fork-save buffer, and is intentional rather than an unbounded
+on-demand model. A COW child is replay-only and allocates nothing from the
+arena, so nested fork depth does not multiply its use; only one in-flight fork
+consumes it at a time, and its cursor resets at each fork's start.
+
 Dynamic-linker reconstruction has a matching fail-closed mode. It accepts
 only shared Memory, passive data segments, and a complete loader transaction.
 For ordinary wasm-ld modules it suppresses only a start function exported as

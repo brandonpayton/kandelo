@@ -80,6 +80,10 @@ function signatures(
       parameters: [i32, i32, i32, i32, pointer, pointer],
       result: i32,
     },
+    kernel_exec_target_shebang: {
+      parameters: [i32, i32, pointer, pointer],
+      result: i32,
+    },
     kernel_exec_target_size: {
       parameters: [i32, i32],
       result: i64,
@@ -217,6 +221,21 @@ function signatures(
     },
     kernel_ioctl: {
       parameters: [i32, i32, pointer, i32, i32],
+      result: i32,
+    },
+    // Workstream H4: SIOCGIFCONF's nested, dynamically-sized output buffer
+    // can't fit the generic single-static-size ioctl contract, so it is
+    // driven by these two dedicated exports instead of `kernel_ioctl`.
+    kernel_network_ifconf_size: {
+      parameters: [i32],
+      result: i32,
+    },
+    kernel_network_ifreq_size: {
+      parameters: [i32],
+      result: i32,
+    },
+    kernel_network_ifconf_write: {
+      parameters: [i32, pointer, i32],
       result: i32,
     },
     kernel_is_fd_nonblock: {
@@ -467,6 +486,10 @@ function signatures(
     },
     kernel_socketpair: {
       parameters: [i32, i32, i32, pointer, i32],
+      result: i32,
+    },
+    kernel_spawn_blob_decode: {
+      parameters: [pointer, pointer, pointer],
       result: i32,
     },
     kernel_spawn_process: {

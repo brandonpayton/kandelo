@@ -73,6 +73,28 @@ unsafe extern "C" {
         offset_lo: u32,
         offset_hi: i32,
     ) -> i32;
+    // Rootfs overlay content byte-leaf read (Phase 5 Increment 2). blob_id and
+    // offset are 64-bit values split into 32-bit words for the JS boundary,
+    // matching the host_pread offset convention.
+    fn host_blob_read(
+        blob_id_lo: u32,
+        blob_id_hi: u32,
+        buf_ptr: *mut u8,
+        buf_len: u32,
+        offset_lo: u32,
+        offset_hi: u32,
+    ) -> i32;
+    // Whole-archive raw-byte transport for a `LazyMember`'s backing archive
+    // (Phase 5 Increment 3b-wiring.2). Mirrors `host_blob_read`; `archive_id`
+    // is already a 32-bit manifest id (no lo/hi split), only `offset` splits
+    // into 32-bit words for the JS boundary.
+    fn host_fetch_archive(
+        archive_id: u32,
+        buf_ptr: *mut u8,
+        buf_len: u32,
+        offset_lo: u32,
+        offset_hi: u32,
+    ) -> i32;
     fn host_pwrite(
         handle: i64,
         buf_ptr: *const u8,
@@ -177,9 +199,14 @@ unsafe extern "C" {
         result_ptr: *mut u8,
         result_len: u32,
     ) -> i32;
+    /// Writes the machine's real assigned IPv4 address (4 bytes) to
+    /// `buf_ptr` and returns 1, or returns 0 if no address is configured.
+    /// Backs `crate::netif::interface_address`'s host-owned, non-loopback
+    /// case (Workstream H4: the interface table, MAC, and struct layout are
+    /// kernel-owned; this is the one fact only the host can know).
+    fn host_network_local_address(buf_ptr: *mut u8) -> i32;
     fn host_futex_wait(addr: usize, expected: u32, timeout_ns_lo: u32, timeout_ns_hi: u32) -> i32;
     fn host_futex_wake(addr: usize, count: u32) -> i32;
-    fn host_is_thread_worker() -> i32;
     fn host_bind_framebuffer(
         pid: i32,
         addr: usize,
@@ -344,6 +371,35 @@ impl HostIO for WasmHostIO {
         let (offset_lo, offset_hi) = split_i64_words(offset);
         let result =
             unsafe { host_pread(handle, buf.as_mut_ptr(), capacity, offset_lo, offset_hi) };
+        checked_host_transfer_result(result, buf.len())
+    }
+
+    fn blob_read(&mut self, blob_id: u64, buf: &mut [u8], offset: u64) -> Result<usize, Errno> {
+        let capacity = checked_host_buffer_len(buf.len())?;
+        let result = unsafe {
+            host_blob_read(
+                blob_id as u32,
+                (blob_id >> 32) as u32,
+                buf.as_mut_ptr(),
+                capacity,
+                offset as u32,
+                (offset >> 32) as u32,
+            )
+        };
+        checked_host_transfer_result(result, buf.len())
+    }
+
+    fn fetch_archive(&mut self, archive_id: u32, buf: &mut [u8], offset: u64) -> Result<usize, Errno> {
+        let capacity = checked_host_buffer_len(buf.len())?;
+        let result = unsafe {
+            host_fetch_archive(
+                archive_id,
+                buf.as_mut_ptr(),
+                capacity,
+                offset as u32,
+                (offset >> 32) as u32,
+            )
+        };
         checked_host_transfer_result(result, buf.len())
     }
 
@@ -907,6 +963,16 @@ impl HostIO for WasmHostIO {
         }
     }
 
+    fn host_network_local_address(&mut self) -> Option<[u8; 4]> {
+        let mut buf = [0u8; 4];
+        let found = unsafe { host_network_local_address(buf.as_mut_ptr()) };
+        if found != 0 {
+            Some(buf)
+        } else {
+            None
+        }
+    }
+
     fn host_futex_wait(
         &mut self,
         addr: usize,
@@ -1435,6 +1501,221 @@ pub extern "C" fn kernel_create_process_with_stdio(
 /// Set the program's initial brk to the value of its `__heap_base` export.
 /// Called by the host once per process — between process creation
 /// (or post-exec re-init) and the first syscall from the new program — so
+/// Enable (nonzero) or disable (zero) in-kernel tmpfs authority over the scratch
+/// mounts (`/tmp`, `/var/*`, `/root`, `/srv`, ...). The host calls this at boot
+/// once it hands scratch-mount ownership to the kernel and stops mounting its
+/// own scratch backends. Returns the previous state (0/1).
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_set_tmpfs_enabled(enabled: i32) -> i32 {
+    crate::tmpfs::set_enabled(enabled != 0) as i32
+}
+
+/// Load the in-kernel rootfs overlay's base tree from a boot manifest buffer in
+/// kernel Wasm memory (Phase 5 Increment 2). The host walks the `/` image tree
+/// once and hands the whole thing over in a single crossing. Returns the number
+/// of entries loaded (>=0) or a negative errno. See `rootfs::load_manifest`.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_rootfs_load_manifest(ptr: *const u8, len: u32) -> i32 {
+    let buf = unsafe { core::slice::from_raw_parts(ptr, len as usize) };
+    match crate::rootfs::load_manifest(buf) {
+        Ok(count) => i32::try_from(count).unwrap_or(i32::MAX),
+        Err(error) => -(error as i32),
+    }
+}
+
+/// Enable (nonzero) or disable (zero) in-kernel rootfs authority over `/`. The
+/// host calls this at boot once it hands `/` ownership to the kernel and demotes
+/// its image backend to a byte-leaf provider. Returns the previous state (0/1).
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_set_rootfs_enabled(enabled: i32) -> i32 {
+    crate::rootfs::set_enabled(enabled != 0) as i32
+}
+
+/// Publish whether the overlay's `/` mount is `nosuid` (nonzero) or set-ID
+/// honoring (zero). The host calls this at boot, after loading the manifest and
+/// before enabling rootfs authority, with the resolved `/` mount-spec flag.
+/// Defaults set-ID honoring, so a setuid/setgid binary staged in the overlay
+/// (for example `/usr/bin/login`) elevates through exec exactly as on the host
+/// `/` mount; an explicitly `nosuid` mount drops the bits. Returns the previous
+/// state (0/1). See `rootfs::set_nosuid`.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_set_rootfs_nosuid(nosuid: i32) -> i32 {
+    crate::rootfs::set_nosuid(nosuid != 0) as i32
+}
+
+/// Register the set of *foreign* mount prefixes still mounted under `/` after
+/// the host hands `/` ownership to the overlay (for example `/dev/shm` shmfs,
+/// `/run/kandelo-run` session-seed host mounts, and extra `HostFileSystem`
+/// mounts). `ptr..len` is a NUL-separated list of canonical absolute mount
+/// points in kernel Wasm memory. The overlay must not claim paths at or under
+/// these prefixes — they belong to a sibling filesystem and must fall through
+/// to the host mount. The host calls this once at boot, after loading the
+/// manifest and before enabling rootfs authority. Returns the number of
+/// prefixes registered (>=0). See `rootfs::set_foreign_prefixes`.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_rootfs_set_foreign_prefixes(ptr: *const u8, len: u32) -> i32 {
+    let buf: &[u8] = if len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(ptr, len as usize) }
+    };
+    i32::try_from(crate::rootfs::set_foreign_prefixes(buf)).unwrap_or(i32::MAX)
+}
+
+/// Publish the wall-clock time the rootfs overlay stamps onto metadata
+/// mutations and onto base entries loaded from the manifest. The host calls this
+/// once at boot before loading the manifest (so base entries are not epoch-
+/// stamped), and the syscall layer refreshes it before each mutating rootfs op.
+///
+/// `sec` is split into two 32-bit words (like the `host_pread` offset) so no
+/// 64-bit value crosses the JS boundary — the host convention never passes i64
+/// parameters to kernel exports.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_set_rootfs_now(sec_lo: u32, sec_hi: u32, nsec: u32) -> i32 {
+    let sec = ((sec_hi as u64) << 32) | (sec_lo as u64);
+    crate::rootfs::set_now(sec, nsec);
+    0
+}
+
+/// Read up to `buf_len` bytes at `offset` from the rootfs file named by the path
+/// bytes `path_ptr..path_len`, into kernel memory `buf_ptr..buf_len`. Host-facing
+/// so, after the 2e cutover drops the host `/` mount, the host reads authoritative
+/// `/` bytes through the overlay (copy-on-written bytes directly; an unmodified
+/// base file's bytes via the `blob_read` provider). `offset` is split into lo/hi
+/// words (host convention: no i64 crosses the boundary). Returns bytes read (>=0,
+/// 0 at EOF) or a negative errno. See `rootfs::read_file_at`.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_rootfs_read_file(
+    path_ptr: *const u8,
+    path_len: u32,
+    offset_lo: u32,
+    offset_hi: i32,
+    buf_ptr: usize,
+    buf_len: usize,
+) -> i32 {
+    if buf_len > i32::MAX as usize {
+        return -(Errno::EOVERFLOW as i32);
+    }
+    if buf_len != 0 && (buf_ptr == 0 || buf_ptr.checked_add(buf_len).is_none()) {
+        return -(Errno::EFAULT as i32);
+    }
+    let path = unsafe { core::slice::from_raw_parts(path_ptr, path_len as usize) };
+    let buf: &mut [u8] = if buf_len == 0 {
+        &mut []
+    } else {
+        unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_len) }
+    };
+    let offset = ((offset_hi as i64) << 32) | i64::from(offset_lo);
+    let mut host = WasmHostIO;
+    match crate::rootfs::read_file_at(path, offset, buf, |req, b| match req {
+        crate::rootfs::ByteReq::Base { blob_id, offset } => host.blob_read(blob_id, b, offset),
+        crate::rootfs::ByteReq::Archive { archive_id, offset } => {
+            host.fetch_archive(archive_id, b, offset)
+        }
+    }) {
+        Ok(read) => read as i32,
+        Err(error) => -(error as i32),
+    }
+}
+
+/// Write `buf_len` bytes at `offset` from kernel memory `buf_ptr..buf_len` to the
+/// rootfs file named by `path_ptr..path_len`, creating it if absent. When
+/// `truncate` is nonzero the file is emptied first and its mode set to `mode`
+/// (the host "replace this whole file" contract); otherwise the bytes land at
+/// `offset` and an existing file's mode is preserved (chunked continuation).
+/// Host-facing so the host's `/` writes land in the authoritative overlay and are
+/// visible to live guests. Returns bytes written (>=0) or a negative errno. See
+/// `rootfs::write_file_at`.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_rootfs_write_file(
+    path_ptr: *const u8,
+    path_len: u32,
+    offset_lo: u32,
+    offset_hi: i32,
+    buf_ptr: usize,
+    buf_len: usize,
+    mode: u32,
+    truncate: i32,
+) -> i32 {
+    if buf_len > i32::MAX as usize {
+        return -(Errno::EOVERFLOW as i32);
+    }
+    if buf_len != 0 && (buf_ptr == 0 || buf_ptr.checked_add(buf_len).is_none()) {
+        return -(Errno::EFAULT as i32);
+    }
+    let path = unsafe { core::slice::from_raw_parts(path_ptr, path_len as usize) };
+    let buf: &[u8] = if buf_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, buf_len) }
+    };
+    let offset = ((offset_hi as i64) << 32) | i64::from(offset_lo);
+    let mut host = WasmHostIO;
+    match crate::rootfs::write_file_at(
+        path,
+        offset,
+        buf,
+        mode,
+        truncate != 0,
+        |req, b| match req {
+            crate::rootfs::ByteReq::Base { blob_id, offset } => host.blob_read(blob_id, b, offset),
+            crate::rootfs::ByteReq::Archive { archive_id, offset } => {
+                host.fetch_archive(archive_id, b, offset)
+            }
+        },
+    ) {
+        Ok(written) => written as i32,
+        Err(error) => -(error as i32),
+    }
+}
+
+/// Return the mode bits (type + permissions, `st_mode & 0xffff`) of the rootfs
+/// entry named by `path_ptr..path_len`, or a negative errno. Host-facing so the
+/// `read_vfs_file` includeMode variant reports the authoritative overlay mode
+/// after the 2e cutover rather than a stale base-image mode. No symlink follow
+/// (the includeMode consumers stage plain regular files).
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_rootfs_stat_mode(path_ptr: *const u8, path_len: u32) -> i32 {
+    let path = unsafe { core::slice::from_raw_parts(path_ptr, path_len as usize) };
+    match crate::rootfs::lstat(path) {
+        Ok(stat) => (stat.st_mode & 0xffff) as i32,
+        Err(error) => -(error as i32),
+    }
+}
+
+/// Copy up to `buf_len` bytes of the overlay tree export (RXPT metadata buffer,
+/// see `rootfs::export_tree`) at byte `offset` into kernel memory
+/// `buf_ptr..buf_len`. Returns bytes copied (>=0, 0 at end of buffer) or a
+/// negative errno. Host-facing so the Phase 5 cutover can rebuild a faithful `/`
+/// image from the authoritative overlay tree instead of the frozen base image.
+/// The host reads the buffer in scratch-region-sized chunks; the kernel
+/// serializes once on the `offset == 0` chunk (the overlay is quiescent during
+/// export) and serves the rest from a cache.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_rootfs_export_tree(
+    offset_lo: u32,
+    offset_hi: i32,
+    buf_ptr: usize,
+    buf_len: usize,
+) -> i32 {
+    if buf_len > i32::MAX as usize {
+        return -(Errno::EOVERFLOW as i32);
+    }
+    if buf_len != 0 && (buf_ptr == 0 || buf_ptr.checked_add(buf_len).is_none()) {
+        return -(Errno::EFAULT as i32);
+    }
+    let buf: &mut [u8] = if buf_len == 0 {
+        &mut []
+    } else {
+        unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_len) }
+    };
+    let offset = ((offset_hi as i64) << 32) | i64::from(offset_lo);
+    match crate::rootfs::export_tree_read(offset, buf) {
+        Ok(read) => read as i32,
+        Err(error) => -(error as i32),
+    }
+}
+
 /// `brk(0)` returns a value above the program's data section and stack
 /// region. Returns 0 on success, -ESRCH if pid not found.
 #[unsafe(no_mangle)]
@@ -1840,6 +2121,66 @@ fn spawn_parsed_for_caller(
     ) {
         Ok(child_pid) => child_pid as i32,
         Err(e) => -(e as i32),
+    }
+}
+
+/// Decode a SYS_SPAWN blob's argv and envp into the host-private read-back
+/// framing, so no host interprets the `posix_spawn` guest ABI.
+///
+/// The kernel is already the authoritative spawn-blob parser
+/// (`kernel_spawn_process` → `crate::spawn::parse_blob`); this export exposes
+/// the same parse to the host worker-launch path, which needs argv/envp as
+/// strings before the child is built. It REUSES `parse_blob` — no second
+/// decoder — then serializes `[argc u32][envc u32]` followed by each argv and
+/// envp entry as `[len u32][raw bytes]` (see `crate::spawn::serialize_argv_envp`).
+///
+/// The decode is in place within one borrowed buffer: `buf` holds the blob in
+/// its first `blob_len` bytes on entry, and the framing overwrites the front of
+/// `buf` on return. WHY a single range instead of separate in/out pointers: the
+/// host scratch lease forbids overlapping borrowed ranges and couples each
+/// pointer to an exact capacity, so a distinct output pointer would either
+/// halve the usable capacity or be rejected. One range keeps the full buffer
+/// available for framing that a duplicated-offset blob can make wider than the
+/// compact blob.
+///
+/// Returns the framed byte length written (positive), or a negated errno:
+/// `parse_blob`'s `EINVAL`/`E2BIG`/`ENAMETOOLONG` for a malformed blob, or
+/// `EOVERFLOW` when `buf_cap` cannot hold the complete framing (the host then
+/// retries with a larger buffer or reports the argv/envp as too large).
+///
+/// SAFETY: `buf_ptr`/`buf_cap` must name one kernel-owned range fully inside
+/// current linear memory whose bytes cannot change for the duration of the
+/// call, and `blob_len <= buf_cap`. The blob's shared borrow is dropped before
+/// the mutable output slice is formed, so no live reference aliases the bytes
+/// the serializer overwrites.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_spawn_blob_decode(
+    buf_ptr: usize,
+    buf_cap: usize,
+    blob_len: usize,
+) -> i32 {
+    if blob_len == 0 || blob_len > buf_cap {
+        return -(Errno::EINVAL as i32);
+    }
+    if buf_cap > i32::MAX as usize {
+        return -(Errno::EOVERFLOW as i32);
+    }
+    if buf_ptr == 0 || buf_ptr.checked_add(buf_cap).is_none() {
+        return -(Errno::EFAULT as i32);
+    }
+    // Parse into an owned representation, then drop the blob borrow before the
+    // mutable output slice exists so the in-place decode stays sound.
+    let parsed = {
+        let bytes = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, blob_len) };
+        match crate::spawn::parse_blob(bytes) {
+            Ok(parsed) => parsed,
+            Err(error) => return -(error as i32),
+        }
+    };
+    let out = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_cap) };
+    match crate::spawn::serialize_argv_envp(&parsed, out) {
+        Ok(written) => written as i32,
+        Err(error) => -(error as i32),
     }
 }
 
@@ -2818,6 +3159,198 @@ pub extern "C" fn kernel_exec_target_read(
     }
 }
 
+/// Decode the retained target's `#!` interpreter line into caller scratch.
+///
+/// The kernel owns the shebang byte interpretation the host formerly did in
+/// TypeScript: it reads the target header through the retained handle and
+/// writes a small record the host uses to assemble argv:
+///
+///   `[has_arg: u8][interp_len: u32 LE][arg_len: u32 LE][interp][arg]`
+///
+/// The return value is the record length in bytes for a script, `0` when the
+/// target is not a script, or a negative errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_exec_target_shebang(
+    owner_pid: u32,
+    token: u32,
+    out_ptr: usize,
+    out_len: usize,
+) -> i32 {
+    if out_len > i32::MAX as usize {
+        return -(Errno::EOVERFLOW as i32);
+    }
+    if out_len != 0 && (out_ptr == 0 || out_ptr.checked_add(out_len).is_none()) {
+        return -(Errno::EFAULT as i32);
+    }
+    let out: &mut [u8] = if out_len == 0 {
+        &mut []
+    } else {
+        unsafe { core::slice::from_raw_parts_mut(out_ptr as *mut u8, out_len) }
+    };
+    let table = unsafe { &*PROCESS_TABLE.0.get() };
+    let Some(proc) = table.get(owner_pid) else {
+        return -(Errno::ESRCH as i32);
+    };
+    let mut host = WasmHostIO;
+    let shebang = match crate::exec_target::shebang(proc, &mut host, owner_pid, token) {
+        Ok(shebang) => shebang,
+        Err(error) => return -(error as i32),
+    };
+    let Some(shebang) = shebang else {
+        return 0;
+    };
+    let interpreter = shebang.interpreter.as_bytes();
+    let argument = shebang.argument.as_deref().map(str::as_bytes);
+    let argument_bytes = argument.unwrap_or(&[]);
+    let Some(total) = 9usize
+        .checked_add(interpreter.len())
+        .and_then(|partial| partial.checked_add(argument_bytes.len()))
+    else {
+        return -(Errno::EOVERFLOW as i32);
+    };
+    if total > out.len() {
+        return -(Errno::EOVERFLOW as i32);
+    }
+    let interpreter_len = interpreter.len() as u32;
+    let argument_len = argument_bytes.len() as u32;
+    out[0] = u8::from(argument.is_some());
+    out[1..5].copy_from_slice(&interpreter_len.to_le_bytes());
+    out[5..9].copy_from_slice(&argument_len.to_le_bytes());
+    out[9..9 + interpreter.len()].copy_from_slice(interpreter);
+    out[9 + interpreter.len()..total].copy_from_slice(argument_bytes);
+    total as i32
+}
+
+/// Resolve the retained target's `#!` chain end-to-end: a non-script target
+/// passes through unchanged, and exactly one level of `#!` script is resolved
+/// by preparing the decoded interpreter under the same owner (the script's
+/// own retained target is released — a script's set-ID bits are never
+/// honored). This is the kernel-owned replacement for the host's former
+/// `resolveShebangChain` (`host/src/exec-target.ts`): the host no longer
+/// walks the chain itself, it only byte-fetches/instantiates/commits/launches
+/// whatever `final_token` this resolves to.
+///
+/// Writes a record to `out_ptr` and returns the record byte length, or a
+/// negative errno — including `-ENOEXEC` for a nested `#!` chain (the decoded
+/// interpreter is itself a script; the kernel's long-standing one-level
+/// shebang limit) and `-EOVERFLOW` if `out_len` is too small for the record.
+///
+/// Record format (little-endian):
+///   `[kind: u8][final_token: u32]`, then, only if `kind == 1` (the input
+///   token was a script):
+///   `[has_arg: u8][interp_len: u32][arg_len: u32][script_path_len: u32]
+///    [interp bytes][arg bytes][script_path bytes]`.
+/// `kind == 0` (not a script) is exactly the first five bytes, with
+/// `final_token` equal to the input `token`.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_exec_target_resolve_shebang(
+    owner_pid: u32,
+    token: u32,
+    out_ptr: usize,
+    out_len: usize,
+) -> i64 {
+    if out_len > i32::MAX as usize {
+        return -(Errno::EOVERFLOW as i64);
+    }
+    if out_len != 0 && (out_ptr == 0 || out_ptr.checked_add(out_len).is_none()) {
+        return -(Errno::EFAULT as i64);
+    }
+    let out: &mut [u8] = if out_len == 0 {
+        &mut []
+    } else {
+        unsafe { core::slice::from_raw_parts_mut(out_ptr as *mut u8, out_len) }
+    };
+    let table = unsafe { &mut *PROCESS_TABLE.0.get() };
+    let (proc, advisory_locks) = match table.process_and_advisory_locks(owner_pid) {
+        Some(pair) => pair,
+        None => return -(Errno::ESRCH as i64),
+    };
+    let mut host = WasmHostIO;
+    let resolved = match crate::exec_target::resolve_shebang(
+        proc,
+        advisory_locks,
+        &mut host,
+        owner_pid,
+        token,
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => return -(error as i64),
+    };
+    let Some(prefix) = resolved.prefix else {
+        if out.len() < 5 {
+            // `resolve_shebang` already retained `final_token` on this
+            // success path; every negative return from this export must
+            // leave zero tokens retained (the native host's
+            // `ShebangError::Resolved` contract assumes the kernel already
+            // released everything on error and does not cancel itself), so
+            // release it here before reporting the caller's buffer as too
+            // small.
+            let _ = crate::exec_target::cancel(
+                proc,
+                advisory_locks,
+                &mut host,
+                owner_pid,
+                resolved.final_token,
+            );
+            return -(Errno::EOVERFLOW as i64);
+        }
+        out[0] = 0;
+        out[1..5].copy_from_slice(&resolved.final_token.to_le_bytes());
+        return 5;
+    };
+    let interpreter = prefix.interpreter.as_bytes();
+    let argument = prefix.argument.as_deref().map(str::as_bytes);
+    let argument_bytes = argument.unwrap_or(&[]);
+    let script_path = prefix.script_path.as_slice();
+    let Some(total) = 18usize
+        .checked_add(interpreter.len())
+        .and_then(|partial| partial.checked_add(argument_bytes.len()))
+        .and_then(|partial| partial.checked_add(script_path.len()))
+    else {
+        // Same "negative ⇒ zero retained" contract: this guard is defensive
+        // (interpreter/argument/script-path lengths are bounded well under
+        // `usize::MAX` in practice) but it is still a post-resolve return, so
+        // it must not leave `final_token` retained either.
+        let _ = crate::exec_target::cancel(
+            proc,
+            advisory_locks,
+            &mut host,
+            owner_pid,
+            resolved.final_token,
+        );
+        return -(Errno::EOVERFLOW as i64);
+    };
+    if total > out.len() {
+        // Same "negative ⇒ zero retained" contract as above: the interpreter
+        // token `resolve_shebang` just prepared must not leak because the
+        // caller's buffer was too small to hold the record describing it.
+        let _ = crate::exec_target::cancel(
+            proc,
+            advisory_locks,
+            &mut host,
+            owner_pid,
+            resolved.final_token,
+        );
+        return -(Errno::EOVERFLOW as i64);
+    }
+    let interp_len = interpreter.len() as u32;
+    let arg_len = argument_bytes.len() as u32;
+    let script_path_len = script_path.len() as u32;
+    out[0] = 1;
+    out[1..5].copy_from_slice(&resolved.final_token.to_le_bytes());
+    out[5] = u8::from(argument.is_some());
+    out[6..10].copy_from_slice(&interp_len.to_le_bytes());
+    out[10..14].copy_from_slice(&arg_len.to_le_bytes());
+    out[14..18].copy_from_slice(&script_path_len.to_le_bytes());
+    let mut offset = 18usize;
+    out[offset..offset + interpreter.len()].copy_from_slice(interpreter);
+    offset += interpreter.len();
+    out[offset..offset + argument_bytes.len()].copy_from_slice(argument_bytes);
+    offset += argument_bytes.len();
+    out[offset..offset + script_path.len()].copy_from_slice(script_path);
+    total as i64
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_exec_target_cancel(owner_pid: u32, target: u32) -> i32 {
     let table = unsafe { &mut *PROCESS_TABLE.0.get() };
@@ -3088,37 +3621,62 @@ fn handle_owned_channel_allocation(
 
     // Read syscall number and args from kernel memory
     let base = offset;
-    let (syscall_nr, args) = {
-        // Keep this immutable view scoped to header decoding. Dispatch can
-        // mutate the same channel allocation through rewritten pointer args.
-        let mem = unsafe {
-            let ptr = base as *const u8;
-            core::slice::from_raw_parts(ptr, DATA_OFFSET)
-        };
-        let syscall_nr = u32::from_le_bytes([
-            mem[SYSCALL_OFFSET],
-            mem[SYSCALL_OFFSET + 1],
-            mem[SYSCALL_OFFSET + 2],
-            mem[SYSCALL_OFFSET + 3],
-        ]);
 
-        // Read i64 args (each arg is 8 bytes in the widened channel layout)
-        let mut args = [0i64; ARGS_COUNT];
-        for (i, arg) in args.iter_mut().enumerate() {
-            let off = ARGS_OFFSET + i * ARG_SIZE;
-            *arg = i64::from_le_bytes([
-                mem[off],
-                mem[off + 1],
-                mem[off + 2],
-                mem[off + 3],
-                mem[off + 4],
-                mem[off + 5],
-                mem[off + 6],
-                mem[off + 7],
-            ]);
-        }
-        (syscall_nr, args)
-    };
+    // Opaque-record transport branch (Phase 2, additive/dormant): if the data
+    // region begins with a record, decode it kernel-side and reconstruct the
+    // exact scratch layout + rewritten arg words the legacy host copy-in
+    // produces. A magic mismatch falls through to the unchanged legacy path.
+    let (syscall_nr, args, record_copy_back): (
+        u32,
+        [i64; ARGS_COUNT],
+        Option<Vec<crate::channel_scratch::ChannelRecordCopyBack>>,
+    ) = match unsafe { crate::channel_scratch::prepare_channel_record(scratch_region) } {
+            Some(Ok(prep)) => (prep.syscall_nr, prep.args, Some(prep.copy_back)),
+            Some(Err(errno)) => {
+                unsafe { &mut *PROCESS_TABLE.0.get() }.clear_current_tid_binding();
+                let out = unsafe {
+                    let ptr = base as *mut u8;
+                    core::slice::from_raw_parts_mut(ptr, DATA_OFFSET)
+                };
+                out[RETURN_OFFSET..RETURN_OFFSET + 8].copy_from_slice(&(-1i64).to_le_bytes());
+                out[ERRNO_OFFSET..ERRNO_OFFSET + 4]
+                    .copy_from_slice(&(errno as u32).to_le_bytes());
+                return -(errno as i32);
+            }
+            None => {
+                // Keep this immutable view scoped to header decoding. Dispatch
+                // can mutate the same channel allocation through rewritten
+                // pointer args.
+                let mem = unsafe {
+                    let ptr = base as *const u8;
+                    core::slice::from_raw_parts(ptr, DATA_OFFSET)
+                };
+                let syscall_nr = u32::from_le_bytes([
+                    mem[SYSCALL_OFFSET],
+                    mem[SYSCALL_OFFSET + 1],
+                    mem[SYSCALL_OFFSET + 2],
+                    mem[SYSCALL_OFFSET + 3],
+                ]);
+
+                // Read i64 args (each arg is 8 bytes in the widened channel
+                // layout)
+                let mut args = [0i64; ARGS_COUNT];
+                for (i, arg) in args.iter_mut().enumerate() {
+                    let off = ARGS_OFFSET + i * ARG_SIZE;
+                    *arg = i64::from_le_bytes([
+                        mem[off],
+                        mem[off + 1],
+                        mem[off + 2],
+                        mem[off + 3],
+                        mem[off + 4],
+                        mem[off + 5],
+                        mem[off + 6],
+                        mem[off + 7],
+                    ]);
+                }
+                (syscall_nr, args, None)
+            }
+        };
 
     // Pointer args in the channel reference kernel memory (JS copies data
     // into the data buffer at offset + DATA_OFFSET). Convert relative
@@ -3180,6 +3738,26 @@ fn handle_owned_channel_allocation(
 
     out[RETURN_OFFSET..RETURN_OFFSET + 8].copy_from_slice(&outcome.channel_result.to_le_bytes());
     out[ERRNO_OFFSET..ERRNO_OFFSET + 4].copy_from_slice(&outcome.channel_errno.to_le_bytes());
+
+    // Record-path outputs: mirror the host copy-out by moving each Out/InOut
+    // result from the contiguous scratch layout back to the span's original
+    // record offset. Read every result first, then write, so overlapping
+    // scratch/record ranges cannot clobber a not-yet-copied source.
+    if let Some(spans) = record_copy_back {
+        let staged: Vec<(usize, Vec<u8>)> = spans
+            .iter()
+            .map(|cb| {
+                let bytes =
+                    unsafe { core::slice::from_raw_parts(cb.scratch_src as *const u8, cb.len) }
+                        .to_vec();
+                (cb.channel_dest, bytes)
+            })
+            .collect();
+        for (dest, bytes) in staged {
+            unsafe { core::slice::from_raw_parts_mut(dest as *mut u8, bytes.len()) }
+                .copy_from_slice(&bytes);
+        }
+    }
 
     outcome.export_result
 }
@@ -9432,6 +10010,20 @@ pub extern "C" fn kernel_mprotect(addr: usize, len: usize, prot: u32) -> i32 {
     result
 }
 
+/// True when the currently-dispatched task is a pthread worker rather than
+/// the process leader (main thread).
+///
+/// A process leader's tid is its pid; pthread tids live in the owning
+/// `Process` record (the same convention `syscalls.rs` uses elsewhere, e.g.
+/// `caller_tid != proc.pid`). This used to be a host-supplied fact
+/// (`host_is_thread_worker()`), but the kernel already tracks the exact
+/// information needed to derive it — the currently-bound tid is set by
+/// `kernel_set_current_tid`/`ProcessTable::bind_current_tid` before any
+/// exported syscall runs — so no host import is needed here.
+fn current_task_is_thread_worker(proc: &Process) -> bool {
+    syscalls::current_tid_for_process(proc) != proc.pid
+}
+
 /// Commit the current task's exit transition and return its recorded status.
 ///
 /// WHY: the host adapter must be able to verify process exit without treating
@@ -9443,7 +10035,7 @@ fn commit_current_task_exit(status: i32) -> i32 {
     let committed_status;
     {
         let (_gkl, proc, advisory_locks) = unsafe { get_process_and_advisory_locks() };
-        if unsafe { host_is_thread_worker() } != 0 {
+        if current_task_is_thread_worker(proc) {
             // Thread exit: don't destroy shared process state (FDs, pipes, etc.).
             // Just set exit status and return — the guest import traps after
             // the host completes its exit-channel handshake.
@@ -11022,6 +11614,70 @@ pub extern "C" fn kernel_ioctl(
     };
     deliver_pending_signals_with_locks(proc, advisory_locks, &mut host);
     result
+}
+
+/// Bytes per `struct ifreq` entry at the caller's pointer width (32 for
+/// wasm32, 40 for wasm64 — `struct ifmap`'s `unsigned long` members are
+/// pointer-sized). `SIOCGIFCONF`'s host-side pointer arithmetic (how many
+/// whole entries fit in the caller's buffer) needs this; every other detail
+/// of the layout is decided by `kernel_network_ifconf_write` itself.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_network_ifreq_size(process_pointer_width: u32) -> i32 {
+    match u8::try_from(process_pointer_width)
+        .ok()
+        .filter(|width| *width == 4 || *width == 8)
+    {
+        Some(pointer_width) => crate::netif::ifreq_size(pointer_width) as i32,
+        None => -(Errno::EINVAL as i32),
+    }
+}
+
+/// SIOCGIFCONF query-mode support: total bytes needed to enumerate every
+/// network interface's `ifreq` entry at the caller's pointer width. Used
+/// when the caller's `struct ifconf.ifc_buf` is null (a size query).
+///
+/// The host still decodes the outer `ifconf`/`ifc_buf` pointers — a
+/// process-memory address the kernel's separate Wasm instance cannot itself
+/// reach — but the interface table and struct layout are kernel-owned
+/// (Workstream H4). Machine-global, so unlike `kernel_ioctl` this does not
+/// take a `fd` or the global kernel lock, matching other read-only
+/// introspection exports (`kernel_enum_procs`, `kernel_read_proc_maps`).
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_network_ifconf_size(process_pointer_width: u32) -> i32 {
+    match u8::try_from(process_pointer_width)
+        .ok()
+        .filter(|width| *width == 4 || *width == 8)
+    {
+        Some(pointer_width) => crate::netif::ifconf_total_size(pointer_width) as i32,
+        None => -(Errno::EINVAL as i32),
+    }
+}
+
+/// SIOCGIFCONF: write as many complete `ifreq` entries as fit in
+/// `out_ptr[..out_len]` (a kernel-scratch buffer; the host copies the result
+/// into the caller's real `ifc_buf` afterward). Returns the number of bytes
+/// written, or a negative errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_network_ifconf_write(
+    process_pointer_width: u32,
+    out_ptr: *mut u8,
+    out_len: u32,
+) -> i32 {
+    let Some(pointer_width) = u8::try_from(process_pointer_width)
+        .ok()
+        .filter(|width| *width == 4 || *width == 8)
+    else {
+        return -(Errno::EINVAL as i32);
+    };
+    if out_len == 0 {
+        return 0;
+    }
+    if out_ptr.is_null() {
+        return -(Errno::EFAULT as i32);
+    }
+    let out = unsafe { core::slice::from_raw_parts_mut(out_ptr, out_len as usize) };
+    let mut host = WasmHostIO;
+    crate::netif::ifconf_write(pointer_width, out, &mut host) as i32
 }
 
 /// prctl — process control. Returns 0 on success, or negative errno.
@@ -12887,6 +13543,38 @@ mod thread_exit_tests {
             kernel_thread_exit_in_table(&mut pt, 9_999, tid),
             Err(Errno::ESRCH)
         );
+    }
+}
+
+/// H2 (host-surface minimization): `current_task_is_thread_worker` replaced
+/// the `host_is_thread_worker()` host import. These tests pin the exact
+/// derivation `commit_current_task_exit` relies on: a process leader (main
+/// thread, tid == pid) is never a thread worker; a pthread task (tid != pid)
+/// always is — using a standalone `ProcessTable`, not the kernel's global
+/// singleton, so the test carries no dependency on ambient kernel state.
+#[cfg(test)]
+mod thread_worker_derivation_tests {
+    use super::*;
+
+    #[test]
+    fn main_thread_leader_is_not_a_thread_worker() {
+        let mut pt = crate::process_table::ProcessTable::new();
+        let leader = pt.create_process().unwrap();
+        pt.bind_current_tid(leader, leader).unwrap();
+
+        let (proc, _locks) = pt.current_process_and_advisory_locks().unwrap();
+        assert!(!current_task_is_thread_worker(proc));
+    }
+
+    #[test]
+    fn pthread_task_is_a_thread_worker() {
+        let mut pt = crate::process_table::ProcessTable::new();
+        let leader = pt.create_process().unwrap();
+        let tid = pt.create_thread(leader, leader, 0, 0, 0x2000).unwrap();
+        pt.bind_current_tid(leader, tid).unwrap();
+
+        let (proc, _locks) = pt.current_process_and_advisory_locks().unwrap();
+        assert!(current_task_is_thread_worker(proc));
     }
 }
 

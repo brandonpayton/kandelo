@@ -537,14 +537,6 @@ const ownershipSeeds: OwnershipSeed[] = [
     why: "The WASI shim operates on its guest process memory.",
   },
   {
-    declaration:
-      "host/src/fork-continuation.ts::LinkedForkContinuation.$param:memory",
-    target: "value",
-    owner: "process-memory",
-    form: "memory",
-    why: "Fork continuation frames live in process memory.",
-  },
-  {
     declaration: "host/src/dylink.ts::LoadSharedLibraryOptions.memory",
     target: "value",
     owner: "process-memory",
@@ -1421,6 +1413,16 @@ const auditAllowances: AuditAllowance[] = [
     why: "The host_pread Wasm import binds the untouched Rust pointer and capacity formals before invoking any positioned producer.",
   },
   {
+    key: 'host/src/kernel.ts::WasmPosixKernel.#buildImportObject::kernel-destination-factory-call::this.#rustLentKernelDestination( bufPtr, bufLen, "host_blob_read destination", )',
+    disposition: "rust-lent",
+    why: "The host_blob_read Wasm import binds the untouched Rust pointer and capacity formals before invoking the rootfs base-file byte producer.",
+  },
+  {
+    key: 'host/src/kernel.ts::WasmPosixKernel.#buildImportObject::kernel-destination-factory-call::this.#rustLentKernelDestination( bufPtr, bufLen, "host_fetch_archive destination", )',
+    disposition: "rust-lent",
+    why: "The host_fetch_archive Wasm import binds the untouched Rust pointer and capacity formals before invoking the rootfs lazy-archive byte producer.",
+  },
+  {
     key: 'host/src/kernel.ts::WasmPosixKernel.#buildImportObject::kernel-destination-factory-call::this.#rustLentKernelDestination( statPtr, WASM_STAT_SIZE, "host_fstat destination", )',
     disposition: "rust-lent",
     why: "The host_fstat import binds its exact pointer formal to the generated fixed stat capacity before the backend consumes the handle.",
@@ -1564,6 +1566,75 @@ const auditAllowances: AuditAllowance[] = [
     key: "host/src/kernel.ts::WasmPosixKernel.ioctl::kernel-pointer-export-bypass::fn( fd, request, this.toKernelPtr(scalarArgument), bufLen, 4, )",
     disposition: "kernel-control",
     why: "This exact non-pointer ioctl branch passes a scalar command argument with zero buffer length; pointer ioctl requests use the scratch lease branch above.",
+  },
+  // Overlay/tmpfs boot path (Phase 5 cutover). `#maybeLoadKernelRootfs` stages
+  // host-authored trusted rootfs config (the manifest bytes and the
+  // NUL-separated foreign mount prefixes) into a kernel-owned scratch region
+  // that the kernel's own `kernel_alloc_scratch` allocated, then hands the
+  // kernel-authored pointer plus its exact byte length to the `kernel_rootfs_*`
+  // exports. Every destination pointer originates from the kernel allocator,
+  // every source is trusted boot config, and no guest-controlled pointer or
+  // length reaches kernel memory. `enableKernelTmpfs` is a pure control-scalar
+  // export call.
+  {
+    key: "host/src/kernel-worker.ts::CentralizedKernelWorker.#maybeLoadKernelRootfs::scratch-allocator-call::alloc(manifest.byteLength)",
+    disposition: "scratch-core",
+    why: "The overlay boot path allocates a kernel-owned scratch region sized to the trusted manifest byte length through the kernel's own scratch allocator; the returned pointer is kernel-authored and stays private to this synchronous manifest load.",
+  },
+  {
+    key: "host/src/kernel-worker.ts::CentralizedKernelWorker.#maybeLoadKernelRootfs::scratch-allocator-call::alloc(encoded.byteLength)",
+    disposition: "scratch-core",
+    why: "The overlay boot path allocates a kernel-owned scratch region sized to the NUL-separated foreign-prefix bytes through the kernel's own scratch allocator; the returned pointer is kernel-authored and stays private to this synchronous foreign-prefix publish.",
+  },
+  {
+    key: "host/src/kernel-worker.ts::CentralizedKernelWorker.#maybeLoadKernelRootfs::kernel-view::new Uint8Array(memory.buffer, ptrValue, manifest.byteLength)",
+    disposition: "kernel-control",
+    why: "This fixed-size view over the kernel-allocated scratch pointer stages the host-authored trusted rootfs manifest into kernel memory; the pointer is kernel-authored (from kernel_alloc_scratch), no guest-controlled pointer or length is involved, and the view is written once and discarded.",
+  },
+  {
+    key: "host/src/kernel-worker.ts::CentralizedKernelWorker.#maybeLoadKernelRootfs::kernel-view::new Uint8Array(memory.buffer, fptrValue, encoded.byteLength)",
+    disposition: "kernel-control",
+    why: "This fixed-size view over the kernel-allocated scratch pointer stages the host-authored NUL-separated foreign mount prefixes into kernel memory; the pointer is kernel-authored, no guest-controlled pointer or length is involved, and the view is written once and discarded.",
+  },
+  {
+    key: "host/src/kernel-worker.ts::CentralizedKernelWorker.#maybeLoadKernelRootfs::kernel-write::new Uint8Array(memory.buffer, ptrValue, manifest.byteLength).set(manifest)",
+    disposition: "kernel-control",
+    why: "Copies the trusted host-authored rootfs manifest bytes into the kernel-allocated scratch region sized to that exact byte length; the destination is a kernel-authored pointer and the source is trusted boot config, so no guest pointer reaches kernel memory.",
+  },
+  {
+    key: "host/src/kernel-worker.ts::CentralizedKernelWorker.#maybeLoadKernelRootfs::kernel-write::new Uint8Array(memory.buffer, fptrValue, encoded.byteLength).set(encoded)",
+    disposition: "kernel-control",
+    why: "Copies the trusted host-authored foreign-prefix bytes into the kernel-allocated scratch region sized to that exact byte length; the destination is a kernel-authored pointer and the source is trusted boot config, so no guest pointer reaches kernel memory.",
+  },
+  {
+    key: "host/src/kernel-worker.ts::CentralizedKernelWorker.#maybeLoadKernelRootfs::kernel-export-direct-use::setNow(rootfsNowSecLo, rootfsNowSecHi, rootfsNowNsec)",
+    disposition: "kernel-control",
+    why: "kernel_set_rootfs_now receives only host clock control scalars (seconds high/low and nanoseconds); it borrows no kernel-memory pointer.",
+  },
+  {
+    key: "host/src/kernel-worker.ts::CentralizedKernelWorker.#maybeLoadKernelRootfs::kernel-export-direct-use::load(ptr, manifest.byteLength)",
+    disposition: "kernel-control",
+    why: "kernel_rootfs_load_manifest parses the trusted manifest from the kernel-authored scratch pointer staged above and its exact byte length; the pointer originates from the kernel's own allocator, not from any guest input.",
+  },
+  {
+    key: "host/src/kernel-worker.ts::CentralizedKernelWorker.#maybeLoadKernelRootfs::kernel-export-direct-use::setForeign(fptr, encoded.byteLength)",
+    disposition: "kernel-control",
+    why: "kernel_rootfs_set_foreign_prefixes reads the trusted NUL-separated mount prefixes from the kernel-authored scratch pointer staged above and its exact byte length; the pointer originates from the kernel's own allocator, not from any guest input.",
+  },
+  {
+    key: "host/src/kernel-worker.ts::CentralizedKernelWorker.#maybeLoadKernelRootfs::kernel-export-direct-use::setNosuid(this.#rootfsNosuid ? 1 : 0)",
+    disposition: "kernel-control",
+    why: "kernel_set_rootfs_nosuid receives a single 0/1 set-ID policy control scalar; it borrows no kernel-memory pointer.",
+  },
+  {
+    key: "host/src/kernel-worker.ts::CentralizedKernelWorker.#maybeLoadKernelRootfs::kernel-export-direct-use::enable(1)",
+    disposition: "kernel-control",
+    why: "kernel_set_rootfs_enabled receives a single enable control scalar to publish the overlay as the `/` authority; it borrows no kernel-memory pointer.",
+  },
+  {
+    key: "host/src/kernel-worker.ts::enableKernelTmpfs::kernel-export-direct-use::fn(1)",
+    disposition: "kernel-control",
+    why: "kernel_set_tmpfs_enabled receives a single enable control scalar for the Phase 5 in-kernel tmpfs cutover; it borrows no kernel-memory pointer.",
   },
 ];
 

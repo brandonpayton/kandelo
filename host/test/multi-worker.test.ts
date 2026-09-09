@@ -3,13 +3,12 @@
 // Tests CentralizedKernelWorker process management and fork flow.
 import { describe, it, expect, vi } from "vitest";
 import {
-  mkdtempSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { makeHostScratchTempRoot } from "./centralized-test-helper";
 import {
   type CentralizedKernelCallbacks,
   createCentralizedKernelWorkerTestDouble,
@@ -54,6 +53,10 @@ import {
   emptyProcessTimerCleanup,
   installKernelWorkerTestScratch,
 } from "./kernel-worker-test-scratch";
+// The in-kernel tmpfs owns the scratch prefixes unconditionally, so the
+// mmap-teardown case stages its host-backed file outside every scratch prefix
+// (`makeHostScratchTempRoot`) and maps it through NodePlatformIO.
+
 
 const MAX_PAGES = 1024; // 64 MiB: enough to prove initial < maximum.
 const WASM32_CONTINUATION_HEADER_SIZE =
@@ -2023,9 +2026,7 @@ describe("CentralizedKernelWorker Process Management", () => {
   });
 
   it("releases a retained mmap handle before forced descriptor teardown", async () => {
-    const tempDirectory = mkdtempSync(
-      join(tmpdir(), "kandelo-mmap-teardown-"),
-    );
+    const tempDirectory = makeHostScratchTempRoot("kandelo-mmap-teardown-");
     const filePath = join(tempDirectory, "mapped.bin");
     writeFileSync(filePath, new Uint8Array(4096).fill(0x41));
     const io = new NodePlatformIO();

@@ -19,6 +19,7 @@ import {
 } from "../../host/src/binary-resolver";
 import { browserBinariesImports } from "./browser-binary-imports.mjs";
 import {
+  browserForkModule32ModuleSpecifier,
   browserKernelModuleSpecifier,
   browserRepositoryAliases,
   browserRootfsModuleSpecifier,
@@ -334,6 +335,7 @@ function injectBlobIframeInterceptorPlaceholder(content: string): string {
 function resolveKernelArtifactsAlias(access: BinaryDevAccess): Plugin {
   const KERNEL = browserKernelModuleSpecifier;
   const ROOTFS = browserRootfsModuleSpecifier;
+  const FORK_MODULE32 = browserForkModule32ModuleSpecifier;
   return {
     name: "resolve-kernel-artifacts-alias",
     enforce: "pre",
@@ -356,6 +358,24 @@ function resolveKernelArtifactsAlias(access: BinaryDevAccess): Plugin {
         }
         this.error(
           "kernel.wasm not found. Build it with ./run.sh setup (or cargo xtask bootstrap kernel).",
+        );
+      }
+      if (pathPart === FORK_MODULE32) {
+        // Phase 6 D5: the wasm32 co-resident fork-module, staged next to the
+        // kernel by `crates/fork-module/build-wasm.sh`. Optional: only demos
+        // that enable WASM_POSIX_FORK_MODULE import it, so a missing artifact
+        // is a loud error pointing at the build script.
+        if (sourceOnlyViteAssets !== null) {
+          return sourceOnlyViteAssets.resolve("fork_module32.wasm");
+        }
+        const resolved = tryResolveBinary("fork_module32.wasm");
+        if (resolved) return access.approve(resolved) + query;
+        const local = path.resolve(repoRoot, "local-binaries/fork_module32.wasm");
+        const hosted = path.resolve(repoRoot, "host/wasm/fork_module32.wasm");
+        this.error(
+          "fork_module32.wasm not found. Run " +
+            "`scripts/dev-shell.sh bash crates/fork-module/build-wasm.sh`.\n" +
+            `  Looked at: ${local}\n  Looked at: ${hosted}`,
         );
       }
       if (pathPart === ROOTFS) {

@@ -47,4 +47,43 @@ describe("ForkAnyrefTransitTable", () => {
     first[0] = 0xff;
     expect(forkAnyrefTransitProviderBytes()[0]).toBe(0x00);
   });
+
+  it("adopts an externally supplied table", () => {
+    const bytes = forkAnyrefTransitProviderBytes();
+    const module = new WebAssembly.Module(bytes as BufferSource);
+    const instance = new WebAssembly.Instance(module);
+    const table = instance.exports[FORK_ANYREF_TRANSIT_IMPORT];
+    expect(table).toBeInstanceOf(WebAssembly.Table);
+
+    const wrapper = new ForkAnyrefTransitTable(table as WebAssembly.Table);
+    expect(wrapper.table).toBe(table);
+
+    const value = {};
+    wrapper.set(0, value);
+    expect(wrapper.get(0)).toBe(value);
+
+    wrapper.ensureRecipeSlot(5);
+    expect(wrapper.table.length).toBeGreaterThanOrEqual(7);
+
+    wrapper.clear();
+    expect(
+      Array.from(
+        { length: wrapper.table.length },
+        (_, index) => wrapper.table.get(index),
+      ),
+    ).toEqual(Array.from({ length: wrapper.table.length }, () => null));
+  });
+
+  it("mints its own when not adopted", () => {
+    const wrapper = new ForkAnyrefTransitTable();
+    expect(wrapper.table.length).toBe(1);
+    wrapper.table.grow(2);
+    wrapper.clear();
+    expect(
+      Array.from(
+        { length: wrapper.table.length },
+        (_, index) => wrapper.table.get(index),
+      ),
+    ).toEqual([null, null, null]);
+  });
 });

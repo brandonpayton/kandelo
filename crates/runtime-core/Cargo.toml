@@ -8,5 +8,6 @@ name = "runtime_core"
 crate-type = ["rlib"]
 
 [dependencies]
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
 spin = { version = "=0.12.2", default-features = false, features = ["mutex", "spin_mutex"] }
 wasm-posix-shared = { path = "../shared" }

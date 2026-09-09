@@ -9,13 +9,14 @@
  *             the on-disk source under `images/rootfs/etc/services`.
  *
  *   scratch   /tmp/<file> is writable through the mount router and
- *             persists across open/close within the same process.
+ *             persists across open/close within the same process. Post-cutover
+ *             `/tmp` is served by the unconditional in-kernel tmpfs.
  *
  *   unmounted /no/such/mount returns ENOENT (proves the mount router
  *             enforces VFS-only-lens — no fallthrough to the host fs).
  *
  *   path-resolution resolves symlinks and dot-dot component-wise across the
- *             `/tmp` HostFS and root MemoryFS mount boundary.
+ *             in-kernel tmpfs `/tmp` and the root image mount boundary.
  *
  *   custom    overriding `io` opts out of the default mount setup —
  *             /etc/services is no longer reachable via the rootfs image.
@@ -37,6 +38,11 @@ import { runCentralizedProgram } from "./centralized-test-helper";
 import { NodePlatformIO } from "../src/platform/node";
 import { NodeKernelHost } from "../src/node-kernel-host";
 import { MemoryFileSystem } from "../src/vfs/memory-fs";
+import { DEFAULT_MOUNT_SPEC, type MountSpec } from "../src/vfs/default-mounts";
+// The in-kernel tmpfs owns its scratch prefixes unconditionally, so scratch
+// writes to `/tmp` etc. are served by the kernel. The session-seed case seeds a
+// non-tmpfs `/run` scratch mount the host still materialises.
+
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "../..");
@@ -126,7 +132,7 @@ describe.skipIf(!haveProbe || !haveRootfs)("node-host default mount setup", () =
     expect(result.stdout).toContain(`head=${expectedHead}`);
   });
 
-  it("/tmp scratch mount round-trips a write through the host filesystem", async () => {
+  it("/tmp scratch mount round-trips a write through the in-kernel tmpfs", async () => {
     const result = await runCentralizedProgram({
       programPath: probeWasm,
       argv: ["mount_probe_test", "scratch", "/tmp/mount-probe.txt"],
@@ -148,44 +154,79 @@ describe.skipIf(!haveProbe || !haveRootfs)("node-host default mount setup", () =
       program.byteOffset,
       program.byteOffset + program.byteLength,
     );
-    const options = {
-      rootfsImage: "default" as const,
-      sessionSeedTrees: [{
-        sourcePath: fixtureRoot,
-        destinationPath: "/tmp/kandelo-run",
-      }],
-    };
-    const first = new NodeKernelHost(options);
-    const second = new NodeKernelHost(options);
+    // Seed a `/run` scratch mount: the in-kernel tmpfs owns `/tmp` and the other
+    // canonical scratch prefixes unconditionally, so host-materialised session
+    // seeds live on a non-tmpfs scratch mount the host still owns.
+    const rootfsMountSpec: MountSpec[] = [
+      ...DEFAULT_MOUNT_SPEC,
+      { path: "/run", source: "scratch", mode: 0o755, nosuid: true },
+    ];
+    const seedPath = "/run/kandelo-run/suite/fixture";
+    // Verify through the guest, not `readFileFromVfs`: the in-kernel rootfs
+    // overlay is the sole `/` authority and disowns the `/run` foreign mount, so
+    // the host-side `readFileFromVfs` (which reads only the overlay) never sees
+    // seeded host-mount bytes. A guest `mount_probe rootfs` read routes through
+    // the `/run` backend and reports `ROOTFS size=<n> ... head=<hex>`.
+    function makeSeededHost(): { host: NodeKernelHost; readOut: () => string } {
+      let out = "";
+      const host = new NodeKernelHost({
+        rootfsImage: "default",
+        rootfsMountSpec,
+        sessionSeedTrees: [{
+          sourcePath: fixtureRoot,
+          destinationPath: "/run/kandelo-run",
+        }],
+        onStdout: (_pid, data) => {
+          out += new TextDecoder().decode(data);
+        },
+      });
+      return { host, readOut: () => out };
+    }
+    async function guestRead(
+      host: NodeKernelHost,
+      readOut: () => string,
+    ): Promise<string> {
+      const before = readOut().length;
+      expect(
+        await host.spawn(programBytes, ["mount_probe_test", "rootfs", seedPath]),
+      ).toBe(0);
+      return readOut().slice(before);
+    }
+    const first = makeSeededHost();
+    const second = makeSeededHost();
+    // "seed" is 4 bytes; probe_rootfs prints the leading bytes as hex.
+    const seedHex = "73656564";
 
     try {
-      await Promise.all([first.init(), second.init()]);
+      await Promise.all([first.host.init(), second.host.init()]);
       writeFileSync(sourceFile, "external");
 
-      for (const host of [first, second]) {
-        await expect(
-          host.readFileFromVfs("/tmp/kandelo-run/suite/fixture"),
-        ).resolves.toEqual(new TextEncoder().encode("seed"));
+      for (const boot of [first, second]) {
+        const output = await guestRead(boot.host, boot.readOut);
+        expect(output).toContain("ROOTFS size=4");
+        expect(output).toContain(`head=${seedHex}`);
       }
 
+      // Mutating the private copy in the first boot must not reach the second.
       expect(
-        await first.spawn(programBytes, [
+        await first.host.spawn(programBytes, [
           "mount_probe_test",
           "scratch",
-          "/tmp/kandelo-run/suite/fixture",
+          seedPath,
         ]),
       ).toBe(0);
-      await expect(
-        first.readFileFromVfs("/tmp/kandelo-run/suite/fixture"),
-      ).resolves.toEqual(
-        new TextEncoder().encode("scratch-mount-roundtrip\n"),
-      );
-      await expect(
-        second.readFileFromVfs("/tmp/kandelo-run/suite/fixture"),
-      ).resolves.toEqual(new TextEncoder().encode("seed"));
+
+      const firstAfter = await guestRead(first.host, first.readOut);
+      // "scratch-mount-roundtrip\n" is 24 bytes.
+      expect(firstAfter).toContain("ROOTFS size=24");
+      const secondAfter = await guestRead(second.host, second.readOut);
+      expect(secondAfter).toContain("ROOTFS size=4");
+      expect(secondAfter).toContain(`head=${seedHex}`);
+
+      // The already-copied seed is independent of later source mutation.
       expect(readFileSync(sourceFile, "utf8")).toBe("external");
     } finally {
-      await Promise.allSettled([first.destroy(), second.destroy()]);
+      await Promise.allSettled([first.host.destroy(), second.host.destroy()]);
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
   });

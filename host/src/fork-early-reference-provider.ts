@@ -5,9 +5,6 @@ import {
   WPK_FORK_MODULE_STATE_GLOBAL_TYPE_FUNCREF,
 } from "./generated/abi";
 import type {
-  ForkActivationExceptionProvider,
-} from "./fork-activation-registry";
-import type {
   ForkImportedReferenceProvider,
 } from "./fork-imported-globals";
 import {
@@ -32,24 +29,42 @@ import {
   type ForkReferenceRecipeEntry,
   type ForkReferenceRecipeNode,
 } from "./fork-reference-recipes";
+// Staying-glue reference contracts + the host-exception sentinel + the shared
+// scratch types. Re-homed out of the deletable JS reference engine
+// (`fork-reference-transaction.ts` / `fork-activation-registry.ts`) so this
+// pre-instantiation imported-global reconstruction FLOOR no longer imports the
+// engine files the A5 delete step removes. `adoptInto` is typed against the
+// minimal `ForkReferenceReplayAdoptionTarget` (which the deletable
+// `ForkReferenceTransaction` satisfies structurally) so the runtime handoff is
+// unchanged while the deletable value import is gone.
+import { FORK_HOST_EXCEPTION_ACTIVATION_ID } from "./fork-reference-wire";
+import type {
+  ForkActivationExceptionProvider,
+  ForkExternrefRecipeProvider,
+  ForkReferenceChildReplayAdoption,
+  ForkReferenceReplayAdoptionTarget,
+} from "./fork-reference-contracts";
+import type {
+  ForkReferenceScratchAllocate,
+  ForkReferenceScratchDeallocate,
+} from "./fork-reference-scratch";
 import {
-  FORK_HOST_EXCEPTION_ACTIVATION_ID,
-  type ForkExternrefRecipeProvider,
-  type ForkReferenceChildReplayAdoption,
-  type ForkReferenceScratchAllocate,
-  type ForkReferenceScratchDeallocate,
-  ForkReferenceTransaction,
-} from "./fork-reference-transaction";
+  PagedForkReferenceDirectory,
+  type ForkReferenceDirectory,
+  type MutableForkReferenceVectorInternIndex,
+} from "./fork-reference-wire";
+// The read-only vector-directory materialization utilities the reconstruction
+// floor genuinely needs still live in `fork-reference-segments.ts` (moving them
+// would drag the encode-side vector subsystem — an A5-full extraction). They are
+// floor infrastructure, NOT the deletable JS reference ENGINE (registry +
+// transaction).
 import {
   findForkReferenceVectorOrdinal,
   forkReferenceVectorFrom,
   ForkReferenceDirectoryOverlay,
   indexForkReferenceVector,
-  PagedForkReferenceDirectory,
   type DecodedSegmentedForkReferenceTransaction,
-  type ForkReferenceDirectory,
   type ForkReferenceVector,
-  type MutableForkReferenceVectorInternIndex,
 } from "./fork-reference-segments";
 
 const MAX_REFERENCE_VECTOR_ORDINAL = 0xffff_ffff;
@@ -979,7 +994,7 @@ export class ForkEarlyChildReferenceProvider
     );
   }
 
-  adoptInto(transaction: ForkReferenceTransaction): void {
+  adoptInto(transaction: ForkReferenceReplayAdoptionTarget): void {
     this.requireActive("adopt reference replay");
     if (this.scratchReservations.length !== 0) {
       throw new Error(

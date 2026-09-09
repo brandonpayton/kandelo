@@ -124,6 +124,21 @@ struct Cli {
         ]
     )]
     reserved_env_imports: bool,
+
+    /// TEST-ONLY: force the emitted artifact's `__abi_version` export to this
+    /// instrumenter's compiled-in current ABI, overwriting a stale marker or
+    /// adding a missing one, regardless of side-module-ness. It stamps the
+    /// CURRENT (correct) epoch, so it auto-tracks future ABI bumps.
+    ///
+    /// Do NOT use this in production build paths: real programs get
+    /// `__abi_version` from the libc syscall glue plus the linker export, and a
+    /// missing or mismatched marker on a real artifact is a genuine defect the
+    /// host must keep rejecting. This flag exists only so hand-authored
+    /// fork-continuation test fixtures (whose committed sources declare a fixed
+    /// historical ABI) can track the current ABI epoch without being
+    /// regenerated on every bump.
+    #[arg(long)]
+    stamp_abi_version: bool,
 }
 
 fn main() -> Result<()> {
@@ -167,6 +182,7 @@ fn main() -> Result<()> {
 
     let opts = Options {
         entry_import: cli.entry,
+        stamp_abi_version: cli.stamp_abi_version,
     };
 
     if cli.discover_only {

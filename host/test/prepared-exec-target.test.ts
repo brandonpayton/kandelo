@@ -9,6 +9,7 @@ const PREPARED_EXEC_EXPORTS = [
   "kernel_spawn_exec_target_prepare",
   "kernel_exec_target_size",
   "kernel_exec_target_read",
+  "kernel_exec_target_shebang",
   "kernel_exec_target_cancel",
   "kernel_exec_commit",
   "kernel_publish_spawn_child",
@@ -79,6 +80,10 @@ describe("prepared exec target ABI", () => {
       {
         name: "kernel_exec_target_read",
         signature: "(i32,i32,i32,i32,i32,i32) -> (i32)",
+      },
+      {
+        name: "kernel_exec_target_shebang",
+        signature: "(i32,i32,i32,i32) -> (i32)",
       },
       { name: "kernel_exec_target_size", signature: "(i32,i32) -> (i64)" },
       { name: "kernel_publish_spawn_child", signature: "(i32,i32) -> (i32)" },

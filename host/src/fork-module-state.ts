@@ -22,6 +22,12 @@ import {
   WPK_FORK_ACTIVATION_CONTINUATIONS_MAGIC,
   WPK_FORK_ACTIVATION_CONTINUATIONS_OWNER,
   WPK_FORK_ACTIVATION_CONTINUATIONS_VERSION,
+  WPK_FORK_JOURNAL_IMAGE_HEADER_SIZE,
+  WPK_FORK_JOURNAL_IMAGE_KNOWN_FLAGS,
+  WPK_FORK_JOURNAL_IMAGE_MAGIC,
+  WPK_FORK_JOURNAL_IMAGE_OWNER,
+  WPK_FORK_JOURNAL_IMAGE_PAYLOAD_SIZE,
+  WPK_FORK_JOURNAL_IMAGE_VERSION,
   WPK_FORK_MODULE_STATE_ARENA_VERSION,
   WPK_FORK_MODULE_STATE_CHUNK_FLAG_ROOT,
   WPK_FORK_MODULE_STATE_CHUNK_FLAG_SEALED,
@@ -63,6 +69,7 @@ import {
   WPK_FORK_MODULE_STATE_RECORD_KIND_MUTABLE_GLOBAL,
   WPK_FORK_MODULE_STATE_RECORD_KIND_REFERENCE_RECIPE,
   WPK_FORK_MODULE_STATE_RECORD_KIND_REFERENCE_RECIPE_SEGMENT,
+  WPK_FORK_MODULE_STATE_RECORD_KIND_JOURNAL_IMAGE,
   WPK_FORK_MODULE_STATE_RECORD_KIND_REPLAY_EVENTS,
   WPK_FORK_MODULE_STATE_RECORD_KIND_REPLAY_EVENT_SEGMENT,
   WPK_FORK_MODULE_STATE_RECORD_KIND_TABLE,
@@ -187,6 +194,7 @@ export const ForkModuleStateRecordKind = {
   ReferenceRecipeSegment:
     WPK_FORK_MODULE_STATE_RECORD_KIND_REFERENCE_RECIPE_SEGMENT,
   ReplayEventSegment: WPK_FORK_MODULE_STATE_RECORD_KIND_REPLAY_EVENT_SEGMENT,
+  JournalImage: WPK_FORK_MODULE_STATE_RECORD_KIND_JOURNAL_IMAGE,
 } as const;
 
 export type ForkModuleStateRecordKind =
@@ -286,6 +294,18 @@ export interface ForkGlobalSnapshot {
 export interface ForkActivationContinuation {
   activationId: number;
   root: bigint;
+}
+
+/**
+ * A `JournalImage` KFMS record (Option B): the guest offset the parent
+ * channel-mmap'd the serialized KFRE replay-event journal image to, plus its
+ * byte length. The child reads this from the inherited arena to find and decode
+ * the image (it no longer sits at a host-computed arena offset). Fixed-width
+ * u64 fields so one record names wasm32 and wasm64 forks alike.
+ */
+export interface ForkJournalImage {
+  ptr: bigint;
+  len: bigint;
 }
 
 export interface ForkModuleDescriptorRecord {
@@ -1913,6 +1933,104 @@ export function decodeForkActivationContinuations(
   return continuations;
 }
 
+/**
+ * Encode a `JournalImage` manifest: the guest offset + byte length of the
+ * channel-mmap'd KFRE journal image. Fixed 32-byte payload (see the shared ABI
+ * layout): magic, version, header_size, flags, reserved, ptr u64, len u64.
+ */
+export function encodeForkJournalImage(image: ForkJournalImage): Uint8Array {
+  const ptr = checkedU64(image.ptr, "journal image ptr");
+  const len = checkedU64(image.len, "journal image len");
+  if (ptr === 0n) {
+    throw new RangeError("journal image ptr is zero");
+  }
+  if (len === 0n) {
+    throw new RangeError("journal image len is zero");
+  }
+  const payload = new Uint8Array(WPK_FORK_JOURNAL_IMAGE_PAYLOAD_SIZE);
+  const view = new DataView(payload.buffer);
+  view.setUint32(0, littleEndianMagic(WPK_FORK_JOURNAL_IMAGE_MAGIC), true);
+  view.setUint16(4, WPK_FORK_JOURNAL_IMAGE_VERSION, true);
+  view.setUint16(6, WPK_FORK_JOURNAL_IMAGE_HEADER_SIZE, true);
+  view.setUint16(8, WPK_FORK_JOURNAL_IMAGE_KNOWN_FLAGS, true);
+  view.setUint16(10, 0, true);
+  view.setUint32(12, 0, true);
+  view.setBigUint64(16, ptr, true);
+  view.setBigUint64(24, len, true);
+  return payload;
+}
+
+export function decodeForkJournalImage(
+  payload: Uint8Array,
+  context = "module-state journal image",
+): ForkJournalImage {
+  if (payload.byteLength !== WPK_FORK_JOURNAL_IMAGE_PAYLOAD_SIZE) {
+    throw new Error(`${context}: payload size is inconsistent`);
+  }
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  if (view.getUint32(0, true) !== littleEndianMagic(WPK_FORK_JOURNAL_IMAGE_MAGIC)) {
+    throw new Error(`${context}: wrong magic`);
+  }
+  const version = view.getUint16(4, true);
+  if (version !== WPK_FORK_JOURNAL_IMAGE_VERSION) {
+    throw new Error(`${context}: unsupported version ${version}`);
+  }
+  if (view.getUint16(6, true) !== WPK_FORK_JOURNAL_IMAGE_HEADER_SIZE) {
+    throw new Error(`${context}: header size is inconsistent`);
+  }
+  const flags = view.getUint16(8, true);
+  if ((flags & ~WPK_FORK_JOURNAL_IMAGE_KNOWN_FLAGS) !== 0) {
+    throw new Error(`${context}: unknown flags 0x${flags.toString(16)}`);
+  }
+  if (view.getUint16(10, true) !== 0 || view.getUint32(12, true) !== 0) {
+    throw new Error(`${context}: reserved header field is nonzero`);
+  }
+  const ptr = view.getBigUint64(16, true);
+  const len = view.getBigUint64(24, true);
+  if (ptr === 0n) {
+    throw new Error(`${context}: image ptr is zero`);
+  }
+  if (len === 0n) {
+    throw new Error(`${context}: image len is zero`);
+  }
+  return { ptr, len };
+}
+
+/**
+ * Recover the single `JournalImage` record from an inherited child arena
+ * (Option B). Mirrors `activationContinuationsForChild` — exactly one record,
+ * activation 0, the journal-image owner — and validates the pointer/length fit
+ * the guest pointer width so the child seeds its replay from a real offset.
+ */
+export function journalImageForChild(
+  records: readonly ForkModuleStateRecordView[],
+  ptrWidth: 4 | 8,
+): ForkJournalImage {
+  const matches = records.filter(
+    (record) => record.kind === ForkModuleStateRecordKind.JournalImage,
+  );
+  if (matches.length !== 1) {
+    throw new Error(
+      `module-state arena has ${matches.length} journal-image records; expected one`,
+    );
+  }
+  const record = matches[0]!;
+  if (
+    record.activationId !== 0
+    || record.ownerId !== WPK_FORK_JOURNAL_IMAGE_OWNER
+  ) {
+    throw new Error("module-state journal image has invalid ownership");
+  }
+  const image = decodeForkJournalImage(record.payload);
+  const maxAddr = ptrWidth === 4 ? 0xffff_ffffn : 0xffff_ffff_ffff_ffffn;
+  if (image.ptr > maxAddr || image.len > maxAddr) {
+    throw new RangeError(
+      `module-state journal image does not fit wasm${ptrWidth * 8}`,
+    );
+  }
+  return image;
+}
+
 const IMPORTED_GLOBAL_BINDING_KINDS = new Set<number>(
   Object.values(ForkImportedGlobalBindingKind),
 );
@@ -2499,6 +2617,7 @@ function validateRecordOwnership(
   let referenceRecipeSegments = 0;
   let importedGlobalBindingsSeen = false;
   let importedTableBindingsSeen = false;
+  let journalImageSeen = false;
   let replayEventManifest: Uint8Array | null = null;
   let activationContinuations: ForkActivationContinuation[] | null = null;
 
@@ -2610,6 +2729,25 @@ function validateRecordOwnership(
       }
       continue;
     }
+    if (record.kind === ForkModuleStateRecordKind.JournalImage) {
+      if (
+        record.activationId !== 0
+        || record.ownerId !== WPK_FORK_JOURNAL_IMAGE_OWNER
+      ) {
+        throw new Error(
+          `${context}: journal image must use process ownership`,
+        );
+      }
+      if (journalImageSeen) {
+        throw new Error(`${context}: duplicate journal-image record`);
+      }
+      const image = decodeForkJournalImage(record.payload, context);
+      if (ptrWidth === 4 && (image.ptr > 0xffff_ffffn || image.len > 0xffff_ffffn)) {
+        throw new RangeError(`${context}: journal image does not fit wasm32`);
+      }
+      journalImageSeen = true;
+      continue;
+    }
     if (record.kind === ForkModuleStateRecordKind.Module) {
       if (record.ownerId !== 0) {
         throw new Error(`${context}: module record must use owner id zero`);
@@ -2715,14 +2853,18 @@ function validateRecordOwnership(
     throw new Error("module-state arena has no declared module activation");
   }
   if (activationContinuations) {
-    if (!replayActivationIds) {
-      throw new Error(
-        "module-state activation continuations have no replay-event manifest",
-      );
-    }
+    // The JS continuation manifest is cross-checked against the process
+    // replay-event wire (both live in this arena, and the manifest names exactly
+    // the ACTIVE activations the events cover). A Phase 6 D7a.1a module-backed
+    // multi-activation fork instead owns its journal inside the co-resident
+    // module's serialized image (not this arena), so it writes NO replay-event
+    // records; its manifest names EVERY registered activation. When the arena has
+    // no replay-event manifest, cross-check the continuation set against the
+    // module-descriptor set — the authoritative activation set on the module path
+    // — so the manifest is still validated exactly, never silently accepted.
     assertActivationContinuationSet(
       activationContinuations,
-      replayActivationIds,
+      replayActivationIds ?? modules,
       "module-state activation continuations",
     );
     for (const { activationId } of activationContinuations) {
@@ -3101,6 +3243,20 @@ export class ForkModuleStateArena {
       activationId: 0,
       ownerId: WPK_FORK_ACTIVATION_CONTINUATIONS_OWNER,
       payload: encodeForkActivationContinuations(continuations),
+    });
+  }
+
+  /**
+   * Append the `JournalImage` manifest (Option B): where the parent
+   * channel-mmap'd the serialized KFRE journal image and its length. The child
+   * reads it (`journalImageForChild`) to find and decode the inherited image.
+   */
+  appendJournalImage(image: ForkJournalImage): void {
+    this.appendRecord({
+      kind: ForkModuleStateRecordKind.JournalImage,
+      activationId: 0,
+      ownerId: WPK_FORK_JOURNAL_IMAGE_OWNER,
+      payload: encodeForkJournalImage(image),
     });
   }
 

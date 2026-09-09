@@ -9,7 +9,11 @@ import type {
   LazyDownloadEvent,
   SerializedLazyArchiveEntry,
 } from "./vfs/memory-fs";
-import type { HostDiagnostic, HostDiagnosticMessage } from "./host-diagnostic";
+import type {
+  ForkModuleProofMessage,
+  HostDiagnostic,
+  HostDiagnosticMessage,
+} from "./host-diagnostic";
 import type { ClosedLazyAsset } from "./vfs/closed-lazy-assets";
 import type { PcmTransportDescriptor } from "./audio/pcm-transport";
 import type { MountSpec } from "./vfs/default-mounts";
@@ -63,6 +67,13 @@ export function initializeBrowserCorsProxyForWorker<TLazyFetcher, TTlsBackend>(
 export interface InitMessage {
   type: "init";
   kernelWasmBytes: ArrayBuffer;
+  /**
+   * Phase 6 D5: the wasm32 fork-module bytes. The kernel worker compiles them
+   * once and ships the compiled module to each fork-instrumented process
+   * worker. The co-resident module is the unconditional fork reconstructor, so
+   * the main thread always fetches and forwards these bytes.
+   */
+  forkModuleBytes?: ArrayBuffer;
   /**
    * Pre-built VFS image bytes from MemoryFileSystem.saveImage(). The worker
    * restores and authenticates an owned memfs through the verified image-mount
@@ -638,6 +649,7 @@ export type KernelToMainMessage =
   | StdoutMessage
   | StderrMessage
   | HostDiagnosticMessage
+  | ForkModuleProofMessage
   | PtyOutputMessage
   | ListenTcpMessage
   | FbBindMessage

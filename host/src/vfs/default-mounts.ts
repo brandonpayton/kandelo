@@ -15,6 +15,29 @@ import { FILE_MODES, OPEN_FLAGS } from "../generated/abi";
 import { MemoryFileSystem } from "./memory-fs";
 import { restoreVerifiedVfsImage } from "./load-image";
 
+/**
+ * Scratch prefixes the in-kernel tmpfs (Phase 5) claims. MUST stay in exact
+ * sync with the `SCRATCH_MOUNTS` table in `crates/runtime-core/src/tmpfs.rs`; a
+ * mount whose path is one of these is served entirely by the kernel, so the
+ * host must not also materialise a backend for it (that would be a second
+ * authority the kernel never consults). A scratch mount at any other path (e.g.
+ * `/run`) stays host-backed.
+ */
+export const KERNEL_TMPFS_OWNED_PREFIXES: readonly string[] = [
+  "/tmp",
+  "/var/tmp",
+  "/var/log",
+  "/var/run",
+  "/home/maker",
+  "/root",
+  "/srv",
+];
+
+/** True when the in-kernel tmpfs owns `mountPath` exactly (a scratch prefix). */
+export function kernelTmpfsOwnsMountPath(mountPath: string): boolean {
+  return KERNEL_TMPFS_OWNED_PREFIXES.includes(mountPath);
+}
+
 const O_WRONLY_CREAT_TRUNC =
   OPEN_FLAGS.O_WRONLY | OPEN_FLAGS.O_CREAT | OPEN_FLAGS.O_TRUNC;
 
@@ -186,6 +209,22 @@ export function ensureMountParentDirectories(
   }
 }
 
+/**
+ * Drop the scratch mounts the in-kernel tmpfs owns, so the host materialises no
+ * backend for a prefix the kernel serves — the cutover's "host stops owning
+ * scratch" half. The in-kernel tmpfs is the unconditional authority for its
+ * scratch prefixes (Phase 5 cutover), so this filtering is always applied.
+ * Image mounts, and host-owned scratch mounts outside tmpfs's prefixes (e.g.
+ * `/run`), are preserved.
+ */
+export function filterMountSpecForKernelTmpfs(
+  spec: readonly MountSpec[],
+): MountSpec[] {
+  return spec.filter(
+    (m) => !(m.source === "scratch" && kernelTmpfsOwnsMountPath(m.path)),
+  );
+}
+
 export function validateSpec(spec: MountSpec[]): void {
   const seen = new Set<string>();
   for (const m of spec) {
@@ -274,9 +313,10 @@ async function resolveValidatedForBrowser(
   rootfsImage: Uint8Array,
   options: BrowserResolverOptions,
 ): Promise<MountConfig[]> {
-  const imageMounts = await restoreVerifiedImageMounts(spec, rootfsImage);
+  const effective = filterMountSpecForKernelTmpfs(spec);
+  const imageMounts = await restoreVerifiedImageMounts(effective, rootfsImage);
   const out: MountConfig[] = [];
-  for (const m of spec) {
+  for (const m of effective) {
     if (m.source === "image") {
       const backend = imageMounts.get(m);
       if (backend === undefined) {

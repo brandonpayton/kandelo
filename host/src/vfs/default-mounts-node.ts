@@ -29,6 +29,7 @@ import {
   HostFileSystem,
 } from "./host-fs";
 import {
+  filterMountSpecForKernelTmpfs,
   restoreVerifiedImageMounts,
   validateSpec,
   type MountSpec,
@@ -62,15 +63,16 @@ async function resolveValidatedForNode(
   sessionSeedTrees: readonly NodeSessionSeedTree[] = [],
   shadowingMountPoints: readonly string[] = [],
 ): Promise<MountConfig[]> {
-  const imageMounts = await restoreVerifiedImageMounts(spec, rootfsImage);
-  for (const m of spec) {
+  const effective = filterMountSpecForKernelTmpfs(spec);
+  const imageMounts = await restoreVerifiedImageMounts(effective, rootfsImage);
+  for (const m of effective) {
     if (m.source !== "scratch") continue;
     const hostDir = join(sessionDir, m.path);
     mkdirSync(hostDir, { recursive: true, mode: m.mode });
   }
   if (sessionOwned) {
     materializeSessionSeedTrees(
-      spec,
+      effective,
       sessionDir,
       sessionSeedTrees,
       shadowingMountPoints,
@@ -80,7 +82,7 @@ async function resolveValidatedForNode(
   }
 
   const out: MountConfig[] = [];
-  for (const m of spec) {
+  for (const m of effective) {
     if (m.source === "image") {
       const backend = imageMounts.get(m);
       if (backend === undefined) {

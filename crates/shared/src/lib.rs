@@ -1,7 +1,9 @@
 #![no_std]
 
+pub mod channel_record;
 pub mod channel_scalar;
 pub mod host_abi;
+pub mod host_raw_syscalls;
 pub mod ioctl_contract;
 pub mod process_layout;
 
@@ -110,8 +112,12 @@ pub mod process_layout;
 ///     completions consumed outside libc's post-syscall trampoline. OSS PCM
 ///     ioctl transfers use request-sized arguments, `/dev/dsp` descriptors
 ///     share a refcounted stream across fork and exec, and the host consumes a
-///     versioned bounded transport paced by the audio clock.
-pub const ABI_VERSION: u32 = 43;
+///     versioned bounded transport paced by the audio clock. The kernel owns
+///     the exec `#!` interpreter-line decode through a required
+///     `kernel_exec_target_shebang` export, and the `posix_spawn` blob's
+///     argv/envp decode through a required `kernel_spawn_blob_decode` export,
+///     so no host interprets the exec or spawn guest ABI.
+pub const ABI_VERSION: u32 = 44;
 
 /// Byte width of Kandelo's Linux-compatible kernel CPU-affinity mask.
 ///
@@ -786,6 +792,15 @@ pub enum ChannelStatus {
     Pending = 1,
     Complete = 2,
     Error = 3,
+    /// Host-driven thread reclamation sentinel (not a normal syscall
+    /// outcome). The pump publishes this value plus an `atomic_notify` to
+    /// unwind a guest thread parked in the channel wait
+    /// (`memory.atomic.wait32`) without letting it resume the
+    /// superseded/doomed image — execve-abandon, fork-replay teardown, and
+    /// spawn `-ECHILD` rollback. The guest glue traps immediately on
+    /// observing this status instead of reading CH_RETURN/CH_ERRNO. See
+    /// `docs/plans/2026-09-05-native-thread-reclamation-spike.md`.
+    Teardown = 4,
 }
 
 impl ChannelStatus {
@@ -799,6 +814,8 @@ impl ChannelStatus {
             Some(Self::Complete)
         } else if val == Self::Error as u32 {
             Some(Self::Error)
+        } else if val == Self::Teardown as u32 {
+            Some(Self::Teardown)
         } else {
             None
         }
@@ -816,6 +833,7 @@ pub enum Errno {
     EIO = 5,
     ENXIO = 6,
     E2BIG = 7,
+    ENOEXEC = 8,
     EBADF = 9,
     ECHILD = 10,
     EAGAIN = 11,
@@ -886,6 +904,7 @@ impl Errno {
             5 => Some(Errno::EIO),
             6 => Some(Errno::ENXIO),
             7 => Some(Errno::E2BIG),
+            8 => Some(Errno::ENOEXEC),
             9 => Some(Errno::EBADF),
             10 => Some(Errno::ECHILD),
             11 => Some(Errno::EAGAIN),
@@ -1274,10 +1293,23 @@ pub mod channel {
     /// until an explicit guest checkpoint can invoke the handler after the
     /// owning host transition returns.
     pub const REQUEST_FLAG_DEFER_SIGNAL_DELIVERY: u32 = 1 << 2;
+    /// The guest self-marshalled this request's pointer arguments into an opaque
+    /// [`crate::channel_record`] record at [`DATA_OFFSET`] (Phase 2 transport).
+    ///
+    /// WHY a header flag, not a data-region magic: the record magic lives in the
+    /// reusable/inheritable data buffer, so a fork child or a reused per-thread
+    /// channel slot can carry a stale magic from a prior process into a RAW
+    /// syscall. This flag is written fresh in the channel header on every
+    /// request (beside the syscall number), exactly like
+    /// [`REQUEST_FLAG_CANCELLATION_POINT`], so it can never be stale. The host
+    /// keys the record vs raw transport decision on this bit; the record magic
+    /// remains the kernel's decode sentinel over the host-owned lease it copies.
+    pub const REQUEST_FLAG_OPAQUE_RECORD: u32 = 1 << 3;
     /// Every request flag understood by this ABI epoch.
     pub const REQUEST_FLAGS_KNOWN_MASK: u32 = REQUEST_FLAG_CANCELLATION_POINT
         | REQUEST_FLAG_CANCELLATION_WAKE_ALLOWED
-        | REQUEST_FLAG_DEFER_SIGNAL_DELIVERY;
+        | REQUEST_FLAG_DEFER_SIGNAL_DELIVERY
+        | REQUEST_FLAG_OPAQUE_RECORD;
     /// Total header size before data buffer.
     pub const HEADER_SIZE: usize = REQUEST_FLAGS_OFFSET + REQUEST_FLAGS_SIZE;
     /// Byte offset of the data buffer region.
@@ -1356,7 +1388,8 @@ mod channel_abi_tests {
             channel::REQUEST_FLAGS_KNOWN_MASK,
             channel::REQUEST_FLAG_CANCELLATION_POINT
                 | channel::REQUEST_FLAG_CANCELLATION_WAKE_ALLOWED
-                | channel::REQUEST_FLAG_DEFER_SIGNAL_DELIVERY,
+                | channel::REQUEST_FLAG_DEFER_SIGNAL_DELIVERY
+                | channel::REQUEST_FLAG_OPAQUE_RECORD,
         );
         assert_eq!(
             channel::SIG_BASE + channel::SIG_AREA_SIZE,
@@ -1373,6 +1406,31 @@ mod channel_abi_tests {
         assert!(channel::SIG_DELIVERY_SIZE <= channel::SIG_AREA_SIZE);
         assert_eq!(channel::SIG_AREA_SIZE - channel::SIG_DELIVERY_SIZE, 0);
         assert_eq!(channel::SIG_BASE % channel::SIG_AREA_ALIGNMENT, 0);
+    }
+
+    #[test]
+    fn teardown_status_is_distinct_from_every_other_channel_status() {
+        use super::ChannelStatus;
+
+        let all = [
+            ChannelStatus::Idle,
+            ChannelStatus::Pending,
+            ChannelStatus::Complete,
+            ChannelStatus::Error,
+            ChannelStatus::Teardown,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert_ne!(*a as u32, *b as u32, "{a:?} collides with {b:?}");
+                }
+            }
+        }
+        assert_eq!(ChannelStatus::Teardown as u32, 4);
+        assert_eq!(
+            ChannelStatus::from_u32(ChannelStatus::Teardown as u32),
+            Some(ChannelStatus::Teardown),
+        );
     }
 }
 
@@ -2051,6 +2109,14 @@ pub mod abi {
     pub const WPK_FORK_MODULE_STATE_RECORD_KIND_IMPORTED_TABLE_BINDINGS: u16 = 11;
     pub const WPK_FORK_MODULE_STATE_RECORD_KIND_REFERENCE_RECIPE_SEGMENT: u16 = 12;
     pub const WPK_FORK_MODULE_STATE_RECORD_KIND_REPLAY_EVENT_SEGMENT: u16 = 13;
+    /// Phase 6 (minimize host surface, Option B): a manifest naming WHERE the
+    /// parent channel-mmap'd the serialized replay-event (KFRE) journal image and
+    /// its length. With Option B the module owns its frame allocation via
+    /// in-realm `SYS_MMAP`, so the KFRE image no longer lives at a host-computed
+    /// arena offset; the child instead reads this record to find the inherited
+    /// image and seed its replay. Additive: only a module-backed (flag-on) seal
+    /// writes it, so the flag-off arena is byte-identical.
+    pub const WPK_FORK_MODULE_STATE_RECORD_KIND_JOURNAL_IMAGE: u16 = 14;
 
     /// One recognized module-state arena record kind.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2111,6 +2177,10 @@ pub mod abi {
         ForkModuleStateRecordKind {
             number: WPK_FORK_MODULE_STATE_RECORD_KIND_REPLAY_EVENT_SEGMENT,
             name: "replay_event_segment",
+        },
+        ForkModuleStateRecordKind {
+            number: WPK_FORK_MODULE_STATE_RECORD_KIND_JOURNAL_IMAGE,
+            name: "journal_image",
         },
     ];
 
@@ -2184,6 +2254,17 @@ pub mod abi {
     pub const WPK_FORK_ACTIVATION_CONTINUATION_ENTRY_SIZE: u16 = 16;
     pub const WPK_FORK_ACTIVATION_CONTINUATIONS_KNOWN_FLAGS: u16 = 0;
     pub const WPK_FORK_ACTIVATION_CONTINUATION_ENTRY_KNOWN_FLAGS: u32 = 0;
+    /// Journal-image manifest payload (Option B). A fixed 32-byte record naming
+    /// the guest offset the parent channel-mmap'd the serialized KFRE journal
+    /// image to (`ptr`, +16) and its byte length (`len`, +24). Layout: magic u32
+    /// (+0), version u16 (+4), header_size u16 (+6), flags u16 (+8), reserved u16
+    /// (+10), reserved u32 (+12), ptr u64 (+16), len u64 (+24).
+    pub const WPK_FORK_JOURNAL_IMAGE_OWNER: u32 = 5;
+    pub const WPK_FORK_JOURNAL_IMAGE_MAGIC: [u8; 4] = *b"KFJI";
+    pub const WPK_FORK_JOURNAL_IMAGE_VERSION: u16 = 1;
+    pub const WPK_FORK_JOURNAL_IMAGE_HEADER_SIZE: u16 = 16;
+    pub const WPK_FORK_JOURNAL_IMAGE_PAYLOAD_SIZE: u16 = 32;
+    pub const WPK_FORK_JOURNAL_IMAGE_KNOWN_FLAGS: u16 = 0;
     pub const WPK_FORK_IMPORTED_TABLE_BINDINGS_OWNER: u32 = 4;
     pub const WPK_FORK_IMPORTED_TABLE_BINDINGS_MAGIC: [u8; 4] = *b"KFBT";
     pub const WPK_FORK_IMPORTED_TABLE_BINDINGS_VERSION: u16 = 1;
@@ -2349,6 +2430,22 @@ pub mod abi {
         "__wpk_fork_ref_gc_provenance_ref";
     pub const WPK_FORK_REFERENCE_IMPORT_GC_ROUTE: &str = "__wpk_fork_ref_gc_route";
     pub const WPK_FORK_REFERENCE_IMPORT_GC_TRANSIT: &str = "__wpk_fork_ref_gc_transit";
+    /// FLOOR-1 externref production-site provenance import (N1-F5).
+    ///
+    /// `wasm-fork-instrument` wraps every call site that invokes a
+    /// declared host-function import whose result includes `externref` so
+    /// the wrapper immediately calls this import with the freshly-minted
+    /// value before handing it to the original caller. The signature is a
+    /// pass-through — `fn(externref) -> externref` — so the host records
+    /// `(externref identity -> handle)` at mint time (the ONLY sound moment
+    /// to observe that association; see
+    /// `docs/plans/2026-09-05-n1-f5-externref-capture-grounding.md`) and
+    /// returns the same value unchanged. Capture-time work then shrinks to a
+    /// lookup against data guaranteed to exist, rather than an attempt to
+    /// derive a handle from an already-live value by inspection (which is
+    /// unsound; see the grounding doc's `§2`).
+    pub const WPK_FORK_REFERENCE_IMPORT_PROVENANCE_EXTERNREF: &str =
+        "__wpk_fork_ref_provenance_externref";
     pub const WPK_FORK_REFERENCE_IMPORT_SCRATCH_RELEASE: &str = "__wpk_fork_ref_scratch_release";
     pub const WPK_FORK_REFERENCE_IMPORT_SCRATCH_RESERVE: &str = "__wpk_fork_ref_scratch_reserve";
     pub const WPK_FORK_REFERENCE_IMPORT_VECTOR_APPEND: &str = "__wpk_fork_ref_vector_append";
@@ -2632,6 +2729,12 @@ pub mod abi {
             name: WPK_FORK_REFERENCE_IMPORT_GC_ROUTE,
             params: &[I32, I32],
             results: &[I32],
+        },
+        ProgramArtifactImport {
+            module: WPK_FORK_REFERENCE_CODEC_IMPORT_MODULE,
+            name: WPK_FORK_REFERENCE_IMPORT_PROVENANCE_EXTERNREF,
+            params: &[ExternRef],
+            results: &[ExternRef],
         },
         ProgramArtifactImport {
             module: WPK_FORK_REFERENCE_CODEC_IMPORT_MODULE,
@@ -2981,6 +3084,7 @@ pub mod abi {
         "kernel_exec_target_cancel",
         "kernel_exec_target_prepare",
         "kernel_exec_target_read",
+        "kernel_exec_target_shebang",
         "kernel_exec_target_size",
         "kernel_fork_process",
         "kernel_get_cwd",
@@ -3029,6 +3133,7 @@ pub mod abi {
         "kernel_set_current_tid",
         "kernel_set_cwd",
         "kernel_shmid_ds_bytes",
+        "kernel_spawn_blob_decode",
         "kernel_spawn_exec_commit",
         "kernel_spawn_exec_target_prepare",
         "kernel_spawn_process",
@@ -3788,7 +3893,7 @@ pub mod abi {
             assert_eq!(wpk_fork_linked_chunk_header_size(16), None);
             assert_eq!(wpk_fork_linked_node_header_size(16), None);
 
-            assert_eq!(WPK_FORK_REQUIRED_IMPORTS.len(), 45);
+            assert_eq!(WPK_FORK_REQUIRED_IMPORTS.len(), 46);
             let mut previous_import = ("", "");
             for requirement in WPK_FORK_REQUIRED_IMPORTS {
                 let current = (requirement.module, requirement.name);
@@ -3853,7 +3958,7 @@ pub mod abi {
                 assert!(!kind.name.is_empty());
                 previous_number = kind.number;
             }
-            assert_eq!(WPK_FORK_MODULE_STATE_RECORD_KINDS.len(), 13);
+            assert_eq!(WPK_FORK_MODULE_STATE_RECORD_KINDS.len(), 14);
 
             assert_eq!(WPK_FORK_MODULE_STATE_MODULE_TEMPLATE_ID_SIZE, 32);
             assert_eq!(WPK_FORK_MODULE_STATE_MODULE_RECORD_PAYLOAD_SIZE, 40);

@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 /* Mirrors wasm_posix_shared::ABI_VERSION. */
-#define WASM_POSIX_ABI_VERSION 43u
+#define WASM_POSIX_ABI_VERSION 44u
 
 /* Non-forking spawn syscall number. */
 #define WASM_POSIX_SYS_SPAWN 500u
@@ -29,6 +29,7 @@
 #define WASM_POSIX_CHANNEL_STATUS_PENDING 1u
 #define WASM_POSIX_CHANNEL_STATUS_COMPLETE 2u
 #define WASM_POSIX_CHANNEL_STATUS_ERROR 3u
+#define WASM_POSIX_CHANNEL_STATUS_TEARDOWN 4u
 
 /* Shared syscall-channel layout. */
 #define WASM_POSIX_CHANNEL_STATUS_OFFSET 0u
@@ -47,7 +48,8 @@
 #define WASM_POSIX_CHANNEL_REQUEST_FLAG_DEFER_SIGNAL_DELIVERY 4u
 #define WASM_POSIX_CHANNEL_REQUEST_FLAG_CANCELLATION_POINT 1u
 #define WASM_POSIX_CHANNEL_REQUEST_FLAG_CANCELLATION_WAKE_ALLOWED 2u
-#define WASM_POSIX_CHANNEL_REQUEST_FLAGS_KNOWN_MASK 7u
+#define WASM_POSIX_CHANNEL_REQUEST_FLAG_OPAQUE_RECORD 8u
+#define WASM_POSIX_CHANNEL_REQUEST_FLAGS_KNOWN_MASK 15u
 #define WASM_POSIX_CHANNEL_DATA_OFFSET 72u
 #define WASM_POSIX_CHANNEL_DATA_SIZE 65536u
 #define WASM_POSIX_CHANNEL_HEADER_SIZE 72u
@@ -259,6 +261,22 @@ WASM_POSIX_IOCTL_UNSUPPORTED_SIZE;
              case 0x00008905u:
 return pointer_width == 4u ? 4u :
 pointer_width == 8u ? 4u :
+WASM_POSIX_IOCTL_UNSUPPORTED_SIZE;
+             case 0x00008910u:
+return pointer_width == 4u ? 32u :
+pointer_width == 8u ? 40u :
+WASM_POSIX_IOCTL_UNSUPPORTED_SIZE;
+             case 0x00008915u:
+return pointer_width == 4u ? 32u :
+pointer_width == 8u ? 40u :
+WASM_POSIX_IOCTL_UNSUPPORTED_SIZE;
+             case 0x00008927u:
+return pointer_width == 4u ? 32u :
+pointer_width == 8u ? 40u :
+WASM_POSIX_IOCTL_UNSUPPORTED_SIZE;
+             case 0x00008933u:
+return pointer_width == 4u ? 32u :
+pointer_width == 8u ? 40u :
 WASM_POSIX_IOCTL_UNSUPPORTED_SIZE;
              case 0x40045004u:
 return pointer_width == 4u ? 4u :

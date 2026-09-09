@@ -1,0 +1,29 @@
+[package]
+name = "runtime-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.runtime-core]
+path = ".."
+
+# Detach from the repo's wasm64-defaulting workspace so this crate
+# builds for the host without build-std dances.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode_record"
+path = "fuzz_targets/decode_record.rs"
+test = false
+doc = false
+bench = false

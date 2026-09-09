@@ -1,0 +1,79 @@
+[package]
+name = "fork-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "fork_codec"
+crate-type = ["rlib"]
+
+[dependencies]
+wasm-posix-shared = { path = "../shared" }
+
+# The gc_codec descriptor is emitted by the REAL Rust instrumenter
+# (`fork_instrument::module_gc_codec::encode_descriptor`), not by any TypeScript
+# encoder: the host only DECODES this section at runtime. To keep the committed
+# cross-language fixture genuine (real encoder output, never hand-authored
+# bytes), the regeneration test drives `plan(&module).descriptor()` over a real
+# GC-typed module. These heavy deps are OPTIONAL and gated behind the
+# `gen-fixtures` feature so the normal library build, `cargo test`, and
+# `cargo clippy --all-targets` never pull in walrus; the committed
+# `testdata/gc-codec-wasm32.bin` is what those paths consume. The `no_std`
+# library build (`cargo build -p fork-codec`) is unaffected.
+fork-instrument = { path = "../fork-instrument", optional = true }
+walrus = { version = "0.26.4", optional = true }
+wat = { version = "1", optional = true }
+# Extracts the emitted `kandelo.wpk_fork.imported_globals` custom section back
+# out of the fully instrumented module, exactly as the fork-instrument test
+# suite does. Gated behind `gen-fixtures` so it never enters the no_std library
+# build or `cargo test`.
+wasmparser = { version = "0.247", optional = true }
+
+[features]
+# Enable only to regenerate the committed instrumenter-emitted fixtures:
+#   cargo test -p fork-codec --features gen-fixtures \
+#     --test gen_gc_codec_fixture -- --ignored --nocapture
+#   cargo test -p fork-codec --features gen-fixtures \
+#     --test gen_imported_globals_fixture -- --ignored --nocapture
+#   cargo test -p fork-codec --features gen-fixtures \
+#     --test gen_imported_tables_fixture -- --ignored --nocapture
+#   cargo test -p fork-codec --features gen-fixtures \
+#     --test gen_exception_codec_fixture -- --ignored --nocapture
+#   cargo test -p fork-codec --features gen-fixtures \
+#     --test gen_static_root_catalog_fixture -- --ignored --nocapture
+#   cargo test -p fork-codec --features gen-fixtures \
+#     --test gen_resume_catalog_fixture -- --ignored --nocapture
+gen-fixtures = ["dep:fork-instrument", "dep:walrus", "dep:wat", "dep:wasmparser"]
+
+# H3 (host-surface minimization, 2026-09-06): the `native-sketch` feature and
+# `src/native_sketch.rs` (a never-enabled design sketch of a native backend
+# for the deleted `ForkHostCapabilities` trait) were removed.
+
+[[test]]
+name = "gen_gc_codec_fixture"
+required-features = ["gen-fixtures"]
+
+[[test]]
+name = "gen_imported_globals_fixture"
+required-features = ["gen-fixtures"]
+
+[[test]]
+name = "gen_imported_tables_fixture"
+required-features = ["gen-fixtures"]
+
+[[test]]
+name = "gen_exception_codec_fixture"
+required-features = ["gen-fixtures"]
+
+[[test]]
+name = "gen_static_root_catalog_fixture"
+required-features = ["gen-fixtures"]
+
+[[test]]
+name = "gen_resume_catalog_fixture"
+required-features = ["gen-fixtures"]
+
+[[test]]
+name = "gen_gc_reference_cycle_fixture"
+required-features = ["gen-fixtures"]

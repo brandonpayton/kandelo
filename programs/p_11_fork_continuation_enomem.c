@@ -161,12 +161,15 @@ int main(void) {
         return 1;
     }
 
-    // WHY: ABI 43 owns process/module/reference metadata separately from the
-    // linked stack. Two free pages let capture allocate the metadata arena and
-    // the continuation root. The deep call chain then needs a third page, so
-    // failure occurs after frames have committed and exercises
-    // ABORT_UNWINDING rather than the simpler root-allocation error path.
-    for (int i = 0; i < 2; i++) {
+    // WHY: a successful module-backed fork transaction needs three distinct
+    // pages — the process/module metadata arena, one continuation frame chunk,
+    // and the serialized replay-journal image — so freeing exactly three lets
+    // the later recovery fork complete while still being tight. The 4,096-deep
+    // call chain, however, needs far more frame chunks than three pages hold, so
+    // its continuation allocation fails AFTER frames have committed (its second
+    // chunk fills and the next mmap is refused), exercising the mid-unwind
+    // ABORT_UNWINDING path rather than the simpler root-allocation error path.
+    for (int i = 0; i < 3; i++) {
         filler_count--;
         if (munmap(filler_mappings[filler_count], WASM_PAGE_BYTES) != 0) {
             printf(
@@ -207,11 +210,12 @@ int main(void) {
     }
     printf("NO_PHANTOM_CHILD: ok\n");
 
-    // Abort replay must unmap both transaction roots and the partial linked
-    // chain. Hold two probe mappings concurrently to prove both pages are
-    // reusable before relying on them for the recovery fork.
-    void *probes[2] = {MAP_FAILED, MAP_FAILED};
-    for (int i = 0; i < 2; i++) {
+    // Abort replay must unmap the metadata arena, the continuation root, and the
+    // partial linked chain. Hold three probe mappings concurrently to prove all
+    // three pages the aborted transaction touched are reusable before relying on
+    // them for the recovery fork.
+    void *probes[3] = {MAP_FAILED, MAP_FAILED, MAP_FAILED};
+    for (int i = 0; i < 3; i++) {
         probes[i] = mmap(
             NULL,
             WASM_PAGE_BYTES,
@@ -229,7 +233,7 @@ int main(void) {
             return 1;
         }
     }
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         if (munmap(probes[i], WASM_PAGE_BYTES) != 0) {
             printf("FAIL: probe cleanup errno=%d\n", errno);
             release_fillers(filler_count);

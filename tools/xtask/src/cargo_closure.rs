@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Command;
 
+use sha2::{Digest, Sha256};
+
 pub(crate) const CARGO_INPUT_PREFIX: &str = "cargo:";
 
 pub(crate) fn cargo_closure_paths(
@@ -99,6 +101,88 @@ pub(crate) fn cargo_closure_paths(
     Ok(dirs.into_iter().collect())
 }
 
+/// Content digest over the union of the cargo dependency closures of
+/// `crate_names` -- the same directory-level, `cargo metadata`-derived
+/// closure `cargo_closure_paths` computes for a single crate (see the
+/// module doc above), extended to cover several crates that are not
+/// necessarily linked together (e.g. a wasm side module plus the separate
+/// host-only tool that post-processes its build output).
+///
+/// This exists for build artifacts that are NOT registered in the package
+/// resolver (so they have no `build.toml` `inputs` list to derive a
+/// resolver cache key from) but still want a drift-proof, closure-derived
+/// freshness fingerprint instead of a hand-maintained file list -- the same
+/// anti-pattern `cargo:<crate>` build.toml inputs already close for
+/// resolver-registered packages. `crates/fork-module/build-wasm.sh` uses
+/// this (via the `workspace-closure-sha` CLI entry point below) to stamp
+/// and later verify the freshness of its staged `fork_module32.wasm` /
+/// `fork_module64.wasm` artifacts.
+///
+/// Deterministic and order-independent: paths are deduped and sorted before
+/// hashing, and each path's digest is folded in as a length-prefixed
+/// `(path, content-digest)` pair so no concatenation ambiguity is possible.
+pub(crate) fn workspace_crates_closure_sha(
+    repo_root: &Path,
+    crate_names: &[String],
+) -> Result<[u8; 32], String> {
+    if crate_names.is_empty() {
+        return Err("workspace-closure-sha: at least one crate name is required".to_string());
+    }
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+    for name in crate_names {
+        for rel in cargo_closure_paths(repo_root, name)? {
+            paths.insert(rel);
+        }
+    }
+    let mut h = Sha256::new();
+    h.update(b"kandelo-workspace-crates-closure-v1\0");
+    for rel in &paths {
+        let digest = crate::build_deps::hash_build_input(&repo_root.join(rel))?;
+        h.update((rel.len() as u64).to_le_bytes());
+        h.update(rel.as_bytes());
+        h.update(digest);
+    }
+    Ok(h.finalize().into())
+}
+
+/// CLI entry point: `xtask workspace-closure-sha --crates <comma,separated>`.
+/// Prints the 64-lowercase-hex digest from [`workspace_crates_closure_sha`]
+/// to stdout. A non-resolver build script (one with no `build.toml` to carry
+/// `cargo:<crate>` inputs) shells out to this to get the same drift-proof,
+/// cargo-metadata-derived closure coverage a resolver package gets for free.
+pub(crate) fn run_workspace_closure_sha(args: Vec<String>) -> Result<(), String> {
+    let mut crates: Option<String> = None;
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        if let Some(value) = arg.strip_prefix("--crates=") {
+            if crates.is_some() {
+                return Err("--crates given more than once".to_string());
+            }
+            crates = Some(value.to_string());
+        } else if arg == "--crates" {
+            if crates.is_some() {
+                return Err("--crates given more than once".to_string());
+            }
+            crates = Some(
+                it.next()
+                    .ok_or_else(|| "--crates requires a comma-separated value".to_string())?,
+            );
+        } else {
+            return Err(format!("unexpected argument {arg:?}"));
+        }
+    }
+    let crates = crates.ok_or_else(|| "workspace-closure-sha: --crates <a,b,c> is required".to_string())?;
+    let names = crates
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    let repo = crate::repo_root();
+    let digest = workspace_crates_closure_sha(&repo, &names)?;
+    println!("{}", crate::util::hex(&digest));
+    Ok(())
+}
+
 fn crate_dir_relative(repo_root: &Path, manifest_path: &str) -> Result<String, String> {
     let manifest = Path::new(manifest_path);
     let dir = manifest
@@ -136,5 +220,190 @@ mod tests {
         let repo = crate::repo_root();
         let err = cargo_closure_paths(&repo, "definitely-not-a-crate").unwrap_err();
         assert!(err.contains("definitely-not-a-crate"), "{err}");
+    }
+
+    // fork-module has no resolver build.toml (see crates/fork-module/
+    // build-wasm.sh), so `workspace_crates_closure_sha` is its only
+    // closure-derived freshness signal. Prove it covers the real closure:
+    // fork-module's own crate dir plus fork-codec and shared (compile-time
+    // path deps, from `cargo metadata`) AND fork-module-inject (a separate
+    // host-only tool the build script also invokes, which is not a Cargo
+    // dependency of fork-module and must be named explicitly).
+    #[test]
+    fn fork_module_closure_covers_its_full_build_graph() {
+        let repo = crate::repo_root();
+        let names = vec!["fork-module".to_string(), "fork-module-inject".to_string()];
+        // Exercise the union logic directly against cargo_closure_paths so a
+        // missing crate in the real closure shows up as a clear path
+        // assertion rather than only as an opaque digest.
+        let mut union: BTreeSet<String> = BTreeSet::new();
+        for name in &names {
+            for rel in cargo_closure_paths(&repo, name).expect("closure") {
+                union.insert(rel);
+            }
+        }
+        assert!(union.contains("crates/fork-module"), "{union:?}");
+        assert!(union.contains("crates/fork-module-inject"), "{union:?}");
+        assert!(union.contains("crates/fork-codec"), "{union:?}");
+        assert!(union.contains("crates/shared"), "{union:?}");
+
+        // The digest itself must be deterministic and must change when a
+        // covered file changes -- the exact property this mechanism exists
+        // to guarantee for a non-resolver build artifact.
+        let first = workspace_crates_closure_sha(&repo, &names).expect("sha");
+        let second = workspace_crates_closure_sha(&repo, &names).expect("sha");
+        assert_eq!(first, second, "must be deterministic for an unchanged tree");
+    }
+
+    #[test]
+    fn workspace_crates_closure_sha_requires_at_least_one_crate() {
+        let repo = crate::repo_root();
+        let err = workspace_crates_closure_sha(&repo, &[]).unwrap_err();
+        assert!(err.contains("at least one crate"), "{err}");
+    }
+
+    // Generalization guard for the #1328 / kernel-staleness design weakness
+    // ("workspace-crate packages hand-list inputs with no cargo-closure
+    // validation"): scan every `packages/registry/<name>/build.toml` whose
+    // build script directly `cargo build`s a workspace crate (as `kernel`'s
+    // `build-kernel.sh` does for `kandelo`), and require the matching
+    // `cargo:<crate>` closure-derived input to be declared. This makes the
+    // anti-pattern that let `crates/runtime-core/src/netif.rs` slip out of
+    // the kernel's cache key impossible to reintroduce -- for the kernel
+    // itself (already fixed) and for any FUTURE registry package that
+    // compiles a workspace crate directly, without needing this test
+    // updated per package.
+    #[test]
+    fn registry_packages_that_cargo_build_a_workspace_crate_declare_its_closure_input() {
+        let repo = crate::repo_root();
+        let registry_dir = repo.join("packages/registry");
+        let mut failures = Vec::new();
+        for entry in std::fs::read_dir(&registry_dir).expect("read packages/registry") {
+            let entry = entry.expect("registry dir entry");
+            if !entry.file_type().expect("file_type").is_dir() {
+                continue;
+            }
+            let package_dir = entry.path();
+            let build_toml_path = package_dir.join("build.toml");
+            let Ok(build_toml_text) = std::fs::read_to_string(&build_toml_path) else {
+                continue;
+            };
+            let build = crate::pkg_manifest::BuildToml::parse(&build_toml_text)
+                .unwrap_or_else(|e| panic!("{}: {e}", build_toml_path.display()));
+            let script_path = repo.join(&build.script_path);
+            let Ok(script_text) = std::fs::read_to_string(&script_path) else {
+                continue;
+            };
+            for crate_name in cargo_build_dash_p_crate_names(&script_text) {
+                // Only workspace-local crates need a `cargo:<crate>` closure
+                // input; a `-p` targeting a registry (non-workspace) crate is
+                // covered by Cargo.lock, already a declared input.
+                if cargo_closure_paths(&repo, &crate_name).is_err() {
+                    continue;
+                }
+                let want = format!("{CARGO_INPUT_PREFIX}{crate_name}");
+                if !build.inputs.iter().any(|input| input == &want) {
+                    failures.push(format!(
+                        "{}: build script {} runs `cargo build -p {crate_name}` (a workspace \
+                         crate) but build.toml inputs do not include {want:?} -- any file added \
+                         to that crate (or a crate it depends on) will silently NOT invalidate \
+                         this package's cache key",
+                        package_dir.display(),
+                        script_path.display(),
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Extract every `-p <name>` / `--package <name>` token following a
+    /// `cargo build` invocation in a shell script's text. Deliberately
+    /// simple (whitespace-token scanning, not a shell parser): false
+    /// negatives are the acceptable failure mode -- a build script that
+    /// invokes cargo in some more exotic way this misses would ship
+    /// undetected, exactly like before this test existed.
+    ///
+    /// To avoid false positives that would fail an unrelated package's test,
+    /// it fires only on an EXACT `-p`/`--package` flag pair AND ignores the
+    /// two common shell vectors where `cargo build -p <name>` text is not a
+    /// real invocation: whole-line and trailing inline `#` comments, and
+    /// `echo`/`printf` lines that merely print such a string. It is not a
+    /// shell lexer, so `cargo build` embedded in a quoted variable assignment
+    /// is still (rarely) matchable; the guard exists for real build recipes,
+    /// where that shape does not occur.
+    ///
+    /// Deliberately excludes `xtask` and `fork-module-inject`: many package
+    /// build scripts run `cargo build -p xtask` (or the fork-module
+    /// injector) to get a HOST-triple build TOOL they shell out to, not a
+    /// wasm crate whose compiled bytes become part of the package's own
+    /// published output. `kernel`'s `-p kandelo` (and `fork-module`'s
+    /// `-p fork-module`) is the pattern this guard exists for: the crate IS
+    /// the package's wasm output, so its content must be a cache-key input.
+    /// A build tool's OWN drift is a different concern, already handled
+    /// where it matters (e.g. `fork_instrument_tool_input_paths` folds
+    /// `cargo:fork-instrument` into every fork-instrumented package's key).
+    fn cargo_build_dash_p_crate_names(script_text: &str) -> BTreeSet<String> {
+        const BUILD_TOOL_CRATES: &[&str] = &["xtask", "fork-module-inject"];
+        let mut names = BTreeSet::new();
+        for raw_line in script_text.lines() {
+            // Strip a trailing inline comment. Shell comments begin at an
+            // unquoted '#'; the common, quote-free form is " #...". This is a
+            // heuristic, not a lexer, and only trims from the first " #".
+            let line = match raw_line.find(" #") {
+                Some(idx) => &raw_line[..idx],
+                None => raw_line,
+            };
+            let trimmed = line.trim_start();
+            // Skip whole-line comments and lines that merely echo/print a
+            // command string: the cargo text there is data, not an invocation.
+            if trimmed.starts_with('#')
+                || trimmed.starts_with("echo ")
+                || trimmed.starts_with("printf ")
+            {
+                continue;
+            }
+            if !line.contains("cargo build") {
+                continue;
+            }
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            for (i, token) in tokens.iter().enumerate() {
+                if (*token == "-p" || *token == "--package") && i + 1 < tokens.len() {
+                    let name = tokens[i + 1];
+                    if !BUILD_TOOL_CRATES.contains(&name) {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn cargo_build_scan_ignores_comments_and_echoed_strings() {
+        // Real invocations are detected.
+        let real = "set -e\ncargo build -p kandelo --release\n";
+        assert!(cargo_build_dash_p_crate_names(real).contains("kandelo"));
+
+        // A whole-line comment must not trigger the guard.
+        let comment = "# formerly cargo build -p kandelo\ncargo build -p realcrate\n";
+        let got = cargo_build_dash_p_crate_names(comment);
+        assert!(got.contains("realcrate"));
+        assert!(!got.contains("kandelo"));
+
+        // A trailing inline comment is stripped.
+        let inline = "cargo build -p realcrate # was: cargo build -p kandelo\n";
+        let got = cargo_build_dash_p_crate_names(inline);
+        assert!(got.contains("realcrate"));
+        assert!(!got.contains("kandelo"));
+
+        // An echoed/printed command string is data, not an invocation.
+        let echoed =
+            "echo \"cargo build -p kandelo\"\nprintf 'cargo build -p other\\n'\n";
+        assert!(cargo_build_dash_p_crate_names(echoed).is_empty());
+
+        // Build-tool crates remain excluded regardless.
+        let tool = "cargo build -p xtask\n";
+        assert!(cargo_build_dash_p_crate_names(tool).is_empty());
     }
 }

@@ -31,9 +31,11 @@ Conformance harnesses may additionally provide one quiescent fixture directory
 with `KANDELO_RUNNER_FIXTURE_ROOT`, a relative
 `KANDELO_RUNNER_FIXTURE_CWD`, and an optional relative
 `KANDELO_RUNNER_GUEST_PROGRAM`. The worker copies that tree under
-`/tmp/kandelo-run` before readiness; the guest cannot mutate the source, and
-ambient host executable lookup is disabled. These controls are runner plumbing,
-not guest environment variables.
+`/run/kandelo-run` before readiness (a host-backed mount the in-kernel tmpfs
+does not claim, so the fixture stays visible whether or not tmpfs owns the
+scratch prefixes); the guest cannot mutate the source, and ambient host
+executable lookup is disabled. These controls are runner plumbing, not guest
+environment variables.
 
 See [docs/sdk-guide.md](../docs/sdk-guide.md) for full SDK documentation.
 

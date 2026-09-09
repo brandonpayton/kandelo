@@ -17,6 +17,7 @@
 import { describe, it, expect } from "vitest";
 import { runCentralizedProgram } from "./centralized-test-helper";
 import { tryResolveBinary } from "../src/binary-resolver";
+import type { HostDiagnostic } from "../src/host-diagnostic";
 
 const forkFromThreadBinary = tryResolveBinary("programs/fork-from-thread.wasm");
 const hasFork = !!forkFromThreadBinary;
@@ -25,9 +26,36 @@ const concurrentForkBinary = tryResolveBinary(
 );
 const hasConcurrentFork = !!concurrentForkBinary;
 
+/**
+ * Extract the co-resident fork-module proof-of-use counts (Phase 6 D7b) from
+ * the host diagnostics of a run. `parentFrames` is the pthread PARENT worker's
+ * committed-frame count (`fork_module_frames=`); `childFrames` is the fork
+ * CHILD worker's replayed-frame count (`fork_module_child_frames=`). Both must
+ * be positive on a flag-on run to prove BOTH sides of a fork-from-thread ran
+ * through the module rather than silently falling back to the JS closures.
+ */
+function forkModuleProof(hostDiagnostics: readonly HostDiagnostic[]): {
+  parentFrames: number[];
+  childFrames: number[];
+} {
+  const parentFrames: number[] = [];
+  const childFrames: number[] = [];
+  for (const diagnostic of hostDiagnostics) {
+    if (diagnostic.source !== "fork-module") continue;
+    const child = /fork_module_child_frames=(\d+)/.exec(diagnostic.message);
+    if (child) {
+      childFrames.push(Number(child[1]));
+      continue;
+    }
+    const parent = /fork_module_frames=(\d+)/.exec(diagnostic.message);
+    if (parent) parentFrames.push(Number(parent[1]));
+  }
+  return { parentFrames, childFrames };
+}
+
 describe("fork-from-non-main-thread", () => {
   it.skipIf(!hasFork)(
-    "a pthread fork child can fork again from its inherited continuation",
+    "drives BOTH sides of a fork-from-thread through the co-resident module",
     async () => {
       const result = await runCentralizedProgram({
         programPath: forkFromThreadBinary!,
@@ -39,25 +67,35 @@ describe("fork-from-non-main-thread", () => {
         useDefaultRootfs: false,
       });
 
-      expect(result.exitCode, `stderr=${result.stderr}\nstdout=${result.stdout}`).toBe(0);
-
-      // Parent thread reached the fork-callable code path.
-      expect(result.stdout).toContain("THREAD_STARTED");
-      expect(result.stdout).toContain("PRE_FORK_THREAD");
-
-      // Parent thread received a positive child pid.
-      expect(result.stdout).toMatch(/PARENT_THREAD: child=\d+/);
-
-      // Child resumed inside the thread function, took the pid==0 branch,
-      // ran the post-fork code, and exited cleanly. This is the load-bearing
-      // expectation: without correct fork-from-thread, the child traps in
-      // _start before any thread code runs.
+      // (a) CORRECTNESS: the child resumed inside the thread function, forked
+      // again, and the run exited cleanly. A wrong module-driven unwind/rewind
+      // would trap or hang.
+      expect(
+        result.exitCode,
+        `stderr=${result.stderr}\nstdout=${result.stdout}`,
+      ).toBe(0);
       expect(result.stdout).toContain("GRANDCHILD_THREAD: ok");
-      expect(result.stdout).toMatch(/CHILD_THREAD: grandchild=\d+/);
-
-      // Final PASS line — main thread joined the worker and waitpid()'d
-      // the child to a normal exit.
       expect(result.stdout).toContain("PASS");
+
+      // (b) PROOF OF USE — BOTH sides. The pthread PARENT worker unwound its
+      // frames through the module (committed > 0) and serialized the KFRE
+      // journal image the child reads; the fork CHILD worker rewound those
+      // frames through the module (replayed > 0). A silent JS fallback on either
+      // side would leave that side's counter absent — flag being on is not
+      // enough; the module must actually drive both the parent and the child.
+      const proof = forkModuleProof(result.forkModuleDiagnostics);
+      expect(
+        proof.parentFrames.length,
+        "expected a pthread-parent fork-module frame proof-of-use diagnostic; " +
+          "the parent did not unwind through the module",
+      ).toBeGreaterThan(0);
+      expect(Math.max(0, ...proof.parentFrames)).toBeGreaterThan(0);
+      expect(
+        proof.childFrames.length,
+        "expected a fork-child fork-module replay proof-of-use diagnostic; the " +
+          "child did not rewind through the module",
+      ).toBeGreaterThan(0);
+      expect(Math.max(0, ...proof.childFrames)).toBeGreaterThan(0);
     },
     20_000,
   );
@@ -74,6 +112,31 @@ describe("fork-from-non-main-thread", () => {
 
       expect(result.exitCode, `stderr=${result.stderr}\nstdout=${result.stdout}`).toBe(0);
       expect(result.stdout).toContain("PASS: 16 concurrent fork pairs");
+    },
+    70_000,
+  );
+
+  it.skipIf(!hasConcurrentFork)(
+    "concurrent pthread forks stay isolated through the co-resident module (flag on)",
+    async () => {
+      const result = await runCentralizedProgram({
+        programPath: concurrentForkBinary!,
+        argv: ["fork-from-concurrent-threads"],
+        timeout: 60_000,
+        useDefaultRootfs: false,
+      });
+
+      // Correctness/parity: 16 concurrent fork pairs, each pthread parent
+      // serializing its own journal and each child replaying it, stay isolated
+      // under the module path exactly as under the JS path.
+      expect(result.exitCode, `stderr=${result.stderr}\nstdout=${result.stdout}`).toBe(0);
+      expect(result.stdout).toContain("PASS: 16 concurrent fork pairs");
+
+      // Proof of use, both sides: the concurrent pthread PARENTS unwound through
+      // the module and the fork CHILDREN rewound through it.
+      const proof = forkModuleProof(result.forkModuleDiagnostics);
+      expect(Math.max(0, ...proof.parentFrames)).toBeGreaterThan(0);
+      expect(Math.max(0, ...proof.childFrames)).toBeGreaterThan(0);
     },
     70_000,
   );

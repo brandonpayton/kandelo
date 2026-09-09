@@ -14,6 +14,7 @@ import { spawnSync } from "node:child_process";
 import { isWithinRealDirectory } from "../../examples/run-example-paths";
 import { resolveRunExampleBuiltinPrograms } from "../../examples/run-example-builtins";
 
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "..", "..");
 const runExample = join(repoRoot, "examples", "run-example.ts");

@@ -7,7 +7,6 @@ import {
   renameSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { NodePlatformIO } from "../src/platform/node";
@@ -17,7 +16,10 @@ import {
   parseDylinkSection,
   readForkInstrumentCapabilities,
 } from "../src/dylink";
-import { runCentralizedProgram } from "./centralized-test-helper";
+import {
+  makeHostScratchTempRoot,
+  runCentralizedProgram,
+} from "./centralized-test-helper";
 import { MemoryFileSystem } from "../src/vfs/memory-fs";
 import { buildVforkSideModuleFixture } from "./vfork-side-module-fixture";
 
@@ -27,7 +29,12 @@ const sysroot = join(repoRoot, "sysroot");
 const glueDir = join(repoRoot, "libc", "glue");
 const clangDriver = process.env.CLANG ?? "clang";
 const instrument = join(repoRoot, "scripts", "run-wasm-fork-instrument.sh");
-const buildDir = join(tmpdir(), "kandelo-fork-from-side-module");
+// Stage the built `.so` under `<repoRoot>/target` (never an in-kernel tmpfs
+// scratch prefix) so the guest reaches the real host file through
+// NodePlatformIO. `os.tmpdir()` frequently resolves under `/tmp` (the nix dev
+// shell sets `TMPDIR=/tmp/nix-shell.*`), where the empty in-kernel tmpfs would
+// shadow the path and the guest dlopen would fail with "cannot stat library".
+const buildDir = makeHostScratchTempRoot("kandelo-fork-from-side-module-");
 const hasPrerequisites =
   existsSync(join(sysroot, "lib", "libc.a"))
   && (
@@ -215,6 +222,69 @@ describe.skipIf(!hasPrerequisites)("fork from a dlopened side module", () => {
     expect(result.stdout).toContain("side fork ok");
   }, 30_000);
 
+  it("preserves the side frame and returns in both parent and child (fork-module flag on)", async () => {
+    // Phase 6 D7a.1b regression: a dlopen fork is multi-activation (main = 0,
+    // side = 1). With the co-resident fork-module ON, its FRAMES route through
+    // the module (D7a.1a) AND its reference path is now admitted (D7a.1b enables
+    // multi-activation reference reconstruction via the merged, activation-
+    // namespaced funcref catalog). This C fixture carries no funcref-typed
+    // references (C function pointers are i32 table indices, not wasm funcrefs),
+    // so the merged-catalog reference drive runs over an empty/null graph; the
+    // point is that admitting multi-activation references does not break a real
+    // multi-activation frame fork. It must exit exactly as the flag-off run.
+    const libraryPath = buildSharedLibrary(`
+      extern int fork(void);
+      extern void exit(int);
+      int side_fork(void) {
+        volatile int preserved = 37;
+        int pid = fork();
+        if (preserved != 37) exit(91);
+        if (pid == 0) exit(0);
+        return pid;
+      }
+    `, "libforkinside-flagon");
+    const programPath = buildMainProgram(`
+      #include <dlfcn.h>
+      #include <stdlib.h>
+      #include <stdio.h>
+      #include <sys/wait.h>
+      #include <unistd.h>
+      typedef int (*side_fork_fn)(void);
+      int main(int argc, char **argv) {
+        void *lib = dlopen(argv[1], RTLD_NOW);
+        if (!lib) {
+          fprintf(stderr, "dlopen failed: %s\\n", dlerror());
+          return 2;
+        }
+        side_fork_fn side_fork = (side_fork_fn)dlsym(lib, "side_fork");
+        if (!side_fork) return 3;
+        for (int i = 0; i < 2; i++) {
+          int pid = side_fork();
+          if (pid < 0) return 4;
+          if (pid == 0) {
+            if (dlclose(lib) != 0) exit(7);
+            exit(0);
+          }
+          int status = 0;
+          if (waitpid(pid, &status, 0) != pid) return 5;
+          if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 6;
+        }
+        if (dlclose(lib) != 0) return 8;
+        puts("side fork ok");
+        return 0;
+      }
+    `);
+
+    const result = await runCentralizedProgram({
+      programPath,
+      argv: ["fork-from-side-main", libraryPath],
+      timeout: 30_000,
+      io: new NodePlatformIO(),
+    });
+    expect(result.exitCode, `stderr:\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain("side fork ok");
+  }, 30_000);
+
   it("runs mode-1 vfork from a real side-module frame in the production worker path", async () => {
     const fixture = buildVforkSideModuleFixture();
     try {
@@ -242,6 +312,49 @@ describe.skipIf(!hasPrerequisites)("fork from a dlopened side module", () => {
       expect(result.stdout.match(/PRODUCTION_SIDE_VFORK_ROUND_TRIP/g))
         .toHaveLength(2);
       expect(result.stdout).toContain("PRODUCTION_SIDE_VFORK_PASS");
+    } finally {
+      fixture.cleanup();
+    }
+  }, 30_000);
+
+  it("runs mode-1 vfork from a real side-module frame through the fork-module (flag on)", async () => {
+    // Phase 6 item 4: a MULTI-activation dlopen-vfork borrowed child drives its
+    // borrowed replay (main + side activation) through the co-resident module via
+    // fm_begin_borrowed_child_replay + fm_add_activation_borrowed_child_replay.
+    const fixture = buildVforkSideModuleFixture();
+    try {
+      const libraryBytes = new Uint8Array(readFileSync(fixture.libraryPath));
+      const imageOwner = MemoryFileSystem.create(
+        new SharedArrayBuffer(Math.max(2 * 1024 * 1024, libraryBytes.length * 4)),
+      );
+      imageOwner.mkdir("/lib", 0o755);
+      imageOwner.createFileWithOwner(
+        "/lib/libvforkinside.so",
+        0o755,
+        0,
+        0,
+        libraryBytes,
+      );
+
+      const result = await runCentralizedProgram({
+        programPath: fixture.programPath,
+        argv: ["vfork-from-side-main", "/lib/libvforkinside.so"],
+        timeout: 30_000,
+        rootfsImage: await imageOwner.saveImage(),
+      });
+      expect(result.exitCode, `stderr:\n${result.stderr}`).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout.match(/PRODUCTION_SIDE_VFORK_ROUND_TRIP/g))
+        .toHaveLength(2);
+      expect(result.stdout).toContain("PRODUCTION_SIDE_VFORK_PASS");
+      // Proof the borrowed child rewound through the module (not a silent JS
+      // fallback): a nonzero replayed-frame count. A multi-activation borrowed
+      // child that failed to add its side activation would crash, not pass.
+      const fm = result.forkModuleDiagnostics.filter((d) => d.source === "fork-module");
+      expect(
+        fm.some((d) => /fork_module_child_frames=\d+/.test(d.message)),
+        `expected a fork-module borrowed proof-of-use; saw: ${JSON.stringify(fm)}`,
+      ).toBe(true);
     } finally {
       fixture.cleanup();
     }

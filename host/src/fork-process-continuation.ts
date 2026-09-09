@@ -1,6 +1,4 @@
 import {
-  WPK_FORK_FRAME_IMPORT_PEEK,
-  WPK_FORK_RESUME_IMPORT_PEEK,
   WPK_FORK_RESUME_IMPORT_TABLE,
 } from "./generated/abi";
 import {
@@ -8,39 +6,43 @@ import {
   ForkActivationRegistry,
 } from "./fork-activation-registry";
 import {
+  ContinuationAllocationError,
   invokeForkContinuationBegin,
-  LinkedForkContinuation,
+  type LinkedFrameFormatDescriptor,
 } from "./fork-continuation";
 import {
-  activationContinuationsForChild,
+  decodeForkActivationContinuations,
   type ForkModuleStateArena,
-  replayEventsForChild,
+  ForkModuleStateRecordKind,
+  journalImageForChild,
   writeForkModuleStateRoot,
 } from "./fork-module-state";
+import type { ForkModuleContinuationBackend } from "./fork-module-backend";
 import {
-  type ForkReplayEvent,
-  ForkReplayEventJournal,
   type ForkResumeTarget,
   ForkResumeTable,
 } from "./fork-replay-events";
-import {
-  checkedWasmGuestPointerOffset,
-  type WasmGuestPointer,
-} from "./wasm-guest-pointer";
+import type { WasmGuestPointer } from "./wasm-guest-pointer";
 import type {
   DecodedSegmentedForkReferenceTransaction,
 } from "./fork-reference-segments";
+
+/**
+ * The subset of a fork activation the co-resident-module coordinator needs from
+ * each registered activation: its linked-frame format descriptor (pointer
+ * width, prefix/alignment). The Rust fork-module owns every linked frame, the
+ * journal, and the resume slots (Phase 4 point of no return deleted the JS
+ * `LinkedForkContinuation` frame storage), so the host no longer holds a
+ * per-activation JS frame allocator/validator.
+ */
+export interface ForkActivationContinuation {
+  readonly format: LinkedFrameFormatDescriptor;
+}
 
 const WPK_FORK_NORMAL = 0;
 const WPK_FORK_UNWINDING = 1;
 const WPK_FORK_REWINDING = 2;
 const WPK_FORK_ABORT_UNWINDING = 3;
-// These names are already part of the Rust ABI table; generated named TS
-// exports land with the ABI generator update that also publishes the fixed
-// resume-boundary export names.
-const WPK_FORK_FRAME_IMPORT_RESERVE = "__wpk_fork_frame_reserve";
-const WPK_FORK_FRAME_IMPORT_COMMIT = "__wpk_fork_frame_commit";
-const WPK_FORK_FRAME_IMPORT_NEXT = "__wpk_fork_frame_next";
 
 type ProcessContinuationPhase =
   | "idle"
@@ -69,7 +71,7 @@ export interface ForkBorrowedReplayWorkspaceRequirements {
 
 export interface ForkProcessActivationBinding {
   readonly activationId: number;
-  readonly continuation: LinkedForkContinuation;
+  readonly continuation: ForkActivationContinuation;
   /**
    * Publish the process launch root in process-owned copied memory.
    *
@@ -129,16 +131,85 @@ export class ForkProcessContinuationCoordinator {
 
   private readonly prepared = new Map<number, ForkProcessActivationBinding>();
   private readonly activations = new Map<number, CompleteForkProcessActivation>();
-  private readonly events = new ForkReplayEventJournal();
   private phase: ProcessContinuationPhase = "idle";
   private arena: ForkModuleStateArena | null = null;
   private replayOwnership: ProcessReplayOwnership | null = null;
+  // F1: the errno recorded when abort-replay began. On the module path the JS
+  // `LinkedForkContinuation` is unrooted and cannot hold it, so it is stored
+  // here instead (populated on both the module and JS branches). Only cleared
+  // on the successful-finish idle resets in `finishModuleTransaction` /
+  // `finishTransaction`; a failed `beginCapture` leaves a stale value behind.
+  // `abortErrno()` guards against reading that stale value by asserting
+  // `phase === "abort-replay"` before returning it.
+  #abortErrno: number | null = null;
+  // Phase 6 D5 step 4b/5: when set (only by `enableModuleBacking`, only for a
+  // QUALIFYING single-activation fork behind `WASM_POSIX_FORK_MODULE`), the
+  // journal + frame storage + resume slots live in the co-resident fork-module
+  // and the module-backed branches below drive them. Null on the JavaScript
+  // default path, so every other fork is byte-identical to today.
+  private moduleBackend: ForkModuleContinuationBackend | null = null;
+  // Phase 6 D7a.1a: evict a per-activation frame trampoline when its activation
+  // is unregistered/cleared. Set alongside `moduleBackend` for a dlopen fork;
+  // null on the JS path and for single-activation module forks.
+  private evictModuleActivation: ((activationId: number) => void) | null = null;
+  // Phase 6 D6.1: when true (only via `enableModuleReferenceReplay`, only for a
+  // qualifying FUNCREF-ONLY child fork whose guest `__wpk_fork_ref_decode_funcref`
+  // import was flipped to the module), the child seeds the module's reference
+  // graph and the module reconstructs funcref/null references during rewind.
+  // False on every other fork (references stay on the JS provider), so the
+  // reference path is byte-identical to today unless the funcref predicate holds.
+  private moduleReferenceReplay = false;
 
   constructor(
     private readonly memory: WebAssembly.Memory,
     private readonly registry: ForkActivationRegistry,
     private readonly label: string,
   ) {}
+
+  /**
+   * Route this coordinator's next transaction through the co-resident module.
+   *
+   * The caller (worker-main) computes the qualifying predicate and passes a
+   * fully set-up backend; the coordinator then takes its module-backed branches
+   * for capture/seal/replay/finish. The JS journal (`this.events`) is left idle
+   * for the module-backed activation — the module owns it, so there is no
+   * double-journal — while the JS resume TABLE (`this.resumeTable`) still backs
+   * the guest's `__wpk_fork_resume_table` funcref import (the module's
+   * `resume_peek` returns slots into it, numbered identically by construction).
+   */
+  enableModuleBacking(
+    backend: ForkModuleContinuationBackend,
+    evictModuleActivation?: (activationId: number) => void,
+  ): void {
+    this.requireIdle("enable fork-module backing");
+    if (this.moduleBackend) {
+      throw new Error(`${this.label}: fork-module backing already enabled`);
+    }
+    this.moduleBackend = backend;
+    this.evictModuleActivation = evictModuleActivation ?? null;
+  }
+
+  /** Whether the module-backed path is active (proof/diagnostics). */
+  isModuleBacked(): boolean {
+    return this.moduleBackend !== null;
+  }
+
+  /**
+   * Route this child's funcref/null reference reconstruction through the module
+   * (Phase 6 D6.1). The caller (worker-main) enables this ONLY when the child's
+   * decoded reference graph is funcref/null AND its guest
+   * `__wpk_fork_ref_decode_funcref` import was flipped to the module export.
+   * Requires module frame backing to already be enabled.
+   */
+  enableModuleReferenceReplay(): void {
+    this.requireIdle("enable fork-module reference replay");
+    if (!this.moduleBackend) {
+      throw new Error(
+        `${this.label}: fork-module reference replay needs module backing`,
+      );
+    }
+    this.moduleReferenceReplay = true;
+  }
 
   /**
    * Bind frame imports before the Wasm instance exists.
@@ -213,6 +284,7 @@ export class ForkProcessContinuationCoordinator {
     this.resumeTable.unregisterActivation(activationId);
     this.registry.unregisterActivation(activationId);
     this.activations.delete(activationId);
+    this.evictModuleActivation?.(activationId);
   }
 
   discardPreparedActivation(activationId: number): void {
@@ -226,11 +298,21 @@ export class ForkProcessContinuationCoordinator {
   }
 
   /**
-   * Imports bound to one activation but coordinated by the process journal.
+   * The host-owned import each activation still needs: the guest's
+   * `__wpk_fork_resume_table` funcref table.
+   *
+   * The co-resident Rust module owns the five per-frame/resume operations
+   * (`__wpk_fork_frame_{reserve,commit,peek,next}` + `__wpk_fork_resume_peek`);
+   * worker-main binds those directly to the module exports (or a per-activation
+   * trampoline for a dlopen fork). The resume TABLE itself, however, is a host
+   * `WebAssembly.Table` of guest resume thunks that must be an IMPORT (the
+   * module's `resume_peek` returns a slot INDEX into it), so it remains the
+   * irreducible host floor bound here. This replaced the JS
+   * `LinkedForkContinuation` frame closures + `ForkReplayEventJournal` that the
+   * Phase 4 point of no return deleted.
    */
   continuationImports(
     activationId: number,
-    onReservationAbort?: (errno: number) => void,
   ): Record<string, WebAssembly.ImportValue> {
     assertActivationId(activationId);
     const binding = this.prepared.get(activationId)
@@ -240,63 +322,7 @@ export class ForkProcessContinuationCoordinator {
         `${this.label}: fork activation ${activationId} has no continuation binding`,
       );
     }
-    const continuation = binding.continuation;
     return {
-      [WPK_FORK_FRAME_IMPORT_RESERVE]: (size: number | bigint) => {
-        const payload = continuation.reserveFrame(size);
-        if ((payload === 0 || payload === 0n) && onReservationAbort) {
-          onReservationAbort(continuation.abortErrno());
-        }
-        return payload;
-      },
-      [WPK_FORK_FRAME_IMPORT_COMMIT]: (payload: WasmGuestPointer): void => {
-        continuation.commitFrame(payload);
-        const functionOrdinal = this.readFunctionOrdinal(
-          payload,
-          continuation,
-          "committed",
-        );
-        this.events.recordCommit(activationId, functionOrdinal);
-      },
-      [WPK_FORK_FRAME_IMPORT_PEEK]: (size: number | bigint) => {
-        const event = this.requireSelectedEvent(activationId, "peek");
-        const payload = continuation.peekFrame(size);
-        const functionOrdinal = this.readFunctionOrdinal(
-          payload,
-          continuation,
-          "peeked",
-        );
-        if (functionOrdinal !== event.functionOrdinal) {
-          throw new Error(
-            `${this.label}: replay selected ${activationId}:${event.functionOrdinal}, `
-            + `but the frame belongs to ${activationId}:${functionOrdinal}`,
-          );
-        }
-        return payload;
-      },
-      [WPK_FORK_FRAME_IMPORT_NEXT]: (size: number | bigint) => {
-        const event = this.requireSelectedEvent(activationId, "consume");
-        // WHY: validate identity through the non-consuming path first. A bad
-        // activation/function coordinate must not advance the linked cursor
-        // and turn a deterministic launch failure into later child corruption.
-        const peeked = continuation.peekFrame(size);
-        const functionOrdinal = this.readFunctionOrdinal(
-          peeked,
-          continuation,
-          "consumed",
-        );
-        if (functionOrdinal !== event.functionOrdinal) {
-          throw new Error(
-            `${this.label}: replay selected ${activationId}:${event.functionOrdinal}, `
-            + `but the frame belongs to ${activationId}:${functionOrdinal}`,
-          );
-        }
-        const payload = continuation.nextFrame(size);
-        this.events.consume(activationId, functionOrdinal);
-        return payload;
-      },
-      [WPK_FORK_RESUME_IMPORT_PEEK]: (_typeDiagnostic: number): number =>
-        this.resumeTable.slotFor(this.events.peek()),
       [WPK_FORK_RESUME_IMPORT_TABLE]:
         this.resumeTable.table as unknown as WebAssembly.ImportValue,
     };
@@ -318,39 +344,8 @@ export class ForkProcessContinuationCoordinator {
         `${this.label}: cannot fork with ${this.prepared.size} incomplete activation(s)`,
       );
     }
-    this.events.beginCapture();
-    this.arena = arena;
-    this.replayOwnership = "owned";
-    try {
-      this.publishProcessLaunchRoot(0);
-      this.registry.beginCapture(arena);
-      this.phase = "capture";
-      for (const activation of this.orderedActivations()) {
-        const root = Number(activation.continuation.beginUnwind());
-        activation.root = root;
-        activation.replayRoot = root;
-        // WHY: the main Wasm activation need not be on a side-module fork
-        // stack. Every activation prefix therefore carries the process arena
-        // root, allowing the deterministic launch root chosen after unwind
-        // to come from any active module without an archive-private side slot.
-        writeForkModuleStateRoot(
-          this.memory,
-          root,
-          activation.continuation.format.ptrWidth,
-          arena.rootAddress(),
-        );
-        invokeForkContinuationBegin(
-          requireExportFunction(activation, "wpk_fork_unwind_begin"),
-          root,
-          activation.continuation.format.ptrWidth,
-          `${this.label}: activation ${activation.activationId} unwind`,
-        );
-        this.requireActivationState(activation, WPK_FORK_UNWINDING, "unwind");
-      }
-    } catch (error) {
-      this.cancelCapture();
-      throw error;
-    }
+    this.requireModuleBackend("begin process continuation capture");
+    this.beginModuleCapture(arena);
   }
 
   /**
@@ -359,55 +354,14 @@ export class ForkProcessContinuationCoordinator {
    */
   sealCapture(): void {
     this.requirePhase("capture", "seal process continuation capture");
-    this.events.sealCapture();
-    const active = this.events.capturedActivationIds();
-    try {
-      for (const activation of this.orderedActivations()) {
-        requireExportFunction(activation, "wpk_fork_unwind_end")();
-        this.requireActivationState(activation, WPK_FORK_NORMAL, "end unwind");
-        if (active.has(activation.activationId)) {
-          activation.continuation.finishUnwind();
-        } else {
-          activation.continuation.cancelUnwindAndRelease();
-          activation.root = 0;
-          activation.replayRoot = 0;
-        }
-      }
-      if (active.size === 0) {
-        throw new Error(`${this.label}: captured fork stack has no continuation frames`);
-      }
-      const continuations = this.orderedActivations()
-        .filter(({ activationId }) => active.has(activationId))
-        .map(({ activationId, root }) => ({
-          activationId,
-          root: BigInt(root),
-      }));
-      const arena = this.registry.currentArena();
-      arena.appendReplayEvents(this.events);
-      arena.appendActivationContinuations(continuations);
-      this.registry.sealCapture();
-      this.publishProcessLaunchRoot(
-        this.selectProcessLaunchRoot(continuations),
-      );
-      this.phase = "sealed-parent";
-    } catch (error) {
-      this.abort();
-      throw error;
-    }
+    this.requireModuleBackend("seal process continuation capture");
+    this.sealModuleCapture();
   }
 
   beginParentReplay(): void {
     this.requirePhase("sealed-parent", "begin parent process replay");
-    this.registry.beginParentReplay();
-    this.events.beginParentReplay();
-    this.phase = "parent-replay";
-    try {
-      this.registry.restoreModuleState();
-      this.beginActivationReplay(WPK_FORK_REWINDING);
-    } catch (error) {
-      this.abort();
-      throw error;
-    }
+    this.requireModuleBackend("begin parent process replay");
+    this.beginModuleParentReplay();
   }
 
   /**
@@ -429,62 +383,8 @@ export class ForkProcessContinuationCoordinator {
         `${this.label}: copied child replay requires an owned module-state arena`,
       );
     }
-    this.arena = arena;
-    this.replayOwnership = "owned";
-    try {
-      this.registry.attachChild(arena, decodedReferences);
-      // Imported immutable references may have forced a strict prefix of the
-      // recipe graph to be materialized while provider activations were still
-      // being instantiated. Adopt those exact identities after the full
-      // transaction validates the copied wire, but before module restore can
-      // request them again.
-      adoptPreinstantiatedReferences?.();
-      const records = arena.recordViews();
-      this.events.attachChild(replayEventsForChild(records));
-      const continuations = activationContinuationsForChild(
-        records,
-        arena.ptrWidth,
-      );
-      const copiedLaunchRoot = this.readProcessLaunchRoot();
-      const expectedLaunchRoot = this.selectProcessLaunchRoot(continuations);
-      if (copiedLaunchRoot !== expectedLaunchRoot) {
-        throw new Error(
-          `${this.label}: copied process launch root ${copiedLaunchRoot} `
-          + `does not match manifest root ${expectedLaunchRoot}`,
-        );
-      }
-      this.phase = "child-replay";
-      this.registry.restoreModuleState();
-      const roots = new Map(
-        continuations.map(({ activationId, root }) => [
-          activationId,
-          Number(root),
-        ]),
-      );
-      for (const activation of this.orderedActivations()) {
-        const root = roots.get(activation.activationId) ?? 0;
-        if (root === 0) {
-          activation.root = 0;
-          activation.replayRoot = 0;
-          continue;
-        }
-        if (!Number.isSafeInteger(root) || root <= 0) {
-          throw new Error(
-            `${this.label}: active child activation ${activation.activationId} `
-            + "has no copied continuation root",
-          );
-        }
-        activation.root = root;
-        activation.replayRoot = root;
-        activation.continuation.attachForReplay(
-          activation.continuation.format.ptrWidth === 8 ? BigInt(root) : root,
-        );
-      }
-      this.beginActivationReplay(WPK_FORK_REWINDING, false);
-    } catch (error) {
-      this.abort();
-      throw error;
-    }
+    this.requireModuleBackend("attach child process replay");
+    this.attachModuleChild(arena, adoptPreinstantiatedReferences, decodedReferences);
   }
 
   /**
@@ -500,82 +400,30 @@ export class ForkProcessContinuationCoordinator {
     adoptPreinstantiatedReferences?: () => void,
     decodedReferences?: DecodedSegmentedForkReferenceTransaction,
   ): void {
-    this.requirePhase("idle", "attach borrowed child process replay");
-    if (this.prepared.size !== 0) {
-      throw new Error(
-        `${this.label}: borrowed child has ${this.prepared.size} incomplete activation(s)`,
-      );
+    this.requireModuleBackend("attach borrowed child process replay");
+    // Route the vfork BORROWED replay through the co-resident module (frames +
+    // references), exactly as `attachModuleChild` does for a COW child — but
+    // reading the parent's borrowed continuation read-only and writing the
+    // guest's mutable prefix into a child-private region.
+    this.attachBorrowedModuleChild(
+      arena,
+      reservePrefix,
+      adoptPreinstantiatedReferences,
+      decodedReferences,
+    );
+  }
+
+  /**
+   * The errno recorded when abort-replay began (module path: the JS
+   * continuation is unrooted and cannot hold it). Valid only in the
+   * "abort-replay" phase.
+   */
+  abortErrno(): number {
+    this.requirePhase("abort-replay", "read abort errno");
+    if (this.#abortErrno === null) {
+      throw new Error(`${this.label}: no abort errno recorded`);
     }
-    if (arena.ownershipMode() !== "borrowed") {
-      throw new Error(
-        `${this.label}: borrowed child replay requires a borrowed module-state arena`,
-      );
-    }
-    this.arena = arena;
-    this.replayOwnership = "borrowed";
-    try {
-      this.registry.attachChild(arena, decodedReferences);
-      adoptPreinstantiatedReferences?.();
-      const records = arena.recordViews();
-      this.events.attachChild(replayEventsForChild(records));
-      const continuations = activationContinuationsForChild(
-        records,
-        arena.ptrWidth,
-      );
-      const parentLaunchRoot = this.readProcessLaunchRoot();
-      const expectedLaunchRoot = this.selectProcessLaunchRoot(continuations);
-      if (parentLaunchRoot !== expectedLaunchRoot) {
-        throw new Error(
-          `${this.label}: borrowed process launch root ${parentLaunchRoot} `
-          + `does not match manifest root ${expectedLaunchRoot}`,
-        );
-      }
-      this.phase = "child-replay";
-      this.registry.restoreModuleState();
-      const roots = new Map(
-        continuations.map(({ activationId, root }) => [
-          activationId,
-          Number(root),
-        ]),
-      );
-      for (const activation of this.orderedActivations()) {
-        const root = roots.get(activation.activationId) ?? 0;
-        if (root === 0) {
-          activation.root = 0;
-          activation.replayRoot = 0;
-          continue;
-        }
-        if (!Number.isSafeInteger(root) || root <= 0) {
-          throw new Error(
-            `${this.label}: active borrowed activation ${activation.activationId} `
-            + "has no parent continuation root",
-          );
-        }
-        const privatePrefix = reservePrefix({
-          activationId: activation.activationId,
-          byteLength: activation.continuation.format.fixedPrefixSize,
-          alignment: activation.continuation.format.alignment,
-        });
-        const replayRoot = Number(
-          activation.continuation.attachForBorrowedReplay(
-            activation.continuation.format.ptrWidth === 8 ? BigInt(root) : root,
-            privatePrefix,
-          ),
-        );
-        if (!Number.isSafeInteger(replayRoot) || replayRoot <= 0) {
-          throw new Error(
-            `${this.label}: borrowed activation ${activation.activationId} `
-            + "received an invalid private replay prefix",
-          );
-        }
-        activation.root = root;
-        activation.replayRoot = replayRoot;
-      }
-      this.beginActivationReplay(WPK_FORK_REWINDING, false);
-    } catch (error) {
-      this.abort();
-      throw error;
-    }
+    return this.#abortErrno;
   }
 
   /**
@@ -589,75 +437,57 @@ export class ForkProcessContinuationCoordinator {
     if (!Number.isInteger(errno) || errno <= 0) {
       throw new RangeError(`${this.label}: invalid fork abort errno ${errno}`);
     }
-    this.registry.beginParentReplay();
-    this.events.beginParentReplay();
-    this.phase = "abort-replay";
-    try {
-      this.registry.restoreModuleState();
-      for (const activation of this.activeActivations()) {
-        activation.continuation.beginAbortReplay(errno);
-        invokeForkContinuationBegin(
-          requireExportFunction(activation, "wpk_fork_abort_begin"),
-          activation.root,
-          activation.continuation.format.ptrWidth,
-          `${this.label}: activation ${activation.activationId} abort replay`,
-        );
-        this.requireActivationState(
-          activation,
-          WPK_FORK_ABORT_UNWINDING,
-          "begin abort replay",
-        );
-      }
-    } catch (error) {
-      this.abort();
-      throw error;
-    }
+    this.#abortErrno = errno;
+    this.requireModuleBackend("begin process abort replay");
+    this.beginModuleAbortReplay();
   }
 
   /**
-   * Turn a partially committed unwind into deterministic errno replay.
+   * Module-mode partial-capture abort — the mid-unwind sibling of the seal-time
+   * abort in `sealModuleCapture`.
    *
-   * A linked-continuation chunk allocation can fail from inside a generated
-   * frame postamble. JavaScript cannot return an errno through that postamble,
-   * so the null reservation asks the same activation stack to replay the
-   * already committed inner frames and return the allocation error from the
-   * original fork call. Every activation remains rooted until that replay
-   * reaches the leaf: an activation with no committed frame can still be an
-   * outer live caller whose runtime state must return to NORMAL.
+   * The Phase 6 D5 import flip binds the guest's `__wpk_fork_frame_reserve`
+   * straight to the module export, so a mid-unwind frame-allocation failure
+   * returns 0 to the guest. The worker-main reserve wrapper reads the module
+   * errno and calls this synchronously. The guest's reserve==0 contract
+   * (fork-instrument `__wpk_fork_select_unwind_frame`
+   * → the abort restart loop) EXPECTS the host to have ALREADY moved to abort
+   * replay synchronously inside that reserve call. This makes that true for the
+   * module path: seal the partial capture into `sealed-parent` (the module owns
+   * the journal), then run the SAME proven module abort-replay `beginAbortReplay`
+   * uses for a failed child launch — driving each activation's
+   * `wpk_fork_abort_begin` to `ABORT_UNWINDING`. When the guest's abort replay
+   * later re-enters `kernel_fork`, the coordinator is in `abort-replay`, the fork
+   * returns `-errno`, the parent is fully intact, and no child was launched.
+   *
+   * Unlike `sealModuleCapture` this does NOT drive the guest `wpk_fork_unwind_end`
+   * (the guest is mid-unwind) and does NOT serialize a journal image (no child).
    */
-  beginCaptureAbort(errno: number): void {
-    this.requirePhase("capture", "begin partial-capture abort replay");
+  beginModuleCaptureAbort(errno: number): void {
+    this.requirePhase("capture", "begin module partial-capture abort replay");
+    if (!this.moduleBackend) {
+      throw new Error(
+        `${this.label}: module partial-capture abort requires a module backend`,
+      );
+    }
     if (!Number.isInteger(errno) || errno <= 0) {
       throw new RangeError(`${this.label}: invalid fork abort errno ${errno}`);
     }
     try {
-      this.events.sealCapture();
-      this.registry.currentArena().appendReplayEvents(this.events);
+      // Seal the partial capture into "sealed-parent" WITHOUT the guest
+      // unwind-end drive or journal serialization. A failed reserve left no
+      // pending frame, so the committed chain is complete and seal-able.
+      this.moduleBackend.sealForAbort();
       this.registry.sealCapture();
-      this.registry.beginParentReplay();
-      this.events.beginParentReplay();
-      this.phase = "abort-replay";
-      for (const activation of this.orderedActivations()) {
-        // reserveFrame has already marked the failing continuation. Repeating
-        // the same errno is intentionally idempotent; the other activation
-        // owners need the identical replay cursor and failure result.
-        activation.continuation.beginAbortReplay(errno);
-        invokeForkContinuationBegin(
-          requireExportFunction(activation, "wpk_fork_abort_begin"),
-          activation.root,
-          activation.continuation.format.ptrWidth,
-          `${this.label}: activation ${activation.activationId} partial abort replay`,
-        );
-        this.requireActivationState(
-          activation,
-          WPK_FORK_ABORT_UNWINDING,
-          "begin partial abort replay",
-        );
-      }
+      this.publishProcessLaunchRoot(this.getActivation(0).root);
+      this.phase = "sealed-parent";
     } catch (error) {
       this.abort();
       throw error;
     }
+    // Reuse the proven module abort-replay path (drives `beginModuleAbortReplay`
+    // → `backend.beginAbort()` + `wpk_fork_abort_begin` on each activation).
+    this.beginAbortReplay(errno);
   }
 
   finishReplay(): void {
@@ -715,14 +545,11 @@ export class ForkProcessContinuationCoordinator {
   abort(): void {
     let failure: unknown;
     const borrowed = this.replayOwnership === "borrowed";
+    // The co-resident module owns all linked frames/journal storage, so the
+    // per-activation teardown is `moduleBackend.abort()` below. The host only
+    // clears each activation's recorded roots and (for an owned transaction)
+    // the process launch anchor.
     for (const activation of this.orderedActivations()) {
-      if (!activation.continuation.hasActiveContinuation()) continue;
-      try {
-        if (borrowed) activation.continuation.cancelBorrowedReplay();
-        else activation.continuation.cancelUnwindAndRelease();
-      } catch (error) {
-        failure ??= error;
-      }
       activation.root = 0;
       activation.replayRoot = 0;
     }
@@ -734,14 +561,16 @@ export class ForkProcessContinuationCoordinator {
       }
     }
     try {
-      this.events.abort();
-    } catch (error) {
-      failure ??= error;
-    }
-    try {
       this.registry.abort();
     } catch (error) {
       failure ??= error;
+    }
+    if (this.moduleBackend) {
+      try {
+        this.moduleBackend.abort();
+      } catch (error) {
+        failure ??= error;
+      }
     }
     try {
       this.releaseArena();
@@ -761,77 +590,653 @@ export class ForkProcessContinuationCoordinator {
     this.registry.clear();
   }
 
-  private beginActivationReplay(
-    expectedState: typeof WPK_FORK_REWINDING,
-    beginContinuation = true,
-  ): void {
-    for (const activation of this.activeActivations()) {
-      if (beginContinuation) activation.continuation.beginReplay();
-      invokeForkContinuationBegin(
-        requireExportFunction(activation, "wpk_fork_rewind_begin"),
-        activation.replayRoot,
-        activation.continuation.format.ptrWidth,
-        `${this.label}: activation ${activation.activationId} replay`,
-      );
-      this.requireActivationState(activation, expectedState, "begin replay");
+  // -- Module-backed branches (Phase 6 D5 step 4b/5) ---------------------
+  //
+  // These mirror the JS capture/seal/replay/finish structure but delegate the
+  // journal, frame storage, and resume-slot numbering to the co-resident
+  // fork-module. They run only for a QUALIFYING single-activation fork; the JS
+  // journal `this.events` stays idle (the module owns it) while the JS resume
+  // TABLE still backs the guest's `__wpk_fork_resume_table` funcref import.
+
+  private beginModuleCapture(arena: ForkModuleStateArena): void {
+    const backend = this.moduleBackend!;
+    this.arena = arena;
+    this.replayOwnership = "owned";
+    try {
+      this.publishProcessLaunchRoot(0);
+      this.registry.beginCapture(arena);
+      this.phase = "capture";
+      // Phase 6 D7a.1a: a dlopen fork has N activations. Activation 0 opens the
+      // module capture (`beginUnwind`); each side activation is added to the SAME
+      // capture with its own prefix (`addActivationUnwind`). Every activation's
+      // root is written into ITS module-state prefix and its guest instance is
+      // put into UNWINDING, exactly mirroring the JS path. Each activation's
+      // linked frame chunks are channel-mmap'd on demand by the module (Option
+      // B: dynamic, kernel-tracked `find_gap` placement), so a deep continuation
+      // grows without a fork-depth cap and a genuine exhaustion is a truthful
+      // `-ENOMEM`.
+      for (const activation of this.orderedActivations()) {
+        const root =
+          activation.activationId === 0
+            ? backend.beginUnwind()
+            : backend.addActivationUnwind(
+                activation.activationId,
+                activation.continuation.format.fixedPrefixSize,
+              );
+        activation.root = root;
+        activation.replayRoot = root;
+        writeForkModuleStateRoot(
+          this.memory,
+          root,
+          activation.continuation.format.ptrWidth,
+          arena.rootAddress(),
+        );
+        invokeForkContinuationBegin(
+          requireExportFunction(activation, "wpk_fork_unwind_begin"),
+          root,
+          activation.continuation.format.ptrWidth,
+          `${this.label}: activation ${activation.activationId} unwind (module)`,
+        );
+        this.requireActivationState(activation, WPK_FORK_UNWINDING, "unwind");
+      }
+    } catch (error) {
+      this.cancelCapture();
+      throw error;
     }
   }
 
-  private finishTransaction(abortReplay: boolean): void {
-    let failure: unknown;
-    const borrowed = this.replayOwnership === "borrowed";
-    if (borrowed && abortReplay) {
+  private sealModuleCapture(): void {
+    const backend = this.moduleBackend!;
+    try {
+      // Control-flow inversion: bind each activation's guest `wpk_fork_unwind_end`
+      // into the drive table, then seal the WHOLE capture in ONE module call
+      // (`sealCaptureAndSerialize`). It drives each activation's
+      // `wpk_fork_unwind_end()` (UNWINDING -> NORMAL) through the injected shim in
+      // ascending id order, then seals the writers + journal and serializes the
+      // child-inheritable image — replacing the former host per-activation
+      // `wpk_fork_unwind_end` loop + `fm_finish_unwind` + `fm_serialize_journal_alloc`.
+      // The per-activation NORMAL assertion moves to a single post-drive sweep
+      // below, exactly as `beginModuleParentReplay` sweeps state after its coarse
+      // drive.
+      for (const activation of this.orderedActivations()) {
+        backend.bindActivationSealDrive(
+          activation.activationId,
+          requireExportFunction(activation, "wpk_fork_unwind_end"),
+        );
+      }
+      // The module serializes its own journal (every activation's events, tagged)
+      // into a chunk it channel-mmaps itself (Option B), inherited verbatim by
+      // the child copy. No JS-wire REPLAY-EVENT records are written — the module
+      // owns the journal, so `this.events` is idle and there is no double-journal.
+      // The image no longer sits at a host-computed arena offset, so record its
+      // (ptr, len) in a `JournalImage` KFMS record for the child to find.
+      let journalImage;
+      try {
+        journalImage = backend.sealCaptureAndSerialize();
+      } catch (error) {
+        if (error instanceof ContinuationAllocationError) {
+          // SEAL-TIME TRUTHFUL FAILURE (Phase 2 carry / Phase 4): `fm_finish_unwind`
+          // already sealed every activation's frame writer + the process journal
+          // and the guest is back at NORMAL, but the module could not channel-mmap
+          // the child-inheritable journal-image chunk. Complete the seal to
+          // `sealed-parent` WITHOUT an image or manifest — no child will inherit
+          // them — so the completion handler can route this fork through the SAME
+          // truthful abort-replay path a mid-unwind reserve failure uses (parent
+          // preserved, `fork()` returns `-errno`, no child launched). This mirrors
+          // `beginModuleCaptureAbort`'s seal exactly. Do NOT tear the capture down;
+          // rethrow so the caller drives `beginAbortReplay`.
+          this.registry.sealCapture();
+          this.publishProcessLaunchRoot(this.getActivation(0).root);
+          this.phase = "sealed-parent";
+        }
+        throw error;
+      }
+      // Post-drive sweep: the coarse seal left every activation back at NORMAL;
+      // assert it exactly as the host per-activation unwind-end loop did (moved
+      // after the coarse drive, mirroring `beginModuleParentReplay`).
+      for (const activation of this.orderedActivations()) {
+        this.requireActivationState(activation, WPK_FORK_NORMAL, "end unwind");
+      }
+      this.registry.currentArena().appendJournalImage({
+        ptr: BigInt(journalImage.ptr),
+        len: BigInt(journalImage.len),
+      });
+      // Phase 6 D7a.1a: a multi-activation (dlopen) fork DOES write the
+      // activation-continuation manifest so the child can recover EACH side
+      // activation's inherited continuation anchor (activation 0's comes from the
+      // launch anchor, but sides have no other authority). The child decodes this
+      // record directly (`activationRootsFromChildArena`) — NOT through
+      // `activationContinuationsForChild`, which cross-checks the JS replay-event
+      // wire the module path deliberately omits. The KFLA dlopen archive stays
+      // the activation-order authority (the child's archived-vs-planner order
+      // assertion), and the module's own `fm_add_activation_child_replay` rebuilds
+      // and re-validates each activation's journal slice. A single-activation
+      // fork writes no manifest (the child reads the launch anchor), so it stays
+      // byte-identical.
+      const activations = this.orderedActivations();
+      if (activations.length > 1) {
+        const continuations = activations.map(({ activationId, root }) => ({
+          activationId,
+          root: BigInt(root),
+        }));
+        this.registry.currentArena().appendActivationContinuations(continuations);
+      }
+      this.registry.sealCapture();
+      this.publishProcessLaunchRoot(this.getActivation(0).root);
+      this.phase = "sealed-parent";
+    } catch (error) {
+      // The seal-time OOM route (above) intentionally completes the seal to
+      // `sealed-parent` before rethrowing so the caller can drive truthful
+      // abort-replay; do NOT tear that capture down. Every other seal failure
+      // leaves the phase pre-seal and must abort.
+      if (this.phase !== "sealed-parent") this.abort();
+      throw error;
+    }
+  }
+
+  private beginModuleParentReplay(): void {
+    const backend = this.moduleBackend!;
+    this.registry.beginParentReplay();
+    this.phase = "parent-replay";
+    try {
+      this.registry.restoreModuleState();
+      // Control-flow inversion: bind each activation's guest begin exports into
+      // the drive table, then drive the WHOLE parent REPLAY-begin phase in ONE
+      // module call (`parentReplay`). It attaches every activation's driver +
+      // registers its resume slots, then `call_indirect`s each guest
+      // `wpk_fork_rewind_begin(root)` in ascending id order — replacing the
+      // former host `fm_begin_replay` + per-activation begin loop. The module
+      // drives from each activation's stored `module_buffer`, which in the parent
+      // worker is exactly `replayRoot`.
+      for (const activation of this.orderedActivations()) {
+        backend.bindActivationBeginDrive(
+          activation.activationId,
+          requireExportFunction(activation, "wpk_fork_rewind_begin"),
+          requireExportFunction(activation, "wpk_fork_abort_begin"),
+        );
+      }
+      backend.parentReplay();
+      // The coarse drive left every activation in REWINDING; assert it exactly
+      // as the host per-activation loop did.
+      for (const activation of this.orderedActivations()) {
+        this.requireActivationState(activation, WPK_FORK_REWINDING, "begin replay");
+      }
+    } catch (error) {
+      this.abort();
+      throw error;
+    }
+  }
+
+  /**
+   * Module abort-replay begin (mirror of `beginModuleParentReplay`,
+   * abort-tagged). Abort replays the parent's already-committed frames from
+   * `activation.root` (not `replayRoot`, which only exists for a fresh
+   * child), matching the JS `beginAbortReplay` above.
+   */
+  private beginModuleAbortReplay(): void {
+    const backend = this.moduleBackend!;
+    this.registry.beginParentReplay();
+    this.phase = "abort-replay";
+    try {
+      this.registry.restoreModuleState();
+      // Control-flow inversion (mirror of `beginModuleParentReplay`,
+      // abort-tagged): bind each activation's begin exports, then drive the whole
+      // ABORT-replay-begin phase in ONE module call (`parentAbort`) — it runs the
+      // shared begin plus the `in_abort` pairing flag `finishAbort` asserts, then
+      // `call_indirect`s each guest `wpk_fork_abort_begin(root)` in ascending id
+      // order. Replaces the host `fm_begin_abort` + per-activation abort loop.
+      // Abort replays the parent's already-committed frames from each
+      // activation's `module_buffer` (== `root` in the parent worker).
+      for (const activation of this.orderedActivations()) {
+        backend.bindActivationBeginDrive(
+          activation.activationId,
+          requireExportFunction(activation, "wpk_fork_rewind_begin"),
+          requireExportFunction(activation, "wpk_fork_abort_begin"),
+        );
+      }
+      backend.parentAbort();
+      for (const activation of this.orderedActivations()) {
+        this.requireActivationState(
+          activation,
+          WPK_FORK_ABORT_UNWINDING,
+          "begin abort replay",
+        );
+      }
+    } catch (error) {
+      this.abort();
+      throw error;
+    }
+  }
+
+  private attachModuleChild(
+    arena: ForkModuleStateArena,
+    adoptPreinstantiatedReferences?: () => void,
+    decodedReferences?: DecodedSegmentedForkReferenceTransaction,
+  ): void {
+    const backend = this.moduleBackend!;
+    this.arena = arena;
+    this.replayOwnership = "owned";
+    try {
+      // When the co-resident module owns reference reconstruction, the registry
+      // constructs the module-backed reconstruction FLOOR (no JS engine) and
+      // sizes the shared transit from the module's resident decoded-graph node
+      // count. A module-backed FRAME fork whose references stayed on the JS path
+      // (`moduleReferenceReplay` false) keeps the JS reconstruction engine.
+      this.registry.attachChild(
+        arena,
+        decodedReferences,
+        this.moduleReferenceReplay ? () => backend.decodedNodeCount() : undefined,
+      );
+      adoptPreinstantiatedReferences?.();
+      // Activation 0's continuation root is the inherited launch anchor. Side
+      // activations (a dlopen fork) recover their inherited anchors from the
+      // activation-continuation manifest the parent wrote at seal.
+      const act0Root = this.readProcessLaunchRoot();
+      this.phase = "child-replay";
+      // Phase 6 D6.1/D7a.1b: seed the module's reference graph from the inherited
+      // KFMS arena BEFORE restoring module state, because `restoreModuleState`
+      // drives the guest's `wpk_fork_module_state_restore`, which reconstructs
+      // GLOBAL/TABLE funcref (and externref) state through the flipped
+      // `__wpk_fork_ref_decode_funcref` import — the module cannot resolve a
+      // recipe until its reference state exists, or it traps. (A single-activation
+      // program whose only references are frame LOCALS reconstructs them during
+      // the later rewind, so it never exercised this order; a dlopen fork whose
+      // side module bakes function pointers into its table does.) This one drive
+      // covers the WHOLE arena: every activation's KMFS records merge into one
+      // `SegmentedReferenceTransaction`, and the merged, activation-namespaced
+      // funcref catalog resolves each funcref against its own activation — so it is
+      // multi-activation (D7a.1b), whereas D7a.1a kept multi-activation references
+      // on the JS path. `enableModuleReferenceReplay` is the single host gate,
+      // set once the whole graph is admitted; externref resolution (PHASE A/B)
+      // must also precede restore so the still-JS externref decode reads the
+      // values the module rooted.
+      // Reconstruction-orchestration ENTRY: seed the module's reference graph
+      // AND build the whole topological drive plan in ONE module call
+      // (`restoreFromArena` = the collapsed `fm_begin_reference_replay` +
+      // `fm_build_gc_plan`). This moves the reference SEEDING + drive-order
+      // CONSTRUCTION into the module; the host then issues a single
+      // `driveRestoredPlan` inside `restoreModuleState`, rather than seeding here
+      // and rebuilding the plan inside the drive closure.
+      let restoredPlan: number | undefined;
+      if (this.moduleReferenceReplay) {
+        // Child-install ENTRY: `attachChild` seeds the reference graph, builds the
+        // topological reconstruction plan, AND appends the two-phase guest
+        // restore/finish install steps — one module call for the whole install.
+        restoredPlan = backend.attachChild(arena.rootAddress());
+      }
+      // P2 (Path B): when the module reference replay is active, the module's
+      // reference graph is seeded and its ATTACH drive plan built (`attachChild`
+      // above) and every participating activation's KFGC codec + the
+      // host-exception owner were seeded at worker init, so hand the WHOLE typed
+      // reconstruction AND the guest restore/finish install to the co-resident
+      // module. `restoreModuleState` invokes this delegate as the SOLE
+      // reconstructor: the module executes the entire pre-built `drive_plan` walk
+      // (static-root publish, EVERY externref transit publish, then the typed
+      // allocate/fill/exn order) and then the `DRIVE_OP_RESTORE` /
+      // `DRIVE_OP_FINISH_RESTORE` install steps, so no JS reconstruction OR JS
+      // restore/finish loop runs. A graph with no typed replay owner
+      // (funcref/externref-only frame locals) reconstructs through the flipped
+      // module decode imports and drives only the install steps. Flag-off children
+      // pass no delegate and keep the byte-identical JS drive + JS restore loop.
+      const typedDrive = this.moduleReferenceReplay
+        ? (): void => {
+            backend.driveRestoredPlan(restoredPlan!);
+          }
+        : undefined;
+      this.registry.restoreModuleState(typedDrive, this.moduleReferenceReplay);
+
+      const activations = this.orderedActivations();
+      const roots = new Map<number, number>([[0, act0Root]]);
+      if (activations.length > 1) {
+        for (const continuation of this.activationRootsFromChildArena()) {
+          const root = Number(continuation.root);
+          if (!Number.isSafeInteger(root) || root <= 0) {
+            throw new Error(
+              `${this.label}: module child activation ${continuation.activationId} `
+                + `manifest root ${continuation.root} is invalid`,
+            );
+          }
+          if (continuation.activationId === 0) {
+            if (root !== act0Root) {
+              throw new Error(
+                `${this.label}: module child activation 0 manifest root ${root} `
+                  + `disagrees with launch anchor ${act0Root}`,
+              );
+            }
+            continue;
+          }
+          roots.set(continuation.activationId, root);
+        }
+      }
+
+      // Seed activation 0's replay from the copied KFRE journal image, then add
+      // each side activation at its inherited continuation anchor. All seeding
+      // happens before any guest rewind drives a frame. Option B: the image was
+      // channel-mmap'd, so its location comes from the inherited `JournalImage`
+      // KFMS record, not a host-computed arena offset.
+      const journalImage = journalImageForChild(
+        this.registry.currentArena().recordViews(),
+        this.getActivation(0).continuation.format.ptrWidth,
+      );
+      const act0 = this.getActivation(0);
+      act0.root = act0Root;
+      act0.replayRoot = act0Root;
+      backend.beginChildReplay(
+        act0Root,
+        Number(journalImage.ptr),
+        Number(journalImage.len),
+      );
+      for (const activation of activations) {
+        if (activation.activationId === 0) continue;
+        const root = roots.get(activation.activationId);
+        if (root === undefined) {
+          throw new Error(
+            `${this.label}: module child activation ${activation.activationId} `
+              + "has no inherited continuation root",
+          );
+        }
+        activation.root = root;
+        activation.replayRoot = root;
+        backend.addActivationChildReplay(
+          activation.activationId,
+          root,
+          activation.continuation.format.fixedPrefixSize,
+        );
+      }
+
+      // Control-flow inversion (the child-worker mirror of
+      // `beginModuleParentReplay`): bind each activation's guest
+      // `wpk_fork_rewind_begin` into the drive table, then drive the WHOLE child
+      // rewind-begin phase in ONE module call (`childReconstruct`). The module
+      // builds the per-activation plan from each activation's stored
+      // `child_rewind_root` — which is exactly `activation.replayRoot` here (the
+      // inherited COW anchor, seeded above by `beginChildReplay` /
+      // `addActivationChildReplay`) — and `call_indirect`s each guest
+      // `wpk_fork_rewind_begin(root)` in ascending id order, replacing the former
+      // host per-activation loop. The abort-begin bind is unused on the child
+      // path but harmless (the child plan never drives it). The post-drive
+      // REWINDING assertion sweep is unchanged.
+      for (const activation of activations) {
+        backend.bindActivationBeginDrive(
+          activation.activationId,
+          requireExportFunction(activation, "wpk_fork_rewind_begin"),
+          requireExportFunction(activation, "wpk_fork_abort_begin"),
+        );
+      }
+      backend.childReconstruct();
+      for (const activation of activations) {
+        this.requireActivationState(activation, WPK_FORK_REWINDING, "begin replay");
+      }
+    } catch (error) {
+      this.abort();
+      throw error;
+    }
+  }
+
+  /**
+   * Decode the activation-continuation manifest a module-backed multi-activation
+   * parent wrote at seal, read from the child's inherited KFMS arena. This
+   * deliberately decodes the single `ActivationContinuations` record directly
+   * rather than going through `activationContinuationsForChild`, whose
+   * cross-check against the JS replay-event wire the module path omits (the
+   * module owns the journal). The KFLA dlopen archive remains the activation-set
+   * / order authority; the module re-validates each activation's journal slice.
+   */
+  /**
+   * The module-backed counterpart of `attachBorrowedChild` (Phase 6 item 4).
+   *
+   * A vfork BORROWED child shares the PARKED parent's memory, so unlike
+   * `attachModuleChild` (which reads a private COPY) it drives a READ-ONLY replay
+   * over the parent's live continuation and writes the guest's mutable module
+   * prefix into a CHILD-PRIVATE region from `reservePrefix`. The module owns no
+   * chunks, so `finishReplay`/`abort` release nothing and the parked parent's
+   * storage is never touched or unmapped. References are reconstructed through the
+   * module (not JS), exactly as the COW module path does.
+   *
+   * This slice supports a SINGLE activation (the common vfork case). A
+   * multi-activation borrowed child (dlopen-vfork "mode-1") is admitted only when
+   * the worker keeps it on the JS borrowed path; if one reaches here it fails
+   * loudly rather than silently mis-driving the parent's storage.
+   */
+  private attachBorrowedModuleChild(
+    arena: ForkModuleStateArena,
+    reservePrefix: ForkBorrowedReplayPrefixAllocator,
+    adoptPreinstantiatedReferences?: () => void,
+    decodedReferences?: DecodedSegmentedForkReferenceTransaction,
+  ): void {
+    const backend = this.moduleBackend!;
+    this.requirePhase("idle", "attach borrowed module child process replay");
+    if (this.prepared.size !== 0) {
+      throw new Error(
+        `${this.label}: borrowed child has ${this.prepared.size} incomplete activation(s)`,
+      );
+    }
+    if (arena.ownershipMode() !== "borrowed") {
+      throw new Error(
+        `${this.label}: borrowed child replay requires a borrowed module-state arena`,
+      );
+    }
+    this.arena = arena;
+    this.replayOwnership = "borrowed";
+    try {
+      // Same module-backed reconstruction floor as the COW module child (see
+      // `attachModuleChild`): the module sizes the transit from its resident
+      // decoded graph and drives the whole reconstruction. A JS-reference
+      // borrowed child (`moduleReferenceReplay` false) keeps the JS engine.
+      this.registry.attachChild(
+        arena,
+        decodedReferences,
+        this.moduleReferenceReplay ? () => backend.decodedNodeCount() : undefined,
+      );
+      adoptPreinstantiatedReferences?.();
+      // Activation 0's borrowed continuation anchor is the parent's launch root
+      // (the borrowed override returns `forkBufAddr`). Unlike the JS borrowed
+      // path, the module path does NOT cross-check against
+      // `activationContinuationsForChild`: the module owns the journal and omits
+      // the JS replay-event wire that helper reads, so it would find nothing (see
+      // `sealModuleCapture`). This mirrors `attachModuleChild`, which likewise
+      // trusts `readProcessLaunchRoot` for the single (activation 0) anchor.
+      const parentLaunchRoot = this.readProcessLaunchRoot();
+      if (!Number.isSafeInteger(parentLaunchRoot) || parentLaunchRoot <= 0) {
+        throw new Error(
+          `${this.label}: borrowed process launch root ${parentLaunchRoot} is invalid`,
+        );
+      }
+      const records = arena.recordViews();
+      this.phase = "child-replay";
+      // Reference reconstruction runs through the module (never a JS fallback),
+      // mirroring `attachModuleChild`: the child-install ENTRY seeds the reference
+      // graph, builds the reconstruction plan, AND appends the two-phase guest
+      // restore/finish install steps in ONE module call (`attachBorrowedChild`),
+      // then the module executes the whole plan via `driveRestoredPlan`. The
+      // install plan is identical to the COW path; only the child-private replay
+      // prefix (reserved below) is borrowed-specific.
+      let restoredPlan: number | undefined;
+      if (this.moduleReferenceReplay) {
+        restoredPlan = backend.attachBorrowedChild(arena.rootAddress());
+      }
+      const typedDrive = this.moduleReferenceReplay
+        ? (): void => {
+            backend.driveRestoredPlan(restoredPlan!);
+          }
+        : undefined;
+      this.registry.restoreModuleState(typedDrive, this.moduleReferenceReplay);
+
+      const activations = this.orderedActivations();
+      const journalImage = journalImageForChild(
+        records,
+        this.getActivation(0).continuation.format.ptrWidth,
+      );
+      // Side activations' borrowed anchors come from the manifest the parent
+      // wrote at seal (activation 0's is the launch root). A single-activation
+      // fork writes no manifest and needs none.
+      const roots = new Map<number, number>([[0, parentLaunchRoot]]);
+      if (activations.length > 1) {
+        for (const continuation of this.activationRootsFromChildArena()) {
+          const root = Number(continuation.root);
+          if (!Number.isSafeInteger(root) || root <= 0) {
+            throw new Error(
+              `${this.label}: borrowed module child activation `
+                + `${continuation.activationId} manifest root ${continuation.root} is invalid`,
+            );
+          }
+          if (continuation.activationId === 0) {
+            if (root !== parentLaunchRoot) {
+              throw new Error(
+                `${this.label}: borrowed module child activation 0 manifest root `
+                  + `${root} disagrees with launch anchor ${parentLaunchRoot}`,
+              );
+            }
+            continue;
+          }
+          roots.set(continuation.activationId, root);
+        }
+      }
+      // Reserve each activation's child-private mutable prefix. The module copies
+      // the parent's fixed prefix into it, so the guest's per-activation rewind
+      // writes its active-frame pointer there, never the parked parent's prefix.
+      // Reserve over `orderedActivations()` (every registered activation, roots
+      // not yet assigned at this point) — the same activation SET the parent
+      // sized `borrowedReplayWorkspaceRequirements` over, so the consumed total
+      // matches exactly (`assertAttachComplete`).
+      const privatePrefixes = new Map<number, number>();
+      for (const activation of activations) {
+        const prefix = Number(
+          reservePrefix({
+            activationId: activation.activationId,
+            byteLength: activation.continuation.format.fixedPrefixSize,
+            alignment: activation.continuation.format.alignment,
+          }),
+        );
+        if (!Number.isSafeInteger(prefix) || prefix <= 0) {
+          throw new Error(
+            `${this.label}: borrowed activation ${activation.activationId} received `
+              + "an invalid private replay prefix",
+          );
+        }
+        privatePrefixes.set(activation.activationId, prefix);
+      }
+      // Seed activation 0 from the inherited journal image, then add each side
+      // activation against the SAME journal, each at its own borrowed anchor and
+      // child-private prefix.
+      const act0 = this.getActivation(0);
+      act0.root = parentLaunchRoot;
+      act0.replayRoot = privatePrefixes.get(0)!;
+      backend.beginBorrowedChildReplay(
+        parentLaunchRoot,
+        Number(journalImage.ptr),
+        Number(journalImage.len),
+        act0.replayRoot,
+      );
+      for (const activation of activations) {
+        if (activation.activationId === 0) continue;
+        const root = roots.get(activation.activationId);
+        if (root === undefined) {
+          throw new Error(
+            `${this.label}: borrowed module child activation `
+              + `${activation.activationId} has no inherited continuation root`,
+          );
+        }
+        activation.root = root;
+        activation.replayRoot = privatePrefixes.get(activation.activationId)!;
+        backend.addActivationBorrowedChildReplay(
+          activation.activationId,
+          root,
+          activation.continuation.format.fixedPrefixSize,
+          activation.replayRoot,
+        );
+      }
+      // Control-flow inversion (mirror of `attachModuleChild`, borrowed): bind
+      // each activation's guest `wpk_fork_rewind_begin` into the drive table,
+      // then drive the WHOLE borrowed child rewind-begin phase in ONE module call
+      // (`childReconstruct`). The module builds the per-activation plan from each
+      // activation's stored `child_rewind_root` — which for a borrowed child is
+      // its child-PRIVATE prefix (== `activation.replayRoot` here, seeded above by
+      // `beginBorrowedChildReplay` / `addActivationBorrowedChildReplay`), so the
+      // guest's active-frame-pointer write lands in private scratch and never the
+      // parked parent's prefix. Replaces the former host per-activation rewind
+      // loop; the post-drive REWINDING assertion sweep is unchanged.
+      for (const activation of activations) {
+        backend.bindActivationBeginDrive(
+          activation.activationId,
+          requireExportFunction(activation, "wpk_fork_rewind_begin"),
+          requireExportFunction(activation, "wpk_fork_abort_begin"),
+        );
+      }
+      backend.childReconstruct();
+      for (const activation of activations) {
+        this.requireActivationState(activation, WPK_FORK_REWINDING, "begin replay");
+      }
+    } catch (error) {
+      this.abort();
+      throw error;
+    }
+  }
+
+  private activationRootsFromChildArena(): ReturnType<
+    typeof decodeForkActivationContinuations
+  > {
+    const records = this.registry.currentArena().recordViews();
+    const matches = records.filter(
+      (record) => record.kind === ForkModuleStateRecordKind.ActivationContinuations,
+    );
+    if (matches.length !== 1) {
+      throw new Error(
+        `${this.label}: module child expected one activation-continuation record, `
+          + `found ${matches.length}`,
+      );
+    }
+    return decodeForkActivationContinuations(
+      matches[0]!.payload,
+      `${this.label}: module activation continuations`,
+    );
+  }
+
+  private finishModuleTransaction(abortReplay: boolean): void {
+    // vfork/borrowed abort stays unsupported on the module path too (mirrors
+    // the JS-path guard in `finishTransaction`, which never reaches this
+    // method's body because it dispatches here first).
+    if (abortReplay && this.replayOwnership === "borrowed") {
       throw new Error(`${this.label}: borrowed child cannot own abort replay`);
     }
-    for (const activation of this.activeActivations()) {
+    let failure: unknown;
+    const backend = this.moduleBackend!;
+    const activations = this.orderedActivations();
+    const endExport = abortReplay ? "wpk_fork_abort_end" : "wpk_fork_rewind_end";
+    for (const activation of activations) {
       try {
-        requireExportFunction(
-          activation,
-          abortReplay ? "wpk_fork_abort_end" : "wpk_fork_rewind_end",
-        )();
+        requireExportFunction(activation, endExport)();
         this.requireActivationState(activation, WPK_FORK_NORMAL, "finish replay");
       } catch (error) {
         failure ??= error;
       }
     }
     try {
-      this.events.finishReplay();
+      if (abortReplay) backend.finishAbort();
+      else backend.finishReplay();
     } catch (error) {
       failure ??= error;
-      // The child journal may retain zero-copy views into the arena. Drop its
-      // cursor before the arena mappings are released even when replay ended
-      // early, or a later diagnostic could read recycled process memory.
-      this.events.abort();
     }
     try {
       this.registry.finishReplay();
     } catch (error) {
       failure ??= error;
     }
-    for (const activation of this.activeActivations()) {
-      try {
-        if (abortReplay) activation.continuation.finishAbortReplayAndRelease();
-        else if (borrowed) activation.continuation.finishBorrowedReplay();
-        else activation.continuation.finishReplayAndRelease();
-      } catch (error) {
-        failure ??= error;
-        if (borrowed && activation.continuation.hasActiveContinuation()) {
-          try {
-            activation.continuation.cancelBorrowedReplay();
-          } catch (cleanupError) {
-            failure ??= cleanupError;
-          }
-        }
-      }
+    for (const activation of activations) {
       activation.root = 0;
       activation.replayRoot = 0;
     }
-    if (!borrowed) {
-      try {
+    try {
+      // A BORROWED (vfork) module child must NEVER write the process launch-root
+      // word: that word lives in the PARKED parent's memory (the borrowed child
+      // shares it), so publishing 0 here would corrupt the parent's continuation
+      // anchor. The JS borrowed path guards this the same way (`finishTransaction`
+      // and `abort`); the module path must too.
+      if (this.replayOwnership !== "borrowed") {
         this.publishProcessLaunchRoot(0);
-      } catch (error) {
-        failure ??= error;
       }
+    } catch (error) {
+      failure ??= error;
     }
     try {
       this.releaseArena();
@@ -840,22 +1245,26 @@ export class ForkProcessContinuationCoordinator {
     }
     this.replayOwnership = null;
     this.phase = "idle";
+    this.#abortErrno = null;
     if (failure !== undefined) throw failure;
   }
 
+  private finishTransaction(abortReplay: boolean): void {
+    this.requireModuleBackend("finish process replay");
+    this.finishModuleTransaction(abortReplay);
+  }
+
   private cancelCapture(): void {
+    // Module-backed teardown of a capture that failed before seal. The co-resident
+    // module owns all frame/journal storage, so `moduleBackend.abort()` reclaims
+    // it; the host drives each guest instance still in UNWINDING back to NORMAL,
+    // clears the launch anchor, and releases the arena.
     let failure: unknown;
     for (const activation of this.orderedActivations()) {
-      if (!activation.continuation.hasActiveContinuation()) continue;
       try {
         if (activationState(activation) === WPK_FORK_UNWINDING) {
           requireExportFunction(activation, "wpk_fork_unwind_end")();
         }
-      } catch (error) {
-        failure ??= error;
-      }
-      try {
-        activation.continuation.cancelUnwindAndRelease();
       } catch (error) {
         failure ??= error;
       }
@@ -868,14 +1277,16 @@ export class ForkProcessContinuationCoordinator {
       failure ??= error;
     }
     try {
-      this.events.abort();
-    } catch (error) {
-      failure ??= error;
-    }
-    try {
       this.registry.abort();
     } catch (error) {
       failure ??= error;
+    }
+    if (this.moduleBackend) {
+      try {
+        this.moduleBackend.abort();
+      } catch (error) {
+        failure ??= error;
+      }
     }
     try {
       this.releaseArena();
@@ -888,40 +1299,16 @@ export class ForkProcessContinuationCoordinator {
   }
 
   private activeActivationIds(): Set<number> {
+    // The co-resident module owns the journal, so the active set is every
+    // activation whose continuation root was assigned (capture/seal writes
+    // roots; replay reads them from the KFMS manifest).
     const ids = new Set<number>();
-    const phase = this.events.phaseName();
-    if (phase === "capture" || phase === "sealed-parent") {
-      return this.events.capturedActivationIds();
-    }
-    // During replay, selecting every remaining event would mutate the journal.
-    // Activation roots came from the exact-set-validated KFMS manifest.
     for (const activation of this.activations.values()) {
       if (activation.root !== 0) {
         ids.add(activation.activationId);
       }
     }
     return ids;
-  }
-
-  private selectProcessLaunchRoot(
-    continuations: readonly {
-      activationId: number;
-      root: bigint;
-    }[],
-  ): number {
-    if (continuations.length === 0) {
-      throw new Error(`${this.label}: process continuation manifest is empty`);
-    }
-    const selected = continuations.find(({ activationId }) => activationId === 0)
-      ?? continuations[0]!;
-    const root = Number(selected.root);
-    if (!Number.isSafeInteger(root) || root <= 0) {
-      throw new RangeError(
-        `${this.label}: activation ${selected.activationId} launch root `
-        + `${selected.root} is not a safe guest address`,
-      );
-    }
-    return root;
   }
 
   private publishProcessLaunchRoot(
@@ -972,44 +1359,6 @@ export class ForkProcessContinuationCoordinator {
     );
   }
 
-  private requireSelectedEvent(
-    activationId: number,
-    operation: string,
-  ): ForkReplayEvent {
-    const event = this.events.peek();
-    if (!event) {
-      throw new Error(
-        `${this.label}: activation ${activationId} cannot ${operation}; `
-        + "the replay event stream is exhausted",
-      );
-    }
-    if (event.activationId !== activationId) {
-      throw new Error(
-        `${this.label}: activation ${activationId} cannot ${operation} frame for `
-        + `activation ${event.activationId}`,
-      );
-    }
-    return event;
-  }
-
-  private readFunctionOrdinal(
-    payload: WasmGuestPointer,
-    continuation: LinkedForkContinuation,
-    operation: string,
-  ): number {
-    const offset = checkedWasmGuestPointerOffset(
-      payload,
-      continuation.format.ptrWidth,
-      `${this.label}: ${operation} frame`,
-    );
-    if (offset > this.memory.buffer.byteLength - 4) {
-      throw new RangeError(
-        `${this.label}: ${operation} frame header escapes process memory`,
-      );
-    }
-    return new DataView(this.memory.buffer).getUint32(offset, true);
-  }
-
   private getActivation(activationId: number): CompleteForkProcessActivation {
     assertActivationId(activationId);
     const activation = this.activations.get(activationId);
@@ -1043,6 +1392,24 @@ export class ForkProcessContinuationCoordinator {
 
   private requireIdle(operation: string): void {
     this.requirePhase("idle", operation);
+  }
+
+  /**
+   * Assert the co-resident fork-module backs this fork (Phase 4 point of no
+   * return: the module is the ONLY capture/replay implementation — there is no
+   * JS continuation fallback). A missing backend is a loud programming error,
+   * never a silent JS route.
+   */
+  private requireModuleBackend(
+    operation: string,
+  ): ForkModuleContinuationBackend {
+    if (!this.moduleBackend) {
+      throw new Error(
+        `${this.label}: cannot ${operation}; the co-resident fork-module ` +
+          "backend is required (there is no JS continuation fallback)",
+      );
+    }
+    return this.moduleBackend;
   }
 
   private requirePhase(

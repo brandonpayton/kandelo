@@ -86,6 +86,11 @@ export interface BrowserKernelOptions {
   onProcessStderr?: (pid: number, data: Uint8Array) => void;
   /** Called for host-runtime diagnostics that are not guest stderr. */
   onHostDiagnostic?: (diagnostic: HostDiagnostic) => void;
+  /** Called for co-resident fork-module proof-of-use telemetry (frame/reference
+   *  reconstruction counts). This is an informational success signal, NOT a
+   *  problem, so it rides a channel separate from `onHostDiagnostic`; a caller
+   *  that does not opt in never sees a fork emit proof-of-use. */
+  onForkModuleProof?: (diagnostic: HostDiagnostic) => void;
   /** Called when a process requests a TCP listener (for service worker bridging) */
   onListenTcp?: (pid: number, fd: number, port: number) => void;
   /** Called when the service-worker HTTP bridge gains or completes preview requests. */
@@ -200,6 +205,20 @@ async function fetchDefaultBrowserKernelArtifact(
     "./browser-kernel-default-artifacts"
   );
   return fetch(browserKernelDefaultArtifactUrls[kind]).then((response) =>
+    response.arrayBuffer()
+  );
+}
+
+/**
+ * Phase 6 D5: fetch the wasm32 fork-module bytes from its optional bundler URL.
+ * Kept behind its own dynamic import so a default boot never requires the
+ * fork-module artifact (see `browser-fork-module-artifact`).
+ */
+async function fetchDefaultBrowserForkModule32(): Promise<ArrayBuffer> {
+  const { browserForkModule32ArtifactUrl } = await import(
+    "./browser-fork-module-artifact"
+  );
+  return fetch(browserForkModule32ArtifactUrl).then((response) =>
     response.arrayBuffer()
   );
 }
@@ -402,6 +421,12 @@ export class BrowserKernel {
     const closedLazyAssets = opts.closedLazyAssets === undefined
       ? undefined
       : snapshotClosedLazyAssets(opts.closedLazyAssets);
+    // The co-resident fork-module is the UNCONDITIONAL fork reconstructor on the
+    // browser V8 host too: fetch the wasm32 module bytes and ship them to the
+    // kernel worker, which compiles them once and hands the compiled module to
+    // every fork-instrumented process worker. There is no kill switch and no JS
+    // reference engine behind it.
+    const forkModuleBytes = await fetchDefaultBrowserForkModule32();
     // Create the kernel worker
     this.kernelWorkerHandle = new Worker(kernelWorkerEntryUrl, { type: "module" });
     this.workerStarted = true;
@@ -474,6 +499,7 @@ export class BrowserKernel {
         const initMsg: MainToKernelMessage = {
           type: "init",
           kernelWasmBytes: transferBuf,
+          ...(forkModuleBytes ? { forkModuleBytes } : {}),
           vfsImage: opts.vfsImage,
           lazyUrlBase: opts.lazyUrlBase,
           closedLazyAssets,
@@ -497,6 +523,9 @@ export class BrowserKernel {
           },
         };
         const transfer: Transferable[] = [transferBuf];
+        if (forkModuleBytes) {
+          transfer.push(forkModuleBytes);
+        }
         if (opts.takeVfsImageOwnership) {
           // WHY: this API is used at durable reboot boundaries where the main
           // thread has already hashed the image and will not reuse it. Transfer
@@ -1491,6 +1520,15 @@ export class BrowserKernel {
         break;
       case "host_diagnostic": {
         this.options.onHostDiagnostic?.({
+          pid: msg.pid,
+          source: msg.source,
+          message: msg.message,
+          ...(msg.status === undefined ? {} : { status: msg.status }),
+        });
+        break;
+      }
+      case "fork_module_proof": {
+        this.options.onForkModuleProof?.({
           pid: msg.pid,
           source: msg.source,
           message: msg.message,

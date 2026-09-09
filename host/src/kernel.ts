@@ -505,6 +505,13 @@ function signedI64FromWords(offsetLo: number, offsetHi: number): bigint {
     | intrinsicBigInt(offsetLo >>> 0);
 }
 
+/** Reconstruct an unsigned 64-bit value from two 32-bit words (both treated as
+ * unsigned). Used for rootfs `blob_id`/`offset`, which are never negative. */
+function u64FromWords(lo: number, hi: number): bigint {
+  return (intrinsicBigInt(hi >>> 0) << 32n)
+    | intrinsicBigInt(lo >>> 0);
+}
+
 interface IntrinsicBufferSourceSpan {
   buffer: ArrayBufferLike;
   byteOffset: number;
@@ -842,6 +849,31 @@ export class WasmPosixKernel {
   private signalWakeSab: SharedArrayBuffer | null = null;
   private programFuncTable: WebAssembly.Table | null = null;
   #kernelFuncTable: WebAssembly.Table | null = null;
+  /**
+   * Rootfs overlay content byte-leaf provider (Phase 5 Increment 2). The Rust
+   * kernel owns the `/` tree and asks the host only for a base file's immutable
+   * bytes, addressed by a manifest-assigned blob id. The provider fills `dest`
+   * from the leaf at `offset` and returns the count (or a negative errno). Wired
+   * by the worker from the boot manifest; until set, `host_blob_read` reports
+   * ENOSYS so the seam is truthfully unbacked.
+   */
+  #rootfsBlobProvider:
+    | ((blobId: bigint, offset: bigint, dest: Uint8Array) => number)
+    | undefined = undefined;
+  /**
+   * Rootfs raw-archive byte-store provider (Phase 5 Increment 3b). The Rust
+   * kernel owns `LazyMember` decode: it asks the host only for whole-archive
+   * bytes at `offset`, addressed by a manifest-assigned `archive_id` (a plain
+   * `u32`, unsplit at the Wasm boundary). The kernel decodes the zip central
+   * directory and extracts members itself; the host is purely a byte
+   * transport. The provider fills `dest` from the archive at `offset` and
+   * returns the count (or a negative errno). Wired by the worker from the
+   * boot manifest; until set, `host_fetch_archive` reports ENOSYS so the
+   * seam is truthfully unbacked.
+   */
+  #rootfsArchiveProvider:
+    | ((archiveId: number, offset: bigint, dest: Uint8Array) => number)
+    | undefined = undefined;
   private waitpidSab: SharedArrayBuffer | null = null;
   /**
    * A backend directory iterator may already have advanced before the host
@@ -868,7 +900,6 @@ export class WasmPosixKernel {
     token: object;
     handle: number | null;
   } | null = null;
-  isThreadWorker = false;
   /**
    * Live `/dev/fb0` mappings the kernel has reported via
    * `host_bind_framebuffer`. Renderers (canvas in browser, no-op in
@@ -932,6 +963,26 @@ export class WasmPosixKernel {
    */
   setProgramFuncTable(table: WebAssembly.Table): void {
     this.programFuncTable = table;
+  }
+
+  /**
+   * Install the rootfs overlay content byte-leaf provider (Phase 5 Increment 2).
+   * See {@link WasmPosixKernel.prototype} `#rootfsBlobProvider`.
+   */
+  setRootfsBlobProvider(
+    provider: (blobId: bigint, offset: bigint, dest: Uint8Array) => number,
+  ): void {
+    this.#rootfsBlobProvider = provider;
+  }
+
+  /**
+   * Install the rootfs raw-archive byte-store provider (Phase 5 Increment 3b).
+   * See {@link WasmPosixKernel.prototype} `#rootfsArchiveProvider`.
+   */
+  setRootfsArchiveProvider(
+    provider: (archiveId: number, offset: bigint, dest: Uint8Array) => number,
+  ): void {
+    this.#rootfsArchiveProvider = provider;
   }
 
   constructor(
@@ -1485,11 +1536,21 @@ export class WasmPosixKernel {
     return {
       env: {
         memory,
+        // Raw byte sink to this host's stderr: no added prefix, no added
+        // newline. Any prefix/newline is the Rust caller's responsibility
+        // (baked into the `&str` passed to `runtime_core::debug_log`), so
+        // Node/browser and native produce byte-for-byte identical output.
+        // Reuses the same callback/process/console fallback chain as the
+        // fd=2 (stderr) path in `#hostWriteAt`.
         host_debug_log: (ptr: KernelPointer, len: number): void => {
-          const msg = new TextDecoder().decode(
-            this.#readKernelBytes(ptr, len),
-          );
-          console.log(`[KERNEL] ${msg}`);
+          const data = this.#readKernelBytes(ptr, len);
+          if (this.callbacks.onStderr) {
+            this.callbacks.onStderr(data);
+          } else if (typeof process !== "undefined" && process.stderr) {
+            process.stderr.write(data);
+          } else {
+            console.error(new TextDecoder().decode(data));
+          }
         },
         host_open: (pathPtr: KernelPointer, pathLen: number, flags: number, mode: number): bigint => {
           return this.#hostOpen(pathPtr, pathLen, flags, mode);
@@ -1552,6 +1613,49 @@ export class WasmPosixKernel {
               ),
               offsetLo,
               offsetHi,
+            );
+          } catch {
+            return -14; // EFAULT
+          }
+        },
+        host_blob_read: (
+          blobIdLo: number,
+          blobIdHi: number,
+          bufPtr: KernelPointer,
+          bufLen: number,
+          offsetLo: number,
+          offsetHi: number,
+        ): number => {
+          try {
+            return this.#hostBlobRead(
+              u64FromWords(blobIdLo, blobIdHi),
+              u64FromWords(offsetLo, offsetHi),
+              this.#rustLentKernelDestination(
+                bufPtr,
+                bufLen,
+                "host_blob_read destination",
+              ),
+            );
+          } catch {
+            return -14; // EFAULT
+          }
+        },
+        host_fetch_archive: (
+          archiveId: number,
+          bufPtr: KernelPointer,
+          bufLen: number,
+          offsetLo: number,
+          offsetHi: number,
+        ): number => {
+          try {
+            return this.#hostFetchArchive(
+              archiveId,
+              u64FromWords(offsetLo, offsetHi),
+              this.#rustLentKernelDestination(
+                bufPtr,
+                bufLen,
+                "host_fetch_archive destination",
+              ),
             );
           } catch {
             return -14; // EFAULT
@@ -1846,6 +1950,25 @@ export class WasmPosixKernel {
             return negErrno(error);
           }
         },
+        // Workstream H4 (host-surface minimization): the network-interface
+        // ioctl content (interface table, MAC, ifreq/ifconf layout) is now
+        // kernel-owned (`crates/runtime-core/src/netif.rs`). This is the one
+        // remaining host-owned fact the kernel cannot compute itself.
+        host_network_local_address: (bufPtr: KernelPointer): number => {
+          const address = this.io.network?.localAddress;
+          if (address?.length !== 4) return 0;
+          try {
+            const destination = this.#rustLentKernelDestination(
+              bufPtr,
+              4,
+              "host_network_local_address destination",
+            );
+            this.#writeKernelBytes(destination, address);
+            return 1;
+          } catch {
+            return 0;
+          }
+        },
         host_utimensat: (
           pathPtr: KernelPointer, pathLen: number,
           atimeSec: bigint, atimeNsec: bigint, mtimeSec: bigint, mtimeNsec: bigint,
@@ -1944,9 +2067,6 @@ export class WasmPosixKernel {
         },
         host_futex_wake: (addr: KernelPointer, count: number): number => {
           return this.#hostFutexWake(addr, count);
-        },
-        host_is_thread_worker: (): number => {
-          return this.isThreadWorker ? 1 : 0;
         },
         // /dev/fb0 hooks: the kernel notifies the host when a process
         // maps or unmaps the framebuffer. The registry is purely
@@ -2621,6 +2741,109 @@ export class WasmPosixKernel {
       destination,
       signedI64FromWords(offsetLo, offsetHi),
     );
+  }
+
+  /**
+   * host_blob_read(blob_id, buf_ptr, buf_len, offset) -> i32
+   *
+   * Serve a rootfs base file's immutable bytes from the installed blob provider.
+   * Bytes are staged outside kernel memory and published once (never lend a live
+   * view of Rust-owned memory to the provider), mirroring `#hostReadAt`. Reports
+   * ENOSYS when no provider is installed (the seam is truthfully unbacked until
+   * the boot manifest wires it).
+   */
+  #hostBlobRead(
+    blobId: bigint,
+    offset: bigint,
+    destination: RustLentKernelDestination,
+  ): number {
+    const provider = this.#rootfsBlobProvider;
+    if (provider === undefined) {
+      return -38; // ENOSYS
+    }
+    const destinationCapacity = destination.capacity;
+    let staged: Uint8Array;
+    try {
+      staged = new IntrinsicUint8Array(destinationCapacity);
+    } catch {
+      return -12; // ENOMEM
+    }
+    let result: number;
+    try {
+      result = provider(blobId, offset, staged);
+    } catch {
+      return -5; // EIO: the provider violated its byte-source contract.
+    }
+    if (!Number.isSafeInteger(result) || result > destinationCapacity) {
+      return -5; // EIO
+    }
+    if (result < 0) {
+      return result; // provider-reported negative errno
+    }
+    if (result > 0) {
+      try {
+        this.#writeKernelBytes(
+          destination,
+          subarrayUint8Array(staged, 0, result),
+        );
+      } catch {
+        return -14; // EFAULT
+      }
+    }
+    return result;
+  }
+
+  /**
+   * host_fetch_archive(archive_id, buf_ptr, buf_len, offset) -> i32
+   *
+   * Serve raw whole-archive bytes from the installed archive provider. The
+   * host is a byte transport only: the Rust kernel decodes the zip central
+   * directory and extracts `LazyMember` bytes itself. `archiveId` is a plain
+   * `u32` (unsplit at the Wasm boundary, unlike `blobId`'s lo/hi split).
+   * Bytes are staged outside kernel memory and published once (never lend a
+   * live view of Rust-owned memory to the provider), mirroring
+   * `#hostBlobRead`. Reports ENOSYS when no provider is installed (the seam
+   * is truthfully unbacked until the boot manifest wires it).
+   */
+  #hostFetchArchive(
+    archiveId: number,
+    offset: bigint,
+    destination: RustLentKernelDestination,
+  ): number {
+    const provider = this.#rootfsArchiveProvider;
+    if (provider === undefined) {
+      return -38; // ENOSYS
+    }
+    const destinationCapacity = destination.capacity;
+    let staged: Uint8Array;
+    try {
+      staged = new IntrinsicUint8Array(destinationCapacity);
+    } catch {
+      return -12; // ENOMEM
+    }
+    let result: number;
+    try {
+      result = provider(archiveId, offset, staged);
+    } catch {
+      return -5; // EIO: the provider violated its byte-source contract.
+    }
+    if (!Number.isSafeInteger(result) || result > destinationCapacity) {
+      return -5; // EIO
+    }
+    if (result < 0) {
+      return result; // provider-reported negative errno
+    }
+    if (result > 0) {
+      try {
+        this.#writeKernelBytes(
+          destination,
+          subarrayUint8Array(staged, 0, result),
+        );
+      } catch {
+        return -14; // EFAULT
+      }
+    }
+    return result;
   }
 
   /**

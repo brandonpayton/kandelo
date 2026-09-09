@@ -256,6 +256,9 @@ describe("kernel task-ID authority", () => {
           return count;
         }),
         kernel_exec_target_cancel: vi.fn(() => 0),
+        // Kernel-owned shebang decode (Phase 6 D3): a real wasm target is not
+        // a script, so the export reports "not a script" with 0.
+        kernel_exec_target_shebang: vi.fn(() => 0),
       },
     });
     kernelBytes = new Uint8Array(emptyPath.kernelMemory.buffer);

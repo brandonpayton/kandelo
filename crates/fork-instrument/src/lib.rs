@@ -34,6 +34,7 @@ use wasmparser::{Parser, Payload};
 
 pub mod call_graph;
 pub mod contract_inventory;
+pub mod externref_provenance;
 pub mod instrument;
 pub mod legacy_eh;
 pub mod legacy_dlopen;
@@ -150,12 +151,28 @@ pub struct Options {
     /// every function import and unresolved reference dispatch becomes a
     /// possible cross-instance fork boundary.
     pub entry_import: String,
+
+    /// TEST-ONLY: force the emitted artifact's `__abi_version` export to this
+    /// instrumenter's compiled-in current [`ABI_VERSION`], overwriting a stale
+    /// marker or adding a missing one, regardless of side-module-ness.
+    ///
+    /// This exists solely so hand-authored fork-continuation test fixtures —
+    /// whose committed `.wat`/bytes declare a fixed historical ABI — can track
+    /// the current ABI epoch without regenerating the fixtures on every bump. It
+    /// stamps the CURRENT (correct) ABI, so it auto-tracks future bumps.
+    ///
+    /// Production build paths MUST leave this `false`: a real program gets
+    /// `__abi_version` from the libc syscall glue plus the linker export, and a
+    /// missing or mismatched marker on a real artifact is a genuine defect the
+    /// host must keep rejecting. See [`force_stamp_abi_version`].
+    pub stamp_abi_version: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             entry_import: "kernel.kernel_fork".into(),
+            stamp_abi_version: false,
         }
     }
 }
@@ -240,6 +257,45 @@ fn ensure_side_module_abi_version(module: &mut walrus::Module, input: &[u8]) -> 
     let function = builder.finish(Vec::new(), &mut module.funcs);
     module.exports.add("__abi_version", function);
     Ok(())
+}
+
+/// TEST-ONLY: force the module's `__abi_version` export to the instrumenter's
+/// compiled-in current [`ABI_VERSION`], overwriting a stale marker or adding a
+/// missing one, regardless of side-module-ness.
+///
+/// Unlike [`ensure_side_module_abi_version`], this never fails on a stale marker
+/// and never restricts itself to side modules — it unconditionally rewrites the
+/// marker to the current epoch. It is wired only through
+/// [`Options::stamp_abi_version`], which the `wasm-fork-instrument` CLI exposes
+/// as the deliberately test-scoped `--stamp-abi-version` flag.
+///
+/// WHY this must never run in a production build path: a real program's
+/// `__abi_version` is baked in by the libc syscall glue and the linker export,
+/// so a missing or mismatched marker on a real artifact signals a genuine
+/// toolchain defect the host must keep rejecting. Force-stamping there would
+/// convert that truthful failure into a convenient illusion. The only sanctioned
+/// caller is hand-authored fork-continuation test fixtures, whose committed
+/// `.wat`/bytes declare a fixed historical ABI that would otherwise go stale on
+/// every ABI bump.
+fn force_stamp_abi_version(module: &mut walrus::Module) {
+    // Drop any existing `__abi_version` export first so we never emit a module
+    // with two exports of the same name. Leave the old function body in place as
+    // harmless dead code so no other section's function indices shift.
+    let stale_exports: Vec<_> = module
+        .exports
+        .iter()
+        .filter(|export| export.name == "__abi_version")
+        .map(|export| export.id())
+        .collect();
+    for id in stale_exports {
+        module.exports.delete(id);
+    }
+
+    let mut builder = FunctionBuilder::new(&mut module.types, &[], &[ValType::I32]);
+    builder.name("__abi_version".into());
+    builder.func_body().i32_const(ABI_VERSION as i32);
+    let function = builder.finish(Vec::new(), &mut module.funcs);
+    module.exports.add("__abi_version", function);
 }
 
 fn fork_boundary_seeds(
@@ -333,6 +389,14 @@ pub fn instrument(input: &[u8], opts: &Options) -> Result<Vec<u8>> {
         reaching.tail_call_landings,
     );
     instrument::validate_activation_state_with_targets(&module, &fork_path, &fork_path_targets)?;
+
+    // N1-F5 Task 1: wrap every externref-returning host-import call site
+    // with a mint-time provenance-recording import (FLOOR-1 capture
+    // primitive; see `externref_provenance` module docs). This must run
+    // before any later pass injects its own imports or local functions, so
+    // it sees only the guest's original import surface and cannot mistake
+    // its own generated wrapper/import for a production site.
+    externref_provenance::inject_provenance_wrappers(&mut module)?;
 
     // The five wpk_fork_* exports prove only that some instrumentation runtime
     // was injected. They do not prove which import seeded the transformed call
@@ -495,6 +559,13 @@ pub fn instrument(input: &[u8], opts: &Options) -> Result<Vec<u8>> {
     // phases are folded into `instrument::instrument_functions` itself;
     // see `instrument_one_function_switch` / `instrument_one_function_nested_switch`
     // for the actual transform.
+
+    // TEST-ONLY: rewrite the ABI marker to this instrumenter's current epoch when
+    // requested, after every transform and just before emission. See
+    // `Options::stamp_abi_version` / `force_stamp_abi_version`.
+    if opts.stamp_abi_version {
+        force_stamp_abi_version(&mut module);
+    }
 
     let output = module.emit_wasm();
     restore_leading_dylink_section(input, output)

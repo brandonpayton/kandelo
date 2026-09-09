@@ -40,6 +40,15 @@ const C_TEST_FIXTURES = [
     out: join(fixturesDir, "fork-memory-clone.wasm"),
     forkInstrument: true,
   },
+  {
+    // Deep-fork fixture for the module-owned growing frame allocator: grows its
+    // heap via a big malloc (tracked SYS_mmap) and forks from a deep linked
+    // continuation, so fork-time continuation frames grow uncapped past the old
+    // 2 MiB Fix X arena and still place coherently above the live heap.
+    src: join(fixturesDir, "malloc-deep-fork.c"),
+    out: join(fixturesDir, "malloc-deep-fork.wasm"),
+    forkInstrument: true,
+  },
 ];
 
 /** Program fixtures resolved through the normal local-binaries contract. */
@@ -66,6 +75,17 @@ const RESOLVED_PROGRAM_FIXTURES = [
     out: join(
       repoRoot,
       "local-binaries/programs/wasm32/scm-rights-semantics.wasm",
+    ),
+  },
+  {
+    // Recompiled from source so the H1 (no-grow) and M2 (close-after-mmap
+    // writeback survives) checks added for the fd-writeback bridge are always
+    // exercised against the current source, not a stale prebuilt binary.
+    arch: "wasm32",
+    src: join(repoRoot, "programs/mmap_shared_test.c"),
+    out: join(
+      repoRoot,
+      "local-binaries/programs/wasm32/mmap_shared_test.wasm",
     ),
   },
   {
@@ -146,11 +166,36 @@ const WAT_FIXTURES = [
   "wasi-scalar-abi.wat",
 ];
 
+/**
+ * Toolchain inputs whose change must force every compiled fixture to rebuild.
+ * The syscall glue and the built libc are compiled into (or linked with) every
+ * program, so a glue/libc edit that does not touch the test source would
+ * otherwise leave stale `.wasm` fixtures behind an mtime-only cache.
+ */
+const FIXTURE_TOOLCHAIN_INPUTS = [
+  join(repoRoot, "libc/glue/channel_syscall.c"),
+  join(repoRoot, "sysroot/lib/libc.a"),
+  join(repoRoot, "sysroot64/lib/libc.a"),
+];
+
+function newestToolchainMtimeMs(): number {
+  let newest = 0;
+  for (const input of FIXTURE_TOOLCHAIN_INPUTS) {
+    if (existsSync(input)) {
+      newest = Math.max(newest, statSync(input).mtimeMs);
+    }
+  }
+  return newest;
+}
+
 function needsRebuild(srcFile: string, outFile: string): boolean {
   if (!existsSync(outFile)) return true;
   const srcStat = statSync(srcFile);
   const outStat = statSync(outFile);
-  return srcStat.mtimeMs > outStat.mtimeMs;
+  if (srcStat.mtimeMs > outStat.mtimeMs) return true;
+  // Rebuild when the syscall glue or libc is newer than the artifact: those
+  // are compiled/linked into every program but are not the test source.
+  return newestToolchainMtimeMs() > outStat.mtimeMs;
 }
 
 function compileCTestProgram(
@@ -203,6 +248,9 @@ function fixtureBuildContract(
     join(repoRoot, "sdk/package.json"),
     join(repoRoot, "sdk/package-lock.json"),
     join(repoRoot, arch === "wasm64" ? "sysroot64" : "sysroot"),
+    // The syscall glue is compiled per-program from libc/glue (not from the
+    // sysroot), so a glue-only edit must still invalidate the fixture cache.
+    join(repoRoot, "libc/glue"),
   ];
   if (forkInstrumented) {
     const configuredTool = process.env.WASM_POSIX_FORK_INSTRUMENT;

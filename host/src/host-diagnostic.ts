@@ -14,3 +14,15 @@ export interface HostDiagnostic {
 export interface HostDiagnosticMessage extends HostDiagnostic {
   type: "host_diagnostic";
 }
+
+/**
+ * Co-resident fork-module proof-of-use telemetry (frame/reference reconstruction
+ * counts). This is an INFORMATIONAL success signal, NOT a host problem: it rides
+ * a channel separate from `HostDiagnosticMessage` so that a clean fork never
+ * pollutes the problem-diagnostic stream a caller inspects for failures. Only
+ * a consumer that explicitly opts in (`onForkModuleProof`) receives it; ordinary
+ * hosts and tests never see a fork emit proof-of-use as a diagnostic.
+ */
+export interface ForkModuleProofMessage extends HostDiagnostic {
+  type: "fork_module_proof";
+}

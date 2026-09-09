@@ -21,11 +21,15 @@ export function browserRepositoryAliases(repoRoot) {
  */
 export const browserKernelModuleSpecifier = "@kernel-wasm";
 export const browserRootfsModuleSpecifier = "@rootfs-vfs";
+// Phase 6 D5: the co-resident wasm32 fork-module, supplied as URL bytes so the
+// kernel host can ship it to process workers behind WASM_POSIX_FORK_MODULE.
+export const browserForkModule32ModuleSpecifier = "@fork-module32-wasm";
 export const browserPagesVfsProductsModuleSpecifier =
   "virtual:kandelo-pages-vfs-products";
 
 export const browserVirtualModuleCapabilities = Object.freeze({
   [browserKernelModuleSpecifier]: "kernel-wasm",
+  [browserForkModule32ModuleSpecifier]: "fork-module32-wasm",
   [browserPagesVfsProductsModuleSpecifier]: "pages-vfs-products",
   [browserRootfsModuleSpecifier]: "rootfs-vfs",
 });

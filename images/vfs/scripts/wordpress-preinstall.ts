@@ -18,7 +18,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { NodeKernelHost, type NodeKernelHostOptions } from "../../../host/src/node-kernel-host";
-import { resolveBinary } from "../../../host/src/binary-resolver";
+import { findRepoRoot, resolveBinary } from "../../../host/src/binary-resolver";
 import type { MemoryFileSystem } from "../../../host/src/vfs/memory-fs";
 import {
   ensureDirRecursive,
@@ -253,6 +253,13 @@ async function withKernelSession(
       ...(hostDataDir ? [{ mountPoint: "/data", hostPath: hostDataDir }] : []),
     ],
     rootfsImage: imageBytes,
+    // MariaDB and PHP both fork, so this build-time boot exercises the
+    // co-resident fork module — the unconditional fork reconstructor the kernel
+    // worker ships to every process worker. Inject the staged artifact
+    // explicitly (like the kernel below): this boot runs under the source-only
+    // resolution policy with no source-only binary root, so the kernel worker
+    // resolving the fork module through the binary resolver would fail.
+    forkModuleBytesByWidth: { 4: loadStagedForkModule32() },
     onStdout: (_pid, data) => {
       activeStdoutSink?.(new Uint8Array(data));
     },
@@ -340,6 +347,20 @@ async function withKernelSession(
 function loadProgram(binaryId: string): ArrayBuffer {
   const bytes = readFileSync(resolveBinary(binaryId));
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+/**
+ * Read the wasm32 co-resident fork module from its repo-staged location. The
+ * fork module is built out-of-band by `crates/fork-module/build-wasm.sh` (the
+ * local-build engine runs it before any package build) and staged into both
+ * `local-binaries/` and `host/wasm/`; it is not a registry package, so there is
+ * no `WASM_POSIX_DEP_*_DIR` for it. Loading the staged artifact directly keeps
+ * this build-time boot independent of the source-only program projection, which
+ * is not finalized mid-build.
+ */
+function loadStagedForkModule32(): Uint8Array {
+  const repoRoot = findRepoRoot();
+  return new Uint8Array(readFileSync(join(repoRoot, "host/wasm/fork_module32.wasm")));
 }
 
 function exactProgramBuffer(bytes: Uint8Array, label: string): ArrayBuffer {

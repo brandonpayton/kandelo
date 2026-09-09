@@ -12,6 +12,7 @@ extern crate wasm_posix_shared;
 
 pub mod audio;
 pub mod blocked_retry;
+pub mod channel_record_decode;
 pub mod channel_result;
 pub mod channel_scratch;
 pub mod credentials;
@@ -28,6 +29,7 @@ pub mod lock;
 pub mod memory;
 pub mod mouse;
 pub mod mqueue;
+pub mod netif;
 pub mod ofd;
 pub mod path;
 pub mod complete_copy;
@@ -39,16 +41,20 @@ pub mod process_wire;
 pub mod procfs;
 pub mod pshared;
 pub mod pty;
+pub mod rootfs;
 pub mod scratch_alloc;
+pub mod sffs;
 pub mod signal;
 pub mod socket;
 pub mod socket_wire;
 pub mod spawn;
 pub mod syscalls;
 pub mod terminal;
+pub mod tmpfs;
 pub mod transfer;
 pub mod unix_socket;
 pub mod wakeup;
+pub mod zip;
 
 // The engine-agnostic capability contract. `HostCapabilities` is the forward
 // name for the Rust-first design; `HostIO` is kept as the primary name to

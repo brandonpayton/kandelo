@@ -25,6 +25,7 @@ import {
   WAIT_WNOHANG,
 } from "../src/generated/abi";
 import { installKernelWorkerTestScratch } from "./kernel-worker-test-scratch";
+import { mockKernelSpawnBlobDecode } from "./support/spawn-blob-decode-mock";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const candidateA = new Uint8Array(
@@ -181,6 +182,40 @@ describe("posix_spawn credential/action/target order", () => {
       return count;
     });
     exports.kernel_exec_target_cancel = cancelTarget;
+    // Faithful kernel-owned shebang decode (Phase 6 D3): the script target
+    // yields its interpreter line; the interpreter target is a real wasm.
+    exports.kernel_exec_target_shebang = vi.fn((
+      _ownerPid: number,
+      target: number,
+      outPtr: number,
+      outLen: number,
+    ): number => {
+      const bytes = bytesForTarget(target);
+      if (!(bytes[0] === 0x23 && bytes[1] === 0x21)) return 0; // not `#!`
+      let end = 2;
+      while (end < bytes.length && bytes[end] !== 0x0a) end++;
+      const line = new TextDecoder().decode(bytes.subarray(2, end)).trim();
+      const sep = line.indexOf(" ");
+      const interpreter = sep === -1 ? line : line.slice(0, sep);
+      const argument = sep === -1 ? "" : line.slice(sep + 1).trim();
+      const encoder = new TextEncoder();
+      const interpreterBytes = encoder.encode(interpreter);
+      const argumentBytes = encoder.encode(argument);
+      const total = 9 + interpreterBytes.byteLength + argumentBytes.byteLength;
+      if (total > outLen) return -75; // -EOVERFLOW
+      const view = new DataView(kernelMemory.buffer, outPtr, outLen);
+      view.setUint8(0, argument.length > 0 ? 1 : 0);
+      view.setUint32(1, interpreterBytes.byteLength, true);
+      view.setUint32(5, argumentBytes.byteLength, true);
+      new Uint8Array(kernelMemory.buffer, outPtr + 9, interpreterBytes.byteLength)
+        .set(interpreterBytes);
+      new Uint8Array(
+        kernelMemory.buffer,
+        outPtr + 9 + interpreterBytes.byteLength,
+        argumentBytes.byteLength,
+      ).set(argumentBytes);
+      return total;
+    });
     const harness = createSpawnHarness({
       kernelMemory,
       callbacks: { onSpawn },
@@ -689,6 +724,7 @@ function preparedSpawnExports(options: {
 }): Record<string, any> {
   const cwd = new TextEncoder().encode("/after-actions");
   return {
+    kernel_spawn_blob_decode: mockKernelSpawnBlobDecode(options.kernelMemory),
     kernel_spawn_process: options.spawnProcess,
     kernel_spawn_exec_target_prepare: options.prepareTarget,
     kernel_exec_target_size: vi.fn(() => BigInt(options.targetBytes.byteLength)),
@@ -710,6 +746,10 @@ function preparedSpawnExports(options: {
       return count;
     }),
     kernel_exec_target_cancel: vi.fn(() => 0),
+    // The shared prepared-target launcher (Phase 6 D3) decodes the interpreter
+    // line in the kernel; a real wasm program is not a script, so the export
+    // reports "not a script" with 0.
+    kernel_exec_target_shebang: vi.fn(() => 0),
     kernel_publish_spawn_child: vi.fn(() => -1),
     kernel_spawn_exec_commit: options.commitTarget,
     kernel_get_cwd: vi.fn((_pid: number, destination: number, capacity: number) => {

@@ -1,0 +1,24 @@
+[package]
+name = "fork-module-inject"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Host-only post-build tool for the fork-module (Phase 6 D6.1). Rust has no
+# native `funcref` type and cannot emit a function that returns `(ref func)` from
+# a `table.get`, so the fork-module's `__wpk_fork_ref_decode_funcref` export —
+# whose whole job is to hand the guest a real funcref reconstructed from the
+# imported function catalog table — cannot be written in Rust. This tool injects
+# that ONE small wasm function into the compiled fork-module, wiring it to the
+# module's Rust `fm_funcref_ordinal` helper (which does the recipe->ordinal
+# lookup) and to a newly imported `env.__wpk_fork_function_catalog` funcref
+# table. See `crates/fork-module/build-wasm.sh`.
+[[bin]]
+name = "fork-module-inject"
+path = "src/main.rs"
+
+[dependencies]
+# The same typed-wasm-IR crate the fork-instrument transforms use; it preserves
+# the fork-module's `dylink.0` PIC custom section across the round trip.
+walrus = "0.26.4"
+anyhow = "1"

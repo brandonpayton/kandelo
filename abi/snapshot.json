@@ -1,5 +1,5 @@
 {
-  "abi_version": 43,
+  "abi_version": 44,
   "channel_buffers": {
     "data_offset": 72,
     "data_size": 65536,
@@ -47,7 +47,7 @@
     "request_flags": {
       "cancellation_point": 1,
       "cancellation_wake_allowed": 2,
-      "known_mask": 7
+      "known_mask": 15
     },
     "size": 72
   },
@@ -939,6 +939,10 @@
     {
       "name": "Error",
       "number": 3
+    },
+    {
+      "name": "Teardown",
+      "number": 4
     }
   ],
   "custom_sections": [
@@ -976,7 +980,7 @@
   },
   "host_adapter": {
     "manifest": {
-      "abi_version": 43,
+      "abi_version": 44,
       "channel_data_offset": 72,
       "channel_data_size": 65536,
       "channel_header_size": 72,
@@ -1065,6 +1069,7 @@
       "kernel_exec_target_cancel",
       "kernel_exec_target_prepare",
       "kernel_exec_target_read",
+      "kernel_exec_target_shebang",
       "kernel_exec_target_size",
       "kernel_fork_process",
       "kernel_get_cwd",
@@ -1113,6 +1118,7 @@
       "kernel_set_current_tid",
       "kernel_set_cwd",
       "kernel_shmid_ds_bytes",
+      "kernel_spawn_blob_decode",
       "kernel_spawn_exec_commit",
       "kernel_spawn_exec_target_prepare",
       "kernel_spawn_process",
@@ -1698,6 +1704,30 @@
       "wasm32Size": 4,
       "wasm64Size": 4
     },
+    "35088": {
+      "argKind": "pointer",
+      "direction": "inout",
+      "wasm32Size": 32,
+      "wasm64Size": 40
+    },
+    "35093": {
+      "argKind": "pointer",
+      "direction": "inout",
+      "wasm32Size": 32,
+      "wasm64Size": 40
+    },
+    "35111": {
+      "argKind": "pointer",
+      "direction": "inout",
+      "wasm32Size": 32,
+      "wasm64Size": 40
+    },
+    "35123": {
+      "argKind": "pointer",
+      "direction": "inout",
+      "wasm32Size": 32,
+      "wasm64Size": 40
+    },
     "64": {
       "argKind": "pointer",
       "direction": "in",
@@ -1999,6 +2029,16 @@
       "kind": "func",
       "name": "kernel_exec_target_read",
       "signature": "(i32,i32,i32,i32,i32,i32) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_exec_target_resolve_shebang",
+      "signature": "(i32,i32,i32,i32) -> (i64)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_exec_target_shebang",
+      "signature": "(i32,i32,i32,i32) -> (i32)"
     },
     {
       "kind": "func",
@@ -2612,6 +2652,21 @@
     },
     {
       "kind": "func",
+      "name": "kernel_network_ifconf_size",
+      "signature": "(i32) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_network_ifconf_write",
+      "signature": "(i32,i32,i32) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_network_ifreq_size",
+      "signature": "(i32) -> (i32)"
+    },
+    {
+      "kind": "func",
       "name": "kernel_open",
       "signature": "(i32,i32,i32,i32) -> (i32)"
     },
@@ -2892,6 +2947,36 @@
     },
     {
       "kind": "func",
+      "name": "kernel_rootfs_export_tree",
+      "signature": "(i32,i32,i32,i32) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_rootfs_load_manifest",
+      "signature": "(i32,i32) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_rootfs_read_file",
+      "signature": "(i32,i32,i32,i32,i32,i32) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_rootfs_set_foreign_prefixes",
+      "signature": "(i32,i32) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_rootfs_stat_mode",
+      "signature": "(i32,i32) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_rootfs_write_file",
+      "signature": "(i32,i32,i32,i32,i32,i32,i32,i32) -> (i32)"
+    },
+    {
+      "kind": "func",
       "name": "kernel_rt_sigtimedwait",
       "signature": "(i32,i32,i32) -> (i32)"
     },
@@ -2992,7 +3077,27 @@
     },
     {
       "kind": "func",
+      "name": "kernel_set_rootfs_enabled",
+      "signature": "(i32) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_set_rootfs_nosuid",
+      "signature": "(i32) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_set_rootfs_now",
+      "signature": "(i32,i32,i32) -> (i32)"
+    },
+    {
+      "kind": "func",
       "name": "kernel_set_tid_address",
+      "signature": "(i32) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_set_tmpfs_enabled",
       "signature": "(i32) -> (i32)"
     },
     {
@@ -3109,6 +3214,11 @@
       "kind": "func",
       "name": "kernel_socketpair",
       "signature": "(i32,i32,i32,i32,i32) -> (i32)"
+    },
+    {
+      "kind": "func",
+      "name": "kernel_spawn_blob_decode",
+      "signature": "(i32,i32,i32) -> (i32)"
     },
     {
       "kind": "func",
@@ -5864,6 +5974,10 @@
               {
                 "name": "replay_event_segment",
                 "number": 13
+              },
+              {
+                "name": "journal_image",
+                "number": 14
               }
             ],
             "magic_bytes": [
@@ -6907,6 +7021,17 @@
           ],
           "results": [
             "i32"
+          ]
+        },
+        {
+          "kind": "func",
+          "module": "env",
+          "name": "__wpk_fork_ref_provenance_externref",
+          "params": [
+            "externref"
+          ],
+          "results": [
+            "externref"
           ]
         },
         {

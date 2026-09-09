@@ -1,15 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   linkSync,
-  mkdtempSync,
   renameSync,
   rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
+import { makeHostScratchTempRoot } from "./centralized-test-helper";
 
 import { resolveBinary } from "../src/binary-resolver";
 import {
@@ -39,6 +38,11 @@ import {
   CH_SYSCALL,
   FCNTL_FLOCK_BYTES,
 } from "../src/generated/abi";
+// The in-kernel tmpfs owns the scratch prefixes unconditionally, so these
+// advisory-lock cases stage their host-backed files outside every scratch
+// prefix (`makeHostScratchTempRoot`) and drive them through NodePlatformIO to
+// exercise host-file identity (rename/unlink/recreate, fork inheritance).
+
 
 const O_RDWR = 2;
 const O_CREAT = 0o100;
@@ -374,7 +378,7 @@ describe("Rust advisory locks through the real kernel Wasm", () => {
   });
 
   it("uses live file identity across aliases, rename, unlink, and recreate", async () => {
-    const root = mkdtempSync(join(tmpdir(), "kandelo-advisory-identity-"));
+    const root = makeHostScratchTempRoot("kandelo-advisory-identity-");
     const original = join(root, "database");
     const alias = join(root, "database-link");
     const renamed = join(root, "database-renamed");
@@ -445,7 +449,7 @@ describe("Rust advisory locks through the real kernel Wasm", () => {
   });
 
   it("does not inherit POSIX process locks across fork", async () => {
-    const root = mkdtempSync(join(tmpdir(), "kandelo-advisory-process-fork-"));
+    const root = makeHostScratchTempRoot("kandelo-advisory-process-fork-");
     const path = join(root, "file");
     writeFileSync(path, "data");
     const worker = await makeWorker();
@@ -491,7 +495,7 @@ describe("Rust advisory locks through the real kernel Wasm", () => {
   });
 
   it("keeps OFD locks through dup and fork until the last machine reference", async () => {
-    const root = mkdtempSync(join(tmpdir(), "kandelo-advisory-ofd-"));
+    const root = makeHostScratchTempRoot("kandelo-advisory-ofd-");
     const path = join(root, "file");
     writeFileSync(path, "data");
     const worker = await makeWorker();
@@ -538,7 +542,7 @@ describe("Rust advisory locks through the real kernel Wasm", () => {
   });
 
   it("stores 4096 separated ranges and reports conflict before exhaustion", async () => {
-    const root = mkdtempSync(join(tmpdir(), "kandelo-advisory-capacity-"));
+    const root = makeHostScratchTempRoot("kandelo-advisory-capacity-");
     const path = join(root, "file");
     writeFileSync(path, "capacity");
     const worker = await makeWorker();

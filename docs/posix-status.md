@@ -180,6 +180,24 @@ same final-OFD lifetime rules.
 | `getcontext()` / `setcontext()` / `makecontext()` / `swapcontext()` | Unsupported | Userspace stack-switching primitives, deprecated in POSIX.1-2008, not planned. See the "ucontext API unsupported" row under [Wasm-Inherent gaps](#wasm-inherent--gaps-that-cannot-be-fully-resolved-in-wasm) for rationale. |
 | `fork()` called from an exception catch handler | Partial | ABI 43 supports mixed `Catch`, `CatchRef`, `CatchAll`, and `CatchAllRef` arms, including scalar, vector, reference, JSTag, and modern C++ cleanup payloads. Scalar tagged arms serialize one exact activation selector and maximum live operand tuple; complete exceptions use the process reference graph and are thrown inside the fresh Wasm instance so reference clauses receive child-local exnrefs. Multiple arms/targets, recursion, loop re-entry, nested catches, later merged-flow forks, reference locals/carryovers, mutable reference globals, and mutated tables use the same versioned ownership machinery without module-static stashes. Dash and the configured shell/rootfs closure rebuild through this path. This row inherits the broader incomplete `fork()` status; catch/reference replay itself is not intentionally excluded. See [fork-instrumentation.md](fork-instrumentation.md). |
 
+### Fork reference reconstruction
+
+`fork()` reconstructs `null`, `funcref`, and wasm-tag `exnref` (C++
+`-fwasm-exceptions`) references across the fork boundary; this covers
+every reference kind produced by every built package program today,
+including `dlopen`-based programs like `php`/`php-fpm` and
+`redis-server`.
+
+Carrying a live `externref`, `struct`, `array`, `i31`, or static-root
+reference across a fork is an explicit unsupported boundary: the fork
+fails loudly with `EOPNOTSUPP` on the parent side instead of being
+silently reconstructed. This is a documented platform gap, not a
+workaround — closing it means building the reconstruction in
+module-owned Wasm rather than host JS, deferred until a real
+workload needs one of these kinds. See
+[fork-reference-support.md](fork-reference-support.md) for the full
+support boundary, why it is safe today, and the future-work plan.
+
 ## Signals
 
 | Function | Status | Notes |
