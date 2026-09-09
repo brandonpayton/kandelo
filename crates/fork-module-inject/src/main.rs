@@ -61,6 +61,14 @@ use walrus::{
 /// and the injected `fm_drive_execute` `call_indirect`s. Imported (initial size
 /// 0; the host provides a table sized to the fork's activations).
 const DRIVE_TABLE_IMPORT: &str = "__wpk_fork_drive_table";
+/// The plain `(ptr, i32) -> ()` placeholder import the module's Rust coarse
+/// entries (`fm_parent_replay` / `fm_parent_abort`) call to run a serialized
+/// drive plan. Rust CAN emit this import (no reference types), but it cannot
+/// emit the ref-typed `call_indirect` the drive needs, so `inject_drive_thunk`
+/// rewrites this import into a local thunk that forwards to the injected
+/// `fm_drive_execute` shim. MUST match the `#[link(wasm_import_module = "env")]`
+/// `extern` name in `crates/fork-module/src/lib.rs`.
+const DRIVE_PLAN_THUNK_IMPORT: &str = "__wpk_fork_drive_plan";
 /// The injected loop export the host calls to run a serialized plan.
 const DRIVE_EXECUTE_EXPORT: &str = "fm_drive_execute";
 /// The Rust drive-step proof-of-use counter the injected shim `call`s once per
@@ -788,6 +796,58 @@ fn inject_drive_execute(module: &mut Module) -> Result<()> {
     Ok(())
 }
 
+/// Rewrite the `__wpk_fork_drive_plan(plan, count)` placeholder import into a
+/// LOCAL thunk that forwards to the injected `fm_drive_execute` shim (control-
+/// flow inversion). The module's Rust coarse entries (`fm_parent_replay` /
+/// `fm_parent_abort`) sequence begin + plan-build in Rust and then call this
+/// placeholder for the one step Rust cannot express — the ref-typed
+/// `call_indirect` drive. `replace_imported_func` turns the import into a local
+/// function whose body just re-issues the two arguments to the shim, so the
+/// emitted module has NO unresolved import for it (the host provides nothing
+/// new) and the coarse entry's drive reaches exactly the same `fm_drive_execute`
+/// loop the host used to call directly.
+///
+/// MUST run AFTER `inject_drive_execute` (it needs the shim's function id). If
+/// the module does not import the placeholder (e.g. a future build with no
+/// coarse entry), this is a no-op — the coarse entries are the only callers.
+fn inject_drive_thunk(module: &mut Module) -> Result<()> {
+    // Find the placeholder import (module "env", the coarse-entry drive name).
+    let import_fn = module.imports.iter().find_map(|import| {
+        if import.module != IMPORT_MODULE || import.name != DRIVE_PLAN_THUNK_IMPORT {
+            return None;
+        }
+        match import.kind {
+            ImportKind::Function(function) => Some(function),
+            _ => None,
+        }
+    });
+    let Some(import_fn) = import_fn else {
+        // No coarse entry references the drive placeholder; nothing to rewire.
+        return Ok(());
+    };
+
+    // The injected drive shim to forward to (added by `inject_drive_execute`).
+    let shim = module
+        .exports
+        .iter()
+        .find(|export| export.name == DRIVE_EXECUTE_EXPORT)
+        .ok_or_else(|| anyhow!("module does not export {DRIVE_EXECUTE_EXPORT}"))?;
+    let shim_fn = match shim.item {
+        ExportItem::Function(id) => id,
+        _ => bail!("{DRIVE_EXECUTE_EXPORT} export is not a function"),
+    };
+
+    // Convert the import into a local function `(plan, count) -> ()` that just
+    // forwards both arguments to the shim. `replace_imported_func` supplies the
+    // parameter locals in declaration order.
+    module
+        .replace_imported_func(import_fn, |(body, args)| {
+            body.local_get(args[0]).local_get(args[1]).call(shim_fn);
+        })
+        .with_context(|| format!("rewriting {DRIVE_PLAN_THUNK_IMPORT} import into a thunk"))?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let input = args
@@ -802,6 +862,7 @@ fn main() -> Result<()> {
     inject(&mut module).context("injecting __wpk_fork_ref_decode_funcref")?;
     inject_decode_externref(&mut module).context("injecting __wpk_fork_ref_decode_externref")?;
     inject_drive_execute(&mut module).context("injecting fm_drive_execute")?;
+    inject_drive_thunk(&mut module).context("rewiring the coarse-entry drive thunk")?;
     let out_bytes = module.emit_wasm();
     std::fs::write(&output, &out_bytes).with_context(|| format!("writing {output}"))?;
     eprintln!(
