@@ -164,6 +164,44 @@ mod wasm {
 
     const PAGE: u64 = 65_536;
 
+    // -- Injector-wired drive placeholder (control-flow inversion) ----------
+    //
+    // The coarse per-phase entries (`fm_parent_replay` / `fm_parent_abort`)
+    // sequence the fine-grained primitives INTERNALLY in Rust — begin the
+    // replay, build the per-activation begin drive plan, then DRIVE it — so the
+    // host issues ONE module call per phase instead of an `fm_begin_*` call plus
+    // a per-activation `wpk_fork_rewind_begin` / `wpk_fork_abort_begin` loop.
+    //
+    // The drive itself is the walrus-injected `fm_drive_execute` shim, which
+    // `call_indirect`s the host-bound `__wpk_fork_drive_table` — a reference-
+    // typed call Rust/LLVM cannot emit (why `lib.rs` declares zero real Wasm
+    // imports and every outward ref-typed call is injected). A Rust coarse entry
+    // therefore cannot call the shim directly. Instead it calls this PLACEHOLDER
+    // import, which `crates/fork-module-inject` rewrites (`replace_imported_func`)
+    // into a thunk that forwards to the injected `fm_drive_execute` shim — the
+    // same injector-wiring seam `resolve_externref` and the decode shims already
+    // use. It is a plain `(ptr, i32) -> ()` import (no reference types), which
+    // Rust CAN emit; after injection it is a local function, so the emitted
+    // module carries no unresolved import for it. Before injection (a bare
+    // `cargo build`) it is an unsatisfied import, exactly like `resolve_externref`.
+    #[link(wasm_import_module = "env")]
+    unsafe extern "C" {
+        /// Drive a serialized drive plan of `count` steps at guest address
+        /// `plan`. Injector-rewritten to forward to the `fm_drive_execute` shim.
+        fn __wpk_fork_drive_plan(plan: usize, count: u32);
+    }
+
+    /// Safe wrapper over the injector-wired drive placeholder. Isolated so the
+    /// coarse entries read as ordinary Rust and the single `unsafe` FFI call has
+    /// one auditable site.
+    fn drive_plan_via_injector(plan: usize, count: u32) {
+        // SAFETY: after injection `__wpk_fork_drive_plan` is a local thunk that
+        // forwards `(plan, count)` to the `fm_drive_execute` shim; the shim
+        // strides `count` 16-byte steps from `plan` (bounds-checked wasm loads)
+        // and owns its own truthful failure (a post-allocate integrity trap).
+        unsafe { __wpk_fork_drive_plan(plan, count) }
+    }
+
     // -- Host-seeded linked-frame format ------------------------------------
     //
     // In production the host reads the guest module's
@@ -781,6 +819,30 @@ mod wasm {
             drive_plan::append_rewind_begin_steps(&mut steps, &roots);
         }
         serialize_and_store_plan(&steps)
+    }
+
+    /// Sequence a parent REPLAY-begin (`abort` false) or ABORT-replay-begin
+    /// (`abort` true) phase entirely in the module: begin the (parent) rewind,
+    /// build the per-activation begin drive plan, then drive it through the
+    /// injector-wired shim. Shared body of `fm_parent_replay` / `fm_parent_abort`.
+    ///
+    /// Order matches the host loop this replaces: begin FIRST (attach each
+    /// driver + register resume slots — abort additionally sets `in_abort`), then
+    /// the per-activation guest begin drive. A plan with zero steps (no open
+    /// activation) drives nothing, which is the same no-op the empty host loop
+    /// was.
+    fn parent_replay_impl(abort: bool) -> Result<(), Errno> {
+        if abort {
+            begin_abort_impl()?;
+        } else {
+            begin_replay_impl()?;
+        }
+        let plan = build_rewind_plan_impl(abort)?;
+        let count = GC_PLAN_COUNT.load(Ordering::Relaxed);
+        if count > 0 {
+            drive_plan_via_injector(plan, count);
+        }
+        Ok(())
     }
 
     // The step count of the plan `fm_build_gc_plan` last serialized (the `count`
@@ -4052,6 +4114,53 @@ mod wasm {
                 set_err(errno);
                 0
             }
+        }
+    }
+
+    /// Sequence a whole PARENT REPLAY-begin phase in the module (control-flow
+    /// inversion): begin the parent rewind (`begin_replay_impl` — attach every
+    /// activation's driver + register its resume slots), build the per-activation
+    /// REWIND-begin drive plan (one `DRIVE_OP_REWIND_BEGIN` step per open
+    /// activation carrying its stored continuation root), then DRIVE it through
+    /// the injector-wired `fm_drive_execute` shim, which `call_indirect`s each
+    /// activation's guest `wpk_fork_rewind_begin(root)` in ascending id order.
+    ///
+    /// This replaces the host's former two-part sequence — `fm_begin_replay`
+    /// followed by a per-activation `wpk_fork_rewind_begin(root)` loop — with ONE
+    /// module call. The host must have bound each activation's
+    /// `wpk_fork_rewind_begin` into `__wpk_fork_drive_table` at
+    /// `fm_drive_table_base(activation) + DRIVE_SLOT_REWIND_BEGIN` before calling
+    /// this (the ref-typed table bind is a host floor). Behaviourally identical
+    /// to the old host loop: same guest export, same roots, same order. A zero-
+    /// activation state or a plan-build failure is a truthful errno
+    /// (`fm_last_errno`); a guest reconstruction failure traps inside the shim
+    /// exactly as it did under the host loop.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_parent_replay() {
+        match parent_replay_impl(false) {
+            Ok(()) => set_ok(),
+            Err(errno) => set_err(errno),
+        }
+    }
+
+    /// Sequence a whole PARENT ABORT-replay-begin phase in the module (mirror of
+    /// [`fm_parent_replay`], abort-tagged). Runs `begin_abort_impl` (the shared
+    /// `begin_replay_impl` plus the `in_abort` pairing flag `fm_finish_abort`
+    /// asserts), builds the per-activation ABORT-begin drive plan
+    /// (`DRIVE_OP_ABORT_BEGIN`), then drives each activation's guest
+    /// `wpk_fork_abort_begin(root)` through the injector-wired shim. Replaces the
+    /// host's `fm_begin_abort` + per-activation `wpk_fork_abort_begin` loop.
+    ///
+    /// Abort replay drives the parent's already-committed frames from the SAME
+    /// continuation root parent replay uses (the module's per-activation
+    /// `module_buffer`), so the plan is byte-identical to the rewind plan except
+    /// for the op tag. The host must have bound `wpk_fork_abort_begin` at
+    /// `fm_drive_table_base(activation) + DRIVE_SLOT_ABORT_BEGIN`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_parent_abort() {
+        match parent_replay_impl(true) {
+            Ok(()) => set_ok(),
+            Err(errno) => set_err(errno),
         }
     }
 
