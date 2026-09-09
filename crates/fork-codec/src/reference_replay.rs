@@ -237,6 +237,44 @@ impl ReferenceReplayDriver {
             .count() as u32
     }
 
+    /// The first Exnref node whose `(module_activation, tag_ordinal)` its owning
+    /// activation's exception codec does NOT declare, or `None` when every exnref
+    /// in the graph names a declared tag. `tag_declared(activation, tag)` answers
+    /// whether that activation's seeded exception codec declared the ordinal; a
+    /// `false` for an exnref's own coordinate — including an activation that
+    /// declared no exception codec at all — is a violation.
+    ///
+    /// This is the exnref tag-validity ADMISSION gate. The module runs it at the
+    /// child-install ENTRY (`fm_attach_child` / `fm_attach_borrowed_child`), BEFORE
+    /// it builds the reconstruction drive plan whose
+    /// [`DRIVE_OP_EXN`](crate::drive_plan) step would otherwise `call_indirect` the
+    /// guest exception-materialize export blindly. A corrupt / mismatched exnref
+    /// recipe (a tag its owning activation never declared) must fail loud with
+    /// `EINVAL` — truthful failure over a silent wrong exception reconstruction —
+    /// never be driven. In normal operation a captured exnref always names a tag
+    /// its activation declared, so this returns `None` on every well-formed fork.
+    /// This is the module-side re-check that supersedes the former host boundary
+    /// `assertForkModuleExnrefTagsDeclared`: the module now owns the fail-loud
+    /// exnref admission, seeded per activation by `fm_set_activation_exception_tags`.
+    pub fn first_undeclared_exnref(
+        &self,
+        tag_declared: impl Fn(u32, u32) -> bool,
+    ) -> Option<(u32, u32)> {
+        for entry in &self.transaction.nodes {
+            if let ReferenceRecipeNode::Exnref {
+                module_activation,
+                tag_ordinal,
+                ..
+            } = entry.node
+            {
+                if !tag_declared(module_activation, tag_ordinal) {
+                    return Some((module_activation, tag_ordinal));
+                }
+            }
+        }
+        None
+    }
+
     /// True when EVERY node is a kind the module admits: Null, Funcref,
     /// Externref, Exnref, a typed-GC value (Struct / Array / I31), or a
     /// StaticRoot. This is the whole set reference reconstruction drives through
@@ -566,6 +604,61 @@ mod tests {
         let driver = funcref_only();
         assert_eq!(driver.node_count(), 3);
         assert_eq!(driver.transaction().nodes.len(), 3);
+    }
+
+    // --- Exnref tag-validity admission gate (`first_undeclared_exnref`) -------
+
+    /// A graph carrying one exnref naming `(module_activation, tag_ordinal)`,
+    /// plus a leading null so ids stay canonical.
+    fn exnref_graph(module_activation: u32, tag_ordinal: u32) -> ReferenceReplayDriver {
+        ReferenceReplayDriver::new(transaction(vec![
+            entry(0, ReferenceRecipeNode::Null),
+            entry(
+                1,
+                ReferenceRecipeNode::Exnref {
+                    module_activation,
+                    tag_ordinal,
+                    layout_id: 0,
+                    scalars: Vec::new(),
+                    payloads: Vec::new(),
+                },
+            ),
+        ]))
+    }
+
+    #[test]
+    fn undeclared_exnref_tag_is_rejected() {
+        // Activation 0 declared tags {0, 1}, but the recipe names tag 7: a
+        // corrupt / mismatched exnref that must fail the admission gate so the
+        // module refuses to drive it (the caller maps `Some` to `EINVAL`).
+        let driver = exnref_graph(0, 7);
+        let declared = |activation: u32, tag: u32| activation == 0 && (tag == 0 || tag == 1);
+        assert_eq!(driver.first_undeclared_exnref(declared), Some((0, 7)));
+    }
+
+    #[test]
+    fn declared_exnref_tag_is_admitted() {
+        // The well-formed case: the recipe names a tag its activation declared,
+        // so the gate returns `None` and reconstruction proceeds.
+        let driver = exnref_graph(0, 1);
+        let declared = |activation: u32, tag: u32| activation == 0 && (tag == 0 || tag == 1);
+        assert_eq!(driver.first_undeclared_exnref(declared), None);
+    }
+
+    #[test]
+    fn exnref_naming_undeclared_activation_is_rejected() {
+        // An exnref naming an activation whose exception codec declared NOTHING
+        // (the lookup is `false` for every coordinate) is a violation, not a
+        // silent admit.
+        let driver = exnref_graph(3, 0);
+        assert_eq!(driver.first_undeclared_exnref(|_, _| false), Some((3, 0)));
+    }
+
+    #[test]
+    fn exnref_free_graph_admits_trivially() {
+        // A funcref-only graph has no exnref node, so the gate never fires even
+        // with a lookup that would reject everything.
+        assert_eq!(funcref_only().first_undeclared_exnref(|_, _| false), None);
     }
 
     // --- D7a.1b: multi-activation funcref graphs (merged catalog) -----------
