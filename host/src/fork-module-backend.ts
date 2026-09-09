@@ -355,6 +355,47 @@ export class ForkModuleContinuationBackend {
   }
 
   /**
+   * Seed ONE activation's declared exnref tag ordinals for this worker (the
+   * exnref tag-validity admission gate). `ordinals` are the tag ordinals that
+   * activation's `kandelo.wpk_fork.exception_codec` section declares; the module's
+   * child-install entry (`fm_attach_child` / `fm_attach_borrowed_child`) re-checks
+   * every captured exnref recipe against them BEFORE building the reconstruction
+   * drive plan, so a recipe naming an undeclared tag fails loud (`EINVAL`) rather
+   * than being materialized blindly. This is the module-side successor to the
+   * former host boundary `assertForkModuleExnrefTagsDeclared`. Staged into guest
+   * memory the same way `setActivationResumeCatalog` stages its ordinals; the
+   * module copies them into its own arena, so the scratch is released
+   * immediately. Called ONCE per activation per worker, before any fork drives
+   * reference reconstruction. An activation that declares no exnref tags is not
+   * seeded (nothing to declare); any exnref naming it then fails the gate.
+   */
+  setActivationExceptionTags(
+    activationId: number,
+    ordinals: readonly number[],
+  ): void {
+    this.requireSetup("seed activation exception tags");
+    const count = ordinals.length;
+    if (count === 0) return;
+    const byteLen = count * 4;
+    const regionBytes = alignUpPage(byteLen);
+    const scratch = this.reserveRegion(regionBytes);
+    try {
+      const view = new DataView(this.memory.buffer);
+      for (let i = 0; i < count; i++) {
+        view.setUint32(scratch + i * 4, ordinals[i]! >>> 0, true);
+      }
+      this.exports.fm_set_activation_exception_tags(
+        this.wptr(activationId),
+        this.wptr(scratch),
+        this.wptr(count),
+      );
+      this.requireOk("fm_set_activation_exception_tags");
+    } finally {
+      this.releaseRegion(scratch, regionBytes);
+    }
+  }
+
+  /**
    * Build the topological typed-GC drive plan for this fork's reference graph and
    * execute it through the module (Phase 6 item 3c). Requires
    * `beginReferenceReplay` to have seeded the driver and every participating GC

@@ -132,10 +132,6 @@ import {
   type ForkExceptionReferenceReplayImports,
   type ForkExceptionProvider,
 } from "./fork-exception-provider";
-import {
-  assertForkModuleExnrefTagsDeclared,
-  type ForkExnrefNode,
-} from "./fork-module-exnref-admission";
 import { ForkEarlyChildReferenceProvider } from "./fork-early-reference-provider";
 import {
   decodeSegmentedForkReferenceTransaction,
@@ -3941,6 +3937,11 @@ export async function centralizedWorkerMain(
       // computes them.
       let childGcCodecBytes: Map<number, Uint8Array> | null = null;
       let childHostExceptionOwner = 0xffff_ffff;
+      // The exnref tag ordinals each activation's exception codec declares,
+      // captured in the planning block (where the compiled `modules` are in
+      // scope) so the attach block can seed the co-resident fork-module's exnref
+      // tag-validity admission gate. Null until a fork child computes them.
+      let childExceptionTags: Map<number, number[]> | null = null;
       const referenceReplay = (): ProcessReferenceReplayImports =>
         earlyChildReferences ?? activationRegistry.currentReferences();
       const processContinuation = new ForkProcessContinuationCoordinator(
@@ -4467,6 +4468,20 @@ export async function centralizedWorkerMain(
             .filter((entry) => entry.exceptionDescriptor !== undefined)
             .map((entry) => entry.activationId)
             .sort((left, right) => left - right)[0] ?? 0xffff_ffff;
+        // Capture each activation's declared exnref tag ordinals for the module's
+        // exnref tag-validity admission gate (moved out of the host, below). The
+        // module re-checks every captured exnref recipe against these at the
+        // child-install entry, so a recipe naming an undeclared tag fails loud.
+        const exceptionTags = new Map<number, number[]>();
+        for (const entry of declarations) {
+          if (entry.exceptionDescriptor !== undefined) {
+            exceptionTags.set(
+              entry.activationId,
+              entry.exceptionDescriptor.tags.map((tag) => tag.tagOrdinal),
+            );
+          }
+        }
+        childExceptionTags = exceptionTags;
         // P2 (Path B): the co-resident module is the SOLE reconstructor whenever
         // it is active for this fork — there is no longer a per-kind host
         // admission gate, and no JS reconstruction fallback behind it. The former
@@ -4482,25 +4497,26 @@ export async function centralizedWorkerMain(
         // engine-floor callback per kind; the module re-checks most kinds and
         // fails loud where IT can see the fault — GC layout validity in
         // `GcCodecHints::require_layout` (`EINVAL`) and externref
-        // production-provenance in `fm_begin_reference_replay`. Two validity checks
-        // remain HOST-OWNED by the module's own contract
-        // (`fork_codec::reference_replay.rs:210-212, 261-263` — "a check it alone
-        // can see"): the GC-descriptor layout gate (still enforced by the module's
-        // `require_layout`) and the EXNREF exception-descriptor tag gate. The
-        // module has NO exception-codec seeding, so it CANNOT re-check that an
-        // exnref recipe's tag is declared by its owning activation; that check is
-        // restored below as a fail-loud host boundary
-        // (`assertForkModuleExnrefTagsDeclared`), NOT as a JS reconstruction
-        // fallback. Whenever the module instantiated for this child it owns the
+        // production-provenance in `fm_begin_reference_replay`. The exnref
+        // tag-validity check the module ALSO now re-checks itself: the host seeds
+        // each activation's declared exnref tag ordinals
+        // (`fm_set_activation_exception_tags`), and the child-install entry
+        // (`fm_attach_child` / `fm_attach_borrowed_child`) fails loud with `EINVAL`
+        // on an exnref recipe whose tag its owning activation never declared,
+        // BEFORE the DRIVE_OP_EXN step materializes it — the fail-loud boundary
+        // that formerly lived here as `assertForkModuleExnrefTagsDeclared`. The one
+        // validity check that remains a module-internal gate over host-seeded
+        // facts is the GC-descriptor layout gate (`GcCodecHints::require_layout`,
+        // `EINVAL`). Whenever the module instantiated for this child it owns the
         // whole reference graph: wire decode (module-internal
         // `fork_codec::reference_segments`, seeded from the KFMS arena by
         // `fm_begin_reference_replay`), the full topological drive-order
         // (`fm_build_gc_plan` + `fm_drive_execute` over `drive_plan` Phase
         // 0/0b/3-5 — static-root publish, EVERY externref transit publish, then
         // typed allocate/fill/exn), and every `fm_ref_*` restore data feed. The
-        // `decodedChildReferences` decode the host keeps no longer drives the two
-        // host-side STRUCTURAL consumers — the exnref tag gate and the static-root
-        // catalog mirror seeding both read node kinds + coordinates from the
+        // `decodedChildReferences` decode the host keeps no longer drives the
+        // host-side STRUCTURAL consumer — the static-root catalog mirror seeding
+        // reads node kinds + coordinates from the
         // module's `fm_decoded_*` accessors now (Path-A INC-C) — but it is still
         // held for the reconstruction WIRING it feeds (`ForkEarlyChildReferenceProvider`
         // + the continuation `attachChild`), not for the reconstruction algorithm
@@ -4511,63 +4527,29 @@ export async function centralizedWorkerMain(
           useForkModule &&
           forkModuleInstance !== null &&
           decodedChildReferences !== null;
-        // HOST-OWNED exnref tag-validity boundary (see
-        // `fork-module-exnref-admission.ts` for the full contract). The module
-        // cannot re-check exnref tag validity — it has no exception-codec seeding
-        // and `GcCodecHints`'s exnref arm assigns the DRIVE_OP_EXN owner
-        // unconditionally — so a corrupt / mismatched exnref recipe would
-        // otherwise be `call_indirect`-driven blindly. Fail loud here instead
-        // (EINVAL), before the module drives reconstruction, so the parent's fork
-        // child dies truthfully rather than silently mis-reconstructing an
-        // exception value. Normal forks always name a declared tag, so this never
-        // fires on a well-formed fork. Survives P6 (host glue).
+        // Make the MODULE's decoded reference graph resident for the merged
+        // static-root catalog mirror seeding below, which reads node kinds +
+        // coordinates from the module's `fm_decoded_*` accessors instead of
+        // walking the JS `decodeSegmentedForkReferenceTransaction` structure. The
+        // resident graph survives the later attach (which seeds the replay
+        // DRIVER, not this read-only graph).
+        //
+        // The exnref tag-validity ADMISSION gate that formerly walked this graph
+        // here MOVED into the co-resident module (its child-install entry
+        // `fm_attach_child` / `fm_attach_borrowed_child` re-checks every captured
+        // exnref recipe against each activation's seeded exception tags before
+        // building the reconstruction drive plan, and fails loud with `EINVAL` on
+        // an undeclared tag — see `fm_set_activation_exception_tags` +
+        // `assert_exnref_tags_admissible` in `crates/fork-module`). The host now
+        // only SEEDS those tags (in the drive block below), so the fail-loud
+        // boundary lives inside reconstruction rather than as a separate host
+        // pre-walk.
         if (
           moduleReferenceKindsSupported &&
           decodedChildReferences &&
           forkModuleBackend
         ) {
-          // Path-A INC-C: make the MODULE's decoded reference graph resident so
-          // BOTH structural consumers — this exnref tag-validity gate and the
-          // merged static-root catalog mirror seeding below — read node kinds +
-          // coordinates from the module's `fm_decoded_*` accessors instead of
-          // walking the JS `decodeSegmentedForkReferenceTransaction` structure.
-          // One decode here serves both: the resident graph survives the later
-          // attach (which seeds the replay DRIVER, not this read-only graph), and
-          // both consumers run under the same `moduleReferenceKindsSupported`
-          // guard, so the exnref gate always runs when the static-root block does.
-          const nodeCount = forkModuleBackend.decodeReferenceGraph(
-            childArena.rootAddress(),
-          );
-          const declaredExnrefTags = new Map<number, ReadonlySet<number>>(
-            declarations.map((declaration) => [
-              declaration.activationId,
-              new Set(
-                declaration.exceptionDescriptor.tags.map((tag) => tag.tagOrdinal),
-              ),
-            ]),
-          );
-          // WireNodeKind.Exnref (`fork-reference-recipes.ts`): the module's
-          // `fm_decoded_node_kind` returns the same discriminant the JS decode's
-          // `entry.node.kind === "exnref"` filter selected.
-          const WIRE_NODE_KIND_EXNREF = 3;
-          const exnrefNodes: ForkExnrefNode[] = [];
-          for (let index = 0; index < nodeCount; index += 1) {
-            if (
-              forkModuleBackend.decodedNodeKind(index) !== WIRE_NODE_KIND_EXNREF
-            ) {
-              continue;
-            }
-            exnrefNodes.push({
-              moduleActivation:
-                forkModuleBackend.decodedNodeModuleActivation(index),
-              tagOrdinal: forkModuleBackend.decodedNodeOrdinal(index),
-            });
-          }
-          assertForkModuleExnrefTagsDeclared(
-            declaredExnrefTags,
-            exnrefNodes,
-            `pid=${pid}: fork exnref admission`,
-          );
+          forkModuleBackend.decodeReferenceGraph(childArena.rootAddress());
         }
         earlyChildReferences = new ForkEarlyChildReferenceProvider({
           records,
@@ -5072,6 +5054,28 @@ export async function centralizedWorkerMain(
           // captured alongside the codec bytes: the smallest activation that
           // declared an exception codec descriptor, or 0xffff_ffff if none.
           forkModuleBackend.setHostExceptionOwner(childHostExceptionOwner);
+          // Seed each activation's declared exnref tag ordinals so the module's
+          // child-install entry can re-check every captured exnref recipe against
+          // them (the exnref tag-validity admission gate, moved out of the host).
+          // A recipe naming an undeclared tag then fails loud (`EINVAL`) from
+          // inside `fm_attach_child` BEFORE the DRIVE_OP_EXN step materializes it.
+          // Seeded here — once per worker — alongside the GC codec; a COW child
+          // re-seed is an idempotent no-op in the module. An activation that
+          // declares no exnref tags is not seeded (nothing to declare).
+          if (!childExceptionTags) {
+            throw new Error(
+              `pid=${pid}: fork-module drive lost the captured exception tags`,
+            );
+          }
+          for (const activation of sortedActivations) {
+            const tags = childExceptionTags.get(activation.activationId);
+            if (tags && tags.length > 0) {
+              forkModuleBackend.setActivationExceptionTags(
+                activation.activationId,
+                tags,
+              );
+            }
+          }
           // Static-root binder: populate the merged anyref catalog mirror the
           // module's injected `fm_drive_execute` reads on a DRIVE_OP_STATIC_ROOT
           // step. The child's static roots were harvested + registered during

@@ -713,6 +713,161 @@ mod wasm {
         Ok(())
     }
 
+    // -- Per-activation exnref tag catalog (the exnref tag-validity admission
+    //    gate's seeding) ---------------------------------------------------------
+    //
+    // The module owns the exnref tag-validity ADMISSION gate at the child-install
+    // entry (`fm_attach_child` / `fm_attach_borrowed_child`): before it builds the
+    // reconstruction drive plan whose `DRIVE_OP_EXN` step `call_indirect`s the
+    // guest exception-materialize export, it re-checks that every captured exnref
+    // recipe names a tag its OWNING activation's exception codec declared. This
+    // supersedes the former host boundary (`assertForkModuleExnrefTagsDeclared`):
+    // to re-check in the module, the module needs each activation's declared tag
+    // ordinals. The host seeds them ONCE per activation per worker via
+    // `fm_set_activation_exception_tags(act, ptr, count)` — `[ptr, ptr+count*4)` is
+    // the little-endian `u32` array of the tag ordinals that activation's
+    // `kandelo.wpk_fork.exception_codec` section declares. A corrupt / mismatched
+    // exnref (an activation that seeded no tags, or a tag not in its set) then
+    // fails loud with `EINVAL`, exactly as the host boundary did.
+    //
+    // Like the resume / GC-codec catalogs, storage is a fixed BSS ordinal arena
+    // plus a small index (activation id -> `[offset, len)`), so it survives the
+    // per-fork bump-heap reset. Both are capped; overflow is a truthful `E2BIG`.
+    // A COW fork CHILD inherits the parent's already-seeded tags through the memory
+    // clone (the module's BSS lives inside the shared linear memory and is NOT
+    // re-zeroed on instantiation), yet the production Node/browser host RE-SEEDS
+    // every activation's tags on the child (`worker-main.ts`'s per-activation
+    // `setActivationExceptionTags`), while the native host relies on inheritance and
+    // does NOT re-seed. Exception tags are the activation module's invariant codec
+    // section, so a re-seed is byte-IDENTICAL by construction: accept it as a no-op
+    // so BOTH hosts converge on the same catalog. A CONFLICTING re-seed (same
+    // activation, DIFFERENT tags) is a truthful `EINVAL`.
+    const ACT_EXN_TAGS_ORD_CAP: usize = 65_536; // total tag ordinals, all activations
+    const ACT_EXN_TAGS_MAX_ACTS: usize = 64; // distinct activations
+
+    #[repr(C, align(4))]
+    struct ActExnTagsOrds(UnsafeCell<[u32; ACT_EXN_TAGS_ORD_CAP]>);
+    // SAFETY: single-threaded per worker (see HeapCell).
+    unsafe impl Sync for ActExnTagsOrds {}
+    static ACT_EXN_TAGS_ORDS: ActExnTagsOrds =
+        ActExnTagsOrds(UnsafeCell::new([0u32; ACT_EXN_TAGS_ORD_CAP]));
+
+    /// Each live entry is `[activation_id, offset, len]` into the ordinal arena.
+    #[repr(C, align(4))]
+    struct ActExnTagsIndex(UnsafeCell<[[u32; 3]; ACT_EXN_TAGS_MAX_ACTS]>);
+    // SAFETY: single-threaded per worker (see HeapCell).
+    unsafe impl Sync for ActExnTagsIndex {}
+    static ACT_EXN_TAGS_INDEX: ActExnTagsIndex =
+        ActExnTagsIndex(UnsafeCell::new([[0u32; 3]; ACT_EXN_TAGS_MAX_ACTS]));
+
+    static ACT_EXN_TAGS_ACT_COUNT: AtomicU32 = AtomicU32::new(0);
+    static ACT_EXN_TAGS_ORD_USED: AtomicU32 = AtomicU32::new(0);
+
+    fn set_activation_exception_tags_impl(
+        activation_id: u32,
+        ptr: u64,
+        count: u64,
+    ) -> Result<(), Errno> {
+        let count = usize::try_from(count).map_err(|_| Errno::EINVAL)?;
+        let act_count = ACT_EXN_TAGS_ACT_COUNT.load(Ordering::Relaxed) as usize;
+        let ord_used = ACT_EXN_TAGS_ORD_USED.load(Ordering::Relaxed) as usize;
+        // Bound the incoming array against guest memory, then copy it out into a
+        // local buffer through raw pointers (the same aliasing-safe idiom the
+        // resume catalog uses) so the re-seed compare and the store both read a
+        // distinct, owned copy rather than aliasing guest memory.
+        let start = usize::try_from(ptr).map_err(|_| Errno::EINVAL)?;
+        let byte_len = count.checked_mul(4).ok_or(Errno::EINVAL)?;
+        let end = start.checked_add(byte_len).ok_or(Errno::EINVAL)?;
+        if end > mem_len_bytes() {
+            return Err(Errno::EINVAL); // ordinal region past the end of guest memory
+        }
+        let mut incoming: Vec<u32> = Vec::with_capacity(count);
+        // SAFETY: `[start, end)` is within guest linear memory (checked above).
+        let src = core::hint::black_box(start) as *const u8;
+        for i in 0..count {
+            let mut bytes = [0u8; 4];
+            unsafe {
+                core::ptr::copy(src.add(i * 4), bytes.as_mut_ptr(), 4);
+            }
+            incoming.push(u32::from_le_bytes(bytes));
+        }
+        // Idempotent re-seed of an already-present activation (see the block
+        // comment): identical tags are a no-op; conflicting tags are `EINVAL`.
+        // SAFETY: single-threaded; the index/ordinals are static buffers read here.
+        let index = unsafe { &*ACT_EXN_TAGS_INDEX.0.get() };
+        let stored_all = unsafe { &*ACT_EXN_TAGS_ORDS.0.get() };
+        for entry in index.iter().take(act_count) {
+            if entry[0] == activation_id {
+                let off = entry[1] as usize;
+                let len = entry[2] as usize;
+                let stored = stored_all.get(off..off + len).ok_or(Errno::EINVAL)?;
+                if stored == incoming.as_slice() {
+                    return Ok(()); // identical re-seed: no-op
+                }
+                return Err(Errno::EINVAL); // conflicting re-seed of the same activation
+            }
+        }
+        if act_count >= ACT_EXN_TAGS_MAX_ACTS {
+            return Err(Errno::E2BIG); // too many distinct activations
+        }
+        let ord_end = ord_used.checked_add(count).ok_or(Errno::EINVAL)?;
+        if ord_end > ACT_EXN_TAGS_ORD_CAP {
+            return Err(Errno::E2BIG); // combined catalogs exceed the arena
+        }
+        // Publish the ordinals into the flat static arena, then the index entry.
+        // SAFETY: single-threaded; the destination slice `[ord_used, ord_end)` is
+        // bounded by the cap check; `incoming` is a distinct local buffer.
+        let ords = unsafe { &mut *ACT_EXN_TAGS_ORDS.0.get() };
+        ords[ord_used..ord_end].copy_from_slice(&incoming);
+        let index = unsafe { &mut *ACT_EXN_TAGS_INDEX.0.get() };
+        index[act_count] = [activation_id, ord_used as u32, count as u32];
+        ACT_EXN_TAGS_ACT_COUNT.store((act_count + 1) as u32, Ordering::Relaxed);
+        ACT_EXN_TAGS_ORD_USED.store(ord_end as u32, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The exception tag ordinals `activation_id`'s codec declared, or `None` when
+    /// the host seeded none for it (an activation that declared no exception codec
+    /// at all). An exnref naming a `None` activation, or a tag outside the returned
+    /// set, fails the admission gate below.
+    fn activation_exception_tags(activation_id: u32) -> Option<&'static [u32]> {
+        let act_count = ACT_EXN_TAGS_ACT_COUNT.load(Ordering::Relaxed) as usize;
+        // SAFETY: single-threaded per worker; the buffers outlive every borrow and
+        // every live entry's `[offset, len)` was bounded on seed.
+        let index = unsafe { &*ACT_EXN_TAGS_INDEX.0.get() };
+        let ords = unsafe { &*ACT_EXN_TAGS_ORDS.0.get() };
+        for entry in index.iter().take(act_count) {
+            if entry[0] == activation_id {
+                let offset = entry[1] as usize;
+                let len = entry[2] as usize;
+                return Some(&ords[offset..offset + len]);
+            }
+        }
+        None
+    }
+
+    /// Exnref tag-validity ADMISSION gate. Walks the resident replay graph's exnref
+    /// nodes (seeded by `begin_reference_replay_impl`) and fails loud with `EINVAL`
+    /// on the first recipe whose `(module_activation, tag_ordinal)` its owning
+    /// activation's seeded exception codec does not declare. Runs at the
+    /// child-install entry BEFORE the reconstruction plan is built, so a corrupt /
+    /// mismatched exnref recipe is REJECTED rather than `call_indirect`-driven
+    /// through the guest exception-materialize export. Mirrors — and supersedes —
+    /// the former host boundary `assertForkModuleExnrefTagsDeclared`. A missing
+    /// resident driver is itself `EINVAL` (the gate must never silently pass
+    /// without a graph to check).
+    fn assert_exnref_tags_admissible() -> Result<(), Errno> {
+        let driver = reference_state().as_ref().ok_or(Errno::EINVAL)?;
+        match driver.first_undeclared_exnref(|activation, tag| {
+            activation_exception_tags(activation)
+                .map(|tags| tags.contains(&tag))
+                .unwrap_or(false)
+        }) {
+            Some(_) => Err(Errno::EINVAL),
+            None => Ok(()),
+        }
+    }
+
     /// Decode every seeded activation's GC codec catalog into a `GcCodec`, keyed by
     /// activation id — the per-activation catalog map `GcCodecHints` consumes. A
     /// section that fails to decode is a truthful `EINVAL` (the host would have
@@ -3112,6 +3267,14 @@ mod wasm {
     /// no reference values), so both entries delegate here.
     fn attach_from_arena_impl(module_state_root: u64, pid: u32) -> Result<usize, Errno> {
         begin_reference_replay_impl(module_state_root, pid)?;
+        // Exnref tag-validity ADMISSION gate (fail-loud SECURITY boundary). Runs
+        // right after the graph is decoded and BEFORE the reconstruction drive plan
+        // is built, so a corrupt / mismatched exnref recipe is rejected (`EINVAL`)
+        // rather than driven blindly through the guest exception-materialize export
+        // by the plan's `DRIVE_OP_EXN` step. Moved here from the host
+        // (`assertForkModuleExnrefTagsDeclared`); the host seeds each activation's
+        // declared tags via `fm_set_activation_exception_tags` before this entry.
+        assert_exnref_tags_admissible()?;
         let mut steps = build_reconstruction_steps()?;
         let activations = arena_module_activations(module_state_root)?;
         drive_plan::append_attach_steps(&mut steps, &activations);
@@ -3989,6 +4152,32 @@ mod wasm {
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_set_activation_gc_codec(activation_id: u32, ptr: usize, byte_len: usize) {
         match set_activation_gc_codec_impl(activation_id, ptr as u64, byte_len as u64) {
+            Ok(()) => set_ok(),
+            Err(errno) => set_err(errno),
+        }
+    }
+
+    /// Seed ONE activation's declared exnref tag ordinals for this worker (the
+    /// exnref tag-validity admission gate): `[ptr, ptr + count*4)` is a
+    /// little-endian `u32` array of the tag ordinals that activation's
+    /// `kandelo.wpk_fork.exception_codec` section declares. The child-install
+    /// entry (`fm_attach_child` / `fm_attach_borrowed_child`) re-checks every
+    /// captured exnref recipe against these before building the reconstruction
+    /// drive plan, so a recipe naming an undeclared tag fails loud (`EINVAL`)
+    /// rather than being materialized blindly. Called ONCE per activation per
+    /// worker, before any fork drives reference reconstruction, alongside
+    /// `fm_set_activation_gc_codec`. An identical re-seed (a COW child on the host
+    /// that re-seeds) is a no-op; a conflicting re-seed fails `EINVAL`; too many
+    /// activations, or catalogs that jointly exceed the module's arena, fail
+    /// `E2BIG` (check `fm_last_errno`). An activation that declares no exnref tags
+    /// need not be seeded at all — any exnref naming it then fails the gate.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_set_activation_exception_tags(
+        activation_id: u32,
+        ptr: usize,
+        count: usize,
+    ) {
+        match set_activation_exception_tags_impl(activation_id, ptr as u64, count as u64) {
             Ok(()) => set_ok(),
             Err(errno) => set_err(errno),
         }

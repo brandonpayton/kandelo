@@ -202,6 +202,14 @@ export const FORK_MODULE_REQUIRED_EXPORTS = [
   //    DRIVE_STEPS_EXECUTED field, distinct from the item-3a GC-nodes feed count.
   "fm_set_activation_gc_codec",
   "fm_set_host_exception_owner",
+  // Exnref tag-validity admission gate (moved into the module): seeds ONE
+  // activation's declared exnref tag ordinals, which the child-install entry
+  // (`fm_attach_child` / `fm_attach_borrowed_child`) re-checks every captured
+  // exnref recipe against before building the reconstruction drive plan. A
+  // recipe naming an undeclared tag fails loud (`EINVAL`) rather than being
+  // materialized blindly — the fail-loud boundary that formerly lived in the
+  // host as `assertForkModuleExnrefTagsDeclared`.
+  "fm_set_activation_exception_tags",
   "fm_build_gc_plan",
   "fm_gc_plan_count",
   // Phase 6 (reconstruction-orchestration ENTRY): the module-owned entry that
