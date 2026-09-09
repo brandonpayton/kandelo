@@ -59,11 +59,6 @@ const DRIVE_STEP_SIZE = 16;
 const DRIVE_STEP_OFF_OP = 0;
 const DRIVE_STEP_OFF_RECIPE = 8;
 const DRIVE_OP_EXTERNREF_TRANSIT = 4;
-// A guest scratch region for the scan output: below the frame reserve (8 MiB)
-// and well above the tiny arena (which grows up from one page), so it never
-// collides with the arena, the reserve, or the module's own data at 32 MiB.
-const SCAN_SCRATCH = 2 * 1024 * 1024;
-
 /** Build a sealed, externref-only KFMS arena in `memory`; return its root. */
 function buildExternrefArena(memory: WebAssembly.Memory): number {
   let next = PAGE;
@@ -112,7 +107,6 @@ interface ForkModuleExports {
   fm_set_format: (pw: number, fixedPrefix: number) => void;
   fm_decode_reference_graph: (root: number) => number;
   fm_decoded_node_count: () => number;
-  fm_scan_externref_handles: (dstPtr: number, dstCap: number) => number;
   fm_restore_from_arena: (root: number, pid: number) => number;
   fm_begin_reference_replay: (root: number, pid: number) => void;
   fm_build_gc_plan: (pid: number) => number;
@@ -190,47 +184,6 @@ describe("fork-module decode / scan / restore (orchestration migration increment
     expect(x.fm_last_errno()).toBe(EINVAL);
     // A failed decode leaves no resident graph.
     expect(x.fm_decoded_node_count()).toBe(-1);
-  });
-
-  it("fm_scan_externref_handles writes the distinct handles in order with proof of use", () => {
-    const memory = new WebAssembly.Memory({ initial: 256, maximum: 16384, shared: true });
-    const root = buildExternrefArena(memory);
-    const { x } = instantiate(memory);
-
-    x.fm_decode_reference_graph(root);
-    const cap = x.fm_decoded_node_count();
-
-    const before = Number(x.fm_stats(FmStatField.ExternrefHandlesScanned));
-    const count = x.fm_scan_externref_handles(SCAN_SCRATCH, cap);
-    expect(x.fm_last_errno()).toBe(0);
-    expect(count).toBe(HANDLES.length);
-
-    const view = new DataView(memory.buffer);
-    const scanned = Array.from({ length: count }, (_, i) =>
-      view.getUint32(SCAN_SCRATCH + i * 4, true),
-    );
-    expect(scanned).toEqual([...HANDLES]);
-    expect(Number(x.fm_stats(FmStatField.ExternrefHandlesScanned)) - before).toBe(HANDLES.length);
-  });
-
-  it("fm_scan_externref_handles fails cleanly on a too-small buffer", () => {
-    const memory = new WebAssembly.Memory({ initial: 256, maximum: 16384, shared: true });
-    const root = buildExternrefArena(memory);
-    const { x } = instantiate(memory);
-
-    x.fm_decode_reference_graph(root);
-    expect(x.fm_scan_externref_handles(SCAN_SCRATCH, HANDLES.length - 1)).toBe(-1);
-    expect(x.fm_last_errno()).toBe(EINVAL);
-  });
-
-  it("fm_scan_externref_handles fails cleanly with no resident decoded graph", () => {
-    const memory = new WebAssembly.Memory({ initial: 256, maximum: 16384, shared: true });
-    buildExternrefArena(memory);
-    const { x } = instantiate(memory);
-
-    // No fm_decode_reference_graph was called.
-    expect(x.fm_scan_externref_handles(SCAN_SCRATCH, 8)).toBe(-1);
-    expect(x.fm_last_errno()).toBe(EINVAL);
   });
 
   it("fm_restore_from_arena seeds the driver and builds a plan identical to begin + build", () => {

@@ -1295,13 +1295,12 @@ mod wasm {
     // `decodeSegmentedForkReferenceTransaction` leaves it unchanged. Never resets.
     static REFERENCE_GRAPHS_DECODED: AtomicU64 = AtomicU64::new(0);
 
-    // Monotonic count of externref handles the module has SCANNED out of decoded
-    // graphs since worker start. Proof-of-use for the scan flip: after the host
-    // routes the pre-launch externref-handle scan through
-    // `fm_scan_externref_handles` this has advanced by the graph's distinct
-    // externref-handle count; a silent fallback to the TypeScript
-    // `scanSegmentedForkReferenceExternrefHandles` leaves it unchanged. Never
-    // resets.
+    // Retained STATS SLOT (fm_stats field 10) held for the frozen host/native
+    // stats-field contract. The externref-handle scan primitive that once wrote
+    // it (`fm_scan_externref_handles`) was a JS-test-only export and has been
+    // removed; no production or native path ever called it, so this counter now
+    // stays 0. Keeping the slot avoids renumbering the downstream FM_STAT_* field
+    // indices native and the host depend on.
     static EXTERNREF_HANDLES_SCANNED: AtomicU64 = AtomicU64::new(0);
 
     // -- Reference CAPTURE session (Path B P3 — module-owned encode graph) ----
@@ -1384,22 +1383,10 @@ mod wasm {
     // a truthful hard failure, never a wrong funcref.
     const NULL_ORDINAL: i32 = -1;
 
-    // -- GC drive-shim state (Phase 6 item 3b — call_indirect drive mechanism) --
-    //
-    // The injected `fm_drive_execute(plan_ptr, count)` shim (crates/fork-module-
-    // inject) loops a serialized drive PLAN and `call_indirect`s the guest's
-    // `_gc_allocate`/`_gc_fill` exports through the host-bound
-    // `env.__wpk_fork_drive_table`, then — after each ALLOC step — reads STORE #2
-    // (the guest's shared Wasm-GC transit table `env.__wpk_fork_ref_gc_transit`)
-    // at slot `recipe + 1` with a wasm `table.get` + `ref.is_null` to assert the
-    // guest's `_gc_allocate` published a live GC object there, trapping otherwise.
-    // That integrity guard lives entirely in the injected wasm (Rust holds no
-    // `anyref`), so the module keeps no host-generation R1 state for it.
-
-    // Owns the serialized drive plan's backing bytes so the pointer
-    // `fm_build_trivial_plan` returns stays valid while the shim reads it. Held
-    // in its OWN static (the bump `dealloc` is a no-op, but keeping the `Vec`
-    // rooted here is explicit and independent of the per-fork heap reset).
+    // Owns the serialized drive plan's backing bytes so the guest pointer a plan
+    // builder returns stays valid while the injected `fm_drive_execute` shim reads
+    // it. Held in its OWN static (the bump `dealloc` is a no-op, but keeping the
+    // `Vec` rooted here is explicit and independent of the per-fork heap reset).
     struct DrivePlanCell(UnsafeCell<Option<Vec<u8>>>);
     // SAFETY: single-threaded per worker (see HeapCell).
     unsafe impl Sync for DrivePlanCell {}
@@ -3022,8 +3009,9 @@ mod wasm {
     /// Decode the sealed KFMS arena rooted at `module_state_root` into the
     /// module-owned decoded graph and return its node count (`>= 0`). Reuses the
     /// SAME shared arena decode as `fm_begin_reference_replay`; unlike replay it
-    /// seeds NO driver/feed — it only makes the decoded graph resident for
-    /// `fm_scan_externref_handles` and host inspection. Reclaims any prior graph.
+    /// seeds NO driver/feed — it only makes the decoded graph resident for the
+    /// per-node structure readout (`fm_decoded_node_*`) and host inspection.
+    /// Reclaims any prior graph.
     fn decode_reference_graph_impl(module_state_root: u64) -> Result<u32, Errno> {
         // Clear any prior resident graph WITHOUT running its `Drop`: the host runs
         // `fm_decode_reference_graph` during child setup (for the exnref-tag and
@@ -3038,50 +3026,6 @@ mod wasm {
         *decoded_graph() = Some(transaction);
         REFERENCE_GRAPHS_DECODED.fetch_add(1, Ordering::Relaxed);
         Ok(node_count)
-    }
-
-    /// Scan the resident decoded graph for its DISTINCT externref broker handles
-    /// (first-seen order, deduped exactly like the JS `Set`), write them as a
-    /// little-endian `u32` array into guest memory at `dst_ptr`, and return the
-    /// count. `dst_cap` is the caller-provided capacity in u32 ELEMENTS (size it
-    /// from the decoded node count, an upper bound). A count that would overflow
-    /// `dst_cap`, or no resident decoded graph, is a truthful `EINVAL` — never a
-    /// partial or fabricated scan.
-    fn scan_externref_handles_impl(dst_ptr: usize, dst_cap: usize) -> Result<u32, Errno> {
-        let transaction = decoded_graph().as_ref().ok_or(Errno::EINVAL)?;
-        let mut handles: Vec<u32> = Vec::new();
-        for entry in &transaction.nodes {
-            if let ReferenceRecipeNode::Externref { handle } = entry.node {
-                if !handles.contains(&handle) {
-                    handles.push(handle);
-                }
-            }
-        }
-        if handles.len() > dst_cap {
-            return Err(Errno::EINVAL);
-        }
-        let byte_len = handles.len().checked_mul(4).ok_or(Errno::EINVAL)?;
-        if byte_len != 0 {
-            let end = dst_ptr.checked_add(byte_len).ok_or(Errno::EINVAL)?;
-            if end > mem_len_bytes() {
-                return Err(Errno::EINVAL); // span past the end of guest memory
-            }
-            // SAFETY: `[dst_ptr, dst_ptr+byte_len)` is within guest linear memory
-            // (checked above); the source is a distinct local `Vec`. Absolute
-            // guest-offset writes through an opaque-zero base, the same
-            // guest-offset-as-pointer idiom the frame/channel paths use.
-            let mut cursor = dst_ptr;
-            for handle in &handles {
-                unsafe {
-                    let ptr = core::hint::black_box(cursor) as *mut u8;
-                    core::ptr::copy_nonoverlapping(handle.to_le_bytes().as_ptr(), ptr, 4);
-                }
-                cursor += 4;
-            }
-        }
-        let count = u32::try_from(handles.len()).map_err(|_| Errno::EINVAL)?;
-        EXTERNREF_HANDLES_SCANNED.fetch_add(count as u64, Ordering::Relaxed);
-        Ok(count)
     }
 
     // -- Module-owned decoded-graph STRUCTURE readout (orchestration migration
@@ -4365,34 +4309,6 @@ mod wasm {
         drive_plan::drive_table_base(activation) as i32
     }
 
-    /// Serialize a TRIVIAL single-struct drive plan (ALLOC then FILL for one
-    /// `recipe` in `activation`) into a module-owned scratch buffer and return its
-    /// guest address for `fm_drive_execute`. The shim's post-ALLOC integrity guard
-    /// reads STORE #2 (the guest's Wasm-GC transit table) directly, so no host
-    /// generation is opened here. Returns 0 on failure (check `fm_last_errno`).
-    /// This proves the drive MECHANISM; item 3c builds the real plan by walking
-    /// the decoded reference graph.
-    #[unsafe(no_mangle)]
-    pub extern "C" fn fm_build_trivial_plan(activation: u32, recipe: u32, pid: u32) -> usize {
-        match build_trivial_plan_impl(activation, recipe, pid) {
-            Ok(ptr) => {
-                set_ok();
-                ptr
-            }
-            Err(errno) => {
-                set_err(errno);
-                0
-            }
-        }
-    }
-
-    /// The step count of the plan `fm_build_trivial_plan` wrote (the `count`
-    /// argument for `fm_drive_execute`). The trivial plan is exactly ALLOC + FILL.
-    #[unsafe(no_mangle)]
-    pub extern "C" fn fm_trivial_plan_count() -> i32 {
-        2
-    }
-
     /// Build the REAL topological GC drive plan (Phase 6 item 3c) for the fork's
     /// whole reference graph, reproducing the JS `materializeTypedGraph` order, and
     /// return its guest address for `fm_drive_execute`. Requires
@@ -4422,18 +4338,26 @@ mod wasm {
         GC_PLAN_COUNT.load(Ordering::Relaxed) as i32
     }
 
-    /// Build the REPLAY-begin drive plan for the current fork's activations and
-    /// return its guest address for `fm_drive_execute` (Phase 6 — the abort/rewind
-    /// drive move). `abort` selects `wpk_fork_abort_begin` (nonzero) vs
-    /// `wpk_fork_rewind_begin` (zero) per activation; each step carries the
-    /// activation's stored continuation root. This moves the per-activation guest
-    /// begin drive the host used to issue directly (`wpk_fork_rewind_begin` /
-    /// `wpk_fork_abort_begin` on each activation) into the co-resident module. The
-    /// step count is read via `fm_gc_plan_count` (shared single-live-plan scratch).
-    /// Returns 0 on failure (check `fm_last_errno`).
+    /// Serialize a TRIVIAL single-struct drive plan (ALLOC then FILL for one
+    /// `recipe` in `activation`) into a module-owned scratch buffer and return its
+    /// guest address for `fm_drive_execute`. The shim's post-ALLOC integrity guard
+    /// reads STORE #2 (the guest's Wasm-GC transit table) directly, so no host
+    /// generation is opened here. Returns 0 on failure (check `fm_last_errno`).
+    ///
+    /// RETENTION: this is a test-only plan builder — no production or native path
+    /// calls it. It survives ONLY to enable the sole runtime regression test of
+    /// the injected `fm_drive_execute` shim's store-#2 GC-integrity trap
+    /// (`host/test/fork-module-drive-shim.test.ts`): the load-bearing
+    /// `table.get`+`ref.is_null` guard that turns a guest `_gc_allocate` that
+    /// failed to publish a live GC object into a truthful trap instead of a silent
+    /// wrong reconstruction. That coverage is wasmtime-runnable (the guard is in
+    /// the injected wasm, not V8-specific) and should migrate to a host-native
+    /// wasmtime instantiation test built on `fork_codec::drive_plan`'s public
+    /// `trivial_struct_plan` + `serialize_plan`; once it does, this export and
+    /// `fm_trivial_plan_count` can be deleted.
     #[unsafe(no_mangle)]
-    pub extern "C" fn fm_build_rewind_plan(abort: u32) -> usize {
-        match build_rewind_plan_impl(abort != 0) {
+    pub extern "C" fn fm_build_trivial_plan(activation: u32, recipe: u32, pid: u32) -> usize {
+        match build_trivial_plan_impl(activation, recipe, pid) {
             Ok(ptr) => {
                 set_ok();
                 ptr
@@ -4443,6 +4367,14 @@ mod wasm {
                 0
             }
         }
+    }
+
+    /// The step count of the plan `fm_build_trivial_plan` wrote (the `count`
+    /// argument for `fm_drive_execute`). The trivial plan is exactly ALLOC + FILL.
+    /// Test-only; see the retention note on `fm_build_trivial_plan`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fm_trivial_plan_count() -> i32 {
+        2
     }
 
     /// Sequence a whole PARENT REPLAY-begin phase in the module (control-flow
@@ -5062,7 +4994,7 @@ mod wasm {
     /// Decode the sealed KFMS module-state arena rooted at `module_state_root`
     /// into the module-owned decoded reference graph. Returns the graph's node
     /// count (`>= 0`) or `-1` (reason in `fm_last_errno`). The decoded graph
-    /// stays resident for `fm_scan_externref_handles` and `fm_decoded_node_count`
+    /// stays resident for `fm_decoded_node_count` / `fm_decoded_node_*`
     /// until the next decode or replay. See `decode_reference_graph_impl`.
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_decode_reference_graph(module_state_root: usize) -> i32 {
@@ -5083,8 +5015,8 @@ mod wasm {
     }
 
     /// The node count of the resident decoded graph (`fm_decode_reference_graph`
-    /// result), or `-1` if none is resident. Lets the host size the
-    /// `fm_scan_externref_handles` destination buffer without re-decoding.
+    /// result), or `-1` if none is resident. Lets the host size a per-node
+    /// readout buffer without re-decoding.
     #[unsafe(no_mangle)]
     pub extern "C" fn fm_decoded_node_count() -> i32 {
         match decoded_graph().as_ref() {
@@ -5100,28 +5032,6 @@ mod wasm {
             },
             None => {
                 set_err(Errno::EINVAL);
-                -1
-            }
-        }
-    }
-
-    /// Scan the resident decoded graph for its distinct externref broker handles,
-    /// writing them as a little-endian `u32` array into guest memory at `dst_ptr`
-    /// (capacity `dst_cap` u32 elements), and return the count (`>= 0`) or `-1`
-    /// (reason in `fm_last_errno`). See `scan_externref_handles_impl`.
-    #[unsafe(no_mangle)]
-    pub extern "C" fn fm_scan_externref_handles(dst_ptr: usize, dst_cap: usize) -> i32 {
-        match scan_externref_handles_impl(dst_ptr, dst_cap) {
-            Ok(count) if count <= i32::MAX as u32 => {
-                set_ok();
-                count as i32
-            }
-            Ok(_) => {
-                set_err(Errno::EINVAL);
-                -1
-            }
-            Err(e) => {
-                set_err(e);
                 -1
             }
         }
