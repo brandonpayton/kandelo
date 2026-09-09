@@ -72,7 +72,10 @@ const DRIVE_OP_EXN = 2;
  *   id 1 = externref naming `PAYLOAD_HANDLE`
  *   id 2 = exnref whose reference payload edge names id 1 (transit-reachable)
  */
-function buildExnrefArena(memory: WebAssembly.Memory): number {
+function buildExnrefArena(
+  memory: WebAssembly.Memory,
+  tagOrdinal = 0,
+): number {
   let next = PAGE;
   const allocate = (size: number): number => {
     const addr = next;
@@ -98,7 +101,7 @@ function buildExnrefArena(memory: WebAssembly.Memory): number {
       node: {
         kind: "exnref",
         moduleActivation: 0,
-        tagOrdinal: 0,
+        tagOrdinal,
         layoutId: 0,
         scalars: new Uint8Array(0),
         payloads: [1],
@@ -143,6 +146,14 @@ interface ForkModuleRefExports {
     referenceCount: number,
   ) => number;
   fm_ref_exn_cache_index: (recipeId: number) => number;
+  // The exnref tag-validity admission gate: seed one activation's declared tag
+  // ordinals, then the child-install entry re-checks the graph against them.
+  fm_set_activation_exception_tags: (
+    activation: number,
+    ptr: number,
+    count: number,
+  ) => void;
+  fm_attach_child: (root: number, pid: number) => number;
 }
 
 const MODULE = new WebAssembly.Module(
@@ -303,5 +314,74 @@ describe("fork-module exnref reference reconstruction + transit into production 
 
     // PROOF OF USE: the module served every one of these feed reads.
     expect(Number(x.fm_stats(FmStatField.RefFeedReads)) - readsBefore).toBeGreaterThan(0);
+  });
+});
+
+// Exnref tag-validity ADMISSION gate (moved out of the host into the module's
+// child-install entry). The gate is a fail-loud SECURITY boundary: an exnref
+// recipe whose wasm tag its owning activation's exception codec never declared
+// must be REJECTED (`EINVAL`) BEFORE the module drives the DRIVE_OP_EXN
+// materialize step, so a corrupt / mismatched exception recipe dies truthfully
+// rather than being `call_indirect`-driven blindly through the guest export.
+// This is the module-side successor to the deleted host boundary
+// `assertForkModuleExnrefTagsDeclared`.
+describe("fork-module exnref tag-validity admission gate (fm_attach_child)", () => {
+  const EINVAL = 22;
+
+  /** Seed activation 0's declared exnref tags, then invoke the coarse
+   *  child-install entry against `root` and return its `fm_last_errno`. */
+  function attachWithSeededTags(
+    memory: WebAssembly.Memory,
+    root: number,
+    declaredTags: readonly number[],
+  ): { errno: number; x: ForkModuleRefExports } {
+    const { x } = instantiate(memory, () => {
+      throw new Error("resolve_externref must not run: the gate rejects first");
+    });
+    x.fm_set_format(PTR_WIDTH, 0);
+    expect(x.fm_last_errno()).toBe(0);
+
+    // Stage the declared tag ordinals into a FRESH page past the current memory
+    // end (the module has not touched it) as a little-endian u32 array, then
+    // seed them. An empty catalog is simply not seeded (nothing to declare).
+    if (declaredTags.length > 0) {
+      const scratch = memory.buffer.byteLength;
+      memory.grow(1);
+      const view = new DataView(memory.buffer);
+      declaredTags.forEach((tag, i) => view.setUint32(scratch + i * 4, tag, true));
+      x.fm_set_activation_exception_tags(0, scratch, declaredTags.length);
+      expect(x.fm_last_errno()).toBe(0);
+    }
+
+    x.fm_attach_child(root, PID);
+    return { errno: x.fm_last_errno(), x };
+  }
+
+  it("REJECTS an exnref recipe naming a tag its activation never declared (EINVAL)", () => {
+    const memory = new WebAssembly.Memory({ initial: 256, maximum: 16384, shared: true });
+    // The captured exnref names tag 7, but activation 0's exception codec only
+    // declares {0, 1}: a corrupt / mismatched recipe the gate must reject.
+    const root = buildExnrefArena(memory, 7);
+    const { errno } = attachWithSeededTags(memory, root, [0, 1]);
+    expect(errno).toBe(EINVAL);
+  });
+
+  it("REJECTS an exnref whose activation declared no exception tags at all (EINVAL)", () => {
+    const memory = new WebAssembly.Memory({ initial: 256, maximum: 16384, shared: true });
+    // A well-formed tag ordinal (0), but NOTHING seeded for activation 0: an
+    // exnref naming an activation with no declared codec is still a violation,
+    // never a silent admit.
+    const root = buildExnrefArena(memory, 0);
+    const { errno } = attachWithSeededTags(memory, root, []);
+    expect(errno).toBe(EINVAL);
+  });
+
+  it("ADMITS an exnref recipe whose tag its activation declares (well-formed fork)", () => {
+    const memory = new WebAssembly.Memory({ initial: 256, maximum: 16384, shared: true });
+    // The well-formed case: tag 0 is declared, so the gate passes and the
+    // child-install entry builds the reconstruction plan (errno 0).
+    const root = buildExnrefArena(memory, 0);
+    const { errno } = attachWithSeededTags(memory, root, [0, 1]);
+    expect(errno).toBe(0);
   });
 });
