@@ -234,6 +234,7 @@ describe("ForkModuleContinuationBackend multi-activation", () => {
     // journal image through the channel (serviced by the worker responder).
     const backend = new ForkModuleContinuationBackend({
       exports: px,
+      driveTable: fm.driveTable,
       memory: parentMemory,
       ptrWidth: 4,
       format: format(128),
@@ -285,6 +286,7 @@ describe("ForkModuleContinuationBackend multi-activation", () => {
     const cerr = (): number => Number((cx.fm_last_errno as () => number)());
     const childBackend = new ForkModuleContinuationBackend({
       exports: cx,
+      driveTable: childFm.driveTable,
       memory: childMemory,
       ptrWidth: 4,
       format: format(128),

@@ -3754,6 +3754,10 @@ export async function centralizedWorkerMain(
           const forkModuleStagingBytes = forkModuleInstance.stagingBytes;
           forkModuleBackend = new ForkModuleContinuationBackend({
             exports: forkModuleInstance.exports,
+            // The coarse `parentReplay`/`parentAbort` entries drive each
+            // activation's guest begin export through this table (host binds the
+            // ref-typed slots; the module `call_indirect`s them).
+            driveTable: forkModuleInstance.driveTable,
             memory,
             ptrWidth,
             format: linkedFrameFormat,
@@ -6749,6 +6753,7 @@ export async function centralizedThreadWorkerMain(
           threadForkModuleInstance.stagingBytes;
         threadForkModuleBackend = new ForkModuleContinuationBackend({
           exports: threadForkModuleInstance.exports,
+          driveTable: threadForkModuleInstance.driveTable,
           memory,
           ptrWidth,
           format: linkedFrameFormat,

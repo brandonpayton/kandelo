@@ -722,16 +722,25 @@ export class ForkProcessContinuationCoordinator {
     this.phase = "parent-replay";
     try {
       this.registry.restoreModuleState();
-      // One `beginParentReplay` registers every activation's driver + resume
-      // slots; then each activation's guest instance begins its rewind.
-      backend.beginParentReplay();
+      // Control-flow inversion: bind each activation's guest begin exports into
+      // the drive table, then drive the WHOLE parent REPLAY-begin phase in ONE
+      // module call (`parentReplay`). It attaches every activation's driver +
+      // registers its resume slots, then `call_indirect`s each guest
+      // `wpk_fork_rewind_begin(root)` in ascending id order — replacing the
+      // former host `fm_begin_replay` + per-activation begin loop. The module
+      // drives from each activation's stored `module_buffer`, which in the parent
+      // worker is exactly `replayRoot`.
       for (const activation of this.orderedActivations()) {
-        invokeForkContinuationBegin(
+        backend.bindActivationBeginDrive(
+          activation.activationId,
           requireExportFunction(activation, "wpk_fork_rewind_begin"),
-          activation.replayRoot,
-          activation.continuation.format.ptrWidth,
-          `${this.label}: activation ${activation.activationId} replay (module)`,
+          requireExportFunction(activation, "wpk_fork_abort_begin"),
         );
+      }
+      backend.parentReplay();
+      // The coarse drive left every activation in REWINDING; assert it exactly
+      // as the host per-activation loop did.
+      for (const activation of this.orderedActivations()) {
         this.requireActivationState(activation, WPK_FORK_REWINDING, "begin replay");
       }
     } catch (error) {
@@ -752,14 +761,23 @@ export class ForkProcessContinuationCoordinator {
     this.phase = "abort-replay";
     try {
       this.registry.restoreModuleState();
-      backend.beginAbort();
+      // Control-flow inversion (mirror of `beginModuleParentReplay`,
+      // abort-tagged): bind each activation's begin exports, then drive the whole
+      // ABORT-replay-begin phase in ONE module call (`parentAbort`) — it runs the
+      // shared begin plus the `in_abort` pairing flag `finishAbort` asserts, then
+      // `call_indirect`s each guest `wpk_fork_abort_begin(root)` in ascending id
+      // order. Replaces the host `fm_begin_abort` + per-activation abort loop.
+      // Abort replays the parent's already-committed frames from each
+      // activation's `module_buffer` (== `root` in the parent worker).
       for (const activation of this.orderedActivations()) {
-        invokeForkContinuationBegin(
+        backend.bindActivationBeginDrive(
+          activation.activationId,
+          requireExportFunction(activation, "wpk_fork_rewind_begin"),
           requireExportFunction(activation, "wpk_fork_abort_begin"),
-          activation.root,
-          activation.continuation.format.ptrWidth,
-          `${this.label}: activation ${activation.activationId} abort replay (module)`,
         );
+      }
+      backend.parentAbort();
+      for (const activation of this.orderedActivations()) {
         this.requireActivationState(
           activation,
           WPK_FORK_ABORT_UNWINDING,

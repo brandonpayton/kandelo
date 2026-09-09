@@ -238,6 +238,7 @@ describe("ForkModuleContinuationBackend abort-replay (beginAbort/finishAbort)", 
     // through the channel (serviced by the worker responder).
     const backend = new ForkModuleContinuationBackend({
       exports: px,
+      driveTable: fm.driveTable,
       memory,
       ptrWidth: 4,
       format: format(128),
@@ -313,6 +314,7 @@ describe("ForkModuleContinuationBackend abort-replay (beginAbort/finishAbort)", 
 
     const backend = new ForkModuleContinuationBackend({
       exports: px,
+      driveTable: fm.driveTable,
       memory,
       ptrWidth: 4,
       format: format(128),
@@ -372,6 +374,7 @@ describe("ForkModuleContinuationBackend module-or-fatal capacity boundary", () =
           // The cap check runs in the constructor before any export is touched,
           // so an empty exports stand-in is sufficient to prove the boundary.
           exports: {} as unknown as ForkModuleExports,
+          driveTable: undefined as unknown as WebAssembly.Table,
           memory,
           ptrWidth: 4,
           format: format(128),

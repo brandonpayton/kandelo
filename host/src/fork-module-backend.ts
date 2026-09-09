@@ -66,6 +66,17 @@ export interface ForkModuleJournalImage {
 export interface ForkModuleBackendOptions {
   /** The co-resident module instance's guest-facing + lifecycle exports. */
   readonly exports: ForkModuleExports;
+  /**
+   * The module's imported `__wpk_fork_drive_table` (funcref). The coarse
+   * `parentReplay`/`parentAbort` entries drive each activation's guest
+   * `wpk_fork_rewind_begin` / `wpk_fork_abort_begin` through the injected
+   * `fm_drive_execute` shim, which `call_indirect`s this table at
+   * `fm_drive_table_base(activation) + DRIVE_SLOT_{REWIND,ABORT}_BEGIN`. The
+   * host binds those slots (`bindActivationBeginDrive`) — the ref-typed table
+   * write is a host floor Rust cannot express. Shared with the child
+   * reconstruct drive's alloc/fill/exn/restore bindings in `worker-main`.
+   */
+  readonly driveTable: WebAssembly.Table;
   /** The single shared guest linear memory (the frame data plane). */
   readonly memory: WebAssembly.Memory;
   /** Guest pointer width: 4 for wasm32, 8 for wasm64. */
@@ -113,8 +124,19 @@ export interface ForkModuleBackendOptions {
  * at a different `__memory_base`, empty journal) calls only `beginChildReplay`
  * → `finishReplay`, seeding entirely from the copied guest memory.
  */
+/**
+ * Drive-table slot offsets within an activation's slice (must match
+ * `fork_codec::drive_plan` DRIVE_SLOT_REWIND_BEGIN / DRIVE_SLOT_ABORT_BEGIN and
+ * the DRIVE_SLOTS_PER_ACTIVATION stride the module's `fm_drive_table_base`
+ * reserves). ALLOC/FILL/EXN/RESTORE/FINISH_RESTORE occupy slots 0..=4; the
+ * per-activation REPLAY/ABORT begin drive occupies 5/6.
+ */
+const DRIVE_SLOT_REWIND_BEGIN = 5;
+const DRIVE_SLOT_ABORT_BEGIN = 6;
+
 export class ForkModuleContinuationBackend {
   private readonly exports: ForkModuleExports;
+  private readonly driveTable: WebAssembly.Table;
   private readonly memory: WebAssembly.Memory;
   private readonly ptrWidth: 4 | 8;
   private readonly format: LinkedFrameFormatDescriptor;
@@ -132,6 +154,7 @@ export class ForkModuleContinuationBackend {
 
   constructor(options: ForkModuleBackendOptions) {
     this.exports = options.exports;
+    this.driveTable = options.driveTable;
     this.memory = options.memory;
     this.ptrWidth = options.ptrWidth;
     this.format = options.format;
@@ -626,7 +649,14 @@ export class ForkModuleContinuationBackend {
     return { ptr, len };
   }
 
-  /** Parent: begin the rewind (attach the driver + register resume slots). */
+  /**
+   * Parent: begin the rewind (attach the driver + register resume slots).
+   * FINE-GRAINED primitive: it does NOT drive the guest `wpk_fork_rewind_begin`.
+   * Production uses the coarse `parentReplay` (which folds this begin + the
+   * per-activation guest drive into one module call); this wrapper is retained
+   * for the module-only unit tests that exercise the begin without any guest
+   * instance / drive-table binding to `call_indirect`.
+   */
   beginParentReplay(): void {
     this.exports.fm_begin_replay();
     this.requireOk("fm_begin_replay");
@@ -634,13 +664,72 @@ export class ForkModuleContinuationBackend {
 
   /**
    * Parent abort-replay: begin (mirror of `beginParentReplay`, abort-tagged).
-   * Drives the exact same frame/journal mechanics as `beginParentReplay` —
-   * the module records the drive as an abort internally so `finishAbort` can
-   * assert the pairing (F1).
+   * FINE-GRAINED primitive (see `beginParentReplay`); production uses the coarse
+   * `parentAbort`. The module records the drive as an abort internally so
+   * `finishAbort` can assert the pairing (F1).
    */
   beginAbort(): void {
     this.exports.fm_begin_abort();
     this.requireOk("fm_begin_abort");
+  }
+
+  /**
+   * Bind ONE activation's guest `wpk_fork_rewind_begin` / `wpk_fork_abort_begin`
+   * into the module's imported drive table at
+   * `fm_drive_table_base(activation) + DRIVE_SLOT_{REWIND,ABORT}_BEGIN`, so the
+   * coarse `parentReplay`/`parentAbort` drive can `call_indirect` them. The
+   * ref-typed `Table.set`/`Table.grow` is a host floor (Rust cannot hold a
+   * funcref). Idempotent: rebinding the same slot to the same export is
+   * harmless. Call once per open activation before `parentReplay`/`parentAbort`.
+   */
+  bindActivationBeginDrive(
+    activationId: number,
+    rewindBegin: Function,
+    abortBegin: Function,
+  ): void {
+    this.requireSetup("bind activation begin drive");
+    const slotBase = this.toNum(
+      (this.exports.fm_drive_table_base as (activation: number) => number | bigint)(
+        activationId,
+      ),
+    );
+    const needed = slotBase + DRIVE_SLOT_ABORT_BEGIN + 1;
+    if (this.driveTable.length < needed) {
+      this.driveTable.grow(needed - this.driveTable.length);
+    }
+    this.driveTable.set(slotBase + DRIVE_SLOT_REWIND_BEGIN, rewindBegin);
+    this.driveTable.set(slotBase + DRIVE_SLOT_ABORT_BEGIN, abortBegin);
+  }
+
+  /**
+   * Parent REPLAY-begin, coarsened (control-flow inversion). ONE module call
+   * sequences the whole phase internally: begin the parent rewind (attach every
+   * activation's driver + register its resume slots), build the per-activation
+   * REWIND-begin drive plan, then drive each activation's guest
+   * `wpk_fork_rewind_begin(root)` through the injected `fm_drive_execute` shim in
+   * ascending id order. Replaces the host's former `fm_begin_replay` +
+   * per-activation `wpk_fork_rewind_begin` loop. Each participating activation's
+   * `bindActivationBeginDrive` must have run first (the ref-typed table bind).
+   * A guest reconstruction failure traps inside the shim exactly as it did under
+   * the host loop; a state/plan-build failure is a truthful errno.
+   */
+  parentReplay(): void {
+    this.requireSetup("parent replay");
+    this.exports.fm_parent_replay();
+    this.requireOk("fm_parent_replay");
+  }
+
+  /**
+   * Parent ABORT-replay-begin, coarsened (mirror of `parentReplay`,
+   * abort-tagged). ONE module call runs `fm_begin_abort` (the shared begin plus
+   * the `in_abort` pairing flag `finishAbort` asserts) and drives each
+   * activation's guest `wpk_fork_abort_begin(root)` through the shim. Replaces
+   * the host's `fm_begin_abort` + per-activation `wpk_fork_abort_begin` loop.
+   */
+  parentAbort(): void {
+    this.requireSetup("parent abort");
+    this.exports.fm_parent_abort();
+    this.requireOk("fm_parent_abort");
   }
 
   /**

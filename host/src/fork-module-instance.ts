@@ -82,6 +82,16 @@ export const FORK_MODULE_REQUIRED_EXPORTS = [
   // Release every channel-mapped frame/image chunk on the host abort path.
   "fm_abort",
   "fm_begin_replay",
+  // Control-flow inversion: coarse per-phase entries that sequence the parent
+  // REPLAY-begin / ABORT-replay-begin phase INTERNALLY — begin the rewind, build
+  // the per-activation begin drive plan, then drive each activation's guest
+  // `wpk_fork_rewind_begin` / `wpk_fork_abort_begin` through the injected
+  // `fm_drive_execute` shim. They replace the host's `fm_begin_replay` +
+  // per-activation begin loop with ONE module call. `fm_begin_replay` /
+  // `fm_begin_abort` remain exported for the fine-grained module unit tests and
+  // the native (`host-native`) runner.
+  "fm_parent_replay",
+  "fm_parent_abort",
   // F1: parent abort-replay begin/finish. Mirror `fm_begin_replay`/
   // `fm_finish_replay` exactly (same frame/journal mechanics), tagging the
   // drive as an abort so `fm_finish_abort` can assert a matching
