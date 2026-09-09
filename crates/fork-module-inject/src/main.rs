@@ -138,6 +138,15 @@ const DRIVE_OP_RESTORE: i32 = 5;
 /// `recipe` (high 32) / `arg` (low 32) fields and `call_indirect`s it through a
 /// `(ptr) -> ()` type. MUST match `fork_codec::drive_plan::DRIVE_OP_REWIND_BEGIN`.
 const DRIVE_OP_REWIND_BEGIN: i32 = 7;
+/// op == run one activation's guest `wpk_fork_unwind_end()` — the capture-SEAL
+/// state flip. UNLIKE every other guest-drive op it takes NO argument, so the
+/// shim `call_indirect`s it through a distinct `() -> ()` type, reading neither
+/// `arg` nor `recipe`. It shares the `>= DRIVE_OP_RESTORE` "install/control"
+/// class (excluded from the reconstruction counter), so it is checked BEFORE the
+/// `>= DRIVE_OP_REWIND_BEGIN` pointer-drive branch (its op value, 9, is also
+/// `>= DRIVE_OP_REWIND_BEGIN`). MUST match
+/// `fork_codec::drive_plan::DRIVE_OP_UNWIND_END`.
+const DRIVE_OP_UNWIND_END: i32 = 9;
 
 /// The Rust helper the injected shim calls to map a recipe id to a catalog
 /// ordinal (or the null sentinel). Exported by `crates/fork-module/src/lib.rs`.
@@ -485,6 +494,10 @@ fn inject_drive_execute(module: &mut Module) -> Result<()> {
     // `call_indirect`s for a REWIND_BEGIN / ABORT_BEGIN step: `(ptr) -> ()`
     // (`i32` on wasm32 — identical to `indirect_ty` there — `i64` on wasm64).
     let ptr_indirect_ty = module.types.add(&[ptr_ty], &[]);
+    // The guest `wpk_fork_unwind_end` signature the shim `call_indirect`s for a
+    // DRIVE_OP_UNWIND_END step: `() -> ()` (no argument — the instrumenter emits
+    // it with an empty signature; see `fork_instrument::runtime::emit_end_fn`).
+    let void_indirect_ty = module.types.add(&[], &[]);
 
     let mut builder =
         FunctionBuilder::new(&mut module.types, &[ptr_ty, ValType::I32], &[]);
@@ -669,7 +682,11 @@ fn inject_drive_execute(module: &mut Module) -> Result<()> {
                                         |_| {},
                                     );
                             },
-                            // Real guest drive. Two shapes, split on the op:
+                            // Real guest drive. Three shapes, split on the op:
+                            //   op == DRIVE_OP_UNWIND_END (capture seal):
+                            //     the guest export takes NO argument,
+                            //     `call_indirect ()->()`. Checked FIRST because its
+                            //     op value (9) is also `>= DRIVE_OP_REWIND_BEGIN`.
                             //   op >= DRIVE_OP_REWIND_BEGIN (REWIND_BEGIN/ABORT_BEGIN):
                             //     the guest export takes the continuation ROOT pointer,
                             //     `call_indirect (ptr)->()`; the root is reconstructed
@@ -677,6 +694,27 @@ fn inject_drive_execute(module: &mut Module) -> Result<()> {
                             //   otherwise (ALLOC/FILL/EXN/RESTORE/FINISH_RESTORE):
                             //     `call_indirect (i32)->()` with `arg`, then (if ALLOC)
                             //     the store-#2 published-object assert.
+                            |drive| {
+                        drive.local_get(op).i32_const(DRIVE_OP_UNWIND_END).binop(BinaryOp::I32Eq);
+                        drive.if_else(
+                            None,
+                            // () -> () drive: call_indirect guest[slot]() — no argument
+                            // (the capture-seal `wpk_fork_unwind_end` flip). Reads only
+                            // the step's slot; `recipe`/`arg` are ignored.
+                            |void_drive| {
+                                void_drive
+                                    .local_get(step)
+                                    .load(
+                                        memory,
+                                        LoadKind::I32 { atomic: false },
+                                        MemArg { align: 4, offset: DRIVE_STEP_OFF_SLOT },
+                                    )
+                                    .instr(CallIndirect {
+                                        ty: void_indirect_ty,
+                                        table: drive_table,
+                                    });
+                            },
+                            // Argument-bearing guest drive: pointer- or i32-argument.
                             |drive| {
                         drive
                             .local_get(op)
@@ -772,6 +810,8 @@ fn inject_drive_execute(module: &mut Module) -> Result<()> {
                                     );
                             },
                             |_| {},
+                        );
+                            },
                         );
                             },
                         );
